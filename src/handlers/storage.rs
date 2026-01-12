@@ -431,7 +431,7 @@ fn get_linux_devices() -> Result<Vec<StorageDevice>, AppError> {
     if let Some(blockdevices) = parsed.get("blockdevices").and_then(|v| v.as_array()) {
         for device in blockdevices {
             // 处理主设备
-            let device_name = device["name"].as_str().unwrap_or("");
+            let _device_name = device["name"].as_str().unwrap_or("");
             let device_type_str = device["type"].as_str().unwrap_or("");
             
             // 跳过非磁盘设备

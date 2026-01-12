@@ -309,13 +309,14 @@ pub fn detect_usb_devices_detailed() -> Vec<UsbDeviceInfo> {
                 .to_string();
 
             if !vendor_id.is_empty() && !product_id.is_empty() {
+                let mount_point = find_device_mount_point(&vendor_id, &product_id);
                 devices.push(UsbDeviceInfo {
                     name: product_name,
                     vendor_id,
                     product_id,
                     manufacturer,
                     device_class: detect_device_class(&path),
-                    mount_point: find_device_mount_point(&vendor_id, &product_id),
+                    mount_point,
                 });
             }
         }
