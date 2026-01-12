@@ -1,0 +1,81 @@
+[package]
+name = "rockzero-service"
+version = "0.1.0"
+edition = "2021"
+authors = ["RockZero Team"]
+description = "Cross-platform Secure Service with Hardware Detection and Media Support"
+
+[dependencies]
+actix-web = { version = "4.4", features = ["rustls-0_21"] }
+actix-cors = "0.7"
+actix-files = "0.6"
+actix-multipart = "0.6"
+
+tokio = { version = "1.35", features = ["full"] }
+futures = "0.3"
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+jsonwebtoken = "9.2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+blake3 = "1.5"
+rand = "0.8"
+getrandom = "0.2"
+
+aes-gcm = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.21"
+hex = "0.4"
+
+bulletproofs = "5.0.0"
+curve25519-dalek = { version = "4.1", features = ["serde", "rand_core"] }
+merlin = "3.0"
+
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+dotenvy = "0.15"
+thiserror = "1.0"
+validator = { version = "0.16", features = ["derive"] }
+
+rustls = "0.21"
+rustls-pemfile = "1.0"
+tokio-rustls = "0.24"
+
+mime_guess = "2.0"
+walkdir = "2.4"
+image = "0.24"
+
+# 跨平台硬件检测
+sysinfo = "0.30"
+libc = "0.2"
+
+# FIDO2/WebAuthn 支持
+webauthn-rs = "0.4"
+webauthn-rs-proto = "0.4"
+
+# 媒体处理
+ffmpeg-next = "6.1"
+symphonia = { version = "0.5", features = ["all"] }
+
+# USB 设备检测
+rusb = "0.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.27", features = ["mount", "fs"] }
+udev = "0.8"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

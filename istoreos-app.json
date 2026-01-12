@@ -1,0 +1,92 @@
+{
+  "name": "rockzero-service",
+  "title": "RockZero 安全服务",
+  "version": "0.1.0",
+  "description": "零知识证明安全服务 - 支持文件管理、媒体播放、小组件。采用 Argon2 密码哈希、单调时钟防篡改推荐码系统。",
+  "icon": "https://cdn.jsdelivr.net/gh/rockzero/rockzero-service@main/icon.png",
+  "author": "RockZero Team",
+  "homepage": "https://github.com/rockzero/rockzero-service",
+  "categories": ["security", "media", "tools"],
+  "tags": ["security", "zero-knowledge", "file-manager", "media-player", "widgets"],
+  "architecture": ["amd64", "arm64", "armv7"],
+  "docker": {
+    "image": "rockzero/rockzero-service:latest",
+    "ports": [
+      {
+        "container": 8443,
+        "host": 8443,
+        "protocol": "tcp",
+        "description": "Web 服务端口"
+      }
+    ],
+    "volumes": [
+      {
+        "container": "/app/data",
+        "host": "/opt/docker/rockzero/data",
+        "mode": "rw",
+        "description": "数据库存储"
+      },
+      {
+        "container": "/app/uploads",
+        "host": "/opt/docker/rockzero/uploads",
+        "mode": "rw",
+        "description": "文件上传存储"
+      }
+    ],
+    "environment": [
+      {
+        "name": "RUST_LOG",
+        "value": "info",
+        "description": "日志级别"
+      },
+      {
+        "name": "JWT_SECRET",
+        "value": "",
+        "required": true,
+        "description": "JWT 密钥（至少32字符）"
+      },
+      {
+        "name": "ENCRYPTION_KEY",
+        "value": "",
+        "required": true,
+        "description": "加密密钥（32字符）"
+      },
+      {
+        "name": "TLS_ENABLED",
+        "value": "false",
+        "description": "是否启用 TLS"
+      }
+    ],
+    "restart_policy": "unless-stopped",
+    "network_mode": "bridge",
+    "privileged": false,
+    "cap_add": ["NET_BIND_SERVICE"],
+    "cap_drop": ["ALL"],
+    "security_opt": ["no-new-privileges:true"]
+  },
+  "requirements": {
+    "memory": "256M",
+    "storage": "1G"
+  },
+  "features": [
+    "🔐 零知识证明认证",
+    "📁 文件管理系统",
+    "🎵 媒体播放支持",
+    "📊 可定制小组件",
+    "⏰ 单调时钟防篡改",
+    "🛡️ Argon2 密码哈希",
+    "🔒 端到端加密"
+  ],
+  "installation": {
+    "steps": [
+      "1. 设置 JWT_SECRET 和 ENCRYPTION_KEY 环境变量",
+      "2. 首次访问进行注册（自动成为超级管理员）",
+      "3. 使用超级管理员账户生成推荐码供其他用户注册"
+    ]
+  },
+  "support": {
+    "documentation": "https://github.com/rockzero/rockzero-service/wiki",
+    "issues": "https://github.com/rockzero/rockzero-service/issues",
+    "community": "https://github.com/rockzero/rockzero-service/discussions"
+  }
+}

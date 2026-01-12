@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  rockzero:
+    build:
+      context: .
+      dockerfile: Dockerfile.multiarch
+      platforms:
+        - linux/amd64
+        - linux/arm64
+        - linux/arm/v7
+        - linux/386
+    image: rockzero-service:latest
+    container_name: rockzero-service
+    restart: unless-stopped
+    
+    ports:
+      - "8443:8443"
+    
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+      - ./certs:/app/certs
+      - /DATA/AppData:/DATA/AppData
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 硬件加速设备
+      - /dev/video10:/dev/video10
+      - /dev/video11:/dev/video11
+      - /dev/meson-vdec:/dev/meson-vdec
+      - /dev/dri:/dev/dri
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      # USB 设备
+      - /dev/bus/usb:/dev/bus/usb
+    
+    devices:
+      - /dev/video10:/dev/video10
+      - /dev/video11:/dev/video11
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    
+    environment:
+      - RUST_LOG=info
+      - DATABASE_URL=sqlite:///app/data/rockzero.db
+      - JWT_SECRET=${JWT_SECRET:-your-secret-key-change-this}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-your-encryption-key-32-bytes-long}
+      - HOST=0.0.0.0
+      - PORT=8443
+      - TLS_ENABLED=false
+      - UPLOAD_DIR=/app/uploads
+      - MAX_FILE_SIZE=104857600
+    
+    privileged: true
+    
+    networks:
+      - rockzero-network
+    
+    labels:
+      - "com.rockzero.service=main"
+      - "com.rockzero.version=0.1.0"
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8443/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  rockzero-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  rockzero-data:
+    driver: local
+  rockzero-uploads:
+    driver: local

@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  rockzero:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rockzero-service
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    environment:
+      - RUST_LOG=info
+      - HOST=0.0.0.0
+      - PORT=8443
+      - DATABASE_URL=sqlite:///app/data/rockzero.db
+      - JWT_SECRET=${JWT_SECRET:-change-this-secret-in-production}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-change-this-encryption-key-32ch}
+      - TLS_ENABLED=false
+    volumes:
+      - rockzero-data:/app/data
+      - rockzero-uploads:/app/uploads
+    networks:
+      - rockzero-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8443/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: false
+    tmpfs:
+      - /tmp
+
+volumes:
+  rockzero-data:
+    driver: local
+  rockzero-uploads:
+    driver: local
+
+networks:
+  rockzero-network:
+    driver: bridge

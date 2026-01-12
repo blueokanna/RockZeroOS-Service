@@ -1,0 +1,117 @@
+# 多架构 Dockerfile for RockZero
+# 支持: amd64, arm64, armv7, i386
+
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+
+FROM --platform=$BUILDPLATFORM rust:1.75-slim as builder
+
+ARG TARGETPLATFORM
+ARG TARGETARCH
+ARG TARGETVARIANT
+
+WORKDIR /app
+
+# 安装构建依赖
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    libsqlite3-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libavutil-dev \
+    libavfilter-dev \
+    libswscale-dev \
+    libswresample-dev \
+    libusb-1.0-0-dev \
+    libudev-dev \
+    libpcsclite-dev \
+    gcc \
+    g++ \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+# 根据目标平台设置 Rust 目标
+RUN case "$TARGETPLATFORM" in \
+    "linux/amd64") \
+        echo "x86_64-unknown-linux-gnu" > /rust_target.txt \
+        ;; \
+    "linux/arm64") \
+        echo "aarch64-unknown-linux-gnu" > /rust_target.txt \
+        ;; \
+    "linux/arm/v7") \
+        echo "armv7-unknown-linux-gnueabihf" > /rust_target.txt \
+        ;; \
+    "linux/386") \
+        echo "i686-unknown-linux-gnu" > /rust_target.txt \
+        ;; \
+    *) \
+        echo "x86_64-unknown-linux-gnu" > /rust_target.txt \
+        ;; \
+    esac
+
+RUN RUST_TARGET=$(cat /rust_target.txt) && \
+    rustup target add $RUST_TARGET
+
+# 复制项目文件
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+# 构建项目
+RUN RUST_TARGET=$(cat /rust_target.txt) && \
+    cargo build --release --target $RUST_TARGET && \
+    cp target/$RUST_TARGET/release/rockzero-service /app/rockzero-service
+
+# 运行时镜像
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim
+
+ARG TARGETPLATFORM
+
+WORKDIR /app
+
+# 安装运行时依赖
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    libsqlite3-0 \
+    ffmpeg \
+    libavcodec59 \
+    libavformat59 \
+    libavutil57 \
+    libswscale6 \
+    libswresample4 \
+    libusb-1.0-0 \
+    libudev1 \
+    pcscd \
+    libpcsclite1 \
+    usbutils \
+    v4l-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# ARM 特定依赖
+RUN if [ "$TARGETPLATFORM" = "linux/arm64" ] || [ "$TARGETPLATFORM" = "linux/arm/v7" ]; then \
+    apt-get update && apt-get install -y \
+    librockchip-mpp1 \
+    librockchip-vpu1 \
+    || true; \
+    rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# 复制二进制文件
+COPY --from=builder /app/rockzero-service /usr/local/bin/rockzero-service
+
+# 创建必要的目录
+RUN mkdir -p /app/data /app/uploads /app/certs /app/storage
+
+# 设置权限
+RUN chmod +x /usr/local/bin/rockzero-service
+
+# 暴露端口
+EXPOSE 8443
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8443/health || exit 1
+
+# 启动服务
+CMD ["/usr/local/bin/rockzero-service"]
