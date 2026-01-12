@@ -5,6 +5,10 @@ edition = "2021"
 authors = ["RockZero Team"]
 description = "Cross-platform Secure Service with Hardware Detection and Media Support"
 
+[features]
+default = []
+fido = ["webauthn-rs", "webauthn-rs-proto"]
+
 [dependencies]
 actix-web = { version = "4.4", features = ["rustls-0_21"] }
 actix-cors = "0.7"
@@ -54,22 +58,17 @@ image = "0.24"
 
 # 跨平台硬件检测
 sysinfo = "0.30"
-libc = "0.2"
 
-# FIDO2/WebAuthn 支持
-webauthn-rs = "0.4"
-webauthn-rs-proto = "0.4"
+# FIDO2/WebAuthn 支持 (可选，需要 OpenSSL)
+webauthn-rs = { version = "0.4", optional = true }
+webauthn-rs-proto = { version = "0.4", optional = true }
 
-# 媒体处理
-ffmpeg-next = "6.1"
+# 媒体处理 (使用命令行 ffmpeg，不需要库依赖)
 symphonia = { version = "0.5", features = ["all"] }
-
-# USB 设备检测
-rusb = "0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.27", features = ["mount", "fs"] }
-udev = "0.8"
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"

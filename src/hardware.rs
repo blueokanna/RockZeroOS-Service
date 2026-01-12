@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::Path;
-use sysinfo::System;
+use sysinfo::{Disks, System};
+
+#[cfg(target_os = "linux")]
+use std::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareCapabilities {
@@ -201,10 +203,11 @@ fn detect_audio_devices() -> Vec<AudioDevice> {
     devices
 }
 
-fn detect_storage_devices(sys: &mut System) -> Vec<StorageDevice> {
+fn detect_storage_devices(_sys: &mut System) -> Vec<StorageDevice> {
     let mut devices = Vec::new();
+    let disks_info = Disks::new_with_refreshed_list();
 
-    for disk in sys.disks() {
+    for disk in disks_info.list() {
         let name = disk.name().to_string_lossy().to_string();
         let device_path = name.clone();
         let mount_point = Some(disk.mount_point().to_string_lossy().to_string());
@@ -322,10 +325,12 @@ pub fn detect_usb_devices_detailed() -> Vec<UsbDeviceInfo> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub fn detect_usb_devices_detailed() -> Vec<UsbDeviceInfo> {
     Vec::new()
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsbDeviceInfo {
     pub name: String,

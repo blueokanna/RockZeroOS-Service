@@ -246,6 +246,7 @@ pub async fn find_user_by_email(pool: &SqlitePool, email: &str) -> Result<Option
     Ok(user)
 }
 
+#[allow(dead_code)]
 pub async fn find_user_by_username(pool: &SqlitePool, username: &str) -> Result<Option<User>, AppError> {
     let user = sqlx::query_as::<_, User>(
         r#"

@@ -1,8 +1,13 @@
 pub mod appstore;
 pub mod auth;
+pub mod disk_manager;
+pub mod docker;
 pub mod filemanager;
 pub mod files;
 pub mod health;
 pub mod media;
+pub mod storage;
+pub mod streaming;
 pub mod system;
+pub mod webdav;
 pub mod widgets;

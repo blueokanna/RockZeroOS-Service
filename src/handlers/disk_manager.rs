@@ -1,0 +1,611 @@
+use actix_web::{web, HttpResponse, Responder};
+use serde::{Deserialize, Serialize};
+use sysinfo::Disks;
+
+#[cfg(target_os = "linux")]
+use std::process::Command;
+
+use crate::error::AppError;
+
+#[derive(Debug, Serialize)]
+pub struct DiskDetail {
+    pub name: String,
+    pub device_path: String,
+    pub mount_point: String,
+    pub file_system: String,
+    pub total_space: u64,
+    pub available_space: u64,
+    pub used_space: u64,
+    pub usage_percentage: f64,
+    pub is_removable: bool,
+    pub disk_type: String,
+    pub is_mounted: bool,
+    pub read_only: bool,
+    pub label: Option<String>,
+    pub uuid: Option<String>,
+    pub serial: Option<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PartitionInfo {
+    pub device: String,
+    pub size: u64,
+    pub partition_type: String,
+    pub file_system: Option<String>,
+    pub mount_point: Option<String>,
+    pub label: Option<String>,
+    pub uuid: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiskHealthInfo {
+    pub device: String,
+    pub healthy: bool,
+    pub temperature: Option<f64>,
+    pub power_on_hours: Option<u64>,
+    pub reallocated_sectors: Option<u64>,
+    pub pending_sectors: Option<u64>,
+    pub details: String,
+    pub smart_status: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiskIOStats {
+    pub device: String,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub read_ops: u64,
+    pub write_ops: u64,
+}
+
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct MountRequest {
+    pub device: String,
+    pub mount_point: String,
+    pub file_system: Option<String>,
+    pub options: Option<Vec<String>>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct UnmountRequest {
+    pub device: String,
+    pub force: Option<bool>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct FormatRequest {
+    pub device: String,
+    pub file_system: String,
+    pub label: Option<String>,
+    #[allow(dead_code)]
+    pub quick: Option<bool>,
+}
+
+pub async fn list_disks() -> Result<impl Responder, AppError> {
+    let disks_info = Disks::new_with_refreshed_list();
+    let mut disks = Vec::new();
+
+    for disk in disks_info.list() {
+        let total_space = disk.total_space();
+        let available_space = disk.available_space();
+        let used_space = total_space.saturating_sub(available_space);
+        let usage_percentage = if total_space > 0 {
+            (used_space as f64 / total_space as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let device_path = disk.name().to_string_lossy().to_string();
+        let mount_point = disk.mount_point().to_string_lossy().to_string();
+        let is_removable = disk.is_removable();
+        let disk_type = format!("{:?}", disk.kind());
+
+        let (label, uuid, serial, model) = get_disk_metadata(&device_path);
+
+        disks.push(DiskDetail {
+            name: device_path.clone(),
+            device_path,
+            mount_point,
+            file_system: disk.file_system().to_string_lossy().to_string(),
+            total_space,
+            available_space,
+            used_space,
+            usage_percentage,
+            is_removable,
+            disk_type,
+            is_mounted: true,
+            read_only: false,
+            label,
+            uuid,
+            serial,
+            model,
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(unmounted) = get_unmounted_disks() {
+            for disk in unmounted {
+                if !disks.iter().any(|d| d.device_path == disk.device_path) {
+                    disks.push(disk);
+                }
+            }
+        }
+    }
+
+    Ok(HttpResponse::Ok().json(disks))
+}
+
+#[cfg(target_os = "linux")]
+fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
+    let output = Command::new("lsblk")
+        .args(["-J", "-o", "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,UUID,MODEL,SERIAL,RM,RO"])
+        .output()?;
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
+
+    let mut disks = Vec::new();
+
+    if let Some(blockdevices) = parsed.get("blockdevices").and_then(|v| v.as_array()) {
+        for device in blockdevices {
+            if let Some(children) = device.get("children").and_then(|v| v.as_array()) {
+                for child in children {
+                    let mount_point = child.get("mountpoint").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                    if mount_point.is_empty() {
+                        let name = child.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let device_path = format!("/dev/{}", name);
+                        let fs_type = child.get("fstype").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let label = child.get("label").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let uuid = child.get("uuid").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let model = child.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let serial = child.get("serial").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let is_removable = child.get("rm").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let read_only = child.get("ro").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                        let size_str = child.get("size").and_then(|v| v.as_str()).unwrap_or("0");
+                        let total_space = parse_size_string(size_str);
+
+                        disks.push(DiskDetail {
+                            name: name.clone(),
+                            device_path,
+                            mount_point: String::new(),
+                            file_system: fs_type,
+                            total_space,
+                            available_space: total_space,
+                            used_space: 0,
+                            usage_percentage: 0.0,
+                            is_removable,
+                            disk_type: "Unknown".to_string(),
+                            is_mounted: false,
+                            read_only,
+                            label,
+                            uuid,
+                            serial,
+                            model,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(disks)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_size_string(size_str: &str) -> u64 {
+    let size_str = size_str.trim();
+    let (num_str, unit) = if size_str.ends_with('G') {
+        (&size_str[..size_str.len() - 1], 1024u64 * 1024 * 1024)
+    } else if size_str.ends_with('M') {
+        (&size_str[..size_str.len() - 1], 1024u64 * 1024)
+    } else if size_str.ends_with('K') {
+        (&size_str[..size_str.len() - 1], 1024u64)
+    } else if size_str.ends_with('T') {
+        (&size_str[..size_str.len() - 1], 1024u64 * 1024 * 1024 * 1024)
+    } else {
+        (size_str, 1u64)
+    };
+    num_str.parse::<f64>().unwrap_or(0.0) as u64 * unit
+}
+
+
+#[allow(unused_variables)]
+fn get_disk_metadata(device_path: &str) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+    #[cfg(target_os = "linux")]
+    {
+        let label = Command::new("blkid")
+            .args(["-s", "LABEL", "-o", "value", device_path])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .filter(|s| !s.is_empty());
+
+        let uuid = Command::new("blkid")
+            .args(["-s", "UUID", "-o", "value", device_path])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .filter(|s| !s.is_empty());
+
+        return (label, uuid, None, None);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        (None, None, None, None)
+    }
+}
+
+pub async fn list_partitions() -> Result<impl Responder, AppError> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("lsblk")
+            .args(["-J", "-o", "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,UUID"])
+            .output()
+            .map_err(|_| AppError::InternalError)?;
+
+        if output.status.success() {
+            let json_str = String::from_utf8_lossy(&output.stdout);
+            return Ok(HttpResponse::Ok().body(json_str.to_string()));
+        }
+    }
+
+    Ok(HttpResponse::Ok().json(Vec::<PartitionInfo>::new()))
+}
+
+pub async fn get_disk_io_stats() -> Result<impl Responder, AppError> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/diskstats") {
+            let mut stats = Vec::new();
+            for line in content.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 14 {
+                    let device = parts[2].to_string();
+                    if device.starts_with("sd") || device.starts_with("nvme") || device.starts_with("vd") {
+                        stats.push(DiskIOStats {
+                            device,
+                            read_ops: parts[3].parse().unwrap_or(0),
+                            read_bytes: parts[5].parse::<u64>().unwrap_or(0) * 512,
+                            write_ops: parts[7].parse().unwrap_or(0),
+                            write_bytes: parts[9].parse::<u64>().unwrap_or(0) * 512,
+                        });
+                    }
+                }
+            }
+            return Ok(HttpResponse::Ok().json(stats));
+        }
+    }
+
+    Ok(HttpResponse::Ok().json(Vec::<DiskIOStats>::new()))
+}
+
+pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, AppError> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::create_dir_all(&body.mount_point)
+            .map_err(|_| AppError::BadRequest("Failed to create mount point".to_string()))?;
+
+        let mut cmd = Command::new("mount");
+
+        if let Some(fs) = &body.file_system {
+            cmd.arg("-t").arg(fs);
+        }
+
+        if let Some(options) = &body.options {
+            if !options.is_empty() {
+                cmd.arg("-o").arg(options.join(","));
+            }
+        }
+
+        cmd.arg(&body.device).arg(&body.mount_point);
+
+        let output = cmd.output().map_err(|_| AppError::InternalError)?;
+
+        if output.status.success() {
+            return Ok(HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "message": "Disk mounted successfully",
+                "device": body.device,
+                "mount_point": body.mount_point,
+            })));
+        } else {
+            let error = String::from_utf8_lossy(&output.stderr);
+            return Err(AppError::BadRequest(format!("Mount failed: {}", error)));
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &body;
+        Err(AppError::BadRequest("Mount operation not supported on this platform".to_string()))
+    }
+}
+
+
+pub async fn unmount_disk(body: web::Json<UnmountRequest>) -> Result<HttpResponse, AppError> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut cmd = Command::new("umount");
+
+        if body.force.unwrap_or(false) {
+            cmd.arg("-f");
+        }
+
+        cmd.arg(&body.device);
+
+        let output = cmd.output().map_err(|_| AppError::InternalError)?;
+
+        if output.status.success() {
+            return Ok(HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "message": "Disk unmounted successfully",
+                "device": body.device,
+            })));
+        } else {
+            let error = String::from_utf8_lossy(&output.stderr);
+            return Err(AppError::BadRequest(format!("Unmount failed: {}", error)));
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &body;
+        Err(AppError::BadRequest("Unmount operation not supported on this platform".to_string()))
+    }
+}
+
+pub async fn format_disk(body: web::Json<FormatRequest>) -> Result<HttpResponse, AppError> {
+    #[cfg(target_os = "linux")]
+    {
+        let cmd_name = match body.file_system.to_lowercase().as_str() {
+            "ext4" => "mkfs.ext4",
+            "ext3" => "mkfs.ext3",
+            "ext2" => "mkfs.ext2",
+            "fat32" | "vfat" => "mkfs.vfat",
+            "ntfs" => "mkfs.ntfs",
+            "exfat" => "mkfs.exfat",
+            "xfs" => "mkfs.xfs",
+            "btrfs" => "mkfs.btrfs",
+            "f2fs" => "mkfs.f2fs",
+            _ => {
+                return Err(AppError::BadRequest(format!("Unsupported file system: {}", body.file_system)))
+            }
+        };
+
+        let mut cmd = Command::new(cmd_name);
+
+        if let Some(label) = &body.label {
+            match body.file_system.to_lowercase().as_str() {
+                "ext4" | "ext3" | "ext2" | "ntfs" | "xfs" | "btrfs" => {
+                    cmd.arg("-L").arg(label);
+                }
+                "vfat" | "fat32" | "exfat" => {
+                    cmd.arg("-n").arg(label);
+                }
+                _ => {}
+            }
+        }
+
+        match body.file_system.to_lowercase().as_str() {
+            "ext4" | "ext3" | "ext2" => { cmd.arg("-F"); }
+            "xfs" | "btrfs" => { cmd.arg("-f"); }
+            _ => {}
+        }
+
+        cmd.arg(&body.device);
+
+        let output = cmd.output().map_err(|_| AppError::InternalError)?;
+
+        if output.status.success() {
+            return Ok(HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "message": "Disk formatted successfully",
+                "device": body.device,
+                "file_system": body.file_system,
+            })));
+        } else {
+            let error = String::from_utf8_lossy(&output.stderr);
+            return Err(AppError::BadRequest(format!("Format failed: {}", error)));
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &body;
+        Err(AppError::BadRequest("Format operation not supported on this platform".to_string()))
+    }
+}
+
+pub async fn check_disk_health(device: web::Path<String>) -> Result<HttpResponse, AppError> {
+    let device_path = if device.starts_with("/dev/") {
+        device.to_string()
+    } else {
+        format!("/dev/{}", device.as_str())
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("smartctl")
+            .args(["-H", "-A", "-i", &device_path])
+            .output();
+
+        if let Ok(output) = output {
+            if output.status.success() || output.status.code() == Some(4) {
+                let result = String::from_utf8_lossy(&output.stdout);
+                let is_healthy = result.contains("PASSED") || !result.contains("FAILED");
+
+                let temperature = parse_smart_attribute(&result, "Temperature");
+                let power_on_hours = parse_smart_attribute(&result, "Power_On_Hours").map(|v| v as u64);
+                let reallocated_sectors = parse_smart_attribute(&result, "Reallocated_Sector").map(|v| v as u64);
+                let pending_sectors = parse_smart_attribute(&result, "Current_Pending_Sector").map(|v| v as u64);
+
+                let smart_status = if is_healthy { "PASSED" } else { "FAILED" };
+
+                return Ok(HttpResponse::Ok().json(DiskHealthInfo {
+                    device: device_path,
+                    healthy: is_healthy,
+                    temperature,
+                    power_on_hours,
+                    reallocated_sectors,
+                    pending_sectors,
+                    details: result.to_string(),
+                    smart_status: smart_status.to_string(),
+                }));
+            }
+        }
+
+        return Ok(HttpResponse::Ok().json(DiskHealthInfo {
+            device: device_path,
+            healthy: true,
+            temperature: None,
+            power_on_hours: None,
+            reallocated_sectors: None,
+            pending_sectors: None,
+            details: "SMART data not available. Install smartmontools for detailed health info.".to_string(),
+            smart_status: "UNKNOWN".to_string(),
+        }));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(HttpResponse::Ok().json(DiskHealthInfo {
+            device: device_path,
+            healthy: true,
+            temperature: None,
+            power_on_hours: None,
+            reallocated_sectors: None,
+            pending_sectors: None,
+            details: "Health check not available on this platform".to_string(),
+            smart_status: "UNKNOWN".to_string(),
+        }))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_smart_attribute(output: &str, attr_name: &str) -> Option<f64> {
+    for line in output.lines() {
+        if line.contains(attr_name) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 10 {
+                return parts[9].parse().ok();
+            }
+        }
+    }
+    None
+}
+
+
+pub async fn eject_disk(device: web::Path<String>) -> Result<HttpResponse, AppError> {
+    #[cfg(target_os = "linux")]
+    {
+        let device_path = if device.starts_with("/dev/") {
+            device.to_string()
+        } else {
+            format!("/dev/{}", device.as_str())
+        };
+
+        let _ = Command::new("umount").arg(&device_path).output();
+
+        let output = Command::new("eject")
+            .arg(&device_path)
+            .output()
+            .map_err(|_| AppError::InternalError)?;
+
+        if output.status.success() {
+            return Ok(HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "message": "Disk ejected successfully",
+                "device": device_path,
+            })));
+        } else {
+            let error = String::from_utf8_lossy(&output.stderr);
+            return Err(AppError::BadRequest(format!("Eject failed: {}", error)));
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &device;
+        Err(AppError::BadRequest("Eject operation not supported on this platform".to_string()))
+    }
+}
+
+pub async fn get_supported_filesystems() -> Result<impl Responder, AppError> {
+    let filesystems = vec![
+        serde_json::json!({
+            "name": "ext4",
+            "description": "Fourth Extended Filesystem - Default Linux filesystem",
+            "supports_label": true,
+            "max_file_size": "16 TB",
+            "max_volume_size": "1 EB",
+            "platforms": ["linux"]
+        }),
+        serde_json::json!({
+            "name": "xfs",
+            "description": "XFS - High-performance filesystem",
+            "supports_label": true,
+            "max_file_size": "8 EB",
+            "max_volume_size": "8 EB",
+            "platforms": ["linux"]
+        }),
+        serde_json::json!({
+            "name": "btrfs",
+            "description": "B-tree Filesystem - Modern copy-on-write filesystem",
+            "supports_label": true,
+            "max_file_size": "16 EB",
+            "max_volume_size": "16 EB",
+            "platforms": ["linux"]
+        }),
+        serde_json::json!({
+            "name": "fat32",
+            "description": "FAT32 - Universal compatibility",
+            "supports_label": true,
+            "max_file_size": "4 GB",
+            "max_volume_size": "2 TB",
+            "platforms": ["linux", "windows", "macos"]
+        }),
+        serde_json::json!({
+            "name": "exfat",
+            "description": "exFAT - Extended FAT for large files",
+            "supports_label": true,
+            "max_file_size": "16 EB",
+            "max_volume_size": "128 PB",
+            "platforms": ["linux", "windows", "macos"]
+        }),
+        serde_json::json!({
+            "name": "ntfs",
+            "description": "NTFS - Windows native filesystem",
+            "supports_label": true,
+            "max_file_size": "16 EB",
+            "max_volume_size": "256 TB",
+            "platforms": ["linux", "windows"]
+        }),
+    ];
+
+    Ok(HttpResponse::Ok().json(filesystems))
+}

@@ -22,10 +22,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::AppConfig;
 use crate::crypto::CryptoContext;
-use crate::fido::FidoManager;
 use crate::invite::InviteCodeManager;
 use crate::media_processor::MediaProcessor;
 use crate::zkp::ZkpContext;
+
+#[cfg(feature = "fido")]
+use crate::fido::FidoManager;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -58,10 +60,17 @@ async fn main() -> std::io::Result<()> {
     let zkp_ctx = Arc::new(ZkpContext::new());
     let invite_manager = Arc::new(InviteCodeManager::new());
     
+    #[cfg(feature = "fido")]
     let fido_manager = Arc::new(
         FidoManager::new(&config.host, &format!("https://{}:{}", config.host, config.port))
             .expect("Failed to initialize FIDO2 manager")
     );
+    
+    #[cfg(feature = "fido")]
+    info!("FIDO2/WebAuthn: Enabled");
+    
+    #[cfg(not(feature = "fido"))]
+    info!("FIDO2/WebAuthn: Disabled (compile with --features fido to enable)");
     
     let media_processor = Arc::new(MediaProcessor::new());
     if media_processor.is_available() {
@@ -85,6 +94,7 @@ async fn main() -> std::io::Result<()> {
     let crypto_data = web::Data::new(crypto_ctx);
     let zkp_data = web::Data::new(zkp_ctx);
     let invite_data = web::Data::new(invite_manager);
+    #[cfg(feature = "fido")]
     let fido_data = web::Data::new(fido_manager);
     let media_data = web::Data::new(media_processor);
     let config_data = web::Data::new(config.clone());
@@ -113,14 +123,18 @@ async fn main() -> std::io::Result<()> {
             .supports_credentials()
             .max_age(3600);
 
-        App::new()
+        let app = App::new()
             .app_data(pool_data.clone())
             .app_data(crypto_data.clone())
             .app_data(zkp_data.clone())
             .app_data(invite_data.clone())
-            .app_data(fido_data.clone())
             .app_data(media_data.clone())
-            .app_data(config_data.clone())
+            .app_data(config_data.clone());
+        
+        #[cfg(feature = "fido")]
+        let app = app.app_data(fido_data.clone());
+        
+        app
             .wrap(Logger::default())
             .wrap(cors)
             .route("/health", web::get().to(handlers::health::health_check))
@@ -161,7 +175,9 @@ async fn main() -> std::io::Result<()> {
                 web::scope("/api/v1/media")
                     .wrap(middleware::JwtAuth)
                     .route("", web::get().to(handlers::media::list_media))
-                    .route("", web::post().to(handlers::media::create_media)),
+                    .route("", web::post().to(handlers::media::create_media))
+                    .route("/codecs", web::get().to(handlers::media::get_codec_info))
+                    .route("/transcode", web::post().to(handlers::media::transcode_media)),
             )
             .service(
                 web::scope("/api/v1/widgets")
@@ -206,12 +222,89 @@ async fn main() -> std::io::Result<()> {
                     .route("/hardware", web::get().to(handlers::system::get_hardware_info)),
             )
             .service(
-                web::scope("/api/v1/media")
+                web::scope("/api/v1/disk")
                     .wrap(middleware::JwtAuth)
-                    .route("", web::get().to(handlers::media::list_media))
-                    .route("", web::post().to(handlers::media::create_media))
-                    .route("/codecs", web::get().to(handlers::media::get_codec_info))
-                    .route("/transcode", web::post().to(handlers::media::transcode_media)),
+                    .route("/list", web::get().to(handlers::disk_manager::list_disks))
+                    .route("/partitions", web::get().to(handlers::disk_manager::list_partitions))
+                    .route("/io-stats", web::get().to(handlers::disk_manager::get_disk_io_stats))
+                    .route("/filesystems", web::get().to(handlers::disk_manager::get_supported_filesystems))
+                    .route("/mount", web::post().to(handlers::disk_manager::mount_disk))
+                    .route("/unmount", web::post().to(handlers::disk_manager::unmount_disk))
+                    .route("/format", web::post().to(handlers::disk_manager::format_disk))
+                    .route("/eject/{device:.*}", web::post().to(handlers::disk_manager::eject_disk))
+                    .route("/health/{device:.*}", web::get().to(handlers::disk_manager::check_disk_health)),
+            )
+            // WebDAV 支持
+            .service(
+                web::scope("/webdav")
+                    .route("", web::method(actix_web::http::Method::OPTIONS).to(handlers::webdav::webdav_options))
+                    .route("/{path:.*}", web::method(actix_web::http::Method::OPTIONS).to(handlers::webdav::webdav_options))
+                    .route("", web::method(actix_web::http::Method::from_bytes(b"PROPFIND").unwrap()).to(handlers::webdav::webdav_propfind))
+                    .route("/{path:.*}", web::method(actix_web::http::Method::from_bytes(b"PROPFIND").unwrap()).to(handlers::webdav::webdav_propfind))
+                    .route("/{path:.*}", web::get().to(handlers::webdav::webdav_get))
+                    .route("/{path:.*}", web::head().to(handlers::webdav::webdav_head))
+                    .route("/{path:.*}", web::put().to(handlers::webdav::webdav_put))
+                    .route("/{path:.*}", web::delete().to(handlers::webdav::webdav_delete))
+                    .route("/{path:.*}", web::method(actix_web::http::Method::from_bytes(b"MKCOL").unwrap()).to(handlers::webdav::webdav_mkcol))
+                    .route("/{path:.*}", web::method(actix_web::http::Method::from_bytes(b"COPY").unwrap()).to(handlers::webdav::webdav_copy))
+                    .route("/{path:.*}", web::method(actix_web::http::Method::from_bytes(b"MOVE").unwrap()).to(handlers::webdav::webdav_move))
+                    .route("/{path:.*}", web::method(actix_web::http::Method::from_bytes(b"LOCK").unwrap()).to(handlers::webdav::webdav_lock))
+                    .route("/{path:.*}", web::method(actix_web::http::Method::from_bytes(b"UNLOCK").unwrap()).to(handlers::webdav::webdav_unlock))
+                    .route("/{path:.*}", web::method(actix_web::http::Method::from_bytes(b"PROPPATCH").unwrap()).to(handlers::webdav::webdav_proppatch)),
+            )
+            // 媒体流播放
+            .service(
+                web::scope("/api/v1/streaming")
+                    .wrap(middleware::JwtAuth)
+                    .route("/formats", web::get().to(handlers::streaming::get_supported_formats))
+                    .route("/library", web::get().to(handlers::streaming::list_media_library))
+                    .route("/info/{path:.*}", web::get().to(handlers::streaming::get_media_info))
+                    .route("/play/{path:.*}", web::get().to(handlers::streaming::stream_media))
+                    .route("/hls/{path:.*}", web::get().to(handlers::streaming::generate_hls_playlist))
+                    .route("/thumbnail/{path:.*}", web::get().to(handlers::streaming::get_thumbnail)),
+            )
+            // 存储管理 (底层硬件访问)
+            .service(
+                web::scope("/api/v1/storage")
+                    .wrap(middleware::JwtAuth)
+                    .route("/devices", web::get().to(handlers::storage::list_storage_devices))
+                    .route("/devices/{id}", web::get().to(handlers::storage::get_storage_device))
+                    .route("/mount", web::post().to(handlers::storage::mount_storage))
+                    .route("/unmount/{device:.*}", web::post().to(handlers::storage::unmount_storage))
+                    .route("/format", web::post().to(handlers::storage::format_storage))
+                    .route("/eject/{device:.*}", web::post().to(handlers::storage::eject_storage))
+                    .route("/read/{path:.*}", web::get().to(handlers::storage::read_file))
+                    .route("/write", web::post().to(handlers::storage::write_file))
+                    .route("/delete/{path:.*}", web::delete().to(handlers::storage::delete_path)),
+            )
+            // Docker 容器管理
+            .service(
+                web::scope("/api/v1/docker")
+                    .wrap(middleware::JwtAuth)
+                    .route("/status", web::get().to(handlers::docker::check_docker_status))
+                    .route("/install", web::post().to(handlers::docker::install_docker))
+                    .route("/uninstall", web::post().to(handlers::docker::uninstall_docker))
+                    // 容器管理
+                    .route("/containers", web::get().to(handlers::docker::list_containers))
+                    .route("/containers", web::post().to(handlers::docker::create_container))
+                    .route("/containers/{id}", web::get().to(handlers::docker::get_container))
+                    .route("/containers/{id}", web::delete().to(handlers::docker::remove_container))
+                    .route("/containers/{id}/start", web::post().to(handlers::docker::start_container))
+                    .route("/containers/{id}/stop", web::post().to(handlers::docker::stop_container))
+                    .route("/containers/{id}/restart", web::post().to(handlers::docker::restart_container))
+                    .route("/containers/{id}/logs", web::get().to(handlers::docker::get_container_logs))
+                    .route("/containers/{id}/stats", web::get().to(handlers::docker::get_container_stats))
+                    .route("/containers/{id}/exec", web::post().to(handlers::docker::exec_in_container))
+                    // 镜像管理
+                    .route("/images", web::get().to(handlers::docker::list_images))
+                    .route("/images/pull", web::post().to(handlers::docker::pull_image))
+                    .route("/images/{id}", web::delete().to(handlers::docker::remove_image))
+                    // Docker Compose
+                    .route("/compose", web::get().to(handlers::docker::list_compose_apps))
+                    .route("/compose", web::post().to(handlers::docker::compose_deploy))
+                    .route("/compose/{name}/start", web::post().to(handlers::docker::compose_start))
+                    .route("/compose/{name}/stop", web::post().to(handlers::docker::compose_stop))
+                    .route("/compose/{name}", web::delete().to(handlers::docker::compose_remove)),
             )
     });
 

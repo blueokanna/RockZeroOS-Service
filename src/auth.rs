@@ -7,7 +7,8 @@ use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::models::TokenResponse;
 
-const HASH_ITERATIONS: u32 = 100000;
+const HASH_ITERATIONS: u32 = 100_000;
+const SALT_LENGTH: usize = 32;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
@@ -100,38 +101,61 @@ impl JwtHandler {
     }
 
     pub fn extract_token_from_header(auth_header: &str) -> Result<&str, AppError> {
-        if auth_header.starts_with("Bearer ") {
-            Ok(&auth_header[7..])
-        } else {
-            Err(AppError::Unauthorized("Invalid authorization header format".to_string()))
-        }
+        auth_header
+            .strip_prefix("Bearer ")
+            .ok_or_else(|| AppError::Unauthorized("Invalid authorization header format".to_string()))
     }
 }
 
+/// Hash password with salt using BLAKE3 key derivation
 pub fn hash_password(password: &str) -> Result<String, AppError> {
-    let mut result = password.as_bytes().to_vec();
+    use rand::RngCore;
+    
+    let mut salt = [0u8; SALT_LENGTH];
+    rand::thread_rng().fill_bytes(&mut salt);
+    
+    let hash = derive_key_with_salt(password.as_bytes(), &salt);
+    
+    // Format: salt$hash (both hex encoded)
+    Ok(format!("{}${}", hex::encode(salt), hex::encode(hash)))
+}
+
+/// Verify password against stored hash
+pub fn verify_password(password: &str, stored: &str) -> Result<bool, AppError> {
+    let parts: Vec<&str> = stored.split('$').collect();
+    if parts.len() != 2 {
+        return Err(AppError::CryptoError("Invalid hash format".to_string()));
+    }
+    
+    let salt = hex::decode(parts[0])
+        .map_err(|_| AppError::CryptoError("Invalid salt".to_string()))?;
+    let stored_hash = hex::decode(parts[1])
+        .map_err(|_| AppError::CryptoError("Invalid hash".to_string()))?;
+    
+    let computed_hash = derive_key_with_salt(password.as_bytes(), &salt);
+    
+    Ok(constant_time_compare(&computed_hash, &stored_hash))
+}
+
+/// Derive key using BLAKE3 with iterations for added security
+fn derive_key_with_salt(password: &[u8], salt: &[u8]) -> Vec<u8> {
+    let mut result = [password, salt].concat();
     
     for _ in 0..HASH_ITERATIONS {
         let hash = blake3::hash(&result);
         result = hash.as_bytes().to_vec();
     }
     
-    Ok(hex::encode(result))
+    result
 }
 
-pub fn verify_password(password: &str, hash: &str) -> Result<bool, AppError> {
-    let computed_hash = hash_password(password)?;
-    Ok(constant_time_compare(&computed_hash, hash))
-}
-
-fn constant_time_compare(a: &str, b: &str) -> bool {
+/// Constant-time comparison to prevent timing attacks
+fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
     
-    let mut result = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        result |= x ^ y;
-    }
-    result == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }

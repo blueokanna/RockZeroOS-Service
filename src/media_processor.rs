@@ -5,6 +5,7 @@ use tracing::{error, info};
 
 use crate::error::AppError;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaInfo {
     pub duration: Option<f64>,
@@ -18,6 +19,7 @@ pub struct MediaInfo {
     pub audio_sample_rate: Option<u32>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscodeOptions {
     pub output_format: String,
@@ -30,6 +32,7 @@ pub struct TranscodeOptions {
     pub hardware_accel: Option<HardwareAccel>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HardwareAccel {
     None,
@@ -41,11 +44,13 @@ pub enum HardwareAccel {
     V4L2M2M,
 }
 
+#[allow(dead_code)]
 pub struct MediaProcessor {
     ffmpeg_path: String,
     ffprobe_path: String,
 }
 
+#[allow(dead_code)]
 impl MediaProcessor {
     pub fn new() -> Self {
         Self {

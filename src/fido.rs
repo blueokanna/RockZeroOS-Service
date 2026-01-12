@@ -1,17 +1,27 @@
+#[cfg(feature = "fido")]
 use actix_web::{web, HttpResponse, Responder};
+#[cfg(feature = "fido")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "fido")]
 use sqlx::SqlitePool;
+#[cfg(feature = "fido")]
 use std::sync::Arc;
+#[cfg(feature = "fido")]
 use tokio::sync::RwLock;
+#[cfg(feature = "fido")]
 use uuid::Uuid;
+#[cfg(feature = "fido")]
 use webauthn_rs::prelude::*;
 
+#[cfg(feature = "fido")]
 use crate::error::AppError;
 
+#[cfg(feature = "fido")]
 pub struct FidoManager {
     webauthn: Arc<RwLock<Webauthn>>,
 }
 
+#[cfg(feature = "fido")]
 impl FidoManager {
     pub fn new(rp_id: &str, rp_origin: &str) -> Result<Self, AppError> {
         let rp_id = rp_id.to_string();
@@ -95,6 +105,7 @@ impl FidoManager {
     }
 }
 
+#[cfg(feature = "fido")]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FidoCredential {
     pub id: String,
@@ -105,40 +116,47 @@ pub struct FidoCredential {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[cfg(feature = "fido")]
 #[derive(Debug, Deserialize)]
 pub struct StartRegistrationRequest {
     pub username: String,
 }
 
+#[cfg(feature = "fido")]
 #[derive(Debug, Serialize)]
 pub struct StartRegistrationResponse {
     pub challenge: CreationChallengeResponse,
     pub session_id: String,
 }
 
+#[cfg(feature = "fido")]
 #[derive(Debug, Deserialize)]
 pub struct FinishRegistrationRequest {
     pub session_id: String,
     pub credential: RegisterPublicKeyCredential,
 }
 
+#[cfg(feature = "fido")]
 #[derive(Debug, Deserialize)]
 pub struct StartAuthenticationRequest {
     pub username: String,
 }
 
+#[cfg(feature = "fido")]
 #[derive(Debug, Serialize)]
 pub struct StartAuthenticationResponse {
     pub challenge: RequestChallengeResponse,
     pub session_id: String,
 }
 
+#[cfg(feature = "fido")]
 #[derive(Debug, Deserialize)]
 pub struct FinishAuthenticationRequest {
     pub session_id: String,
     pub credential: PublicKeyCredential,
 }
 
+#[cfg(feature = "fido")]
 pub async fn start_fido_registration(
     pool: web::Data<SqlitePool>,
     fido: web::Data<Arc<FidoManager>>,
@@ -176,6 +194,7 @@ pub async fn start_fido_registration(
     }))
 }
 
+#[cfg(feature = "fido")]
 pub async fn finish_fido_registration(
     pool: web::Data<SqlitePool>,
     fido: web::Data<Arc<FidoManager>>,
@@ -228,6 +247,7 @@ pub async fn finish_fido_registration(
     })))
 }
 
+#[cfg(feature = "fido")]
 pub async fn start_fido_authentication(
     pool: web::Data<SqlitePool>,
     fido: web::Data<Arc<FidoManager>>,
@@ -279,6 +299,7 @@ pub async fn start_fido_authentication(
     }))
 }
 
+#[cfg(feature = "fido")]
 pub async fn finish_fido_authentication(
     pool: web::Data<SqlitePool>,
     fido: web::Data<Arc<FidoManager>>,
@@ -313,15 +334,13 @@ pub async fn finish_fido_authentication(
         .await
         .ok();
 
-    let token = crate::auth::generate_jwt(&session.user_id)?;
-
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
-        "token": token,
         "user_id": session.user_id
     })))
 }
 
+#[cfg(feature = "fido")]
 pub async fn list_fido_credentials(
     pool: web::Data<SqlitePool>,
     claims: web::ReqData<crate::auth::Claims>,
@@ -349,6 +368,7 @@ pub async fn list_fido_credentials(
     Ok(HttpResponse::Ok().json(response))
 }
 
+#[cfg(feature = "fido")]
 pub async fn delete_fido_credential(
     pool: web::Data<SqlitePool>,
     claims: web::ReqData<crate::auth::Claims>,
@@ -373,4 +393,63 @@ pub async fn delete_fido_credential(
         "success": true,
         "message": "FIDO2 credential deleted"
     })))
+}
+
+// Stub implementations when fido feature is disabled
+#[cfg(not(feature = "fido"))]
+#[allow(dead_code)]
+pub struct FidoManager;
+
+#[cfg(not(feature = "fido"))]
+#[allow(dead_code)]
+impl FidoManager {
+    pub fn new(_rp_id: &str, _rp_origin: &str) -> Result<Self, crate::error::AppError> {
+        Ok(Self)
+    }
+    
+    pub fn is_available(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(not(feature = "fido"))]
+pub async fn start_fido_registration() -> actix_web::HttpResponse {
+    actix_web::HttpResponse::NotImplemented().json(serde_json::json!({
+        "error": "FIDO2 support not enabled. Compile with --features fido"
+    }))
+}
+
+#[cfg(not(feature = "fido"))]
+pub async fn finish_fido_registration() -> actix_web::HttpResponse {
+    actix_web::HttpResponse::NotImplemented().json(serde_json::json!({
+        "error": "FIDO2 support not enabled. Compile with --features fido"
+    }))
+}
+
+#[cfg(not(feature = "fido"))]
+pub async fn start_fido_authentication() -> actix_web::HttpResponse {
+    actix_web::HttpResponse::NotImplemented().json(serde_json::json!({
+        "error": "FIDO2 support not enabled. Compile with --features fido"
+    }))
+}
+
+#[cfg(not(feature = "fido"))]
+pub async fn finish_fido_authentication() -> actix_web::HttpResponse {
+    actix_web::HttpResponse::NotImplemented().json(serde_json::json!({
+        "error": "FIDO2 support not enabled. Compile with --features fido"
+    }))
+}
+
+#[cfg(not(feature = "fido"))]
+pub async fn list_fido_credentials() -> actix_web::HttpResponse {
+    actix_web::HttpResponse::NotImplemented().json(serde_json::json!({
+        "error": "FIDO2 support not enabled. Compile with --features fido"
+    }))
+}
+
+#[cfg(not(feature = "fido"))]
+pub async fn delete_fido_credential() -> actix_web::HttpResponse {
+    actix_web::HttpResponse::NotImplemented().json(serde_json::json!({
+        "error": "FIDO2 support not enabled. Compile with --features fido"
+    }))
 }

@@ -1,7 +1,9 @@
 use actix_web::{HttpResponse, Responder};
 use serde::Serialize;
+use sysinfo::{Disks, System};
+
+#[cfg(target_os = "linux")]
 use std::fs;
-use sysinfo::System;
 
 use crate::error::AppError;
 
@@ -93,7 +95,7 @@ pub async fn get_system_info() -> Result<impl Responder, AppError> {
 pub async fn get_cpu_info() -> Result<impl Responder, AppError> {
     let mut sys = System::new_all();
     sys.refresh_cpu();
-    
+
     std::thread::sleep(std::time::Duration::from_millis(200));
     sys.refresh_cpu();
 
@@ -137,12 +139,10 @@ pub async fn get_memory_info() -> Result<impl Responder, AppError> {
 }
 
 pub async fn get_disk_info() -> Result<impl Responder, AppError> {
-    let mut sys = System::new_all();
-    sys.refresh_all();
-
+    let disks_info = Disks::new_with_refreshed_list();
     let mut disks = Vec::new();
 
-    for disk in sys.disks() {
+    for disk in disks_info.list() {
         let total_space = disk.total_space();
         let available_space = disk.available_space();
         let used_space = total_space - available_space;
@@ -159,7 +159,7 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
         disks.push(DiskInfo {
             name: disk.name().to_string_lossy().to_string(),
             mount_point,
-            file_system: String::from_utf8_lossy(disk.file_system()).to_string(),
+            file_system: disk.file_system().to_string_lossy().to_string(),
             total_space,
             available_space,
             used_space,
@@ -180,7 +180,7 @@ pub async fn get_usb_devices() -> Result<impl Responder, AppError> {
 pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
     let mut sys = System::new_all();
     sys.refresh_all();
-    
+
     std::thread::sleep(std::time::Duration::from_millis(200));
     sys.refresh_cpu();
 
@@ -228,8 +228,9 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
         swap_used: sys.used_swap(),
     };
 
+    let disks_info = Disks::new_with_refreshed_list();
     let mut disks = Vec::new();
-    for disk in sys.disks() {
+    for disk in disks_info.list() {
         let total_space = disk.total_space();
         let available_space = disk.available_space();
         let used_space = total_space - available_space;
@@ -242,7 +243,7 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
         disks.push(DiskInfo {
             name: disk.name().to_string_lossy().to_string(),
             mount_point: disk.mount_point().to_string_lossy().to_string(),
-            file_system: String::from_utf8_lossy(disk.file_system()).to_string(),
+            file_system: disk.file_system().to_string_lossy().to_string(),
             total_space,
             available_space,
             used_space,
@@ -296,17 +297,17 @@ fn detect_usb_devices() -> Vec<UsbDevice> {
     if let Ok(entries) = fs::read_dir("/sys/bus/usb/devices") {
         for entry in entries.flatten() {
             let path = entry.path();
-            
+
             let vendor_id = fs::read_to_string(path.join("idVendor"))
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            
+
             let product_id = fs::read_to_string(path.join("idProduct"))
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            
+
             let product_name = fs::read_to_string(path.join("product"))
                 .unwrap_or_else(|_| "Unknown USB Device".to_string())
                 .trim()
@@ -343,7 +344,7 @@ fn find_usb_mount_point(_vendor_id: &str, _product_id: &str) -> Option<String> {
             if parts.len() >= 2 {
                 let device = parts[0];
                 let mount_point = parts[1];
-                
+
                 if device.starts_with("/dev/sd") || device.starts_with("/dev/mmcblk") {
                     if mount_point.starts_with("/media") || mount_point.starts_with("/mnt") {
                         return Some(mount_point.to_string());
@@ -357,10 +358,9 @@ fn find_usb_mount_point(_vendor_id: &str, _product_id: &str) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn get_mount_size(mount_point: &str) -> Option<u64> {
-    let mut sys = System::new_all();
-    sys.refresh_all();
-    
-    for disk in sys.disks() {
+    let disks_info = Disks::new_with_refreshed_list();
+
+    for disk in disks_info.list() {
         if disk.mount_point().to_string_lossy() == mount_point {
             return Some(disk.total_space());
         }
@@ -368,6 +368,7 @@ fn get_mount_size(mount_point: &str) -> Option<u64> {
     None
 }
 
+#[allow(dead_code)]
 pub async fn get_hardware_capabilities() -> Result<impl Responder, AppError> {
     let capabilities = crate::hardware::detect_hardware();
     Ok(HttpResponse::Ok().json(capabilities))
