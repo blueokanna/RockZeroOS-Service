@@ -113,6 +113,13 @@ async fn main() -> std::io::Result<()> {
                     || origin_str.starts_with("https://127.0.0.1")
                     || origin_str.starts_with("http://100.")
                     || origin_str.starts_with("https://100.")
+                    // 允许常见局域网网段
+                    || origin_str.starts_with("http://192.168.")
+                    || origin_str.starts_with("https://192.168.")
+                    || origin_str.starts_with("http://10.")
+                    || origin_str.starts_with("https://10.")
+                    || origin_str.starts_with("http://172.16.")
+                    || origin_str.starts_with("https://172.16.")
             })
             .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
             .allowed_headers(vec![
