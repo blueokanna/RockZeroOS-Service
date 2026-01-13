@@ -15,7 +15,8 @@ use walkdir::WalkDir;
 
 use crate::error::AppError;
 
-const BASE_DIR: &str = "/home";
+// 支持多个基础目录，按优先级尝试
+const BASE_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
 const MAX_FILE_SIZE: usize = 10 * 1024 * 1024 * 1024;
 const MAX_TEXT_PREVIEW_SIZE: usize = 1024 * 1024 * 1024;
 const ALLOWED_TEXT_EXTENSIONS: &[&str] = &[
@@ -274,9 +275,10 @@ pub async fn create_directory(
 
     info!("Directory created: {:?}", new_dir_path);
 
+    let base = get_base_directory().unwrap_or_else(|_| PathBuf::from("/"));
     Ok(HttpResponse::Created().json(serde_json::json!({
         "message": "Directory created successfully",
-        "path": new_dir_path.strip_prefix(BASE_DIR).unwrap_or(&new_dir_path).to_string_lossy()
+        "path": new_dir_path.strip_prefix(&base).unwrap_or(&new_dir_path).to_string_lossy()
     })))
 }
 
@@ -461,10 +463,10 @@ pub async fn delete_files(body: web::Json<DeleteRequest>) -> Result<impl Respond
 }
 
 pub async fn get_storage_info() -> Result<impl Responder, AppError> {
-    let base_path = Path::new(BASE_DIR);
+    let base_path = get_base_directory()?;
 
     let mut total_size = 0u64;
-    for entry in WalkDir::new(base_path).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(&base_path).max_depth(5).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             if let Ok(metadata) = entry.metadata() {
                 total_size += metadata.len();
@@ -472,6 +474,41 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
         }
     }
 
+    // 尝试获取实际的磁盘空间信息
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+        if let Ok(output) = Command::new("df")
+            .args(&["-B1", base_path.to_str().unwrap_or("/")])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(line) = stdout.lines().nth(1) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        let total_space = parts[1].parse::<u64>().unwrap_or(0);
+                        let used_space = parts[2].parse::<u64>().unwrap_or(0);
+                        let available_space = parts[3].parse::<u64>().unwrap_or(0);
+                        let usage_percentage = if total_space > 0 {
+                            (used_space as f64 / total_space as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        
+                        return Ok(HttpResponse::Ok().json(StorageInfo {
+                            total_space,
+                            used_space,
+                            available_space,
+                            usage_percentage,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    // 回退到估算值
     let available_space = 100 * 1024 * 1024 * 1024u64;
     let total_space = available_space + total_size;
     let usage_percentage = (total_size as f64 / total_space as f64) * 100.0;
@@ -484,44 +521,92 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
     }))
 }
 
-fn sanitize_path(path: &str) -> Result<PathBuf, AppError> {
-    let base = Path::new(BASE_DIR);
-
-    // Ensure base directory exists
-    if !base.exists() {
-        // Fallback to current directory if /home doesn't exist (Windows)
-        #[cfg(target_os = "windows")]
-        {
-            let fallback = Path::new("./storage");
-            std::fs::create_dir_all(fallback).ok();
-            let full_path = if path.is_empty() {
-                fallback.to_path_buf()
-            } else {
-                fallback.join(path)
-            };
-            return Ok(full_path);
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            return Err(AppError::NotFound("Base directory not found".to_string()));
-        }
+/// 获取有效的基础目录
+fn get_base_directory() -> Result<PathBuf, AppError> {
+    // Windows 特殊处理
+    #[cfg(target_os = "windows")]
+    {
+        let fallback = Path::new("./storage");
+        std::fs::create_dir_all(fallback).ok();
+        return Ok(fallback.to_path_buf());
     }
 
+    // Linux/Unix: 按优先级查找可用的基础目录
+    #[cfg(not(target_os = "windows"))]
+    {
+        for base_dir in BASE_DIRS {
+            let path = Path::new(base_dir);
+            if path.exists() && path.is_dir() {
+                // 检查是否有读取权限
+                if std::fs::read_dir(path).is_ok() {
+                    return Ok(path.to_path_buf());
+                }
+            }
+        }
+        
+        // 如果都不存在，尝试创建 /data 目录
+        let data_dir = Path::new("/data");
+        if std::fs::create_dir_all(data_dir).is_ok() {
+            return Ok(data_dir.to_path_buf());
+        }
+        
+        // 最后尝试当前目录下的 storage
+        let fallback = Path::new("./storage");
+        std::fs::create_dir_all(fallback).ok();
+        Ok(fallback.to_path_buf())
+    }
+}
+
+/// 检查路径是否在允许的基础目录内
+fn is_path_allowed(path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    
+    // 允许的基础目录
+    for base in BASE_DIRS {
+        if path_str.starts_with(base) {
+            return true;
+        }
+    }
+    
+    // 也允许 ./storage (开发环境)
+    if path_str.starts_with("./storage") || path_str.starts_with("storage") {
+        return true;
+    }
+    
+    false
+}
+
+fn sanitize_path(path: &str) -> Result<PathBuf, AppError> {
+    // 如果路径是绝对路径且在允许的目录内，直接使用
+    if path.starts_with('/') {
+        let abs_path = Path::new(path);
+        if is_path_allowed(abs_path) {
+            if abs_path.exists() {
+                return Ok(abs_path.to_path_buf());
+            }
+            // 路径不存在但在允许范围内，可能是要创建的新路径
+            return Ok(abs_path.to_path_buf());
+        }
+    }
+    
+    // 获取基础目录
+    let base = get_base_directory()?;
+
     let full_path = if path.is_empty() {
-        base.to_path_buf()
+        base.clone()
     } else {
-        base.join(path)
+        // 移除开头的斜杠以避免路径问题
+        let clean_path = path.trim_start_matches('/');
+        base.join(clean_path)
     };
 
     // Try to canonicalize, but allow non-existent paths for creation
     let canonical = full_path
         .canonicalize()
-        .or_else(|_| Ok::<_, AppError>(full_path.clone()))?;
+        .unwrap_or_else(|_| full_path.clone());
 
-    // Security check: ensure path is within base directory
-    let base_canonical = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
-    if !canonical.starts_with(&base_canonical) && !full_path.starts_with(base) {
+    // Security check: ensure path is within allowed directories
+    if !is_path_allowed(&canonical) && !is_path_allowed(&full_path) {
         return Err(AppError::Forbidden("Path traversal detected".to_string()));
     }
 

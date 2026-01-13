@@ -583,6 +583,140 @@ pub async fn list_store_apps() -> Result<impl Responder, AppError> {
             }],
             required_env: vec![],
         },
+        // Stash - Media Organizer
+        AppStoreItem {
+            id: "stash".to_string(),
+            name: "stash".to_string(),
+            display_name: "Stash".to_string(),
+            description: "An organizer for your adult media, written in Go".to_string(),
+            icon: "https://raw.githubusercontent.com/stashapp/stash/develop/ui/v2.5/public/favicon.ico".to_string(),
+            category: "Media".to_string(),
+            docker_image: "stashapp/stash".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![PortMapping {
+                container_port: 9999,
+                host_port: 9999,
+                protocol: "tcp".to_string(),
+            }],
+            default_volumes: vec![
+                VolumeMapping {
+                    container_path: "/root/.stash".to_string(),
+                    host_path: "/DATA/AppData/stash/config".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/data".to_string(),
+                    host_path: "/DATA/Media".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/metadata".to_string(),
+                    host_path: "/DATA/AppData/stash/metadata".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/cache".to_string(),
+                    host_path: "/DATA/AppData/stash/cache".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/blobs".to_string(),
+                    host_path: "/DATA/AppData/stash/blobs".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/generated".to_string(),
+                    host_path: "/DATA/AppData/stash/generated".to_string(),
+                    mode: "rw".to_string(),
+                },
+            ],
+            required_env: vec![],
+        },
+        // Immich - Photo Management
+        AppStoreItem {
+            id: "immich".to_string(),
+            name: "immich".to_string(),
+            display_name: "Immich".to_string(),
+            description: "High performance self-hosted photo and video backup solution".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/immich.png".to_string(),
+            category: "Media".to_string(),
+            docker_image: "ghcr.io/immich-app/immich-server".to_string(),
+            recommended_tag: "release".to_string(),
+            default_ports: vec![PortMapping {
+                container_port: 3001,
+                host_port: 2283,
+                protocol: "tcp".to_string(),
+            }],
+            default_volumes: vec![VolumeMapping {
+                container_path: "/usr/src/app/upload".to_string(),
+                host_path: "/DATA/AppData/immich/upload".to_string(),
+                mode: "rw".to_string(),
+            }],
+            required_env: vec!["DB_PASSWORD".to_string()],
+        },
+        // Kavita - eBook/Manga Reader
+        AppStoreItem {
+            id: "kavita".to_string(),
+            name: "kavita".to_string(),
+            display_name: "Kavita".to_string(),
+            description: "A fast, feature rich, cross platform reading server".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/kavita.png".to_string(),
+            category: "Media".to_string(),
+            docker_image: "kizaing/kavita".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![PortMapping {
+                container_port: 5000,
+                host_port: 5000,
+                protocol: "tcp".to_string(),
+            }],
+            default_volumes: vec![
+                VolumeMapping {
+                    container_path: "/kavita/config".to_string(),
+                    host_path: "/DATA/AppData/kavita/config".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/manga".to_string(),
+                    host_path: "/DATA/Media/Manga".to_string(),
+                    mode: "rw".to_string(),
+                },
+            ],
+            required_env: vec![],
+        },
+        // Audiobookshelf
+        AppStoreItem {
+            id: "audiobookshelf".to_string(),
+            name: "audiobookshelf".to_string(),
+            display_name: "Audiobookshelf".to_string(),
+            description: "Self-hosted audiobook and podcast server".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/audiobookshelf.png".to_string(),
+            category: "Media".to_string(),
+            docker_image: "ghcr.io/advplyr/audiobookshelf".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![PortMapping {
+                container_port: 80,
+                host_port: 13378,
+                protocol: "tcp".to_string(),
+            }],
+            default_volumes: vec![
+                VolumeMapping {
+                    container_path: "/config".to_string(),
+                    host_path: "/DATA/AppData/audiobookshelf/config".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/metadata".to_string(),
+                    host_path: "/DATA/AppData/audiobookshelf/metadata".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/audiobooks".to_string(),
+                    host_path: "/DATA/Media/Audiobooks".to_string(),
+                    mode: "rw".to_string(),
+                },
+            ],
+            required_env: vec![],
+        },
     ];
 
     Ok(HttpResponse::Ok().json(apps))
