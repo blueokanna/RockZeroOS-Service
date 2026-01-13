@@ -223,7 +223,13 @@ async fn main() -> std::io::Result<()> {
                     .route("/move", web::post().to(handlers::filemanager::move_files))
                     .route("/copy", web::post().to(handlers::filemanager::copy_files))
                     .route("/delete", web::post().to(handlers::filemanager::delete_files))
-                    .route("/storage", web::get().to(handlers::filemanager::get_storage_info)),
+                    .route("/storage", web::get().to(handlers::filemanager::get_storage_info))
+                    // File preview and media streaming APIs
+                    .route("/preview", web::get().to(handlers::filemanager::preview_text_file))
+                    .route("/media/info", web::get().to(handlers::filemanager::get_media_info))
+                    .route("/media/stream", web::get().to(handlers::filemanager::stream_media))
+                    .route("/media/image", web::get().to(handlers::filemanager::serve_image))
+                    .route("/media/thumbnail", web::get().to(handlers::filemanager::get_thumbnail)),
             )
             .service(
                 web::scope("/api/v1/system")
@@ -233,6 +239,8 @@ async fn main() -> std::io::Result<()> {
                     .route("/memory", web::get().to(handlers::system::get_memory_info))
                     .route("/disks", web::get().to(handlers::system::get_disk_info))
                     .route("/usb", web::get().to(handlers::system::get_usb_devices))
+                    .route("/network", web::get().to(handlers::system::get_network_interfaces))
+                    .route("/blocks", web::get().to(handlers::system::get_block_devices))
                     .route("/hardware", web::get().to(handlers::system::get_hardware_info)),
             )
             .service(

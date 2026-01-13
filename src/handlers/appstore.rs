@@ -78,6 +78,7 @@ pub struct AppStoreItem {
 
 pub async fn list_store_apps() -> Result<impl Responder, AppError> {
     let apps = vec![
+        // Cloud Storage
         AppStoreItem {
             id: "nextcloud".to_string(),
             name: "nextcloud".to_string(),
@@ -101,6 +102,35 @@ pub async fn list_store_apps() -> Result<impl Responder, AppError> {
             ],
             required_env: vec![],
         },
+        AppStoreItem {
+            id: "filebrowser".to_string(),
+            name: "filebrowser".to_string(),
+            display_name: "File Browser".to_string(),
+            description: "Web-based file manager with a clean interface".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/filebrowser.png".to_string(),
+            category: "Cloud Storage".to_string(),
+            docker_image: "filebrowser/filebrowser".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![PortMapping {
+                container_port: 80,
+                host_port: 8081,
+                protocol: "tcp".to_string(),
+            }],
+            default_volumes: vec![
+                VolumeMapping {
+                    container_path: "/srv".to_string(),
+                    host_path: "/DATA".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/database.db".to_string(),
+                    host_path: "/DATA/AppData/filebrowser/database.db".to_string(),
+                    mode: "rw".to_string(),
+                },
+            ],
+            required_env: vec![],
+        },
+        // Media
         AppStoreItem {
             id: "jellyfin".to_string(),
             name: "jellyfin".to_string(),
@@ -129,6 +159,162 @@ pub async fn list_store_apps() -> Result<impl Responder, AppError> {
             ],
             required_env: vec![],
         },
+        AppStoreItem {
+            id: "plex".to_string(),
+            name: "plex".to_string(),
+            display_name: "Plex".to_string(),
+            description: "Stream movies, TV shows, music and more".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/plex.png".to_string(),
+            category: "Media".to_string(),
+            docker_image: "plexinc/pms-docker".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![PortMapping {
+                container_port: 32400,
+                host_port: 32400,
+                protocol: "tcp".to_string(),
+            }],
+            default_volumes: vec![
+                VolumeMapping {
+                    container_path: "/config".to_string(),
+                    host_path: "/DATA/AppData/plex/config".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/media".to_string(),
+                    host_path: "/DATA/Media".to_string(),
+                    mode: "ro".to_string(),
+                },
+            ],
+            required_env: vec![],
+        },
+        AppStoreItem {
+            id: "navidrome".to_string(),
+            name: "navidrome".to_string(),
+            display_name: "Navidrome".to_string(),
+            description: "Modern music server and streamer".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/navidrome.png".to_string(),
+            category: "Media".to_string(),
+            docker_image: "deluan/navidrome".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![PortMapping {
+                container_port: 4533,
+                host_port: 4533,
+                protocol: "tcp".to_string(),
+            }],
+            default_volumes: vec![
+                VolumeMapping {
+                    container_path: "/data".to_string(),
+                    host_path: "/DATA/AppData/navidrome".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/music".to_string(),
+                    host_path: "/DATA/Music".to_string(),
+                    mode: "ro".to_string(),
+                },
+            ],
+            required_env: vec![],
+        },
+        AppStoreItem {
+            id: "photoprism".to_string(),
+            name: "photoprism".to_string(),
+            display_name: "PhotoPrism".to_string(),
+            description: "AI-powered photo management".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/photoprism.png".to_string(),
+            category: "Media".to_string(),
+            docker_image: "photoprism/photoprism".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![PortMapping {
+                container_port: 2342,
+                host_port: 2342,
+                protocol: "tcp".to_string(),
+            }],
+            default_volumes: vec![
+                VolumeMapping {
+                    container_path: "/photoprism/storage".to_string(),
+                    host_path: "/DATA/AppData/photoprism".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/photoprism/originals".to_string(),
+                    host_path: "/DATA/Photos".to_string(),
+                    mode: "ro".to_string(),
+                },
+            ],
+            required_env: vec![],
+        },
+        // Download
+        AppStoreItem {
+            id: "qbittorrent".to_string(),
+            name: "qbittorrent".to_string(),
+            display_name: "qBittorrent".to_string(),
+            description: "BitTorrent client with web UI".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/qbittorrent.png".to_string(),
+            category: "Download".to_string(),
+            docker_image: "linuxserver/qbittorrent".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![
+                PortMapping {
+                    container_port: 8080,
+                    host_port: 8082,
+                    protocol: "tcp".to_string(),
+                },
+                PortMapping {
+                    container_port: 6881,
+                    host_port: 6881,
+                    protocol: "tcp".to_string(),
+                },
+            ],
+            default_volumes: vec![
+                VolumeMapping {
+                    container_path: "/config".to_string(),
+                    host_path: "/DATA/AppData/qbittorrent".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/downloads".to_string(),
+                    host_path: "/DATA/Downloads".to_string(),
+                    mode: "rw".to_string(),
+                },
+            ],
+            required_env: vec![],
+        },
+        AppStoreItem {
+            id: "aria2".to_string(),
+            name: "aria2".to_string(),
+            display_name: "Aria2".to_string(),
+            description: "Lightweight multi-protocol download utility".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/ariang.png".to_string(),
+            category: "Download".to_string(),
+            docker_image: "p3terx/aria2-pro".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![
+                PortMapping {
+                    container_port: 6800,
+                    host_port: 6800,
+                    protocol: "tcp".to_string(),
+                },
+                PortMapping {
+                    container_port: 6888,
+                    host_port: 6888,
+                    protocol: "tcp".to_string(),
+                },
+            ],
+            default_volumes: vec![
+                VolumeMapping {
+                    container_path: "/config".to_string(),
+                    host_path: "/DATA/AppData/aria2".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/downloads".to_string(),
+                    host_path: "/DATA/Downloads".to_string(),
+                    mode: "rw".to_string(),
+                },
+            ],
+            required_env: vec![],
+        },
+        // Management
         AppStoreItem {
             id: "portainer".to_string(),
             name: "portainer".to_string(),
@@ -165,6 +351,28 @@ pub async fn list_store_apps() -> Result<impl Responder, AppError> {
             required_env: vec![],
         },
         AppStoreItem {
+            id: "heimdall".to_string(),
+            name: "heimdall".to_string(),
+            display_name: "Heimdall".to_string(),
+            description: "Application dashboard and launcher".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/heimdall.png".to_string(),
+            category: "Management".to_string(),
+            docker_image: "linuxserver/heimdall".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![PortMapping {
+                container_port: 80,
+                host_port: 8083,
+                protocol: "tcp".to_string(),
+            }],
+            default_volumes: vec![VolumeMapping {
+                container_path: "/config".to_string(),
+                host_path: "/DATA/AppData/heimdall".to_string(),
+                mode: "rw".to_string(),
+            }],
+            required_env: vec![],
+        },
+        // Smart Home
+        AppStoreItem {
             id: "homeassistant".to_string(),
             name: "homeassistant".to_string(),
             display_name: "Home Assistant".to_string(),
@@ -181,6 +389,196 @@ pub async fn list_store_apps() -> Result<impl Responder, AppError> {
             default_volumes: vec![VolumeMapping {
                 container_path: "/config".to_string(),
                 host_path: "/DATA/AppData/homeassistant".to_string(),
+                mode: "rw".to_string(),
+            }],
+            required_env: vec![],
+        },
+        AppStoreItem {
+            id: "mqtt".to_string(),
+            name: "mqtt".to_string(),
+            display_name: "Eclipse Mosquitto".to_string(),
+            description: "Lightweight MQTT message broker".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/eclipse-mosquitto.png".to_string(),
+            category: "Smart Home".to_string(),
+            docker_image: "eclipse-mosquitto".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![
+                PortMapping {
+                    container_port: 1883,
+                    host_port: 1883,
+                    protocol: "tcp".to_string(),
+                },
+                PortMapping {
+                    container_port: 9001,
+                    host_port: 9001,
+                    protocol: "tcp".to_string(),
+                },
+            ],
+            default_volumes: vec![VolumeMapping {
+                container_path: "/mosquitto".to_string(),
+                host_path: "/DATA/AppData/mosquitto".to_string(),
+                mode: "rw".to_string(),
+            }],
+            required_env: vec![],
+        },
+        // Network
+        AppStoreItem {
+            id: "adguard".to_string(),
+            name: "adguard".to_string(),
+            display_name: "AdGuard Home".to_string(),
+            description: "Network-wide ad and tracker blocking DNS server".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/adguard-home.png".to_string(),
+            category: "Network".to_string(),
+            docker_image: "adguard/adguardhome".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![
+                PortMapping {
+                    container_port: 3000,
+                    host_port: 3000,
+                    protocol: "tcp".to_string(),
+                },
+                PortMapping {
+                    container_port: 53,
+                    host_port: 53,
+                    protocol: "udp".to_string(),
+                },
+            ],
+            default_volumes: vec![
+                VolumeMapping {
+                    container_path: "/opt/adguardhome/work".to_string(),
+                    host_path: "/DATA/AppData/adguard/work".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/opt/adguardhome/conf".to_string(),
+                    host_path: "/DATA/AppData/adguard/conf".to_string(),
+                    mode: "rw".to_string(),
+                },
+            ],
+            required_env: vec![],
+        },
+        AppStoreItem {
+            id: "nginx-proxy-manager".to_string(),
+            name: "nginx-proxy-manager".to_string(),
+            display_name: "Nginx Proxy Manager".to_string(),
+            description: "Easy reverse proxy with SSL management".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/nginx-proxy-manager.png".to_string(),
+            category: "Network".to_string(),
+            docker_image: "jc21/nginx-proxy-manager".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![
+                PortMapping {
+                    container_port: 80,
+                    host_port: 80,
+                    protocol: "tcp".to_string(),
+                },
+                PortMapping {
+                    container_port: 443,
+                    host_port: 443,
+                    protocol: "tcp".to_string(),
+                },
+                PortMapping {
+                    container_port: 81,
+                    host_port: 81,
+                    protocol: "tcp".to_string(),
+                },
+            ],
+            default_volumes: vec![
+                VolumeMapping {
+                    container_path: "/data".to_string(),
+                    host_path: "/DATA/AppData/npm/data".to_string(),
+                    mode: "rw".to_string(),
+                },
+                VolumeMapping {
+                    container_path: "/etc/letsencrypt".to_string(),
+                    host_path: "/DATA/AppData/npm/letsencrypt".to_string(),
+                    mode: "rw".to_string(),
+                },
+            ],
+            required_env: vec![],
+        },
+        // Database
+        AppStoreItem {
+            id: "mariadb".to_string(),
+            name: "mariadb".to_string(),
+            display_name: "MariaDB".to_string(),
+            description: "Popular open source relational database".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/mariadb.png".to_string(),
+            category: "Database".to_string(),
+            docker_image: "mariadb".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![PortMapping {
+                container_port: 3306,
+                host_port: 3306,
+                protocol: "tcp".to_string(),
+            }],
+            default_volumes: vec![VolumeMapping {
+                container_path: "/var/lib/mysql".to_string(),
+                host_path: "/DATA/AppData/mariadb".to_string(),
+                mode: "rw".to_string(),
+            }],
+            required_env: vec!["MYSQL_ROOT_PASSWORD".to_string()],
+        },
+        AppStoreItem {
+            id: "redis".to_string(),
+            name: "redis".to_string(),
+            display_name: "Redis".to_string(),
+            description: "In-memory data structure store".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/redis.png".to_string(),
+            category: "Database".to_string(),
+            docker_image: "redis".to_string(),
+            recommended_tag: "alpine".to_string(),
+            default_ports: vec![PortMapping {
+                container_port: 6379,
+                host_port: 6379,
+                protocol: "tcp".to_string(),
+            }],
+            default_volumes: vec![VolumeMapping {
+                container_path: "/data".to_string(),
+                host_path: "/DATA/AppData/redis".to_string(),
+                mode: "rw".to_string(),
+            }],
+            required_env: vec![],
+        },
+        // Productivity
+        AppStoreItem {
+            id: "vaultwarden".to_string(),
+            name: "vaultwarden".to_string(),
+            display_name: "Vaultwarden".to_string(),
+            description: "Lightweight Bitwarden-compatible password manager".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/vaultwarden.png".to_string(),
+            category: "Productivity".to_string(),
+            docker_image: "vaultwarden/server".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![PortMapping {
+                container_port: 80,
+                host_port: 8084,
+                protocol: "tcp".to_string(),
+            }],
+            default_volumes: vec![VolumeMapping {
+                container_path: "/data".to_string(),
+                host_path: "/DATA/AppData/vaultwarden".to_string(),
+                mode: "rw".to_string(),
+            }],
+            required_env: vec![],
+        },
+        AppStoreItem {
+            id: "code-server".to_string(),
+            name: "code-server".to_string(),
+            display_name: "Code Server".to_string(),
+            description: "VS Code in the browser".to_string(),
+            icon: "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/code-server.png".to_string(),
+            category: "Productivity".to_string(),
+            docker_image: "linuxserver/code-server".to_string(),
+            recommended_tag: "latest".to_string(),
+            default_ports: vec![PortMapping {
+                container_port: 8443,
+                host_port: 8443,
+                protocol: "tcp".to_string(),
+            }],
+            default_volumes: vec![VolumeMapping {
+                container_path: "/config".to_string(),
+                host_path: "/DATA/AppData/code-server".to_string(),
                 mode: "rw".to_string(),
             }],
             required_env: vec![],

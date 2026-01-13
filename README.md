@@ -2,11 +2,10 @@
 
 **Cross-Platform | Hardware Acceleration | Zero-Knowledge Proof | FIDO2 Authentication**
 
-[中文文档](README_CN.md) | [Deployment Guide](DEPLOYMENT.md) | [API Documentation](API_COMPLETE.md)
-
 ## Features
 
 ### 🔐 Security
+
 - Zero-Knowledge Proof (Bulletproofs)
 - FIDO2/WebAuthn hardware key support
 - End-to-end encryption (AES-256-GCM)
@@ -14,6 +13,7 @@
 - Anti-tampering invite code system
 
 ### 🎬 Media Processing
+
 - Hardware-accelerated encoding/decoding
   - Rockchip MPP (RK3588, RK3568)
   - Amlogic VDEC (A311D)
@@ -25,6 +25,7 @@
 - Audio processing: AAC, MP3, Opus, FLAC
 
 ### 💻 Cross-Platform
+
 - ✅ x86_64 (AMD64)
 - ✅ x86 (i386)
 - ✅ aarch64 (ARM64)
@@ -32,6 +33,7 @@
 - ✅ armv8
 
 ### 🔧 Hardware Detection
+
 - Accurate CPU detection (model, cores, frequency, temperature)
 - Real-time memory monitoring
 - Storage device identification (HDD/SSD/NVMe/MMC/USB)
@@ -39,6 +41,7 @@
 - GPU/VPU auto-detection and configuration
 
 ### 📦 App Store
+
 - CasaOS AppStore Play integration
 - Docker container management
 - One-click install/start/stop
@@ -76,6 +79,7 @@ cargo build --release
 ## Supported Hardware
 
 ### ARM Boards
+
 - Orange Pi 5 Plus (RK3588) - 8K video
 - Radxa Rock 5B (RK3588) - 8K video
 - Khadas VIM3 (A311D) - 4K video
@@ -83,6 +87,7 @@ cargo build --release
 - Odroid N2+ (S922X) - 4K video
 
 ### x86 Devices
+
 - Intel NUC (all models)
 - Standard PC/Servers
 - Virtual Machines (VMware, VirtualBox, KVM)
@@ -130,4 +135,4 @@ Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ---
 
-Made with ❤️ by RockZero Team
+Made with ❤️ by Blueokanna
