@@ -24,13 +24,10 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), AppError> {
     .execute(pool)
     .await?;
 
-    // 迁移：为旧数据库添加 is_super_admin 列
     let _ = sqlx::query("ALTER TABLE users ADD COLUMN is_super_admin INTEGER NOT NULL DEFAULT 0")
         .execute(pool)
         .await;
-    // 忽略错误（列已存在时会报错）
 
-    // 推荐码表
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS invite_codes (
@@ -50,7 +47,6 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), AppError> {
     .execute(pool)
     .await?;
 
-    // 文件元数据表
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS file_metadata (
@@ -72,7 +68,6 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), AppError> {
     .execute(pool)
     .await?;
 
-    // 媒体项表
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS media_items (
@@ -93,7 +88,6 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), AppError> {
     .execute(pool)
     .await?;
 
-    // 小组件表
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS widgets (
@@ -116,7 +110,6 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), AppError> {
     .execute(pool)
     .await?;
 
-    // 创建索引
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
         .execute(pool)
         .await?;
@@ -133,7 +126,6 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), AppError> {
         .execute(pool)
         .await?;
 
-    // FIDO2/WebAuthn 表
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS fido_credentials (
@@ -165,9 +157,11 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), AppError> {
     .execute(pool)
     .await?;
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_fido_credentials_user_id ON fido_credentials(user_id)")
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_fido_credentials_user_id ON fido_credentials(user_id)",
+    )
+    .execute(pool)
+    .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_fido_sessions_user_id ON fido_sessions(user_id)")
         .execute(pool)
         .await?;
@@ -253,7 +247,10 @@ pub async fn find_user_by_email(pool: &SqlitePool, email: &str) -> Result<Option
 }
 
 #[allow(dead_code)]
-pub async fn find_user_by_username(pool: &SqlitePool, username: &str) -> Result<Option<User>, AppError> {
+pub async fn find_user_by_username(
+    pool: &SqlitePool,
+    username: &str,
+) -> Result<Option<User>, AppError> {
     let user = sqlx::query_as::<_, User>(
         r#"
         SELECT id, username, email, password_hash, password_commitment, role, is_active, is_super_admin,
@@ -583,8 +580,11 @@ pub async fn delete_widget(pool: &SqlitePool, id: &str, user_id: &str) -> Result
     Ok(result.rows_affected() > 0)
 }
 
-
-pub async fn create_installed_app(pool: &SqlitePool, app: &DockerApp, user_id: &str) -> Result<(), AppError> {
+pub async fn create_installed_app(
+    pool: &SqlitePool,
+    app: &DockerApp,
+    user_id: &str,
+) -> Result<(), AppError> {
     let ports_json = serde_json::to_string(&app.ports).unwrap_or_default();
     let volumes_json = serde_json::to_string(&app.volumes).unwrap_or_default();
     let env_json = serde_json::to_string(&app.environment).unwrap_or_default();
@@ -617,7 +617,10 @@ pub async fn create_installed_app(pool: &SqlitePool, app: &DockerApp, user_id: &
     Ok(())
 }
 
-pub async fn list_installed_apps(pool: &SqlitePool, user_id: &str) -> Result<Vec<DockerApp>, AppError> {
+pub async fn list_installed_apps(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> Result<Vec<DockerApp>, AppError> {
     #[derive(sqlx::FromRow)]
     struct AppRow {
         id: String,
@@ -653,8 +656,10 @@ pub async fn list_installed_apps(pool: &SqlitePool, user_id: &str) -> Result<Vec
     let mut apps = Vec::new();
     for row in rows {
         let ports: Vec<PortMapping> = serde_json::from_str(&row.ports_json).unwrap_or_default();
-        let volumes: Vec<VolumeMapping> = serde_json::from_str(&row.volumes_json).unwrap_or_default();
-        let environment: Vec<EnvVar> = serde_json::from_str(&row.environment_json).unwrap_or_default();
+        let volumes: Vec<VolumeMapping> =
+            serde_json::from_str(&row.volumes_json).unwrap_or_default();
+        let environment: Vec<EnvVar> =
+            serde_json::from_str(&row.environment_json).unwrap_or_default();
         let created_at = chrono::DateTime::parse_from_rfc3339(&row.created_at)
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| chrono::Utc::now());
@@ -684,7 +689,11 @@ pub async fn list_installed_apps(pool: &SqlitePool, user_id: &str) -> Result<Vec
     Ok(apps)
 }
 
-pub async fn find_installed_app(pool: &SqlitePool, id: &str, user_id: &str) -> Result<Option<DockerApp>, AppError> {
+pub async fn find_installed_app(
+    pool: &SqlitePool,
+    id: &str,
+    user_id: &str,
+) -> Result<Option<DockerApp>, AppError> {
     #[derive(sqlx::FromRow)]
     struct AppRow {
         id: String,
@@ -719,8 +728,10 @@ pub async fn find_installed_app(pool: &SqlitePool, id: &str, user_id: &str) -> R
 
     if let Some(row) = row {
         let ports: Vec<PortMapping> = serde_json::from_str(&row.ports_json).unwrap_or_default();
-        let volumes: Vec<VolumeMapping> = serde_json::from_str(&row.volumes_json).unwrap_or_default();
-        let environment: Vec<EnvVar> = serde_json::from_str(&row.environment_json).unwrap_or_default();
+        let volumes: Vec<VolumeMapping> =
+            serde_json::from_str(&row.volumes_json).unwrap_or_default();
+        let environment: Vec<EnvVar> =
+            serde_json::from_str(&row.environment_json).unwrap_or_default();
         let created_at = chrono::DateTime::parse_from_rfc3339(&row.created_at)
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| chrono::Utc::now());
@@ -750,7 +761,11 @@ pub async fn find_installed_app(pool: &SqlitePool, id: &str, user_id: &str) -> R
     }
 }
 
-pub async fn delete_installed_app(pool: &SqlitePool, id: &str, user_id: &str) -> Result<bool, AppError> {
+pub async fn delete_installed_app(
+    pool: &SqlitePool,
+    id: &str,
+    user_id: &str,
+) -> Result<bool, AppError> {
     let result = sqlx::query("DELETE FROM installed_apps WHERE id = ? AND user_id = ?")
         .bind(id)
         .bind(user_id)

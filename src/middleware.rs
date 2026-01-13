@@ -66,7 +66,7 @@ where
                         Ok(token) => {
                             let jwt_handler = JwtHandler::new(config.get_ref());
                             
-                            match jwt_handler.verify_access_token(token) {
+                            match jwt_handler.verify_access_token(token).await {
                                 Ok(claims) => {
                                     req.extensions_mut().insert(claims);
                                     

@@ -159,7 +159,8 @@ pub async fn get_memory_info() -> Result<impl Responder, AppError> {
 pub async fn get_disk_info() -> Result<impl Responder, AppError> {
     let disks_info = Disks::new_with_refreshed_list();
     let mut disks = Vec::new();
-    let mut seen_devices: std::collections::HashSet<(u64, String)> = std::collections::HashSet::new();
+    let mut seen_devices: std::collections::HashSet<(u64, String)> =
+        std::collections::HashSet::new();
 
     for disk in disks_info.list() {
         let total_space = disk.total_space();
@@ -177,9 +178,8 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
         let name = disk.name().to_string_lossy().to_string();
         let file_system = disk.file_system().to_string_lossy().to_string();
 
-        // 跳过虚拟文件系统和特殊挂载点
-        if mount_point.starts_with("/sys") 
-            || mount_point.starts_with("/proc") 
+        if mount_point.starts_with("/sys")
+            || mount_point.starts_with("/proc")
             || mount_point.starts_with("/dev") && !mount_point.starts_with("/dev/shm")
             || mount_point.starts_with("/run")
             || mount_point.contains("/snap/")
@@ -191,15 +191,12 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
             continue;
         }
 
-        // 使用设备大小和文件系统作为唯一标识，避免重复（如 /var/log.hdd 和 / 指向同一设备）
         let device_key = (total_space, file_system.clone());
         if seen_devices.contains(&device_key) && total_space > 0 {
-            // 如果已经有相同大小和文件系统的设备，优先保留根目录或更短的挂载点
             let existing_idx = disks.iter().position(|d: &DiskInfo| {
                 d.total_space == total_space && d.file_system == file_system
             });
             if let Some(idx) = existing_idx {
-                // 如果当前挂载点是根目录或更短，替换现有的
                 if mount_point == "/" || mount_point.len() < disks[idx].mount_point.len() {
                     disks[idx] = DiskInfo {
                         name: name.clone(),
@@ -231,12 +228,19 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
         });
     }
 
-    // 按挂载点排序：根目录优先，然后是 /boot，最后是其他
     disks.sort_by(|a, b| {
-        if a.mount_point == "/" { return std::cmp::Ordering::Less; }
-        if b.mount_point == "/" { return std::cmp::Ordering::Greater; }
-        if a.mount_point == "/boot" { return std::cmp::Ordering::Less; }
-        if b.mount_point == "/boot" { return std::cmp::Ordering::Greater; }
+        if a.mount_point == "/" {
+            return std::cmp::Ordering::Less;
+        }
+        if b.mount_point == "/" {
+            return std::cmp::Ordering::Greater;
+        }
+        if a.mount_point == "/boot" {
+            return std::cmp::Ordering::Less;
+        }
+        if b.mount_point == "/boot" {
+            return std::cmp::Ordering::Greater;
+        }
         a.mount_point.cmp(&b.mount_point)
     });
 
@@ -248,13 +252,11 @@ pub async fn get_usb_devices() -> Result<impl Responder, AppError> {
     Ok(HttpResponse::Ok().json(usb_devices))
 }
 
-/// 获取网络接口信息
 pub async fn get_network_interfaces() -> Result<impl Responder, AppError> {
     let interfaces = detect_network_interfaces();
     Ok(HttpResponse::Ok().json(interfaces))
 }
 
-/// 获取块设备信息（包括未挂载的）
 pub async fn get_block_devices() -> Result<impl Responder, AppError> {
     let devices = hardware::get_all_block_devices();
     Ok(HttpResponse::Ok().json(devices))
@@ -380,44 +382,58 @@ fn detect_usb_devices() -> Vec<UsbDevice> {
     let detailed = hardware::detect_usb_devices_detailed();
     let disks_info = Disks::new_with_refreshed_list();
     let mut used_mount_points: std::collections::HashSet<String> = std::collections::HashSet::new();
-    
-    // 首先收集所有可用的 USB 存储挂载点
+
     let mut available_usb_mounts: Vec<(String, u64)> = Vec::new();
     for disk in disks_info.list() {
         let mount_point = disk.mount_point().to_string_lossy().to_string();
-        if disk.is_removable() && (mount_point.starts_with("/mnt/") || mount_point.starts_with("/media/")) {
+        if disk.is_removable()
+            && (mount_point.starts_with("/mnt/") || mount_point.starts_with("/media/"))
+        {
             available_usb_mounts.push((mount_point, disk.total_space()));
         }
     }
-    
-    detailed.into_iter().filter_map(|d| {
-        // 只处理存储设备
-        if d.device_class != "Mass Storage" && !d.device_class.contains("Storage") {
-            // 非存储设备，直接返回
-            return Some(UsbDevice {
-                name: d.name,
-                vendor_id: d.vendor_id,
-                product_id: d.product_id,
-                manufacturer: Some(d.manufacturer),
-                device_class: d.device_class,
-                mount_point: None,
-                size: None,
-                serial: d.serial,
-                speed: d.speed,
-            });
-        }
-        
-        // 对于存储设备，查找挂载点
-        let (mount_point, size) = if let Some(mp) = &d.mount_point {
-            if !used_mount_points.contains(mp) {
-                used_mount_points.insert(mp.clone());
-                let sz = disks_info.list().iter()
-                    .find(|disk| disk.mount_point().to_string_lossy() == *mp)
-                    .map(|disk| disk.total_space());
-                (Some(mp.clone()), sz)
+
+    detailed
+        .into_iter()
+        .filter_map(|d| {
+            if d.device_class != "Mass Storage" && !d.device_class.contains("Storage") {
+                return Some(UsbDevice {
+                    name: d.name,
+                    vendor_id: d.vendor_id,
+                    product_id: d.product_id,
+                    manufacturer: Some(d.manufacturer),
+                    device_class: d.device_class,
+                    mount_point: None,
+                    size: None,
+                    serial: d.serial,
+                    speed: d.speed,
+                });
+            }
+
+            let (mount_point, size) = if let Some(mp) = &d.mount_point {
+                if !used_mount_points.contains(mp) {
+                    used_mount_points.insert(mp.clone());
+                    let sz = disks_info
+                        .list()
+                        .iter()
+                        .find(|disk| disk.mount_point().to_string_lossy() == *mp)
+                        .map(|disk| disk.total_space());
+                    (Some(mp.clone()), sz)
+                } else {
+                    let alt = available_usb_mounts
+                        .iter()
+                        .find(|(m, _)| !used_mount_points.contains(m))
+                        .map(|(m, s)| (m.clone(), *s));
+                    if let Some((alt_mp, alt_sz)) = alt {
+                        used_mount_points.insert(alt_mp.clone());
+                        (Some(alt_mp), Some(alt_sz))
+                    } else {
+                        (None, None)
+                    }
+                }
             } else {
-                // 挂载点已被使用，尝试找另一个可用的挂载点
-                let alt = available_usb_mounts.iter()
+                let alt = available_usb_mounts
+                    .iter()
                     .find(|(m, _)| !used_mount_points.contains(m))
                     .map(|(m, s)| (m.clone(), *s));
                 if let Some((alt_mp, alt_sz)) = alt {
@@ -426,32 +442,21 @@ fn detect_usb_devices() -> Vec<UsbDevice> {
                 } else {
                     (None, None)
                 }
-            }
-        } else {
-            // 没有挂载点，尝试从可用列表中分配一个
-            let alt = available_usb_mounts.iter()
-                .find(|(m, _)| !used_mount_points.contains(m))
-                .map(|(m, s)| (m.clone(), *s));
-            if let Some((alt_mp, alt_sz)) = alt {
-                used_mount_points.insert(alt_mp.clone());
-                (Some(alt_mp), Some(alt_sz))
-            } else {
-                (None, None)
-            }
-        };
+            };
 
-        Some(UsbDevice {
-            name: d.name,
-            vendor_id: d.vendor_id,
-            product_id: d.product_id,
-            manufacturer: Some(d.manufacturer),
-            device_class: d.device_class,
-            mount_point,
-            size,
-            serial: d.serial,
-            speed: d.speed,
+            Some(UsbDevice {
+                name: d.name,
+                vendor_id: d.vendor_id,
+                product_id: d.product_id,
+                manufacturer: Some(d.manufacturer),
+                device_class: d.device_class,
+                mount_point,
+                size,
+                serial: d.serial,
+                speed: d.speed,
+            })
         })
-    }).collect()
+        .collect()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -479,7 +484,7 @@ fn detect_network_interfaces() -> Vec<NetworkInterfaceInfo> {
 
     for (name, data) in networks.iter() {
         let mac_address = data.mac_address().to_string();
-        
+
         // 获取 IP 地址和接口详情
         let (ip_addresses, is_up, speed_mbps, interface_type) = get_interface_info(name);
 
@@ -513,7 +518,7 @@ fn detect_network_interfaces() -> Vec<NetworkInterfaceInfo> {
 fn get_interface_info(name: &str) -> (Vec<String>, bool, Option<u64>, String) {
     let sys_path = format!("/sys/class/net/{}", name);
     let mut ips = Vec::new();
-    
+
     // 获取 IP 地址
     if let Ok(output) = std::process::Command::new("ip")
         .args(["addr", "show", name])
@@ -529,18 +534,18 @@ fn get_interface_info(name: &str) -> (Vec<String>, bool, Option<u64>, String) {
             }
         }
     }
-    
+
     // 检查接口状态
     let is_up = fs::read_to_string(format!("{}/operstate", sys_path))
         .map(|s| s.trim() == "up")
         .unwrap_or(false);
-    
+
     // 获取速度
     let speed_mbps = fs::read_to_string(format!("{}/speed", sys_path))
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&s| s > 0 && s < 1000000);
-    
+
     // 判断接口类型
     let interface_type = if name == "lo" {
         "Loopback"
@@ -554,8 +559,9 @@ fn get_interface_info(name: &str) -> (Vec<String>, bool, Option<u64>, String) {
         "Virtual"
     } else {
         "Unknown"
-    }.to_string();
-    
+    }
+    .to_string();
+
     (ips, is_up, speed_mbps, interface_type)
 }
 

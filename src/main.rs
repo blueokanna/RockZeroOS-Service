@@ -10,6 +10,7 @@ mod invite;
 mod media_processor;
 mod middleware;
 mod models;
+mod secure_db;
 mod tls;
 mod zkp;
 
@@ -22,6 +23,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::AppConfig;
 use crate::crypto::CryptoContext;
+use crate::handlers::secure_storage::SecureStorageManager;
 use crate::invite::InviteCodeManager;
 use crate::media_processor::MediaProcessor;
 use crate::zkp::ZkpContext;
@@ -63,7 +65,10 @@ async fn main() -> std::io::Result<()> {
     db::run_migrations(&pool).await.expect("Database migration failed");
     info!("Database initialized successfully");
 
-    let crypto_ctx = Arc::new(CryptoContext::new(&config.encryption_key));
+    let crypto_ctx = Arc::new(
+        CryptoContext::new(&config.encryption_key)
+            .expect("Failed to initialize crypto context")
+    );
     let zkp_ctx = Arc::new(ZkpContext::new());
     let invite_manager = Arc::new(InviteCodeManager::new());
     
@@ -97,10 +102,17 @@ async fn main() -> std::io::Result<()> {
     
     info!("Security modules initialized successfully");
 
+    // 初始化安全存储管理器
+    let secure_storage_path = std::path::PathBuf::from(&config.data_dir).join("secure_storage");
+    std::fs::create_dir_all(&secure_storage_path).ok();
+    let secure_storage = Arc::new(SecureStorageManager::new(secure_storage_path));
+    info!("Secure Storage: ZKP + WPA3-SAE + CRC32 + Reed-Solomon enabled");
+
     let pool_data = web::Data::new(pool);
     let crypto_data = web::Data::new(crypto_ctx);
     let zkp_data = web::Data::new(zkp_ctx);
     let invite_data = web::Data::new(invite_manager);
+    let secure_storage_data = web::Data::new(secure_storage);
     #[cfg(feature = "fido")]
     let fido_data = web::Data::new(fido_manager);
     let media_data = web::Data::new(media_processor);
@@ -142,6 +154,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(crypto_data.clone())
             .app_data(zkp_data.clone())
             .app_data(invite_data.clone())
+            .app_data(secure_storage_data.clone())
             .app_data(media_data.clone())
             .app_data(config_data.clone());
         
@@ -157,11 +170,21 @@ async fn main() -> std::io::Result<()> {
                     .route("/register", web::post().to(handlers::auth::register))
                     .route("/login", web::post().to(handlers::auth::login))
                     .route("/login/zkp", web::post().to(handlers::auth::login_zkp))
+                    .route("/login/zkp-enhanced", web::post().to(handlers::auth::login_zkp_enhanced))
                     .route("/refresh", web::post().to(handlers::auth::refresh_token))
+                    // ZKP 工具 API（公开）
+                    .route("/zkp/proof", web::post().to(handlers::auth::generate_zkp_proof))
+                    .route("/zkp/proof-enhanced", web::post().to(handlers::auth::generate_enhanced_zkp_proof))
+                    .route("/zkp/password-strength", web::post().to(handlers::auth::check_password_strength))
+                    .route("/zkp/range-proof", web::post().to(handlers::auth::generate_range_proof))
+                    .route("/zkp/range-proof/verify", web::post().to(handlers::auth::verify_range_proof))
+                    .route("/zkp/derive-key", web::post().to(handlers::auth::derive_encryption_key))
                     .service(
                         web::scope("")
                             .wrap(middleware::JwtAuth)
-                            .route("/invite", web::post().to(handlers::auth::generate_invite_code)),
+                            .route("/invite", web::post().to(handlers::auth::generate_invite_code))
+                            .route("/verify-password", web::post().to(handlers::auth::verify_password_endpoint))
+                            .route("/logout", web::post().to(handlers::auth::logout)),
                     ),
             )
             .service(
@@ -184,6 +207,46 @@ async fn main() -> std::io::Result<()> {
                     .route("", web::get().to(handlers::files::list_files))
                     .route("/{id}/download", web::get().to(handlers::files::download_file))
                     .route("/{id}", web::delete().to(handlers::files::delete_file)),
+            )
+            // 安全存储 API - 零知识加密 + CRC32 + Reed-Solomon
+            .service(
+                web::scope("/api/v1/secure-storage")
+                    .wrap(middleware::JwtAuth)
+                    .route("/init", web::post().to(handlers::secure_storage::init_secure_database))
+                    .route("/store", web::post().to(handlers::secure_storage::store_secure_data))
+                    .route("/retrieve", web::post().to(handlers::secure_storage::retrieve_secure_data))
+                    .route("/delete", web::post().to(handlers::secure_storage::delete_secure_data))
+                    .route("/integrity", web::post().to(handlers::secure_storage::check_integrity))
+                    .route("/repair", web::post().to(handlers::secure_storage::repair_data))
+                    .route("/stats", web::post().to(handlers::secure_storage::get_database_stats))
+                    .route("/close", web::post().to(handlers::secure_storage::close_database))
+                    // 加密工具 API
+                    .route("/encrypt", web::post().to(handlers::secure_storage::encrypt_data))
+                    .route("/decrypt", web::post().to(handlers::secure_storage::decrypt_data))
+                    .route("/encrypt-string", web::post().to(handlers::secure_storage::encrypt_string))
+                    .route("/decrypt-string", web::post().to(handlers::secure_storage::decrypt_string))
+                    .route("/derive-key", web::post().to(handlers::secure_storage::derive_key))
+                    .route("/derive-keys", web::post().to(handlers::secure_storage::derive_batch_keys))
+                    .route("/derive-specific-key", web::post().to(handlers::secure_storage::derive_specific_key))
+                    .route("/wpa3-sae-key", web::post().to(handlers::secure_storage::derive_wpa3_sae_key))
+                    .route("/random", web::post().to(handlers::secure_storage::generate_random))
+                    .route("/hash", web::post().to(handlers::secure_storage::hash_data))
+                    .route("/crc32", web::post().to(handlers::secure_storage::crc32_check))
+                    .route("/compare", web::post().to(handlers::secure_storage::constant_time_compare_endpoint))
+                    .route("/secure-erase", web::post().to(handlers::secure_storage::secure_erase_demo))
+                    // 文件传输管理 API
+                    .route("/transfer/status", web::post().to(handlers::secure_storage::get_transfer_status))
+                    .route("/transfer/start", web::post().to(handlers::secure_storage::start_transfer))
+                    .route("/transfer/complete", web::post().to(handlers::secure_storage::complete_transfer))
+                    .route("/transfer/progress", web::post().to(handlers::secure_storage::update_transfer_progress))
+                    .route("/transfer/failed", web::post().to(handlers::secure_storage::mark_encryption_failed))
+                    .route("/transfer/remove", web::post().to(handlers::secure_storage::remove_transfer))
+                    .route("/transfer/list", web::get().to(handlers::secure_storage::list_active_transfers))
+                    .route("/transfer/cleanup", web::post().to(handlers::secure_storage::cleanup_transfers))
+                    // 文件加密 API
+                    .route("/file/encrypt", web::post().to(handlers::secure_storage::encrypt_file))
+                    .route("/file/decrypt", web::post().to(handlers::secure_storage::decrypt_file))
+                    .route("/file/can-encrypt", web::post().to(handlers::secure_storage::can_safely_encrypt)),
             )
             .service(
                 web::scope("/api/v1/media")

@@ -2,7 +2,7 @@
   "name": "rockzero-service",
   "title": "RockZero 安全服务",
   "version": "0.1.0",
-  "description": "零知识证明安全服务 - 支持文件管理、媒体播放、小组件。采用 Argon2 密码哈希、单调时钟防篡改推荐码系统。",
+  "description": "零知识证明安全服务 - 支持文件管理、媒体播放、小组件。采用 Blake3 密码哈希、单调时钟防篡改推荐码系统。",
   "icon": "https://cdn.jsdelivr.net/gh/rockzero/rockzero-service@main/icon.png",
   "author": "RockZero Team",
   "homepage": "https://github.com/rockzero/rockzero-service",

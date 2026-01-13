@@ -9,6 +9,7 @@ pub struct AppConfig {
     pub jwt_expiration_hours: i64,
     pub refresh_token_expiration_days: i64,
     pub encryption_key: String,
+    pub data_dir: String,
     pub tls_enabled: bool,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
@@ -71,6 +72,8 @@ impl AppConfig {
                 .expect("REFRESH_TOKEN_EXPIRATION_DAYS must be a valid number"),
             encryption_key: env::var("ENCRYPTION_KEY")
                 .unwrap_or_else(|_| "default-dev-key-change-in-production-32b".to_string()),
+            data_dir: env::var("DATA_DIR")
+                .unwrap_or_else(|_| "./data".to_string()),
             tls_enabled: env::var("TLS_ENABLED")
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
