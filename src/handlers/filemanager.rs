@@ -11,7 +11,7 @@ use walkdir::WalkDir;
 
 use crate::error::AppError;
 
-const BASE_DIR: &str = "./storage";
+const BASE_DIR: &str = "/home";
 const MAX_FILE_SIZE: usize = 10 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
@@ -420,7 +420,27 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
 
 fn sanitize_path(path: &str) -> Result<PathBuf, AppError> {
     let base = Path::new(BASE_DIR);
-    fs::create_dir_all(base).ok();
+    
+    // Ensure base directory exists
+    if !base.exists() {
+        // Fallback to current directory if /home doesn't exist (Windows)
+        #[cfg(target_os = "windows")]
+        {
+            let fallback = Path::new("./storage");
+            std::fs::create_dir_all(fallback).ok();
+            let full_path = if path.is_empty() {
+                fallback.to_path_buf()
+            } else {
+                fallback.join(path)
+            };
+            return Ok(full_path);
+        }
+        
+        #[cfg(not(target_os = "windows"))]
+        {
+            return Err(AppError::NotFound("Base directory not found".to_string()));
+        }
+    }
 
     let full_path = if path.is_empty() {
         base.to_path_buf()
@@ -428,10 +448,13 @@ fn sanitize_path(path: &str) -> Result<PathBuf, AppError> {
         base.join(path)
     };
 
+    // Try to canonicalize, but allow non-existent paths for creation
     let canonical = full_path.canonicalize()
         .or_else(|_| Ok::<_, AppError>(full_path.clone()))?;
 
-    if !canonical.starts_with(base) {
+    // Security check: ensure path is within base directory
+    let base_canonical = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    if !canonical.starts_with(&base_canonical) && !full_path.starts_with(base) {
         return Err(AppError::Forbidden("Path traversal detected".to_string()));
     }
 

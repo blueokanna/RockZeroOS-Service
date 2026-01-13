@@ -31,6 +31,13 @@ use crate::fido::FidoManager;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Check for --help argument
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--help") {
+        AppConfig::print_usage();
+        return Ok(());
+    }
+
     dotenvy::dotenv().ok();
 
     tracing_subscriber::registry()

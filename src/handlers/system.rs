@@ -293,6 +293,7 @@ fn get_cpu_temperature() -> Option<f32> {
 #[cfg(target_os = "linux")]
 fn detect_usb_devices() -> Vec<UsbDevice> {
     let mut devices = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
 
     if let Ok(entries) = fs::read_dir("/sys/bus/usb/devices") {
         for entry in entries.flatten() {
@@ -313,18 +314,28 @@ fn detect_usb_devices() -> Vec<UsbDevice> {
                 .trim()
                 .to_string();
 
-            if !vendor_id.is_empty() && !product_id.is_empty() {
-                let mount_point = find_usb_mount_point(&vendor_id, &product_id);
-                let size = mount_point.as_ref().and_then(|mp| get_mount_size(mp));
-
-                devices.push(UsbDevice {
-                    name: product_name,
-                    vendor_id,
-                    product_id,
-                    mount_point,
-                    size,
-                });
+            // Skip empty or invalid entries
+            if vendor_id.is_empty() || product_id.is_empty() {
+                continue;
             }
+
+            // Create unique key to avoid duplicates
+            let unique_key = format!("{}:{}", vendor_id, product_id);
+            if seen_ids.contains(&unique_key) {
+                continue;
+            }
+            seen_ids.insert(unique_key);
+
+            let mount_point = find_usb_mount_point(&vendor_id, &product_id);
+            let size = mount_point.as_ref().and_then(|mp| get_mount_size(mp));
+
+            devices.push(UsbDevice {
+                name: product_name,
+                vendor_id,
+                product_id,
+                mount_point,
+                size,
+            });
         }
     }
 

@@ -24,6 +24,12 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), AppError> {
     .execute(pool)
     .await?;
 
+    // 迁移：为旧数据库添加 is_super_admin 列
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN is_super_admin INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
+    // 忽略错误（列已存在时会报错）
+
     // 推荐码表
     sqlx::query(
         r#"
