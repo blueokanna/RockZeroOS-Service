@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+#[allow(dead_code)]
 pub const KEY_SIZE: usize = 32;
 pub const NONCE_SIZE: usize = 12;
 
@@ -303,6 +304,7 @@ impl KeyDeriver {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_seed(seed: &[u8]) -> Self {
         Self {
             sae: Wpa3Sae::with_seed(seed),
@@ -552,6 +554,7 @@ impl SecureFileEncryptor {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct EncryptedFileData {
     pub encrypted_data: EncryptedData,
     pub original_crc32: u32,
@@ -559,6 +562,7 @@ pub struct EncryptedFileData {
     pub file_path: String,
 }
 
+#[allow(dead_code)]
 impl EncryptedFileData {
     /// 序列化为字节
     pub fn to_bytes(&self) -> Vec<u8> {
