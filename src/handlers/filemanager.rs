@@ -10,15 +10,22 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tracing::info;
 use walkdir::WalkDir;
+use bytes::Bytes;
 
 use crate::error::AppError;
 
 // 支持多个基础目录，按优先级尝试
 const BASE_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
 const MAX_FILE_SIZE: usize = 10 * 1024 * 1024 * 1024;
-const MAX_TEXT_PREVIEW_SIZE: usize = 1024 * 1024 * 1024;
+const MAX_TEXT_PREVIEW_SIZE: usize = 1024 * 1024; // 1MB text preview limit
+// 流式传输的chunk大小 - 128KB适合低内存设备 (1GB RAM)
+const STREAM_CHUNK_SIZE: u64 = 128 * 1024;
+// 单次Range请求的最大大小 - 1MB 防止OOM
+const MAX_RANGE_SIZE: u64 = 1024 * 1024;
 const ALLOWED_TEXT_EXTENSIONS: &[&str] = &[
     "txt",
     "md",
@@ -777,7 +784,48 @@ pub async fn get_media_info(
     }))
 }
 
-/// Stream media file with range support
+/// 流式文件读取器 - 用于低内存设备的视频流传输
+struct StreamingFileReader {
+    file: File,
+    remaining: u64,
+    chunk_size: u64,
+}
+
+impl StreamingFileReader {
+    fn new(file: File, total_size: u64) -> Self {
+        Self {
+            file,
+            remaining: total_size,
+            chunk_size: STREAM_CHUNK_SIZE,
+        }
+    }
+}
+
+impl futures::Stream for StreamingFileReader {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.remaining == 0 {
+            return Poll::Ready(None);
+        }
+
+        let to_read = std::cmp::min(self.remaining, self.chunk_size) as usize;
+        let mut buffer = vec![0u8; to_read];
+        
+        match self.file.read(&mut buffer) {
+            Ok(0) => Poll::Ready(None),
+            Ok(n) => {
+                buffer.truncate(n);
+                self.remaining = self.remaining.saturating_sub(n as u64);
+                Poll::Ready(Some(Ok(Bytes::from(buffer))))
+            }
+            Err(e) => Poll::Ready(Some(Err(e))),
+        }
+    }
+}
+
+/// Stream media file with range support - 优化版本，使用流式传输
+/// 避免一次性加载整个文件到内存，防止OOM
 pub async fn stream_media(
     req: HttpRequest,
     query: web::Query<StreamQuery>,
@@ -813,16 +861,20 @@ pub async fn stream_media(
 
     if let Some(range_value) = range_header {
         let range_str = range_value.to_str().unwrap_or("");
-        if let Some((start, end)) = parse_range_header(range_str, file_size) {
+        if let Some((start, mut end)) = parse_range_header(range_str, file_size) {
+            // 限制单次请求的最大范围，防止内存溢出
+            if end - start + 1 > MAX_RANGE_SIZE {
+                end = start + MAX_RANGE_SIZE - 1;
+            }
+            
             let length = end - start + 1;
 
             let mut file = File::open(&full_path).map_err(|_| AppError::InternalError)?;
             file.seek(SeekFrom::Start(start))
                 .map_err(|_| AppError::InternalError)?;
 
-            let mut buffer = vec![0u8; length as usize];
-            file.read_exact(&mut buffer)
-                .map_err(|_| AppError::InternalError)?;
+            // 使用流式传输
+            let stream = StreamingFileReader::new(file, length);
 
             return Ok(HttpResponse::PartialContent()
                 .insert_header((
@@ -830,26 +882,30 @@ pub async fn stream_media(
                     format!("bytes {}-{}/{}", start, end, file_size),
                 ))
                 .insert_header((ACCEPT_RANGES, "bytes"))
+                .insert_header(("Cache-Control", "no-cache"))
                 .insert_header(ContentType(
                     mime_type
                         .parse()
                         .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
                 ))
-                .body(buffer));
+                .streaming(stream));
         }
     }
 
-    // No range requested, return full file
-    let file_content = fs::read(&full_path).map_err(|_| AppError::InternalError)?;
+    // No range requested - 也使用流式传输
+    let file = File::open(&full_path).map_err(|_| AppError::InternalError)?;
+    let stream = StreamingFileReader::new(file, file_size);
 
     Ok(HttpResponse::Ok()
         .insert_header((ACCEPT_RANGES, "bytes"))
+        .insert_header(("Cache-Control", "no-cache"))
+        .insert_header(("Content-Length", file_size.to_string()))
         .insert_header(ContentType(
             mime_type
                 .parse()
                 .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
         ))
-        .body(file_content))
+        .streaming(stream))
 }
 
 /// Serve image file with optional resize

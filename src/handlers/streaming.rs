@@ -1,14 +1,21 @@
 use actix_web::{web, HttpRequest, HttpResponse};
+use actix_web::body::SizedStream;
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::Command;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use bytes::Bytes;
 
 use crate::error::AppError;
 
 const MEDIA_BASE: &str = "./media";
-const CHUNK_SIZE: u64 = 1024 * 1024; // 1MB chunks
+// 使用较小的chunk size以减少内存占用，适合低内存设备 (128KB适合1GB RAM设备)
+const CHUNK_SIZE: u64 = 128 * 1024; // 128KB chunks - 更适合低内存设备
+const MAX_RANGE_CHUNK: u64 = 1024 * 1024; // 最大单次Range请求1MB - 防止OOM
 
 #[derive(Debug, Serialize)]
 pub struct MediaStreamInfo {
@@ -73,7 +80,48 @@ pub async fn get_media_info(path: web::Path<String>) -> Result<HttpResponse, App
     Ok(HttpResponse::Ok().json(info))
 }
 
-/// 流式播放媒体文件 (支持 Range 请求)
+/// 流式文件读取器 - 使用小块读取以减少内存占用
+struct ChunkedFileStream {
+    file: File,
+    remaining: u64,
+    chunk_size: u64,
+}
+
+impl ChunkedFileStream {
+    fn new(file: File, total_size: u64) -> Self {
+        Self {
+            file,
+            remaining: total_size,
+            chunk_size: CHUNK_SIZE,
+        }
+    }
+}
+
+impl futures::Stream for ChunkedFileStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.remaining == 0 {
+            return Poll::Ready(None);
+        }
+
+        let to_read = std::cmp::min(self.remaining, self.chunk_size) as usize;
+        let mut buffer = vec![0u8; to_read];
+        
+        match self.file.read(&mut buffer) {
+            Ok(0) => Poll::Ready(None),
+            Ok(n) => {
+                buffer.truncate(n);
+                self.remaining = self.remaining.saturating_sub(n as u64);
+                Poll::Ready(Some(Ok(Bytes::from(buffer))))
+            }
+            Err(e) => Poll::Ready(Some(Err(e))),
+        }
+    }
+}
+
+/// 流式播放媒体文件 (支持 Range 请求) - 优化内存使用
+/// 使用流式传输，避免一次性加载整个文件到内存
 pub async fn stream_media(
     req: HttpRequest,
     path: web::Path<String>,
@@ -94,17 +142,22 @@ pub async fn stream_media(
     let range_header = req.headers().get("Range").and_then(|v| v.to_str().ok());
 
     if let Some(range) = range_header {
-        // 处理 Range 请求
-        let (start, end) = parse_range(range, file_size)?;
+        // 处理 Range 请求 - 使用流式传输
+        let (start, mut end) = parse_range(range, file_size)?;
+        
+        // 限制单次请求的最大范围，防止内存溢出
+        if end - start + 1 > MAX_RANGE_CHUNK {
+            end = start + MAX_RANGE_CHUNK - 1;
+        }
+        
         let content_length = end - start + 1;
 
         let mut file = File::open(&file_path).map_err(|_| AppError::InternalError)?;
         file.seek(SeekFrom::Start(start))
             .map_err(|_| AppError::InternalError)?;
 
-        let mut buffer = vec![0u8; content_length as usize];
-        file.read_exact(&mut buffer)
-            .map_err(|_| AppError::InternalError)?;
+        // 使用流式传输而不是一次性读取
+        let stream = ChunkedFileStream::new(file, content_length);
 
         Ok(HttpResponse::PartialContent()
             .insert_header(("Content-Type", content_type))
@@ -114,19 +167,19 @@ pub async fn stream_media(
                 format!("bytes {}-{}/{}", start, end, file_size),
             ))
             .insert_header(("Accept-Ranges", "bytes"))
-            .body(buffer))
+            .insert_header(("Cache-Control", "no-cache"))
+            .streaming(stream))
     } else {
-        // 完整文件请求
-        let mut file = File::open(&file_path).map_err(|_| AppError::InternalError)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)
-            .map_err(|_| AppError::InternalError)?;
+        // 完整文件请求 - 也使用流式传输
+        let file = File::open(&file_path).map_err(|_| AppError::InternalError)?;
+        let stream = ChunkedFileStream::new(file, file_size);
 
         Ok(HttpResponse::Ok()
             .insert_header(("Content-Type", content_type))
             .insert_header(("Content-Length", file_size.to_string()))
             .insert_header(("Accept-Ranges", "bytes"))
-            .body(buffer))
+            .insert_header(("Cache-Control", "no-cache"))
+            .streaming(stream))
     }
 }
 
