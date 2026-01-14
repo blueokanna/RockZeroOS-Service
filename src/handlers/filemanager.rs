@@ -164,13 +164,18 @@ pub async fn list_directory(
     query: web::Query<ListDirectoryQuery>,
 ) -> Result<impl Responder, AppError> {
     let requested_path = query.path.as_deref().unwrap_or("");
+    tracing::info!("Listing directory: {:?}", requested_path);
+    
     let full_path = sanitize_path(requested_path)?;
+    tracing::info!("Full path: {:?}", full_path);
 
     if !full_path.exists() {
+        tracing::warn!("Directory not found: {:?}", full_path);
         return Err(AppError::NotFound("Directory not found".to_string()));
     }
 
     if !full_path.is_dir() {
+        tracing::warn!("Path is not a directory: {:?}", full_path);
         return Err(AppError::BadRequest("Path is not a directory".to_string()));
     }
 
@@ -180,11 +185,30 @@ pub async fn list_directory(
     let mut total_directories = 0usize;
 
     let read_dir = fs::read_dir(&full_path)
-        .map_err(|_| AppError::Forbidden("Permission denied".to_string()))?;
+        .map_err(|e| {
+            tracing::error!("Permission denied reading directory {:?}: {}", full_path, e);
+            AppError::Forbidden("Permission denied".to_string())
+        })?;
 
     for entry in read_dir {
-        let entry = entry.map_err(|_| AppError::InternalError)?;
-        let metadata = entry.metadata().map_err(|_| AppError::InternalError)?;
+        // Skip entries that can't be read
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("Skipping unreadable entry: {}", e);
+                continue;
+            }
+        };
+        
+        // Skip entries whose metadata can't be read (broken symlinks, permission issues, etc.)
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("Skipping entry with unreadable metadata {:?}: {}", entry.path(), e);
+                continue;
+            }
+        };
+        
         let file_name = entry.file_name().to_string_lossy().to_string();
 
         let relative_path = if requested_path.is_empty() {
@@ -231,6 +255,8 @@ pub async fn list_directory(
             mime_type,
         });
     }
+    
+    tracing::info!("Listed {} files and {} directories", total_files, total_directories);
 
     let sort_by = query.sort_by.as_deref().unwrap_or("name");
     let order = query.order.as_deref().unwrap_or("asc");
