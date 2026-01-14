@@ -158,10 +158,15 @@ pub struct StreamQuery {
 pub async fn list_directory(
     query: web::Query<ListDirectoryQuery>,
 ) -> Result<impl Responder, AppError> {
+    // URL-decode the path to handle UTF-8 encoded characters (e.g., Chinese, Japanese, etc.)
     let requested_path = query.path.as_deref().unwrap_or("");
-    tracing::info!("Listing directory: {:?}", requested_path);
+    let decoded_path = urlencoding::decode(requested_path)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| requested_path.to_string());
+    
+    tracing::info!("Listing directory: {:?} (decoded: {:?})", requested_path, decoded_path);
 
-    let full_path = sanitize_path(requested_path)?;
+    let full_path = sanitize_path(&decoded_path)?;
     tracing::info!("Full path: {:?}", full_path);
 
     if !full_path.exists() {
@@ -207,18 +212,26 @@ pub async fn list_directory(
             }
         };
 
-        let file_name = entry.file_name().to_string_lossy().to_string();
+        // Use OsStr to properly handle UTF-8 file names
+        let file_name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(os_str) => {
+                // Fallback to lossy conversion for non-UTF8 names
+                os_str.to_string_lossy().to_string()
+            }
+        };
 
         // Build the relative path - ensure it matches the format expected by the frontend
-        let relative_path = if requested_path.is_empty() {
+        // Use the original (decoded) path for consistency
+        let relative_path = if decoded_path.is_empty() {
             // When at base directory, just use the filename
             file_name.clone()
-        } else if requested_path.starts_with('/') {
+        } else if decoded_path.starts_with('/') {
             // Absolute path - append filename
-            format!("{}/{}", requested_path, file_name)
+            format!("{}/{}", decoded_path, file_name)
         } else {
             // Relative path - append filename
-            format!("{}/{}", requested_path, file_name)
+            format!("{}/{}", decoded_path, file_name)
         };
 
         let is_directory = metadata.is_dir();
@@ -305,8 +318,16 @@ pub async fn list_directory(
 pub async fn create_directory(
     body: web::Json<CreateDirectoryRequest>,
 ) -> Result<impl Responder, AppError> {
-    let parent_path = sanitize_path(&body.path)?;
-    let new_dir_path = parent_path.join(&body.name);
+    // URL-decode paths to handle UTF-8 characters
+    let decoded_path = urlencoding::decode(&body.path)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| body.path.clone());
+    let decoded_name = urlencoding::decode(&body.name)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| body.name.clone());
+    
+    let parent_path = sanitize_path(&decoded_path)?;
+    let new_dir_path = parent_path.join(&decoded_name);
 
     if new_dir_path.exists() {
         return Err(AppError::Conflict("Directory already exists".to_string()));
@@ -328,7 +349,12 @@ pub async fn upload_files(
     mut payload: Multipart,
 ) -> Result<impl Responder, AppError> {
     let target_path = query.path.as_deref().unwrap_or("");
-    let full_path = sanitize_path(target_path)?;
+    // URL-decode the path to handle UTF-8 characters
+    let decoded_target_path = urlencoding::decode(target_path)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| target_path.to_string());
+    
+    let full_path = sanitize_path(&decoded_target_path)?;
 
     if !full_path.exists() || !full_path.is_dir() {
         return Err(AppError::BadRequest("Invalid target directory".to_string()));
@@ -344,8 +370,13 @@ pub async fn upload_files(
             .get_filename()
             .ok_or_else(|| AppError::BadRequest("Missing filename".to_string()))?
             .to_string();
+        
+        // URL-decode filename to handle UTF-8 characters
+        let decoded_filename = urlencoding::decode(&filename)
+            .map(|s| s.into_owned())
+            .unwrap_or_else(|_| filename.clone());
 
-        let file_path = full_path.join(&filename);
+        let file_path = full_path.join(&decoded_filename);
         let mut file = fs::File::create(&file_path).map_err(|_| AppError::InternalError)?;
 
         let mut hasher = Sha256::new();
@@ -366,10 +397,10 @@ pub async fn upload_files(
 
         let checksum = format!("{:x}", hasher.finalize());
 
-        info!("File uploaded: {} ({} bytes)", filename, file_size);
+        info!("File uploaded: {} ({} bytes)", decoded_filename, file_size);
 
         uploaded_files.push(serde_json::json!({
-            "filename": filename,
+            "filename": decoded_filename,
             "size": file_size,
             "checksum": checksum,
         }));
@@ -388,27 +419,56 @@ pub async fn download_file(
         .path
         .as_deref()
         .ok_or_else(|| AppError::BadRequest("Missing file path".to_string()))?;
+    
+    // URL-decode the path to handle UTF-8 characters
+    let decoded_file_path = urlencoding::decode(file_path)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| file_path.to_string());
 
-    let full_path = sanitize_path(file_path)?;
+    let full_path = sanitize_path(&decoded_file_path)?;
 
     if !full_path.exists() || !full_path.is_file() {
         return Err(AppError::NotFound("File not found".to_string()));
     }
 
+    // Get the file name and properly encode it for Content-Disposition header
+    // Clone the file name before opening the file to avoid borrow issues
+    let file_name = full_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("download")
+        .to_string();
+
     Ok(actix_files::NamedFile::open(full_path)
         .map_err(|_| AppError::InternalError)?
         .set_content_disposition(actix_web::http::header::ContentDisposition {
             disposition: actix_web::http::header::DispositionType::Attachment,
-            parameters: vec![],
+            parameters: vec![
+                actix_web::http::header::DispositionParam::FilenameExt(
+                    actix_web::http::header::ExtendedValue {
+                        charset: actix_web::http::header::Charset::Ext("UTF-8".to_string()),
+                        language_tag: None,
+                        value: file_name.as_bytes().to_vec(),
+                    }
+                ),
+            ],
         }))
 }
 
 pub async fn rename_file(body: web::Json<RenameRequest>) -> Result<impl Responder, AppError> {
-    let old_path = sanitize_path(&body.old_path)?;
+    // URL-decode paths to handle UTF-8 characters
+    let decoded_old_path = urlencoding::decode(&body.old_path)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| body.old_path.clone());
+    let decoded_new_name = urlencoding::decode(&body.new_name)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| body.new_name.clone());
+    
+    let old_path = sanitize_path(&decoded_old_path)?;
     let new_path = old_path
         .parent()
         .ok_or_else(|| AppError::BadRequest("Invalid path".to_string()))?
-        .join(&body.new_name);
+        .join(&decoded_new_name);
 
     if new_path.exists() {
         return Err(AppError::Conflict("Target already exists".to_string()));
@@ -424,8 +484,16 @@ pub async fn rename_file(body: web::Json<RenameRequest>) -> Result<impl Responde
 }
 
 pub async fn move_files(body: web::Json<MoveRequest>) -> Result<impl Responder, AppError> {
-    let source_path = sanitize_path(&body.source)?;
-    let dest_path = sanitize_path(&body.destination)?;
+    // URL-decode paths to handle UTF-8 characters
+    let decoded_source = urlencoding::decode(&body.source)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| body.source.clone());
+    let decoded_dest = urlencoding::decode(&body.destination)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| body.destination.clone());
+    
+    let source_path = sanitize_path(&decoded_source)?;
+    let dest_path = sanitize_path(&decoded_dest)?;
 
     if !source_path.exists() {
         return Err(AppError::NotFound("Source not found".to_string()));
@@ -451,8 +519,16 @@ pub async fn move_files(body: web::Json<MoveRequest>) -> Result<impl Responder, 
 }
 
 pub async fn copy_files(body: web::Json<CopyRequest>) -> Result<impl Responder, AppError> {
-    let source_path = sanitize_path(&body.source)?;
-    let dest_path = sanitize_path(&body.destination)?;
+    // URL-decode paths to handle UTF-8 characters
+    let decoded_source = urlencoding::decode(&body.source)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| body.source.clone());
+    let decoded_dest = urlencoding::decode(&body.destination)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| body.destination.clone());
+    
+    let source_path = sanitize_path(&decoded_source)?;
+    let dest_path = sanitize_path(&decoded_dest)?;
 
     if !source_path.exists() {
         return Err(AppError::NotFound("Source not found".to_string()));
@@ -481,7 +557,12 @@ pub async fn delete_files(body: web::Json<DeleteRequest>) -> Result<impl Respond
     let mut deleted = Vec::new();
 
     for path_str in &body.paths {
-        let path = sanitize_path(path_str)?;
+        // URL-decode path to handle UTF-8 characters
+        let decoded_path = urlencoding::decode(path_str)
+            .map(|s| s.into_owned())
+            .unwrap_or_else(|_| path_str.clone());
+        
+        let path = sanitize_path(&decoded_path)?;
 
         if !path.exists() {
             continue;
@@ -619,26 +700,31 @@ fn is_path_allowed(path: &Path) -> bool {
 }
 
 fn sanitize_path(path: &str) -> Result<PathBuf, AppError> {
-    // 如果路径是绝对路径且在允许的目录内，直接使用
-    if path.starts_with('/') {
-        let abs_path = Path::new(path);
+    // URL-decode the path first to handle UTF-8 encoded characters
+    let decoded_path = urlencoding::decode(path)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    
+    // If path is absolute and in allowed directories, use it directly
+    if decoded_path.starts_with('/') {
+        let abs_path = Path::new(&decoded_path);
         if is_path_allowed(abs_path) {
             if abs_path.exists() {
                 return Ok(abs_path.to_path_buf());
             }
-            // 路径不存在但在允许范围内，可能是要创建的新路径
+            // Path doesn't exist but is in allowed range, may be for creating new paths
             return Ok(abs_path.to_path_buf());
         }
     }
 
-    // 获取基础目录
+    // Get base directory
     let base = get_base_directory()?;
 
-    let full_path = if path.is_empty() {
+    let full_path = if decoded_path.is_empty() {
         base.clone()
     } else {
-        // 移除开头的斜杠以避免路径问题
-        let clean_path = path.trim_start_matches('/');
+        // Remove leading slashes to avoid path issues
+        let clean_path = decoded_path.trim_start_matches('/');
         base.join(clean_path)
     };
 

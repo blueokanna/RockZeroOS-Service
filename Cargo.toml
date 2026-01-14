@@ -56,6 +56,7 @@ tokio-rustls = "0.24"
 mime_guess = "2.0"
 walkdir = "2.4"
 image = "0.24"
+urlencoding = "2.1"
 
 # 跨平台硬件检测
 sysinfo = "0.30"
