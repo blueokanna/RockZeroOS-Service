@@ -19,6 +19,13 @@ pub struct SystemInfo {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CpuCoreInfo {
+    pub core_id: usize,
+    pub usage: f32,
+    pub frequency: u64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct CpuInfo {
     pub name: String,
     pub vendor: String,
@@ -27,6 +34,7 @@ pub struct CpuInfo {
     pub cores: usize,
     pub usage: f32,
     pub temperature: Option<f32>,
+    pub per_core_usage: Vec<CpuCoreInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +130,17 @@ pub async fn get_cpu_info() -> Result<impl Responder, AppError> {
 
     let total_usage: f32 = cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32;
 
+    // 获取每个核心的使用率
+    let per_core_usage: Vec<CpuCoreInfo> = cpus
+        .iter()
+        .enumerate()
+        .map(|(idx, c)| CpuCoreInfo {
+            core_id: idx,
+            usage: c.cpu_usage(),
+            frequency: c.frequency(),
+        })
+        .collect();
+
     let cpu_info = CpuInfo {
         name: cpu.name().to_string(),
         vendor: cpu.vendor_id().to_string(),
@@ -130,6 +149,7 @@ pub async fn get_cpu_info() -> Result<impl Responder, AppError> {
         cores: cpus.len(),
         usage: total_usage,
         temperature: get_cpu_temperature(),
+        per_core_usage,
     };
 
     Ok(HttpResponse::Ok().json(cpu_info))
@@ -289,6 +309,17 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
     let cpu = cpus.first().ok_or(AppError::InternalError)?;
     let total_usage: f32 = cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32;
 
+    // 获取每个核心的使用率
+    let per_core_usage: Vec<CpuCoreInfo> = cpus
+        .iter()
+        .enumerate()
+        .map(|(idx, c)| CpuCoreInfo {
+            core_id: idx,
+            usage: c.cpu_usage(),
+            frequency: c.frequency(),
+        })
+        .collect();
+
     let cpu_info = CpuInfo {
         name: cpu.name().to_string(),
         vendor: cpu.vendor_id().to_string(),
@@ -297,6 +328,7 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
         cores: cpus.len(),
         usage: total_usage,
         temperature: get_cpu_temperature(),
+        per_core_usage,
     };
 
     let total_mem = sys.total_memory();
