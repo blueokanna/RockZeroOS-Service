@@ -38,6 +38,75 @@ pub struct MediaStreamInfo {
     pub audio_codec: Option<String>,
     pub bitrate: Option<u64>,
     pub supports_range: bool,
+    // Extended media info
+    pub video_bitrate: Option<u64>,
+    pub audio_bitrate: Option<u64>,
+    pub frame_rate: Option<f64>,
+    pub audio_channels: Option<u32>,
+    pub audio_sample_rate: Option<u32>,
+    pub audio_tracks: Option<Vec<AudioTrackInfo>>,
+    pub has_audio: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct AudioTrackInfo {
+    pub index: u32,
+    pub codec: String,
+    pub channels: u32,
+    pub sample_rate: u32,
+    pub bitrate: Option<u64>,
+    pub language: Option<String>,
+    pub title: Option<String>,
+}
+
+/// Extended media info for file details
+#[derive(Debug, Serialize)]
+pub struct ExtendedMediaInfo {
+    pub filename: String,
+    pub content_type: String,
+    pub size: u64,
+    // Video info
+    pub duration: Option<f64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub video_codec: Option<String>,
+    pub video_bitrate: Option<u64>,
+    pub frame_rate: Option<f64>,
+    pub aspect_ratio: Option<String>,
+    pub color_space: Option<String>,
+    // Audio info
+    pub audio_codec: Option<String>,
+    pub audio_bitrate: Option<u64>,
+    pub audio_channels: Option<u32>,
+    pub audio_sample_rate: Option<u32>,
+    pub audio_tracks: Vec<AudioTrackInfo>,
+    pub has_audio: bool,
+    // Overall
+    pub bitrate: Option<u64>,
+    pub container_format: Option<String>,
+    // Image EXIF data
+    pub exif: Option<ExifData>,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct ExifData {
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+    pub date_taken: Option<String>,
+    pub exposure_time: Option<String>,
+    pub f_number: Option<String>,
+    pub iso: Option<u32>,
+    pub focal_length: Option<String>,
+    pub gps_latitude: Option<f64>,
+    pub gps_longitude: Option<f64>,
+    pub gps_altitude: Option<f64>,
+    pub image_width: Option<u32>,
+    pub image_height: Option<u32>,
+    pub orientation: Option<u32>,
+    pub software: Option<String>,
+    pub color_space: Option<String>,
+    pub flash: Option<String>,
+    pub lens_model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,7 +135,7 @@ pub async fn get_media_info(path: web::Path<String>) -> Result<HttpResponse, App
         .first_or_octet_stream()
         .to_string();
 
-    let (duration, width, height, video_codec, audio_codec, bitrate) = get_ffprobe_info(&file_path);
+    let media_details = get_detailed_ffprobe_info(&file_path);
     let info = MediaStreamInfo {
         filename: file_path
             .file_name()
@@ -74,13 +143,78 @@ pub async fn get_media_info(path: web::Path<String>) -> Result<HttpResponse, App
             .unwrap_or_default(),
         content_type,
         size: metadata.len(),
-        duration,
-        width,
-        height,
-        video_codec,
-        audio_codec,
-        bitrate,
+        duration: media_details.duration,
+        width: media_details.width,
+        height: media_details.height,
+        video_codec: media_details.video_codec,
+        audio_codec: media_details.audio_codec,
+        bitrate: media_details.bitrate,
         supports_range: true,
+        video_bitrate: media_details.video_bitrate,
+        audio_bitrate: media_details.audio_bitrate,
+        frame_rate: media_details.frame_rate,
+        audio_channels: media_details.audio_channels,
+        audio_sample_rate: media_details.audio_sample_rate,
+        audio_tracks: if media_details.audio_tracks.is_empty() { None } else { Some(media_details.audio_tracks) },
+        has_audio: media_details.has_audio,
+    };
+
+    Ok(HttpResponse::Ok().json(info))
+}
+
+/// Get extended media info including EXIF for images
+pub async fn get_extended_media_info(path: web::Path<String>) -> Result<HttpResponse, AppError> {
+    let file_path = get_media_path(&path.into_inner())?;
+    if !file_path.exists() {
+        return Err(AppError::NotFound("File not found".to_string()));
+    }
+
+    let metadata = std::fs::metadata(&file_path).map_err(|_| AppError::InternalError)?;
+    let content_type = mime_guess::from_path(&file_path)
+        .first_or_octet_stream()
+        .to_string();
+    
+    let extension = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+
+    // Check if it's an image for EXIF extraction
+    let is_image = matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "tiff" | "tif" | "webp" | "heic" | "heif");
+    
+    let exif = if is_image {
+        extract_exif_data(&file_path)
+    } else {
+        None
+    };
+
+    let media_details = get_detailed_ffprobe_info(&file_path);
+    
+    let info = ExtendedMediaInfo {
+        filename: file_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        content_type,
+        size: metadata.len(),
+        duration: media_details.duration,
+        width: media_details.width,
+        height: media_details.height,
+        video_codec: media_details.video_codec,
+        video_bitrate: media_details.video_bitrate,
+        frame_rate: media_details.frame_rate,
+        aspect_ratio: media_details.aspect_ratio,
+        color_space: media_details.color_space,
+        audio_codec: media_details.audio_codec,
+        audio_bitrate: media_details.audio_bitrate,
+        audio_channels: media_details.audio_channels,
+        audio_sample_rate: media_details.audio_sample_rate,
+        audio_tracks: media_details.audio_tracks,
+        has_audio: media_details.has_audio,
+        bitrate: media_details.bitrate,
+        container_format: media_details.container_format,
+        exif,
     };
 
     Ok(HttpResponse::Ok().json(info))
@@ -185,6 +319,19 @@ pub async fn stream_media(
     );
     let range_header = req.headers().get("Range").and_then(|v| v.to_str().ok());
 
+    // Get detailed media info for proper audio handling
+    let media_details = get_detailed_ffprobe_info(&file_path);
+    
+    // Determine proper content type for container formats
+    let effective_content_type = match extension.as_str() {
+        "mkv" => "video/x-matroska".to_string(),
+        "webm" => "video/webm".to_string(),
+        "avi" => "video/x-msvideo".to_string(),
+        "mov" => "video/quicktime".to_string(),
+        "m2ts" | "ts" => "video/mp2t".to_string(),
+        _ => content_type.clone(),
+    };
+
     let max_range_chunk = if file_size >= MASSIVE_FILE_THRESHOLD {
         HUGE_FILE_MAX_RANGE
     } else if file_size >= HUGE_FILE_THRESHOLD {
@@ -231,7 +378,7 @@ pub async fn stream_media(
         let stream = ChunkedFileStream::with_chunk_size(file, content_length, adaptive_chunk_size);
 
         let mut response = HttpResponse::PartialContent();
-        response.insert_header(("Content-Type", content_type));
+        response.insert_header(("Content-Type", effective_content_type.clone()));
         response.insert_header(("Content-Length", content_length.to_string()));
         response.insert_header((
             "Content-Range",
@@ -251,23 +398,32 @@ pub async fn stream_media(
         ));
         response.insert_header((
             "Access-Control-Expose-Headers",
-            "Content-Range, Accept-Ranges, Content-Length, Content-Duration",
+            "Content-Range, Accept-Ranges, Content-Length, Content-Duration, X-Audio-Codec, X-Has-Audio, X-Audio-Tracks",
         ));
 
         // For container formats with complex audio (MKV, AVI, etc.)
         if is_container_format {
             response.insert_header(("X-Content-Type-Options", "nosniff"));
             // Hint for duration if available
-            if let Some(duration) = get_media_duration(&file_path) {
+            if let Some(duration) = media_details.duration {
                 response.insert_header(("Content-Duration", duration.to_string()));
             }
+            // Audio info headers for client-side handling
+            response.insert_header(("X-Has-Audio", media_details.has_audio.to_string()));
+            response.insert_header(("X-Audio-Tracks", media_details.audio_tracks.len().to_string()));
         }
 
         if is_mkv {
-            response.insert_header((
-                "X-Audio-Codec",
-                get_audio_codec(&file_path).unwrap_or_default(),
-            ));
+            if let Some(ref codec) = media_details.audio_codec {
+                response.insert_header(("X-Audio-Codec", codec.clone()));
+            }
+            // Add audio track info for MKV files
+            if !media_details.audio_tracks.is_empty() {
+                let audio_info: Vec<String> = media_details.audio_tracks.iter()
+                    .map(|t| format!("{}:{}:{}:{}", t.index, t.codec, t.channels, t.sample_rate))
+                    .collect();
+                response.insert_header(("X-Audio-Info", audio_info.join(",")));
+            }
         }
 
         Ok(response.streaming(stream))
@@ -276,33 +432,36 @@ pub async fn stream_media(
         let stream = ChunkedFileStream::new(file, file_size);
 
         let mut response = HttpResponse::Ok();
-        response.insert_header(("Content-Type", content_type));
+        response.insert_header(("Content-Type", effective_content_type));
         response.insert_header(("Content-Length", file_size.to_string()));
         response.insert_header(("Accept-Ranges", "bytes"));
         response.insert_header(("Cache-Control", "private, max-age=3600"));
         response.insert_header(("Access-Control-Allow-Origin", "*"));
         response.insert_header((
             "Access-Control-Expose-Headers",
-            "Content-Range, Accept-Ranges, Content-Length, Content-Duration",
+            "Content-Range, Accept-Ranges, Content-Length, Content-Duration, X-Audio-Codec, X-Has-Audio",
         ));
 
         // Add duration hint for full file requests
-        if let Some(duration) = get_media_duration(&file_path) {
+        if let Some(duration) = media_details.duration {
             response.insert_header(("Content-Duration", duration.to_string()));
+        }
+        
+        // Audio info for container formats
+        if is_container_format || is_mkv {
+            response.insert_header(("X-Has-Audio", media_details.has_audio.to_string()));
+            if let Some(ref codec) = media_details.audio_codec {
+                response.insert_header(("X-Audio-Codec", codec.clone()));
+            }
         }
 
         Ok(response.streaming(stream))
     }
 }
 
-fn get_media_duration(path: &Path) -> Option<f64> {
-    let (duration, _, _, _, _, _) = get_ffprobe_info(path);
-    duration
-}
-
-fn get_audio_codec(path: &Path) -> Option<String> {
-    let (_, _, _, _, audio_codec, _) = get_ffprobe_info(path);
-    audio_codec
+#[allow(dead_code)] fn get_media_duration(path: &Path) -> Option<f64> {
+    let info = get_detailed_ffprobe_info(path);
+    info.duration
 }
 
 pub async fn list_media_library(query: web::Query<StreamQuery>) -> Result<HttpResponse, AppError> {
@@ -508,16 +667,29 @@ fn is_media_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn get_ffprobe_info(
-    path: &Path,
-) -> (
-    Option<f64>,
-    Option<u32>,
-    Option<u32>,
-    Option<String>,
-    Option<String>,
-    Option<u64>,
-) {
+/// Detailed media info structure for internal use
+#[derive(Debug, Default)]
+struct DetailedMediaInfo {
+    duration: Option<f64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    video_codec: Option<String>,
+    video_bitrate: Option<u64>,
+    frame_rate: Option<f64>,
+    aspect_ratio: Option<String>,
+    color_space: Option<String>,
+    audio_codec: Option<String>,
+    audio_bitrate: Option<u64>,
+    audio_channels: Option<u32>,
+    audio_sample_rate: Option<u32>,
+    audio_tracks: Vec<AudioTrackInfo>,
+    has_audio: bool,
+    bitrate: Option<u64>,
+    container_format: Option<String>,
+}
+
+/// Get detailed ffprobe info including all audio tracks
+fn get_detailed_ffprobe_info(path: &Path) -> DetailedMediaInfo {
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -530,61 +702,201 @@ fn get_ffprobe_info(
         ])
         .output();
 
+    let mut info = DetailedMediaInfo::default();
+
     if let Ok(out) = output {
         if out.status.success() {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                let duration = json
-                    .get("format")
-                    .and_then(|f| f.get("duration"))
-                    .and_then(|d| d.as_str())
-                    .and_then(|s| s.parse().ok());
+                // Parse format info
+                if let Some(format) = json.get("format") {
+                    info.duration = format
+                        .get("duration")
+                        .and_then(|d| d.as_str())
+                        .and_then(|s| s.parse().ok());
+                    info.bitrate = format
+                        .get("bit_rate")
+                        .and_then(|b| b.as_str())
+                        .and_then(|s| s.parse().ok());
+                    info.container_format = format
+                        .get("format_name")
+                        .and_then(|f| f.as_str())
+                        .map(|s| s.to_string());
+                }
 
-                let bitrate = json
-                    .get("format")
-                    .and_then(|f| f.get("bit_rate"))
-                    .and_then(|b| b.as_str())
-                    .and_then(|s| s.parse().ok());
-
-                let streams = json.get("streams").and_then(|s| s.as_array());
-
-                let (mut width, mut height, mut video_codec, mut audio_codec) =
-                    (None, None, None, None);
-
-                if let Some(streams) = streams {
+                // Parse streams
+                if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
+                    let mut audio_track_index = 0u32;
+                    
                     for stream in streams {
                         let codec_type = stream.get("codec_type").and_then(|t| t.as_str());
+                        
                         match codec_type {
                             Some("video") => {
-                                width = stream
+                                info.width = stream
                                     .get("width")
                                     .and_then(|w| w.as_u64())
                                     .map(|w| w as u32);
-                                height = stream
+                                info.height = stream
                                     .get("height")
                                     .and_then(|h| h.as_u64())
                                     .map(|h| h as u32);
-                                video_codec = stream
+                                info.video_codec = stream
                                     .get("codec_name")
+                                    .and_then(|c| c.as_str())
+                                    .map(|s| s.to_string());
+                                info.video_bitrate = stream
+                                    .get("bit_rate")
+                                    .and_then(|b| b.as_str())
+                                    .and_then(|s| s.parse().ok());
+                                
+                                // Parse frame rate
+                                if let Some(fps_str) = stream.get("r_frame_rate").and_then(|f| f.as_str()) {
+                                    if let Some((num, den)) = fps_str.split_once('/') {
+                                        if let (Ok(n), Ok(d)) = (num.parse::<f64>(), den.parse::<f64>()) {
+                                            if d != 0.0 {
+                                                info.frame_rate = Some(n / d);
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // Aspect ratio
+                                info.aspect_ratio = stream
+                                    .get("display_aspect_ratio")
+                                    .and_then(|a| a.as_str())
+                                    .map(|s| s.to_string());
+                                
+                                // Color space
+                                info.color_space = stream
+                                    .get("color_space")
                                     .and_then(|c| c.as_str())
                                     .map(|s| s.to_string());
                             }
                             Some("audio") => {
-                                audio_codec = stream
+                                info.has_audio = true;
+                                
+                                let codec = stream
                                     .get("codec_name")
                                     .and_then(|c| c.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let channels = stream
+                                    .get("channels")
+                                    .and_then(|c| c.as_u64())
+                                    .unwrap_or(2) as u32;
+                                let sample_rate = stream
+                                    .get("sample_rate")
+                                    .and_then(|s| s.as_str())
+                                    .and_then(|s| s.parse::<u32>().ok())
+                                    .unwrap_or(44100);
+                                let bitrate = stream
+                                    .get("bit_rate")
+                                    .and_then(|b| b.as_str())
+                                    .and_then(|s| s.parse().ok());
+                                
+                                // Get language from tags
+                                let language = stream
+                                    .get("tags")
+                                    .and_then(|t| t.get("language"))
+                                    .and_then(|l| l.as_str())
                                     .map(|s| s.to_string());
+                                
+                                let title = stream
+                                    .get("tags")
+                                    .and_then(|t| t.get("title"))
+                                    .and_then(|l| l.as_str())
+                                    .map(|s| s.to_string());
+                                
+                                // Set first audio track as default
+                                if info.audio_codec.is_none() {
+                                    info.audio_codec = Some(codec.clone());
+                                    info.audio_channels = Some(channels);
+                                    info.audio_sample_rate = Some(sample_rate);
+                                    info.audio_bitrate = bitrate;
+                                }
+                                
+                                info.audio_tracks.push(AudioTrackInfo {
+                                    index: audio_track_index,
+                                    codec,
+                                    channels,
+                                    sample_rate,
+                                    bitrate,
+                                    language,
+                                    title,
+                                });
+                                
+                                audio_track_index += 1;
                             }
                             _ => {}
                         }
                     }
                 }
-
-                return (duration, width, height, video_codec, audio_codec, bitrate);
             }
         }
     }
 
-    (None, None, None, None, None, None)
+    info
+}
+
+/// Extract EXIF data from image files using exiftool
+fn extract_exif_data(path: &Path) -> Option<ExifData> {
+    let output = Command::new("exiftool")
+        .args(["-json", "-n", path.to_str().unwrap_or("")])
+        .output();
+
+    if let Ok(out) = output {
+        if out.status.success() {
+            if let Ok(json_array) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) {
+                if let Some(json) = json_array.first() {
+                    return Some(ExifData {
+                        camera_make: json.get("Make").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        camera_model: json.get("Model").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        date_taken: json.get("DateTimeOriginal").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        exposure_time: json.get("ExposureTime").and_then(|v| {
+                            if let Some(f) = v.as_f64() {
+                                if f < 1.0 {
+                                    Some(format!("1/{:.0}", 1.0 / f))
+                                } else {
+                                    Some(format!("{:.1}s", f))
+                                }
+                            } else {
+                                v.as_str().map(|s| s.to_string())
+                            }
+                        }),
+                        f_number: json.get("FNumber").and_then(|v| v.as_f64()).map(|f| format!("f/{:.1}", f)),
+                        iso: json.get("ISO").and_then(|v| v.as_u64()).map(|i| i as u32),
+                        focal_length: json.get("FocalLength").and_then(|v| v.as_f64()).map(|f| format!("{:.1}mm", f)),
+                        gps_latitude: json.get("GPSLatitude").and_then(|v| v.as_f64()),
+                        gps_longitude: json.get("GPSLongitude").and_then(|v| v.as_f64()),
+                        gps_altitude: json.get("GPSAltitude").and_then(|v| v.as_f64()),
+                        image_width: json.get("ImageWidth").and_then(|v| v.as_u64()).map(|w| w as u32),
+                        image_height: json.get("ImageHeight").and_then(|v| v.as_u64()).map(|h| h as u32),
+                        orientation: json.get("Orientation").and_then(|v| v.as_u64()).map(|o| o as u32),
+                        software: json.get("Software").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        color_space: json.get("ColorSpace").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        flash: json.get("Flash").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        lens_model: json.get("LensModel").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    });
+                }
+            }
+        }
+    }
+    
+    None
+}
+
+fn get_ffprobe_info(
+    path: &Path,
+) -> (
+    Option<f64>,
+    Option<u32>,
+    Option<u32>,
+    Option<String>,
+    Option<String>,
+    Option<u64>,
+) {
+    let info = get_detailed_ffprobe_info(path);
+    (info.duration, info.width, info.height, info.video_codec, info.audio_codec, info.bitrate)
 }
 
 fn get_hw_accel_info() -> serde_json::Value {

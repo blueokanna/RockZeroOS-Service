@@ -201,12 +201,20 @@ pub async fn create_container(body: web::Json<CreateContainerRequest>) -> Result
     let pull_output = Command::new("docker")
         .args(["pull", &image_full])
         .output()
-        .map_err(|_| AppError::InternalError)?;
+        .map_err(|e| AppError::BadRequest(format!("Failed to execute docker pull: {}", e)))?;
     
     if !pull_output.status.success() {
         let err = String::from_utf8_lossy(&pull_output.stderr);
         warn!("Failed to pull image: {}", err);
-        // 继续尝试，可能本地已有镜像
+        // 检查本地是否已有镜像
+        let check_output = Command::new("docker")
+            .args(["image", "inspect", &image_full])
+            .output();
+        
+        if check_output.map(|o| !o.status.success()).unwrap_or(true) {
+            return Err(AppError::BadRequest(format!("Failed to pull image and image not found locally: {}", err)));
+        }
+        info!("Using local image: {}", image_full);
     }
     
     // 构建 docker run 命令
@@ -304,19 +312,24 @@ pub async fn create_container(body: web::Json<CreateContainerRequest>) -> Result
         args.extend(cmd.clone());
     }
     
+    info!("Creating container with args: {:?}", args);
+    
     // 执行创建
     let output = Command::new("docker")
         .args(&args)
         .output()
-        .map_err(|_| AppError::InternalError)?;
+        .map_err(|e| AppError::BadRequest(format!("Failed to execute docker run: {}", e)))?;
     
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::BadRequest(format!("Failed to create container: {}", err)));
+        return Err(AppError::BadRequest(format!("Failed to start container: {}", err)));
     }
     
     let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
     info!("Container created: {} ({})", req.name, container_id);
+    
+    // 等待容器启动
+    std::thread::sleep(std::time::Duration::from_millis(500));
     
     // 获取容器详情
     let container = get_container_details(&container_id)?;

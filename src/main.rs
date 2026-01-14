@@ -355,6 +355,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/formats", web::get().to(handlers::streaming::get_supported_formats))
                     .route("/library", web::get().to(handlers::streaming::list_media_library))
                     .route("/info/{path:.*}", web::get().to(handlers::streaming::get_media_info))
+                    .route("/extended-info/{path:.*}", web::get().to(handlers::streaming::get_extended_media_info))
                     .route("/play/{path:.*}", web::get().to(handlers::streaming::stream_media))
                     .route("/hls/{path:.*}", web::get().to(handlers::streaming::generate_hls_playlist))
                     .route("/thumbnail/{path:.*}", web::get().to(handlers::streaming::get_thumbnail)),
@@ -643,6 +644,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/formats", web::get().to(handlers::streaming::get_supported_formats))
                     .route("/library", web::get().to(handlers::streaming::list_media_library))
                     .route("/info/{path:.*}", web::get().to(handlers::streaming::get_media_info))
+                    .route("/extended-info/{path:.*}", web::get().to(handlers::streaming::get_extended_media_info))
                     .route("/play/{path:.*}", web::get().to(handlers::streaming::stream_media))
                     .route("/hls/{path:.*}", web::get().to(handlers::streaming::generate_hls_playlist))
                     .route("/thumbnail/{path:.*}", web::get().to(handlers::streaming::get_thumbnail)),
