@@ -122,7 +122,18 @@ async fn main() -> std::io::Result<()> {
 
     info!("Service ready, waiting for connections...");
 
-    let server = HttpServer::new(move || {
+    // 克隆数据用于第二个 HttpServer 闭包
+    let pool_data2 = pool_data.clone();
+    let crypto_data2 = crypto_data.clone();
+    let zkp_data2 = zkp_data.clone();
+    let invite_data2 = invite_data.clone();
+    let secure_storage_data2 = secure_storage_data.clone();
+    let media_data2 = media_data.clone();
+    let config_data2 = config_data.clone();
+    #[cfg(feature = "fido")]
+    let fido_data2 = fido_data.clone();
+
+    let _server = HttpServer::new(move || {
         let cors = Cors::default()
             .allowed_origin_fn(|origin, _req_head| {
                 let origin_str = origin.to_str().unwrap_or("");
@@ -446,16 +457,16 @@ async fn main() -> std::io::Result<()> {
         let app = App::new()
             .app_data(payload_config.clone())
             .app_data(json_config.clone())
-            .app_data(pool_data.clone())
-            .app_data(crypto_data.clone())
-            .app_data(zkp_data.clone())
-            .app_data(invite_data.clone())
-            .app_data(secure_storage_data.clone())
-            .app_data(media_data.clone())
-            .app_data(config_data.clone());
+            .app_data(pool_data2.clone())
+            .app_data(crypto_data2.clone())
+            .app_data(zkp_data2.clone())
+            .app_data(invite_data2.clone())
+            .app_data(secure_storage_data2.clone())
+            .app_data(media_data2.clone())
+            .app_data(config_data2.clone());
         
         #[cfg(feature = "fido")]
-        let app = app.app_data(fido_data.clone());
+        let app = app.app_data(fido_data2.clone());
         
         app
             .wrap(Logger::default())

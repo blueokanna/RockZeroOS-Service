@@ -2394,6 +2394,7 @@ dependencies = [
  "base64 0.21.7",
  "blake3",
  "bulletproofs",
+ "bytes",
  "chrono",
  "curve25519-dalek",
  "dotenvy",

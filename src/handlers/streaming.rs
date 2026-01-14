@@ -1,14 +1,12 @@
 use actix_web::{web, HttpRequest, HttpResponse};
-use actix_web::body::SizedStream;
-use futures::stream::{self, StreamExt};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::process::Command;
 use std::pin::Pin;
+use std::process::Command;
 use std::task::{Context, Poll};
-use bytes::Bytes;
 
 use crate::error::AppError;
 
@@ -107,7 +105,7 @@ impl futures::Stream for ChunkedFileStream {
 
         let to_read = std::cmp::min(self.remaining, self.chunk_size) as usize;
         let mut buffer = vec![0u8; to_read];
-        
+
         match self.file.read(&mut buffer) {
             Ok(0) => Poll::Ready(None),
             Ok(n) => {
@@ -144,12 +142,12 @@ pub async fn stream_media(
     if let Some(range) = range_header {
         // 处理 Range 请求 - 使用流式传输
         let (start, mut end) = parse_range(range, file_size)?;
-        
+
         // 限制单次请求的最大范围，防止内存溢出
         if end - start + 1 > MAX_RANGE_CHUNK {
             end = start + MAX_RANGE_CHUNK - 1;
         }
-        
+
         let content_length = end - start + 1;
 
         let mut file = File::open(&file_path).map_err(|_| AppError::InternalError)?;
@@ -183,11 +181,8 @@ pub async fn stream_media(
     }
 }
 
-
 /// 列出媒体库中的文件
-pub async fn list_media_library(
-    query: web::Query<StreamQuery>,
-) -> Result<HttpResponse, AppError> {
+pub async fn list_media_library(query: web::Query<StreamQuery>) -> Result<HttpResponse, AppError> {
     let base_path = if let Some(ref p) = query.path {
         get_media_path(p)?
     } else {
@@ -445,8 +440,14 @@ fn get_ffprobe_info(
                         let codec_type = stream.get("codec_type").and_then(|t| t.as_str());
                         match codec_type {
                             Some("video") => {
-                                width = stream.get("width").and_then(|w| w.as_u64()).map(|w| w as u32);
-                                height = stream.get("height").and_then(|h| h.as_u64()).map(|h| h as u32);
+                                width = stream
+                                    .get("width")
+                                    .and_then(|w| w.as_u64())
+                                    .map(|w| w as u32);
+                                height = stream
+                                    .get("height")
+                                    .and_then(|h| h.as_u64())
+                                    .map(|h| h as u32);
                                 video_codec = stream
                                     .get("codec_name")
                                     .and_then(|c| c.as_str())
