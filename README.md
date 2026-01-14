@@ -343,7 +343,7 @@ RockZeroOS-Service/
 
 ## 开源协议
 
-本项目采用 MIT 协议开源，详见 [LICENSE](LICENSE) 文件。
+本项目采用 AGPL-3.0 license 协议开源，详见 [LICENSE](LICENSE) 文件。
 
 ## 致谢
 
