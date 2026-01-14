@@ -2,7 +2,7 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Command;
@@ -11,9 +11,20 @@ use std::task::{Context, Poll};
 use crate::error::AppError;
 
 const MEDIA_BASE: &str = "./media";
-// 使用较小的chunk size以减少内存占用，适合低内存设备 (128KB适合1GB RAM设备)
-const CHUNK_SIZE: u64 = 128 * 1024; // 128KB chunks - 更适合低内存设备
-const MAX_RANGE_CHUNK: u64 = 1024 * 1024; // 最大单次Range请求1MB - 防止OOM
+const SMALL_CHUNK_SIZE: u64 = 256 * 1024;
+const MEDIUM_CHUNK_SIZE: u64 = 1024 * 1024;
+const LARGE_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
+const HUGE_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+
+// Dynamic max range based on file size
+const DEFAULT_MAX_RANGE_CHUNK: u64 = 8 * 1024 * 1024;
+const LARGE_FILE_MAX_RANGE: u64 = 16 * 1024 * 1024;
+const HUGE_FILE_MAX_RANGE: u64 = 32 * 1024 * 1024;
+
+// File size thresholds
+const LARGE_FILE_THRESHOLD: u64 = 1024 * 1024 * 1024;
+const HUGE_FILE_THRESHOLD: u64 = 10 * 1024 * 1024 * 1024;
+const MASSIVE_FILE_THRESHOLD: u64 = 20 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 pub struct MediaStreamInfo {
@@ -44,10 +55,8 @@ pub struct StreamQuery {
     pub quality: Option<String>,
 }
 
-/// 获取媒体文件信息
 pub async fn get_media_info(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let file_path = get_media_path(&path.into_inner())?;
-
     if !file_path.exists() {
         return Err(AppError::NotFound("Media file not found".to_string()));
     }
@@ -58,7 +67,6 @@ pub async fn get_media_info(path: web::Path<String>) -> Result<HttpResponse, App
         .to_string();
 
     let (duration, width, height, video_codec, audio_codec, bitrate) = get_ffprobe_info(&file_path);
-
     let info = MediaStreamInfo {
         filename: file_path
             .file_name()
@@ -78,19 +86,47 @@ pub async fn get_media_info(path: web::Path<String>) -> Result<HttpResponse, App
     Ok(HttpResponse::Ok().json(info))
 }
 
-/// 流式文件读取器 - 使用小块读取以减少内存占用
 struct ChunkedFileStream {
-    file: File,
+    reader: BufReader<File>,
     remaining: u64,
     chunk_size: u64,
+    buffer: Vec<u8>,
 }
 
 impl ChunkedFileStream {
     fn new(file: File, total_size: u64) -> Self {
+        let chunk_size = Self::calculate_optimal_chunk_size(total_size);
+        let buffer_capacity = chunk_size as usize;
+
         Self {
-            file,
+            reader: BufReader::with_capacity(buffer_capacity, file),
             remaining: total_size,
-            chunk_size: CHUNK_SIZE,
+            chunk_size,
+            buffer: vec![0u8; buffer_capacity],
+        }
+    }
+
+    fn with_chunk_size(file: File, total_size: u64, chunk_size: u64) -> Self {
+        let buffer_capacity = chunk_size as usize;
+
+        Self {
+            reader: BufReader::with_capacity(buffer_capacity, file),
+            remaining: total_size,
+            chunk_size,
+            buffer: vec![0u8; buffer_capacity],
+        }
+    }
+
+    /// Calculate optimal chunk size based on file size for smooth streaming
+    fn calculate_optimal_chunk_size(file_size: u64) -> u64 {
+        if file_size >= MASSIVE_FILE_THRESHOLD {
+            HUGE_CHUNK_SIZE
+        } else if file_size >= HUGE_FILE_THRESHOLD {
+            LARGE_CHUNK_SIZE
+        } else if file_size >= LARGE_FILE_THRESHOLD {
+            MEDIUM_CHUNK_SIZE
+        } else {
+            SMALL_CHUNK_SIZE
         }
     }
 }
@@ -98,28 +134,29 @@ impl ChunkedFileStream {
 impl futures::Stream for ChunkedFileStream {
     type Item = Result<Bytes, std::io::Error>;
 
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.remaining == 0 {
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        if this.remaining == 0 {
             return Poll::Ready(None);
         }
 
-        let to_read = std::cmp::min(self.remaining, self.chunk_size) as usize;
-        let mut buffer = vec![0u8; to_read];
+        let to_read = std::cmp::min(this.remaining, this.chunk_size) as usize;
+        if this.buffer.len() < to_read {
+            this.buffer.resize(to_read, 0);
+        }
 
-        match self.file.read(&mut buffer) {
+        match this.reader.read(&mut this.buffer[..to_read]) {
             Ok(0) => Poll::Ready(None),
             Ok(n) => {
-                buffer.truncate(n);
-                self.remaining = self.remaining.saturating_sub(n as u64);
-                Poll::Ready(Some(Ok(Bytes::from(buffer))))
+                this.remaining = this.remaining.saturating_sub(n as u64);
+                Poll::Ready(Some(Ok(Bytes::copy_from_slice(&this.buffer[..n]))))
             }
             Err(e) => Poll::Ready(Some(Err(e))),
         }
     }
 }
 
-/// 流式播放媒体文件 (支持 Range 请求) - 优化内存使用
-/// 使用流式传输，避免一次性加载整个文件到内存
 pub async fn stream_media(
     req: HttpRequest,
     path: web::Path<String>,
@@ -135,17 +172,48 @@ pub async fn stream_media(
     let content_type = mime_guess::from_path(&file_path)
         .first_or_octet_stream()
         .to_string();
+    let extension = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
 
-    // 解析 Range 头
+    let is_mkv = extension == "mkv";
+    let is_container_format = matches!(
+        extension.as_str(),
+        "mkv" | "avi" | "mov" | "m2ts" | "ts" | "webm"
+    );
     let range_header = req.headers().get("Range").and_then(|v| v.to_str().ok());
 
-    if let Some(range) = range_header {
-        // 处理 Range 请求 - 使用流式传输
-        let (start, mut end) = parse_range(range, file_size)?;
+    let max_range_chunk = if file_size >= MASSIVE_FILE_THRESHOLD {
+        HUGE_FILE_MAX_RANGE
+    } else if file_size >= HUGE_FILE_THRESHOLD {
+        LARGE_FILE_MAX_RANGE
+    } else if file_size >= LARGE_FILE_THRESHOLD {
+        DEFAULT_MAX_RANGE_CHUNK
+    } else {
+        DEFAULT_MAX_RANGE_CHUNK / 2
+    };
 
-        // 限制单次请求的最大范围，防止内存溢出
-        if end - start + 1 > MAX_RANGE_CHUNK {
-            end = start + MAX_RANGE_CHUNK - 1;
+    let stream_chunk_size = ChunkedFileStream::calculate_optimal_chunk_size(file_size);
+    if let Some(range) = range_header {
+        let (start, mut end) = parse_range(range, file_size)?;
+        let effective_max = if start == 0 {
+            if file_size >= MASSIVE_FILE_THRESHOLD {
+                MEDIUM_CHUNK_SIZE
+            } else {
+                SMALL_CHUNK_SIZE
+            }
+        } else {
+            max_range_chunk
+        };
+
+        if end - start + 1 > effective_max && start != 0 {
+            end = start + effective_max - 1;
+        }
+
+        if end >= file_size {
+            end = file_size - 1;
         }
 
         let content_length = end - start + 1;
@@ -154,34 +222,89 @@ pub async fn stream_media(
         file.seek(SeekFrom::Start(start))
             .map_err(|_| AppError::InternalError)?;
 
-        // 使用流式传输而不是一次性读取
-        let stream = ChunkedFileStream::new(file, content_length);
+        let adaptive_chunk_size = if content_length > LARGE_CHUNK_SIZE {
+            stream_chunk_size
+        } else {
+            std::cmp::min(stream_chunk_size, content_length)
+        };
 
-        Ok(HttpResponse::PartialContent()
-            .insert_header(("Content-Type", content_type))
-            .insert_header(("Content-Length", content_length.to_string()))
-            .insert_header((
-                "Content-Range",
-                format!("bytes {}-{}/{}", start, end, file_size),
-            ))
-            .insert_header(("Accept-Ranges", "bytes"))
-            .insert_header(("Cache-Control", "no-cache"))
-            .streaming(stream))
+        let stream = ChunkedFileStream::with_chunk_size(file, content_length, adaptive_chunk_size);
+
+        let mut response = HttpResponse::PartialContent();
+        response.insert_header(("Content-Type", content_type));
+        response.insert_header(("Content-Length", content_length.to_string()));
+        response.insert_header((
+            "Content-Range",
+            format!("bytes {}-{}/{}", start, end, file_size),
+        ));
+        response.insert_header(("Accept-Ranges", "bytes"));
+
+        // Optimized caching headers for streaming
+        response.insert_header(("Cache-Control", "private, max-age=3600"));
+
+        // CORS headers for cross-origin requests
+        response.insert_header(("Access-Control-Allow-Origin", "*"));
+        response.insert_header(("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS"));
+        response.insert_header((
+            "Access-Control-Allow-Headers",
+            "Range, Accept-Ranges, Content-Range",
+        ));
+        response.insert_header((
+            "Access-Control-Expose-Headers",
+            "Content-Range, Accept-Ranges, Content-Length, Content-Duration",
+        ));
+
+        // For container formats with complex audio (MKV, AVI, etc.)
+        if is_container_format {
+            response.insert_header(("X-Content-Type-Options", "nosniff"));
+            // Hint for duration if available
+            if let Some(duration) = get_media_duration(&file_path) {
+                response.insert_header(("Content-Duration", duration.to_string()));
+            }
+        }
+
+        if is_mkv {
+            response.insert_header((
+                "X-Audio-Codec",
+                get_audio_codec(&file_path).unwrap_or_default(),
+            ));
+        }
+
+        Ok(response.streaming(stream))
     } else {
-        // 完整文件请求 - 也使用流式传输
         let file = File::open(&file_path).map_err(|_| AppError::InternalError)?;
         let stream = ChunkedFileStream::new(file, file_size);
 
-        Ok(HttpResponse::Ok()
-            .insert_header(("Content-Type", content_type))
-            .insert_header(("Content-Length", file_size.to_string()))
-            .insert_header(("Accept-Ranges", "bytes"))
-            .insert_header(("Cache-Control", "no-cache"))
-            .streaming(stream))
+        let mut response = HttpResponse::Ok();
+        response.insert_header(("Content-Type", content_type));
+        response.insert_header(("Content-Length", file_size.to_string()));
+        response.insert_header(("Accept-Ranges", "bytes"));
+        response.insert_header(("Cache-Control", "private, max-age=3600"));
+        response.insert_header(("Access-Control-Allow-Origin", "*"));
+        response.insert_header((
+            "Access-Control-Expose-Headers",
+            "Content-Range, Accept-Ranges, Content-Length, Content-Duration",
+        ));
+
+        // Add duration hint for full file requests
+        if let Some(duration) = get_media_duration(&file_path) {
+            response.insert_header(("Content-Duration", duration.to_string()));
+        }
+
+        Ok(response.streaming(stream))
     }
 }
 
-/// 列出媒体库中的文件
+fn get_media_duration(path: &Path) -> Option<f64> {
+    let (duration, _, _, _, _, _) = get_ffprobe_info(path);
+    duration
+}
+
+fn get_audio_codec(path: &Path) -> Option<String> {
+    let (_, _, _, _, audio_codec, _) = get_ffprobe_info(path);
+    audio_codec
+}
+
 pub async fn list_media_library(query: web::Query<StreamQuery>) -> Result<HttpResponse, AppError> {
     let base_path = if let Some(ref p) = query.path {
         get_media_path(p)?
@@ -198,7 +321,6 @@ pub async fn list_media_library(query: web::Query<StreamQuery>) -> Result<HttpRe
             let path = entry.path();
             let filename = entry.file_name().to_string_lossy().to_string();
 
-            // 只列出媒体文件
             if is_media_file(&path) {
                 let (duration, _, _, _, _, _) = get_ffprobe_info(&path);
                 let relative_path = path
@@ -221,7 +343,6 @@ pub async fn list_media_library(query: web::Query<StreamQuery>) -> Result<HttpRe
     Ok(HttpResponse::Ok().json(entries))
 }
 
-/// 生成 HLS 播放列表 (m3u8)
 pub async fn generate_hls_playlist(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let file_path = get_media_path(&path.into_inner())?;
 
@@ -233,7 +354,6 @@ pub async fn generate_hls_playlist(path: web::Path<String>) -> Result<HttpRespon
     let total_duration = duration.unwrap_or(0.0);
     let segment_duration = 10.0;
     let num_segments = (total_duration / segment_duration).ceil() as u32;
-
     let mut playlist = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
     playlist.push_str(&format!(
         "#EXT-X-TARGETDURATION:{}\n",
@@ -258,7 +378,6 @@ pub async fn generate_hls_playlist(path: web::Path<String>) -> Result<HttpRespon
         .body(playlist))
 }
 
-/// 获取视频缩略图
 pub async fn get_thumbnail(
     path: web::Path<String>,
     query: web::Query<StreamQuery>,
@@ -275,7 +394,6 @@ pub async fn get_thumbnail(
         .and_then(|q| q.parse::<f64>().ok())
         .unwrap_or(1.0);
 
-    // 使用 ffmpeg 生成缩略图
     let output = Command::new("ffmpeg")
         .args([
             "-ss",
@@ -300,7 +418,6 @@ pub async fn get_thumbnail(
     }
 }
 
-/// 获取支持的媒体格式
 pub async fn get_supported_formats() -> Result<HttpResponse, AppError> {
     let formats = serde_json::json!({
         "video": {
@@ -324,8 +441,6 @@ pub async fn get_supported_formats() -> Result<HttpResponse, AppError> {
     Ok(HttpResponse::Ok().json(formats))
 }
 
-// 辅助函数
-
 fn get_media_path(path: &str) -> Result<std::path::PathBuf, AppError> {
     let base = Path::new(MEDIA_BASE);
     std::fs::create_dir_all(base).ok();
@@ -337,7 +452,6 @@ fn get_media_path(path: &str) -> Result<std::path::PathBuf, AppError> {
         base.join(clean_path)
     };
 
-    // 防止路径遍历
     let canonical = full_path
         .canonicalize()
         .unwrap_or_else(|_| full_path.clone());
@@ -366,8 +480,9 @@ fn parse_range(range: &str, file_size: u64) -> Result<(u64, u64), AppError> {
             .map_err(|_| AppError::BadRequest("Invalid range start".to_string()))?
     };
 
+    let optimal_chunk = ChunkedFileStream::calculate_optimal_chunk_size(file_size);
     let end: u64 = if parts[1].is_empty() {
-        std::cmp::min(start + CHUNK_SIZE - 1, file_size - 1)
+        std::cmp::min(start + optimal_chunk - 1, file_size - 1)
     } else {
         parts[1]
             .parse()
@@ -474,8 +589,6 @@ fn get_ffprobe_info(
 
 fn get_hw_accel_info() -> serde_json::Value {
     let mut accel = Vec::new();
-
-    // 检测各平台硬件加速
     #[cfg(target_arch = "aarch64")]
     {
         accel.push("v4l2m2m");
