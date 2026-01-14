@@ -1,9 +1,9 @@
 use actix_multipart::Multipart;
 use actix_web::http::header::{
-    ContentDisposition, ContentType, DispositionType, ACCEPT_RANGES,
-    CONTENT_RANGE, RANGE,
+    ContentDisposition, ContentType, DispositionType, ACCEPT_RANGES, CONTENT_RANGE, RANGE,
 };
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
+use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,17 +14,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tracing::info;
 use walkdir::WalkDir;
-use bytes::Bytes;
-
 use crate::error::AppError;
 
-// 支持多个基础目录，按优先级尝试
 const BASE_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
 const MAX_FILE_SIZE: usize = 10 * 1024 * 1024 * 1024;
-const MAX_TEXT_PREVIEW_SIZE: usize = 1024 * 1024; // 1MB text preview limit
-// 流式传输的chunk大小 - 128KB适合低内存设备 (1GB RAM)
+const MAX_TEXT_PREVIEW_SIZE: usize = 1024 * 1024;
 const STREAM_CHUNK_SIZE: u64 = 128 * 1024;
-// 单次Range请求的最大大小 - 1MB 防止OOM
 const MAX_RANGE_SIZE: u64 = 1024 * 1024;
 const ALLOWED_TEXT_EXTENSIONS: &[&str] = &[
     "txt",
@@ -165,7 +160,7 @@ pub async fn list_directory(
 ) -> Result<impl Responder, AppError> {
     let requested_path = query.path.as_deref().unwrap_or("");
     tracing::info!("Listing directory: {:?}", requested_path);
-    
+
     let full_path = sanitize_path(requested_path)?;
     tracing::info!("Full path: {:?}", full_path);
 
@@ -184,11 +179,10 @@ pub async fn list_directory(
     let mut total_files = 0usize;
     let mut total_directories = 0usize;
 
-    let read_dir = fs::read_dir(&full_path)
-        .map_err(|e| {
-            tracing::error!("Permission denied reading directory {:?}: {}", full_path, e);
-            AppError::Forbidden("Permission denied".to_string())
-        })?;
+    let read_dir = fs::read_dir(&full_path).map_err(|e| {
+        tracing::error!("Permission denied reading directory {:?}: {}", full_path, e);
+        AppError::Forbidden("Permission denied".to_string())
+    })?;
 
     for entry in read_dir {
         // Skip entries that can't be read
@@ -199,21 +193,31 @@ pub async fn list_directory(
                 continue;
             }
         };
-        
+
         // Skip entries whose metadata can't be read (broken symlinks, permission issues, etc.)
         let metadata = match entry.metadata() {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("Skipping entry with unreadable metadata {:?}: {}", entry.path(), e);
+                tracing::warn!(
+                    "Skipping entry with unreadable metadata {:?}: {}",
+                    entry.path(),
+                    e
+                );
                 continue;
             }
         };
-        
+
         let file_name = entry.file_name().to_string_lossy().to_string();
 
+        // Build the relative path - ensure it matches the format expected by the frontend
         let relative_path = if requested_path.is_empty() {
+            // When at base directory, just use the filename
             file_name.clone()
+        } else if requested_path.starts_with('/') {
+            // Absolute path - append filename
+            format!("{}/{}", requested_path, file_name)
         } else {
+            // Relative path - append filename
             format!("{}/{}", requested_path, file_name)
         };
 
@@ -255,8 +259,12 @@ pub async fn list_directory(
             mime_type,
         });
     }
-    
-    tracing::info!("Listed {} files and {} directories", total_files, total_directories);
+
+    tracing::info!(
+        "Listed {} files and {} directories",
+        total_files,
+        total_directories
+    );
 
     let sort_by = query.sort_by.as_deref().unwrap_or("name");
     let order = query.order.as_deref().unwrap_or("asc");
@@ -499,7 +507,11 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
     let base_path = get_base_directory()?;
 
     let mut total_size = 0u64;
-    for entry in WalkDir::new(&base_path).max_depth(5).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(&base_path)
+        .max_depth(5)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if entry.file_type().is_file() {
             if let Ok(metadata) = entry.metadata() {
                 total_size += metadata.len();
@@ -528,7 +540,7 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
                         } else {
                             0.0
                         };
-                        
+
                         return Ok(HttpResponse::Ok().json(StorageInfo {
                             total_space,
                             used_space,
@@ -541,7 +553,6 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
         }
     }
 
-    // 回退到估算值
     let available_space = 100 * 1024 * 1024 * 1024u64;
     let total_space = available_space + total_size;
     let usage_percentage = (total_size as f64 / total_space as f64) * 100.0;
@@ -556,7 +567,6 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
 
 /// 获取有效的基础目录
 fn get_base_directory() -> Result<PathBuf, AppError> {
-    // Windows 特殊处理
     #[cfg(target_os = "windows")]
     {
         let fallback = Path::new("./storage");
@@ -564,7 +574,6 @@ fn get_base_directory() -> Result<PathBuf, AppError> {
         return Ok(fallback.to_path_buf());
     }
 
-    // Linux/Unix: 按优先级查找可用的基础目录
     #[cfg(not(target_os = "windows"))]
     {
         for base_dir in BASE_DIRS {
@@ -576,13 +585,13 @@ fn get_base_directory() -> Result<PathBuf, AppError> {
                 }
             }
         }
-        
+
         // 如果都不存在，尝试创建 /data 目录
         let data_dir = Path::new("/data");
         if std::fs::create_dir_all(data_dir).is_ok() {
             return Ok(data_dir.to_path_buf());
         }
-        
+
         // 最后尝试当前目录下的 storage
         let fallback = Path::new("./storage");
         std::fs::create_dir_all(fallback).ok();
@@ -593,19 +602,19 @@ fn get_base_directory() -> Result<PathBuf, AppError> {
 /// 检查路径是否在允许的基础目录内
 fn is_path_allowed(path: &Path) -> bool {
     let path_str = path.to_string_lossy();
-    
+
     // 允许的基础目录
     for base in BASE_DIRS {
         if path_str.starts_with(base) {
             return true;
         }
     }
-    
+
     // 也允许 ./storage (开发环境)
     if path_str.starts_with("./storage") || path_str.starts_with("storage") {
         return true;
     }
-    
+
     false
 }
 
@@ -621,7 +630,7 @@ fn sanitize_path(path: &str) -> Result<PathBuf, AppError> {
             return Ok(abs_path.to_path_buf());
         }
     }
-    
+
     // 获取基础目录
     let base = get_base_directory()?;
 
@@ -837,7 +846,7 @@ impl futures::Stream for StreamingFileReader {
 
         let to_read = std::cmp::min(self.remaining, self.chunk_size) as usize;
         let mut buffer = vec![0u8; to_read];
-        
+
         match self.file.read(&mut buffer) {
             Ok(0) => Poll::Ready(None),
             Ok(n) => {
@@ -892,7 +901,7 @@ pub async fn stream_media(
             if end - start + 1 > MAX_RANGE_SIZE {
                 end = start + MAX_RANGE_SIZE - 1;
             }
-            
+
             let length = end - start + 1;
 
             let mut file = File::open(&full_path).map_err(|_| AppError::InternalError)?;
@@ -959,7 +968,9 @@ pub async fn serve_image(query: web::Query<ListDirectoryQuery>) -> Result<HttpRe
     let file_content = fs::read(&full_path).map_err(|_| AppError::InternalError)?;
 
     Ok(HttpResponse::Ok()
-        .insert_header(ContentType(mime_type.parse().unwrap_or(mime_guess::mime::IMAGE_PNG)))
+        .insert_header(ContentType(
+            mime_type.parse().unwrap_or(mime_guess::mime::IMAGE_PNG),
+        ))
         .insert_header(ContentDisposition {
             disposition: DispositionType::Inline,
             parameters: vec![],
@@ -989,7 +1000,9 @@ pub async fn get_thumbnail(query: web::Query<StreamQuery>) -> Result<HttpRespons
         let file_content = fs::read(&full_path).map_err(|_| AppError::InternalError)?;
 
         return Ok(HttpResponse::Ok()
-            .insert_header(ContentType(mime_type.parse().unwrap_or(mime_guess::mime::IMAGE_PNG)))
+            .insert_header(ContentType(
+                mime_type.parse().unwrap_or(mime_guess::mime::IMAGE_PNG),
+            ))
             .body(file_content));
     }
 
