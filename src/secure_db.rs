@@ -124,6 +124,7 @@ pub struct ReedSolomon {
     generator_matrix: Vec<Vec<u8>>,
 }
 
+#[allow(clippy::needless_range_loop)]
 impl ReedSolomon {
     pub fn new(data_shards: usize, parity_shards: usize) -> Self {
         let gf = GaloisField::new();
@@ -154,7 +155,7 @@ impl ReedSolomon {
 
     /// 编码数据，生成校验分片
     pub fn encode(&self, data: &[u8]) -> Result<Vec<Vec<u8>>, AppError> {
-        let shard_size = (data.len() + self.data_shards - 1) / self.data_shards;
+        let shard_size = data.len().div_ceil(self.data_shards);
         let mut shards = vec![vec![0u8; shard_size]; self.data_shards + self.parity_shards];
         
         // 填充数据分片
@@ -611,7 +612,7 @@ impl SecureDatabase {
             .ok_or_else(|| AppError::NotFound("Block not found".to_string()))?;
         
         // 准备分片用于重建
-        let shard_size = (block.encrypted_data.len() + DATA_SHARDS - 1) / DATA_SHARDS;
+        let shard_size = block.encrypted_data.len().div_ceil(DATA_SHARDS);
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
         
         // 尝试使用现有数据分片
@@ -716,7 +717,7 @@ impl SecureDatabase {
 
     /// 计算数据分片的 CRC
     fn calculate_shard_crcs(&self, data: &[u8]) -> Vec<u32> {
-        let shard_size = (data.len() + DATA_SHARDS - 1) / DATA_SHARDS;
+        let shard_size = data.len().div_ceil(DATA_SHARDS);
         data.chunks(shard_size)
             .map(|chunk| self.crc.checksum(chunk))
             .collect()

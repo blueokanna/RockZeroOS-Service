@@ -358,7 +358,10 @@ async fn main() -> std::io::Result<()> {
                     .route("/extended-info/{path:.*}", web::get().to(handlers::streaming::get_extended_media_info))
                     .route("/play/{path:.*}", web::get().to(handlers::streaming::stream_media))
                     .route("/hls/{path:.*}", web::get().to(handlers::streaming::generate_hls_playlist))
-                    .route("/thumbnail/{path:.*}", web::get().to(handlers::streaming::get_thumbnail)),
+                    .route("/thumbnail/{path:.*}", web::get().to(handlers::streaming::get_thumbnail))
+                    // Audio transcoding for DTS/AC3/TrueHD
+                    .route("/transcode/{path:.*}", web::get().to(handlers::streaming::transcode_stream))
+                    .route("/check-transcode/{path:.*}", web::get().to(handlers::streaming::check_transcode_needed)),
             )
             // 存储管理 (底层硬件访问)
             .service(
@@ -647,7 +650,10 @@ async fn main() -> std::io::Result<()> {
                     .route("/extended-info/{path:.*}", web::get().to(handlers::streaming::get_extended_media_info))
                     .route("/play/{path:.*}", web::get().to(handlers::streaming::stream_media))
                     .route("/hls/{path:.*}", web::get().to(handlers::streaming::generate_hls_playlist))
-                    .route("/thumbnail/{path:.*}", web::get().to(handlers::streaming::get_thumbnail)),
+                    .route("/thumbnail/{path:.*}", web::get().to(handlers::streaming::get_thumbnail))
+                    // Audio transcoding for DTS/AC3/TrueHD
+                    .route("/transcode/{path:.*}", web::get().to(handlers::streaming::transcode_stream))
+                    .route("/check-transcode/{path:.*}", web::get().to(handlers::streaming::check_transcode_needed)),
             )
             .service(
                 web::scope("/api/v1/storage")

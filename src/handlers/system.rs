@@ -18,11 +18,25 @@ pub struct SystemInfo {
     pub uptime: u64,
 }
 
+/// CPU 核心使用率信息
 #[derive(Debug, Serialize)]
-pub struct CpuCoreInfo {
+pub struct CpuCoreUsage {
     pub core_id: usize,
     pub usage: f32,
     pub frequency: u64,
+}
+
+/// CPU 核心架构信息 (用于 ARM big.LITTLE 等异构架构)
+#[derive(Debug, Serialize)]
+pub struct CpuCoreArchInfo {
+    /// 核心架构名称 (如 Cortex-A55, Cortex-A76)
+    pub core_name: String,
+    /// CPU Part ID
+    pub part_id: String,
+    /// 该类型核心的数量
+    pub count: usize,
+    /// CPU 实现者 (如 ARM, Qualcomm)
+    pub implementer: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -34,7 +48,9 @@ pub struct CpuInfo {
     pub cores: usize,
     pub usage: f32,
     pub temperature: Option<f32>,
-    pub per_core_usage: Vec<CpuCoreInfo>,
+    pub per_core_usage: Vec<CpuCoreUsage>,
+    /// CPU 核心架构信息 (ARM 异构架构)
+    pub core_types: Vec<CpuCoreArchInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,13 +147,25 @@ pub async fn get_cpu_info() -> Result<impl Responder, AppError> {
     let total_usage: f32 = cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32;
 
     // 获取每个核心的使用率
-    let per_core_usage: Vec<CpuCoreInfo> = cpus
+    let per_core_usage: Vec<CpuCoreUsage> = cpus
         .iter()
         .enumerate()
-        .map(|(idx, c)| CpuCoreInfo {
+        .map(|(idx, c)| CpuCoreUsage {
             core_id: idx,
             usage: c.cpu_usage(),
             frequency: c.frequency(),
+        })
+        .collect();
+
+    // 获取 CPU 核心架构信息 (ARM big.LITTLE 等)
+    let hw_caps = hardware::detect_hardware();
+    let core_types: Vec<CpuCoreArchInfo> = hw_caps.cpu_core_types
+        .into_iter()
+        .map(|ct| CpuCoreArchInfo {
+            core_name: ct.core_name,
+            part_id: ct.part_id,
+            count: ct.count,
+            implementer: ct.implementer,
         })
         .collect();
 
@@ -150,6 +178,7 @@ pub async fn get_cpu_info() -> Result<impl Responder, AppError> {
         usage: total_usage,
         temperature: get_cpu_temperature(),
         per_core_usage,
+        core_types,
     };
 
     Ok(HttpResponse::Ok().json(cpu_info))
@@ -310,13 +339,25 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
     let total_usage: f32 = cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32;
 
     // 获取每个核心的使用率
-    let per_core_usage: Vec<CpuCoreInfo> = cpus
+    let per_core_usage: Vec<CpuCoreUsage> = cpus
         .iter()
         .enumerate()
-        .map(|(idx, c)| CpuCoreInfo {
+        .map(|(idx, c)| CpuCoreUsage {
             core_id: idx,
             usage: c.cpu_usage(),
             frequency: c.frequency(),
+        })
+        .collect();
+
+    // 获取 CPU 核心架构信息 (ARM big.LITTLE 等)
+    let hw_caps = hardware::detect_hardware();
+    let core_types: Vec<CpuCoreArchInfo> = hw_caps.cpu_core_types
+        .into_iter()
+        .map(|ct| CpuCoreArchInfo {
+            core_name: ct.core_name,
+            part_id: ct.part_id,
+            count: ct.count,
+            implementer: ct.implementer,
         })
         .collect();
 
@@ -329,6 +370,7 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
         usage: total_usage,
         temperature: get_cpu_temperature(),
         per_core_usage,
+        core_types,
     };
 
     let total_mem = sys.total_memory();

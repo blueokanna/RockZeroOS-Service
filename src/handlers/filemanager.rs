@@ -652,7 +652,7 @@ fn get_base_directory() -> Result<PathBuf, AppError> {
     {
         let fallback = Path::new("./storage");
         std::fs::create_dir_all(fallback).ok();
-        return Ok(fallback.to_path_buf());
+        Ok(fallback.to_path_buf())
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1137,6 +1137,7 @@ fn parse_range_header(range: &str, file_size: u64) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
+#[allow(clippy::type_complexity)]
 fn get_ffprobe_info(
     path: &Path,
 ) -> (
@@ -1150,7 +1151,7 @@ fn get_ffprobe_info(
     use std::process::Command;
 
     let output = Command::new("ffprobe")
-        .args(&[
+        .args([
             "-v",
             "quiet",
             "-print_format",
@@ -1207,7 +1208,7 @@ fn generate_video_thumbnail(path: &Path, timestamp: &str) -> Option<Vec<u8>> {
     let temp_path = std::env::temp_dir().join(format!("thumb_{}.jpg", uuid::Uuid::new_v4()));
 
     let output = Command::new("ffmpeg")
-        .args(&[
+        .args([
             "-ss",
             timestamp,
             "-i",

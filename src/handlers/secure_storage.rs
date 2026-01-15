@@ -695,7 +695,7 @@ pub async fn encrypt_file(
     let encrypted = encryptor.encrypt_file(&body.path, &data, &body.password).await?;
     
     Ok(HttpResponse::Ok().json(EncryptFileResponse {
-        encrypted: BASE64.encode(&encrypted.encrypted_data.to_base64().as_bytes()),
+        encrypted: BASE64.encode(encrypted.encrypted_data.to_base64().as_bytes()),
         original_crc32: encrypted.original_crc32,
         original_size: encrypted.original_size,
     }))

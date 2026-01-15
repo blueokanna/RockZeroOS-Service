@@ -753,7 +753,7 @@ pub async fn install_app(
 
     info!("Pulling Docker image: {}", full_image);
     let pull_output = Command::new("docker")
-        .args(&["pull", &full_image])
+        .args(["pull", &full_image])
         .output()
         .map_err(|e| {
             error!("Failed to pull image: {}", e);
@@ -765,7 +765,7 @@ pub async fn install_app(
         return Err(AppError::BadRequest("Failed to pull Docker image".to_string()));
     }
 
-    let container_name = format!("rockzero-{}-{}", body.name, Uuid::new_v4().to_string()[..8].to_string());
+    let container_name = format!("rockzero-{}-{}", body.name, &Uuid::new_v4().to_string()[..8]);
     
     let mut docker_args = vec!["run", "-d", "--name", &container_name, "--restart", "unless-stopped"];
 
@@ -844,13 +844,13 @@ pub async fn uninstall_app(
     if let Some(container_id) = &app.container_id {
         info!("Stopping container: {}", container_id);
         Command::new("docker")
-            .args(&["stop", container_id])
+            .args(["stop", container_id])
             .output()
             .ok();
 
         info!("Removing container: {}", container_id);
         Command::new("docker")
-            .args(&["rm", container_id])
+            .args(["rm", container_id])
             .output()
             .ok();
     }
@@ -874,7 +874,7 @@ pub async fn start_app(
         .ok_or_else(|| AppError::BadRequest("No container ID".to_string()))?;
 
     let output = Command::new("docker")
-        .args(&["start", &container_id])
+        .args(["start", &container_id])
         .output()
         .map_err(|_| AppError::InternalError)?;
 
@@ -899,7 +899,7 @@ pub async fn stop_app(
         .ok_or_else(|| AppError::BadRequest("No container ID".to_string()))?;
 
     let output = Command::new("docker")
-        .args(&["stop", &container_id])
+        .args(["stop", &container_id])
         .output()
         .map_err(|_| AppError::InternalError)?;
 
@@ -924,7 +924,7 @@ pub async fn restart_app(
         .ok_or_else(|| AppError::BadRequest("No container ID".to_string()))?;
 
     let output = Command::new("docker")
-        .args(&["restart", &container_id])
+        .args(["restart", &container_id])
         .output()
         .map_err(|_| AppError::InternalError)?;
 
@@ -939,7 +939,7 @@ pub async fn restart_app(
 
 async fn get_container_status(container_id: &str) -> String {
     let output = Command::new("docker")
-        .args(&["inspect", "--format", "{{.State.Status}}", container_id])
+        .args(["inspect", "--format", "{{.State.Status}}", container_id])
         .output();
 
     match output {

@@ -1,9 +1,24 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use tracing::{error, info};
+use std::process::{Command, Stdio, Child};
+use std::io::Read;
+use tracing::{error, info, warn};
 
 use crate::error::AppError;
+
+/// Audio codecs that require transcoding for mobile/web playback
+pub const UNSUPPORTED_AUDIO_CODECS: &[&str] = &[
+    "dts", "dca", "dts-hd", "dtshd", "dts_hd",
+    "truehd", "mlp",
+    "ac3", "eac3", "ac-3", "e-ac-3",
+    "pcm_bluray", "pcm_dvd",
+];
+
+/// Check if audio codec needs transcoding
+pub fn needs_audio_transcode(codec: &str) -> bool {
+    let codec_lower = codec.to_lowercase();
+    UNSUPPORTED_AUDIO_CODECS.iter().any(|&c| codec_lower.contains(c))
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +32,8 @@ pub struct MediaInfo {
     pub frame_rate: Option<f64>,
     pub audio_channels: Option<u32>,
     pub audio_sample_rate: Option<u32>,
+    #[serde(default)]
+    pub needs_audio_transcode: bool,
 }
 
 #[allow(dead_code)]
@@ -33,6 +50,7 @@ pub struct TranscodeOptions {
 }
 
 #[allow(dead_code)]
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HardwareAccel {
     None,
@@ -70,7 +88,7 @@ impl MediaProcessor {
 
     pub fn get_media_info(&self, file_path: &str) -> Result<MediaInfo, AppError> {
         let output = Command::new(&self.ffprobe_path)
-            .args(&[
+            .args([
                 "-v", "quiet",
                 "-print_format", "json",
                 "-show_format",
@@ -101,6 +119,7 @@ impl MediaProcessor {
             frame_rate: None,
             audio_channels: None,
             audio_sample_rate: None,
+            needs_audio_transcode: false,
         };
 
         if let Some(format) = json.get("format") {
@@ -260,7 +279,7 @@ impl MediaProcessor {
         timestamp: f64,
     ) -> Result<(), AppError> {
         let output = Command::new(&self.ffmpeg_path)
-            .args(&[
+            .args([
                 "-ss", &timestamp.to_string(),
                 "-i", input_path,
                 "-vframes", "1",
@@ -349,6 +368,245 @@ pub struct HardwareCapabilities {
 }
 
 impl Default for MediaProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Audio transcoding stream for DTS/AC3/TrueHD to AAC conversion
+#[allow(dead_code)]
+pub struct AudioTranscodeStream {
+    child: Child,
+    buffer: Vec<u8>,
+}
+
+#[allow(dead_code)]
+impl AudioTranscodeStream {
+    /// Create a new audio transcoding stream
+    /// Converts DTS/AC3/TrueHD audio to AAC while keeping video stream intact
+    pub fn new(
+        input_path: &str,
+        start_position: Option<f64>,
+        hardware_accel: Option<&HardwareAccel>,
+    ) -> Result<Self, AppError> {
+        let mut args: Vec<String> = Vec::new();
+        
+        // Hardware acceleration for decoding
+        match hardware_accel {
+            Some(HardwareAccel::VAAPI) => {
+                args.extend_from_slice(&[
+                    "-hwaccel".to_string(), 
+                    "vaapi".to_string(), 
+                    "-hwaccel_device".to_string(), 
+                    "/dev/dri/renderD128".to_string()
+                ]);
+            }
+            Some(HardwareAccel::NVENC) => {
+                args.extend_from_slice(&["-hwaccel".to_string(), "cuda".to_string()]);
+            }
+            Some(HardwareAccel::RockchipMPP) => {
+                args.extend_from_slice(&["-hwaccel".to_string(), "rkmpp".to_string()]);
+            }
+            Some(HardwareAccel::V4L2M2M) => {
+                args.extend_from_slice(&["-hwaccel".to_string(), "v4l2m2m".to_string()]);
+            }
+            _ => {}
+        }
+        
+        // Seek position if specified
+        if let Some(pos) = start_position {
+            args.push("-ss".to_string());
+            args.push(pos.to_string());
+        }
+        
+        // Input file
+        args.push("-i".to_string());
+        args.push(input_path.to_string());
+        
+        // Copy video stream, transcode audio to AAC
+        args.extend_from_slice(&[
+            "-c:v".to_string(), "copy".to_string(),           // Copy video without re-encoding
+            "-c:a".to_string(), "aac".to_string(),            // Transcode audio to AAC
+            "-b:a".to_string(), "256k".to_string(),           // Audio bitrate
+            "-ac".to_string(), "2".to_string(),               // Stereo output (for compatibility)
+            "-ar".to_string(), "48000".to_string(),           // Sample rate
+            "-movflags".to_string(), "frag_keyframe+empty_moov+faststart".to_string(), // Streaming-friendly MP4
+            "-f".to_string(), "mp4".to_string(),              // Output format
+            "-".to_string(),                                   // Output to stdout
+        ]);
+        
+        info!("Starting audio transcode with args: {:?}", args);
+        
+        let child = Command::new("ffmpeg")
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                error!("Failed to start ffmpeg transcode: {}", e);
+                AppError::InternalError
+            })?;
+        
+        Ok(Self {
+            child,
+            buffer: vec![0u8; 64 * 1024], // 64KB buffer
+        })
+    }
+    
+    /// Read next chunk from the transcoding stream
+    pub fn read_chunk(&mut self) -> Option<Vec<u8>> {
+        if let Some(ref mut stdout) = self.child.stdout {
+            match stdout.read(&mut self.buffer) {
+                Ok(0) => None, // EOF
+                Ok(n) => Some(self.buffer[..n].to_vec()),
+                Err(e) => {
+                    warn!("Error reading transcode stream: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+    
+    /// Check if the process is still running
+    pub fn is_running(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(Some(_)) => false,
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    }
+}
+
+impl Drop for AudioTranscodeStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+/// Streaming transcoder that outputs to a pipe for HTTP streaming
+pub struct StreamingTranscoder {
+    ffmpeg_path: String,
+}
+
+impl StreamingTranscoder {
+    pub fn new() -> Self {
+        Self {
+            ffmpeg_path: "ffmpeg".to_string(),
+        }
+    }
+    
+    /// Start a streaming transcode process for DTS/AC3 audio
+    /// Returns a Child process with stdout as the transcoded stream
+    pub fn start_audio_transcode(
+        &self,
+        input_path: &str,
+        seek_seconds: Option<f64>,
+        audio_bitrate: Option<&str>,
+        channels: Option<u32>,
+    ) -> Result<Child, AppError> {
+        let mut args: Vec<String> = vec![
+            "-hide_banner".to_string(),
+            "-loglevel".to_string(), 
+            "error".to_string(),
+        ];
+        
+        // Seek position
+        if let Some(pos) = seek_seconds {
+            args.push("-ss".to_string());
+            args.push(pos.to_string());
+        }
+        
+        // Input
+        args.push("-i".to_string());
+        args.push(input_path.to_string());
+        
+        // Video: copy (no re-encoding)
+        args.push("-c:v".to_string());
+        args.push("copy".to_string());
+        
+        // Audio: transcode to AAC
+        args.push("-c:a".to_string());
+        args.push("aac".to_string());
+        
+        // Audio bitrate
+        args.push("-b:a".to_string());
+        args.push(audio_bitrate.unwrap_or("256k").to_string());
+        
+        // Channels (default to stereo for compatibility)
+        args.push("-ac".to_string());
+        args.push(channels.unwrap_or(2).to_string());
+        
+        // Sample rate
+        args.push("-ar".to_string());
+        args.push("48000".to_string());
+        
+        // Streaming-optimized MP4
+        args.push("-movflags".to_string());
+        args.push("frag_keyframe+empty_moov+faststart+default_base_moof".to_string());
+        
+        // Output format and destination
+        args.push("-f".to_string());
+        args.push("mp4".to_string());
+        args.push("-".to_string());
+        
+        info!("Starting streaming transcode: ffmpeg {:?}", args);
+        
+        Command::new(&self.ffmpeg_path)
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                error!("Failed to start streaming transcode: {}", e);
+                AppError::InternalError
+            })
+    }
+    
+    /// Start HLS transcode for better seeking support
+    #[allow(dead_code)]
+    pub fn start_hls_transcode(
+        &self,
+        input_path: &str,
+        output_dir: &str,
+        segment_duration: u32,
+    ) -> Result<Child, AppError> {
+        let playlist_path = format!("{}/playlist.m3u8", output_dir);
+        let segment_pattern = format!("{}/segment_%03d.ts", output_dir);
+        let segment_duration_str = segment_duration.to_string();
+        
+        let args: Vec<&str> = vec![
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", input_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "256k",
+            "-ac", "2",
+            "-ar", "48000",
+            "-f", "hls",
+            "-hls_time", &segment_duration_str,
+            "-hls_list_size", "0",
+            "-hls_segment_filename", &segment_pattern,
+            &playlist_path,
+        ];
+        
+        info!("Starting HLS transcode: ffmpeg {:?}", args);
+        
+        Command::new(&self.ffmpeg_path)
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                error!("Failed to start HLS transcode: {}", e);
+                AppError::InternalError
+            })
+    }
+}
+
+impl Default for StreamingTranscoder {
     fn default() -> Self {
         Self::new()
     }

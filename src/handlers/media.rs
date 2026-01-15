@@ -177,7 +177,7 @@ pub async fn transcode_media(
         .ok_or_else(|| AppError::NotFound("File not found".to_string()))?;
 
     let output_filename = format!("transcoded_{}_{}.{}", 
-        Uuid::new_v4().to_string()[..8].to_string(),
+        &Uuid::new_v4().to_string()[..8],
         file.original_filename.split('.').next().unwrap_or("file"),
         body.output_format
     );
@@ -192,12 +192,11 @@ pub async fn transcode_media(
         ffmpeg_args.push("-c:v".to_string());
         ffmpeg_args.push(video_codec.clone());
         
-        if cfg!(target_arch = "aarch64") && video_codec == "h264" {
-            if Path::new("/dev/video10").exists() {
+        if cfg!(target_arch = "aarch64") && video_codec == "h264"
+            && Path::new("/dev/video10").exists() {
                 ffmpeg_args.push("-hwaccel".to_string());
                 ffmpeg_args.push("rkmpp".to_string());
             }
-        }
     }
 
     if let Some(audio_codec) = &body.audio_codec {
@@ -237,7 +236,7 @@ pub async fn transcode_media(
 
 fn get_media_duration(file_path: &str) -> Option<i64> {
     let output = Command::new("ffprobe")
-        .args(&[
+        .args([
             "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",

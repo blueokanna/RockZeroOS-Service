@@ -177,7 +177,7 @@ pub async fn eject_storage(path: web::Path<String>) -> Result<HttpResponse, AppE
 fn get_all_storage_devices() -> Result<Vec<StorageDevice>, AppError> {
     #[cfg(target_os = "windows")]
     {
-        return get_windows_devices();
+        get_windows_devices()
     }
     
     #[cfg(target_os = "linux")]

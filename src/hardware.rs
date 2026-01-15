@@ -1,17 +1,119 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use sysinfo::{Disks, Networks, System};
 
 #[cfg(target_os = "linux")]
 use std::fs;
 
+// ============ ARM CPU Part ID 映射表 ============
+
+/// ARM CPU Part ID 到核心名称的映射
+#[allow(dead_code)]
+fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
+    let mut map = HashMap::new();
+    // ARM Holdings
+    map.insert(0x810, "ARM810");
+    map.insert(0x920, "ARM920");
+    map.insert(0x922, "ARM922");
+    map.insert(0x926, "ARM926");
+    map.insert(0x940, "ARM940");
+    map.insert(0x946, "ARM946");
+    map.insert(0x966, "ARM966");
+    map.insert(0xa20, "ARM1020");
+    map.insert(0xa22, "ARM1022");
+    map.insert(0xa26, "ARM1026");
+    map.insert(0xb02, "ARM11 MPCore");
+    map.insert(0xb36, "ARM1136");
+    map.insert(0xb56, "ARM1156");
+    map.insert(0xb76, "ARM1176");
+    // Cortex-A 系列
+    map.insert(0xc05, "Cortex-A5");
+    map.insert(0xc07, "Cortex-A7");
+    map.insert(0xc08, "Cortex-A8");
+    map.insert(0xc09, "Cortex-A9");
+    map.insert(0xc0d, "Cortex-A12");
+    map.insert(0xc0e, "Cortex-A17");
+    map.insert(0xc0f, "Cortex-A15");
+    map.insert(0xc14, "Cortex-R4");
+    map.insert(0xc15, "Cortex-R5");
+    map.insert(0xc17, "Cortex-R7");
+    map.insert(0xc18, "Cortex-R8");
+    // Cortex-M 系列
+    map.insert(0xc20, "Cortex-M0");
+    map.insert(0xc21, "Cortex-M1");
+    map.insert(0xc23, "Cortex-M3");
+    map.insert(0xc24, "Cortex-M4");
+    map.insert(0xc27, "Cortex-M7");
+    map.insert(0xc60, "Cortex-M0+");
+    // ARMv8 Cortex-A 系列
+    map.insert(0xd01, "Cortex-A32");
+    map.insert(0xd02, "Cortex-A34");
+    map.insert(0xd03, "Cortex-A53");
+    map.insert(0xd04, "Cortex-A35");
+    map.insert(0xd05, "Cortex-A55");
+    map.insert(0xd06, "Cortex-A65");
+    map.insert(0xd07, "Cortex-A57");
+    map.insert(0xd08, "Cortex-A72");
+    map.insert(0xd09, "Cortex-A73");
+    map.insert(0xd0a, "Cortex-A75");
+    map.insert(0xd0b, "Cortex-A76");
+    map.insert(0xd0c, "Neoverse-N1");
+    map.insert(0xd0d, "Cortex-A77");
+    map.insert(0xd0e, "Cortex-A76AE");
+    map.insert(0xd13, "Cortex-R52");
+    map.insert(0xd20, "Cortex-M23");
+    map.insert(0xd21, "Cortex-M33");
+    map.insert(0xd40, "Neoverse-V1");
+    map.insert(0xd41, "Cortex-A78");
+    map.insert(0xd42, "Cortex-A78AE");
+    map.insert(0xd43, "Cortex-A65AE");
+    map.insert(0xd44, "Cortex-X1");
+    map.insert(0xd46, "Cortex-A510");
+    map.insert(0xd47, "Cortex-A710");
+    map.insert(0xd48, "Cortex-X2");
+    map.insert(0xd49, "Neoverse-N2");
+    map.insert(0xd4a, "Neoverse-E1");
+    map.insert(0xd4b, "Cortex-A78C");
+    map.insert(0xd4c, "Cortex-X1C");
+    map.insert(0xd4d, "Cortex-A715");
+    map.insert(0xd4e, "Cortex-X3");
+    map.insert(0xd4f, "Neoverse-V2");
+    map.insert(0xd80, "Cortex-A520");
+    map.insert(0xd81, "Cortex-A720");
+    map.insert(0xd82, "Cortex-X4");
+    map.insert(0xd84, "Neoverse-V3");
+    map.insert(0xd85, "Cortex-X925");
+    map.insert(0xd87, "Cortex-A725");
+    map.insert(0xd8e, "Neoverse-N3");
+    map
+}
+
 // ============ 数据结构定义 ============
+
+/// CPU 核心信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CpuCoreInfo {
+    /// 核心架构名称 (如 Cortex-A55, Cortex-A76)
+    pub core_name: String,
+    /// CPU Part ID (十六进制)
+    pub part_id: String,
+    /// 该类型核心的数量
+    pub count: usize,
+    /// CPU 实现者
+    pub implementer: Option<String>,
+    /// CPU 变体
+    pub variant: Option<String>,
+    /// CPU 修订版本
+    pub revision: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareCapabilities {
     pub architecture: String,
     pub cpu_model: String,
     pub cpu_cores: usize,
+    pub cpu_core_types: Vec<CpuCoreInfo>,
     pub total_memory: u64,
     pub video_acceleration: Vec<VideoAccelerator>,
     pub audio_devices: Vec<AudioDevice>,
@@ -50,6 +152,7 @@ pub struct StorageDevice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum StorageType {
     HDD,
     SSD,
@@ -118,6 +221,9 @@ pub fn detect_hardware() -> HardwareCapabilities {
     let cpu_cores = sys.cpus().len();
     let total_memory = sys.total_memory();
 
+    // 检测 CPU 核心类型（仅在 ARM 架构上）
+    let cpu_core_types = detect_cpu_core_types(&architecture);
+
     let video_acceleration = detect_video_accelerators(&architecture);
     let audio_devices = detect_audio_devices();
     let storage_devices = detect_storage_devices();
@@ -128,12 +234,197 @@ pub fn detect_hardware() -> HardwareCapabilities {
         architecture,
         cpu_model,
         cpu_cores,
+        cpu_core_types,
         total_memory,
         video_acceleration,
         audio_devices,
         storage_devices,
         usb_controllers,
         network_interfaces,
+    }
+}
+
+// ============ CPU 核心类型检测 ============
+
+/// 检测 CPU 核心类型（主要用于 ARM 架构）
+fn detect_cpu_core_types(arch: &str) -> Vec<CpuCoreInfo> {
+    match arch {
+        "aarch64" | "arm" | "armv7" => {
+            #[cfg(target_os = "linux")]
+            {
+                detect_arm_cpu_cores_linux()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Vec::new()
+            }
+        }
+        "x86_64" | "x86" => {
+            // x86 架构返回简单信息
+            detect_x86_cpu_info()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// 在 Linux 上检测 ARM CPU 核心类型
+#[cfg(target_os = "linux")]
+fn detect_arm_cpu_cores_linux() -> Vec<CpuCoreInfo> {
+    use std::collections::HashMap;
+    
+    let mut core_counts: HashMap<String, (String, String, Option<String>, Option<String>, Option<String>, usize)> = HashMap::new();
+    let arm_part_map = get_arm_cpu_part_map();
+    
+    // 读取 /proc/cpuinfo
+    if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
+        let mut current_part: Option<String> = None;
+        let mut current_implementer: Option<String> = None;
+        let mut current_variant: Option<String> = None;
+        let mut current_revision: Option<String> = None;
+        
+        for line in cpuinfo.lines() {
+            let line = line.trim();
+            
+            if line.starts_with("CPU implementer") {
+                if let Some(value) = line.split(':').nth(1) {
+                    current_implementer = Some(value.trim().to_string());
+                }
+            } else if line.starts_with("CPU variant") {
+                if let Some(value) = line.split(':').nth(1) {
+                    current_variant = Some(value.trim().to_string());
+                }
+            } else if line.starts_with("CPU part") {
+                if let Some(value) = line.split(':').nth(1) {
+                    current_part = Some(value.trim().to_string());
+                }
+            } else if line.starts_with("CPU revision") {
+                if let Some(value) = line.split(':').nth(1) {
+                    current_revision = Some(value.trim().to_string());
+                }
+            } else if line.is_empty() {
+                // 处理器条目结束，记录信息
+                if let Some(ref part) = current_part {
+                    let part_id = part.trim_start_matches("0x");
+                    let part_num = u64::from_str_radix(part_id, 16).unwrap_or(0);
+                    
+                    let core_name = arm_part_map
+                        .get(&part_num)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("Unknown (0x{:x})", part_num));
+                    
+                    let key = part.clone();
+                    let entry = core_counts.entry(key).or_insert((
+                        core_name,
+                        part.clone(),
+                        current_implementer.clone(),
+                        current_variant.clone(),
+                        current_revision.clone(),
+                        0,
+                    ));
+                    entry.5 += 1;
+                }
+                
+                // 重置当前处理器信息
+                current_part = None;
+                current_implementer = None;
+                current_variant = None;
+                current_revision = None;
+            }
+        }
+        
+        // 处理最后一个处理器（如果没有空行结尾）
+        if let Some(ref part) = current_part {
+            let part_id = part.trim_start_matches("0x");
+            let part_num = u64::from_str_radix(part_id, 16).unwrap_or(0);
+            
+            let core_name = arm_part_map
+                .get(&part_num)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("Unknown (0x{:x})", part_num));
+            
+            let key = part.clone();
+            let entry = core_counts.entry(key).or_insert((
+                core_name,
+                part.clone(),
+                current_implementer.clone(),
+                current_variant.clone(),
+                current_revision.clone(),
+                0,
+            ));
+            entry.5 += 1;
+        }
+    }
+    
+    // 转换为 Vec 并按核心数量排序
+    let mut cores: Vec<CpuCoreInfo> = core_counts
+        .into_iter()
+        .map(|(_, (core_name, part_id, implementer, variant, revision, count))| {
+            CpuCoreInfo {
+                core_name,
+                part_id,
+                count,
+                implementer: implementer.map(|i| get_implementer_name(&i)),
+                variant,
+                revision,
+            }
+        })
+        .collect();
+    
+    // 按核心数量降序排序
+    cores.sort_by(|a, b| b.count.cmp(&a.count));
+    
+    cores
+}
+
+/// 获取 CPU 实现者名称
+#[cfg(target_os = "linux")]
+fn get_implementer_name(implementer: &str) -> String {
+    let code = implementer.trim_start_matches("0x");
+    let num = u64::from_str_radix(code, 16).unwrap_or(0);
+    
+    match num {
+        0x41 => "ARM".to_string(),
+        0x42 => "Broadcom".to_string(),
+        0x43 => "Cavium".to_string(),
+        0x44 => "DEC".to_string(),
+        0x46 => "Fujitsu".to_string(),
+        0x48 => "HiSilicon".to_string(),
+        0x49 => "Infineon".to_string(),
+        0x4d => "Motorola/Freescale".to_string(),
+        0x4e => "NVIDIA".to_string(),
+        0x50 => "APM".to_string(),
+        0x51 => "Qualcomm".to_string(),
+        0x53 => "Samsung".to_string(),
+        0x56 => "Marvell".to_string(),
+        0x61 => "Apple".to_string(),
+        0x66 => "Faraday".to_string(),
+        0x69 => "Intel".to_string(),
+        0x6d => "Microsoft".to_string(),
+        0x70 => "Phytium".to_string(),
+        0xc0 => "Ampere".to_string(),
+        _ => format!("Unknown ({})", implementer),
+    }
+}
+
+/// 检测 x86 CPU 信息
+fn detect_x86_cpu_info() -> Vec<CpuCoreInfo> {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    
+    if let Some(cpu) = sys.cpus().first() {
+        let brand = cpu.brand().to_string();
+        let core_count = sys.cpus().len();
+        
+        vec![CpuCoreInfo {
+            core_name: brand,
+            part_id: "x86_64".to_string(),
+            count: core_count,
+            implementer: Some(cpu.vendor_id().to_string()),
+            variant: None,
+            revision: None,
+        }]
+    } else {
+        Vec::new()
     }
 }
 

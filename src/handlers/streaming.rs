@@ -6,9 +6,11 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Command;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::error::AppError;
+use crate::media_processor::{MediaProcessor, needs_audio_transcode, StreamingTranscoder};
 
 const MEDIA_BASE: &str = "./media";
 const SMALL_CHUNK_SIZE: u64 = 256 * 1024;
@@ -46,6 +48,9 @@ pub struct MediaStreamInfo {
     pub audio_sample_rate: Option<u32>,
     pub audio_tracks: Option<Vec<AudioTrackInfo>>,
     pub has_audio: bool,
+    // Audio transcoding info
+    pub needs_audio_transcode: bool,
+    pub transcode_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -136,6 +141,25 @@ pub async fn get_media_info(path: web::Path<String>) -> Result<HttpResponse, App
         .to_string();
 
     let media_details = get_detailed_ffprobe_info(&file_path);
+    
+    // Check if audio needs transcoding (DTS/AC3/TrueHD)
+    let needs_transcode = media_details.audio_codec
+        .as_ref()
+        .map(|codec| needs_audio_transcode(codec))
+        .unwrap_or(false);
+    
+    // Generate transcode URL if needed
+    let relative_path = file_path
+        .strip_prefix(MEDIA_BASE)
+        .unwrap_or(&file_path)
+        .to_string_lossy()
+        .to_string();
+    let transcode_url = if needs_transcode {
+        Some(format!("/api/v1/streaming/transcode/{}", relative_path))
+    } else {
+        None
+    };
+    
     let info = MediaStreamInfo {
         filename: file_path
             .file_name()
@@ -147,9 +171,9 @@ pub async fn get_media_info(path: web::Path<String>) -> Result<HttpResponse, App
         width: media_details.width,
         height: media_details.height,
         video_codec: media_details.video_codec,
-        audio_codec: media_details.audio_codec,
+        audio_codec: media_details.audio_codec.clone(),
         bitrate: media_details.bitrate,
-        supports_range: true,
+        supports_range: !needs_transcode, // Transcoded streams don't support range requests well
         video_bitrate: media_details.video_bitrate,
         audio_bitrate: media_details.audio_bitrate,
         frame_rate: media_details.frame_rate,
@@ -157,6 +181,8 @@ pub async fn get_media_info(path: web::Path<String>) -> Result<HttpResponse, App
         audio_sample_rate: media_details.audio_sample_rate,
         audio_tracks: if media_details.audio_tracks.is_empty() { None } else { Some(media_details.audio_tracks) },
         has_audio: media_details.has_audio,
+        needs_audio_transcode: needs_transcode,
+        transcode_url,
     };
 
     Ok(HttpResponse::Ok().json(info))
@@ -885,6 +911,7 @@ fn extract_exif_data(path: &Path) -> Option<ExifData> {
     None
 }
 
+#[allow(clippy::type_complexity)]
 fn get_ffprobe_info(
     path: &Path,
 ) -> (
@@ -924,4 +951,153 @@ fn get_hw_accel_info() -> serde_json::Value {
     }
 
     serde_json::json!(accel)
+}
+
+// ============================================================================
+// Audio Transcoding Stream for DTS/AC3/TrueHD
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct TranscodeQuery {
+    /// Seek position in seconds
+    pub seek: Option<f64>,
+    /// Audio bitrate (e.g., "256k", "320k")
+    pub bitrate: Option<String>,
+    /// Number of audio channels (default: 2 for stereo)
+    pub channels: Option<u32>,
+}
+
+/// Stream for reading from ffmpeg transcode process
+struct TranscodeStream {
+    child: std::process::Child,
+    buffer: Vec<u8>,
+}
+
+impl TranscodeStream {
+    fn new(child: std::process::Child) -> Self {
+        Self {
+            child,
+            buffer: vec![0u8; 64 * 1024], // 64KB buffer
+        }
+    }
+}
+
+impl futures::Stream for TranscodeStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        
+        if let Some(ref mut stdout) = this.child.stdout {
+            match stdout.read(&mut this.buffer) {
+                Ok(0) => Poll::Ready(None), // EOF
+                Ok(n) => Poll::Ready(Some(Ok(Bytes::copy_from_slice(&this.buffer[..n])))),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Would block, try again later
+                    Poll::Pending
+                }
+                Err(e) => Poll::Ready(Some(Err(e))),
+            }
+        } else {
+            Poll::Ready(None)
+        }
+    }
+}
+
+impl Drop for TranscodeStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+/// Transcode media with DTS/AC3/TrueHD audio to AAC for playback
+/// This endpoint streams the transcoded video in real-time
+pub async fn transcode_stream(
+    path: web::Path<String>,
+    query: web::Query<TranscodeQuery>,
+    _media_processor: web::Data<Arc<MediaProcessor>>,
+) -> Result<HttpResponse, AppError> {
+    let file_path = get_media_path(&path.into_inner())?;
+    
+    if !file_path.exists() {
+        return Err(AppError::NotFound("Media file not found".to_string()));
+    }
+    
+    // Get media info to verify it needs transcoding
+    let media_details = get_detailed_ffprobe_info(&file_path);
+    let audio_codec = media_details.audio_codec.as_deref().unwrap_or("");
+    
+    if !needs_audio_transcode(audio_codec) {
+        // If no transcoding needed, redirect to normal stream
+        return Err(AppError::BadRequest(
+            "This file does not require audio transcoding".to_string()
+        ));
+    }
+    
+    // Build ffmpeg command for transcoding
+    let transcoder = StreamingTranscoder::new();
+    let child = transcoder.start_audio_transcode(
+        file_path.to_str().unwrap_or(""),
+        query.seek,
+        query.bitrate.as_deref(),
+        query.channels,
+    )?;
+    
+    let stream = TranscodeStream::new(child);
+    
+    // Build response with appropriate headers
+    let mut response = HttpResponse::Ok();
+    response.insert_header(("Content-Type", "video/mp4"));
+    response.insert_header(("Transfer-Encoding", "chunked"));
+    response.insert_header(("Cache-Control", "no-cache, no-store"));
+    response.insert_header(("X-Content-Type-Options", "nosniff"));
+    response.insert_header(("X-Transcoded", "true"));
+    response.insert_header(("X-Original-Audio-Codec", audio_codec));
+    response.insert_header(("X-Transcoded-Audio-Codec", "aac"));
+    
+    // CORS headers
+    response.insert_header(("Access-Control-Allow-Origin", "*"));
+    response.insert_header(("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS"));
+    response.insert_header((
+        "Access-Control-Expose-Headers",
+        "X-Transcoded, X-Original-Audio-Codec, X-Transcoded-Audio-Codec",
+    ));
+    
+    // Duration hint if available
+    if let Some(duration) = media_details.duration {
+        response.insert_header(("Content-Duration", duration.to_string()));
+    }
+    
+    Ok(response.streaming(stream))
+}
+
+/// Check if a file needs audio transcoding
+pub async fn check_transcode_needed(path: web::Path<String>) -> Result<HttpResponse, AppError> {
+    let file_path = get_media_path(&path.into_inner())?;
+    
+    if !file_path.exists() {
+        return Err(AppError::NotFound("Media file not found".to_string()));
+    }
+    
+    let media_details = get_detailed_ffprobe_info(&file_path);
+    let audio_codec = media_details.audio_codec.as_deref().unwrap_or("");
+    let needs_transcode = needs_audio_transcode(audio_codec);
+    
+    let relative_path = file_path
+        .strip_prefix(MEDIA_BASE)
+        .unwrap_or(&file_path)
+        .to_string_lossy()
+        .to_string();
+    
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "needs_transcode": needs_transcode,
+        "audio_codec": audio_codec,
+        "transcode_url": if needs_transcode {
+            Some(format!("/api/v1/streaming/transcode/{}", relative_path))
+        } else {
+            None
+        },
+        "supported_codecs": ["aac", "mp3", "opus", "vorbis", "flac"],
+        "unsupported_codecs": crate::media_processor::UNSUPPORTED_AUDIO_CODECS,
+    })))
 }

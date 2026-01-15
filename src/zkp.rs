@@ -129,7 +129,7 @@ impl ZkpContext {
         Ok(PasswordProofData {
             commitment,
             challenge: BASE64.encode(challenge_scalar.as_bytes()),
-            response: BASE64.encode(&response_bytes),
+            response: BASE64.encode(response_bytes),
             blinding_commitment,
         })
     }
@@ -146,7 +146,7 @@ impl ZkpContext {
         let mut nonce_bytes = [0u8; 16];
         getrandom::getrandom(&mut nonce_bytes)
             .map_err(|_| AppError::CryptoError("Failed to generate nonce".to_string()))?;
-        let nonce = BASE64.encode(&nonce_bytes);
+        let nonce = BASE64.encode(nonce_bytes);
 
         Ok(EnhancedPasswordProof {
             schnorr_proof,
