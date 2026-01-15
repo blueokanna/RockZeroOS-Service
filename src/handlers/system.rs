@@ -206,77 +206,93 @@ pub async fn get_memory_info() -> Result<impl Responder, AppError> {
 }
 
 pub async fn get_disk_info() -> Result<impl Responder, AppError> {
-    let disks_info = Disks::new_with_refreshed_list();
+    // 获取所有块设备信息（包括未挂载的）
+    let block_devices = hardware::get_all_block_devices();
     let mut disks = Vec::new();
-    let mut seen_devices: std::collections::HashSet<(u64, String)> =
-        std::collections::HashSet::new();
+    let mut seen_devices: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for disk in disks_info.list() {
-        let total_space = disk.total_space();
-        let available_space = disk.available_space();
-        let used_space = total_space - available_space;
-        let usage_percentage = if total_space > 0 {
-            (used_space as f64 / total_space as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        let mount_point = disk.mount_point().to_string_lossy().to_string();
-        let is_removable = disk.is_removable();
-        let disk_type = format!("{:?}", disk.kind());
-        let name = disk.name().to_string_lossy().to_string();
-        let file_system = disk.file_system().to_string_lossy().to_string();
-
-        if mount_point.starts_with("/sys")
-            || mount_point.starts_with("/proc")
-            || mount_point.starts_with("/dev") && !mount_point.starts_with("/dev/shm")
-            || mount_point.starts_with("/run")
-            || mount_point.contains("/snap/")
-            || file_system == "squashfs"
-            || file_system == "tmpfs"
-            || file_system == "devtmpfs"
-            || file_system == "overlay"
-        {
+    // 首先添加所有块设备
+    for block_dev in block_devices {
+        // 跳过虚拟设备
+        if block_dev.name.starts_with("loop") 
+            || block_dev.name.starts_with("ram") 
+            || block_dev.name.starts_with("zram")
+            || block_dev.name.starts_with("dm-") {
             continue;
         }
 
-        let device_key = (total_space, file_system.clone());
-        if seen_devices.contains(&device_key) && total_space > 0 {
-            let existing_idx = disks.iter().position(|d: &DiskInfo| {
-                d.total_space == total_space && d.file_system == file_system
-            });
-            if let Some(idx) = existing_idx {
-                if mount_point == "/" || mount_point.len() < disks[idx].mount_point.len() {
-                    disks[idx] = DiskInfo {
-                        name: name.clone(),
-                        mount_point: mount_point.clone(),
-                        file_system: file_system.clone(),
-                        total_space,
-                        available_space,
-                        used_space,
-                        usage_percentage,
-                        is_removable,
-                        disk_type: disk_type.clone(),
-                    };
+        // 如果设备有分区，添加分区信息
+        if !block_dev.partitions.is_empty() {
+            for partition in &block_dev.partitions {
+                let device_key = partition.device_path.clone();
+                if seen_devices.contains(&device_key) {
+                    continue;
                 }
-            }
-            continue;
-        }
-        seen_devices.insert(device_key);
+                seen_devices.insert(device_key.clone());
 
-        disks.push(DiskInfo {
-            name,
-            mount_point,
-            file_system,
-            total_space,
-            available_space,
-            used_space,
-            usage_percentage,
-            is_removable,
-            disk_type,
-        });
+                let mount_point = partition.mount_point.clone().unwrap_or_else(|| "Not mounted".to_string());
+                let file_system = partition.file_system.clone().unwrap_or_else(|| "Unknown".to_string());
+                
+                // 跳过系统虚拟文件系统
+                if mount_point.starts_with("/sys")
+                    || mount_point.starts_with("/proc")
+                    || mount_point.starts_with("/dev") && !mount_point.starts_with("/dev/shm")
+                    || mount_point.starts_with("/run")
+                    || mount_point.contains("/snap/")
+                    || file_system == "squashfs"
+                    || file_system == "tmpfs"
+                    || file_system == "devtmpfs"
+                    || file_system == "overlay" {
+                    continue;
+                }
+
+                let used_space = if partition.mount_point.is_some() {
+                    partition.size - get_available_space(&partition.device_path).unwrap_or(partition.size)
+                } else {
+                    0
+                };
+                
+                let usage_percentage = if partition.size > 0 {
+                    (used_space as f64 / partition.size as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                disks.push(DiskInfo {
+                    name: partition.name.clone(),
+                    mount_point,
+                    file_system,
+                    total_space: partition.size,
+                    available_space: partition.size - used_space,
+                    used_space,
+                    usage_percentage,
+                    is_removable: block_dev.is_removable,
+                    disk_type: block_dev.device_type.clone(),
+                });
+            }
+        } else {
+            // 没有分区的设备，显示整个设备
+            let device_key = block_dev.device_path.clone();
+            if seen_devices.contains(&device_key) {
+                continue;
+            }
+            seen_devices.insert(device_key);
+
+            disks.push(DiskInfo {
+                name: block_dev.name.clone(),
+                mount_point: "Not mounted".to_string(),
+                file_system: "Unknown".to_string(),
+                total_space: block_dev.size,
+                available_space: block_dev.size,
+                used_space: 0,
+                usage_percentage: 0.0,
+                is_removable: block_dev.is_removable,
+                disk_type: block_dev.device_type,
+            });
+        }
     }
 
+    // 按挂载点排序
     disks.sort_by(|a, b| {
         if a.mount_point == "/" {
             return std::cmp::Ordering::Less;
@@ -290,10 +306,44 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
         if b.mount_point == "/boot" {
             return std::cmp::Ordering::Greater;
         }
+        if a.mount_point == "Not mounted" && b.mount_point != "Not mounted" {
+            return std::cmp::Ordering::Greater;
+        }
+        if b.mount_point == "Not mounted" && a.mount_point != "Not mounted" {
+            return std::cmp::Ordering::Less;
+        }
         a.mount_point.cmp(&b.mount_point)
     });
 
     Ok(HttpResponse::Ok().json(disks))
+}
+
+#[cfg(target_os = "linux")]
+fn get_available_space(device_path: &str) -> Option<u64> {
+    use std::fs;
+    
+    // 从 /proc/mounts 查找挂载点
+    if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+        for line in mounts.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 && parts[0] == device_path {
+                let mount_point = parts[1];
+                // 使用 statvfs 获取可用空间
+                let disks_info = Disks::new_with_refreshed_list();
+                for disk in disks_info.list() {
+                    if disk.mount_point().to_string_lossy() == mount_point {
+                        return Some(disk.available_space());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_available_space(_device_path: &str) -> Option<u64> {
+    None
 }
 
 pub async fn get_usb_devices() -> Result<impl Responder, AppError> {

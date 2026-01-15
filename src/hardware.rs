@@ -12,7 +12,7 @@ use std::fs;
 #[allow(dead_code)]
 fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
     let mut map = HashMap::new();
-    // ARM Holdings
+    // ARM Holdings - 早期架构
     map.insert(0x810, "ARM810");
     map.insert(0x920, "ARM920");
     map.insert(0x922, "ARM922");
@@ -27,18 +27,22 @@ fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
     map.insert(0xb36, "ARM1136");
     map.insert(0xb56, "ARM1156");
     map.insert(0xb76, "ARM1176");
+    
     // Cortex-A 系列
     map.insert(0xc05, "Cortex-A5");
     map.insert(0xc07, "Cortex-A7");
     map.insert(0xc08, "Cortex-A8");
     map.insert(0xc09, "Cortex-A9");
-    map.insert(0xc0d, "Cortex-A12");
+    map.insert(0xc0d, "Cortex-A17");
     map.insert(0xc0e, "Cortex-A17");
     map.insert(0xc0f, "Cortex-A15");
+    
+    // Cortex-R 系列
     map.insert(0xc14, "Cortex-R4");
     map.insert(0xc15, "Cortex-R5");
     map.insert(0xc17, "Cortex-R7");
     map.insert(0xc18, "Cortex-R8");
+    
     // Cortex-M 系列
     map.insert(0xc20, "Cortex-M0");
     map.insert(0xc21, "Cortex-M1");
@@ -46,7 +50,8 @@ fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
     map.insert(0xc24, "Cortex-M4");
     map.insert(0xc27, "Cortex-M7");
     map.insert(0xc60, "Cortex-M0+");
-    // ARMv8 Cortex-A 系列
+    
+    // ARMv8 Cortex-A 系列 (64位)
     map.insert(0xd01, "Cortex-A32");
     map.insert(0xd02, "Cortex-A34");
     map.insert(0xd03, "Cortex-A53");
@@ -61,9 +66,15 @@ fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
     map.insert(0xd0c, "Neoverse-N1");
     map.insert(0xd0d, "Cortex-A77");
     map.insert(0xd0e, "Cortex-A76AE");
+    
+    // Cortex-R 系列 (ARMv8)
     map.insert(0xd13, "Cortex-R52");
+    
+    // Cortex-M 系列 (ARMv8)
     map.insert(0xd20, "Cortex-M23");
     map.insert(0xd21, "Cortex-M33");
+    
+    // Neoverse 和最新 Cortex 系列
     map.insert(0xd40, "Neoverse-V1");
     map.insert(0xd41, "Cortex-A78");
     map.insert(0xd42, "Cortex-A78AE");
@@ -79,6 +90,8 @@ fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
     map.insert(0xd4d, "Cortex-A715");
     map.insert(0xd4e, "Cortex-X3");
     map.insert(0xd4f, "Neoverse-V2");
+    
+    // 最新一代 (2023+)
     map.insert(0xd80, "Cortex-A520");
     map.insert(0xd81, "Cortex-A720");
     map.insert(0xd82, "Cortex-X4");
@@ -86,6 +99,7 @@ fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
     map.insert(0xd85, "Cortex-X925");
     map.insert(0xd87, "Cortex-A725");
     map.insert(0xd8e, "Neoverse-N3");
+    
     map
 }
 
