@@ -61,9 +61,32 @@ if command -v ufw &> /dev/null; then
     echo -e "${GREEN}✅ 防火墙规则已添加${NC}"
 fi
 
-echo -e "${GREEN}[6/6] 创建服务目录...${NC}"
+echo -e "${GREEN}[6/6] 创建服务目录和安装系统服务...${NC}"
 mkdir -p /opt/rockzero
 cd /opt/rockzero
+
+# 复制并设置脚本权限
+if [ -d scripts ]; then
+    chmod +x scripts/*.sh
+fi
+
+# 安装自动挂载服务
+if [ -f rockzero-automount.service ]; then
+    echo "安装自动挂载服务..."
+    cp rockzero-automount.service /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable rockzero-automount.service
+    echo -e "${GREEN}✅ 自动挂载服务已安装${NC}"
+fi
+
+# 安装安全关机服务
+if [ -f rockzero-safe-shutdown.service ]; then
+    echo "安装安全关机服务..."
+    cp rockzero-safe-shutdown.service /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable rockzero-safe-shutdown.service
+    echo -e "${GREEN}✅ 安全关机服务已安装${NC}"
+fi
 
 # 运行设置脚本
 if [ -f scripts/setup.sh ]; then
@@ -79,6 +102,12 @@ echo "后续步骤:"
 echo "  1. 将项目文件复制到 /opt/rockzero"
 echo "  2. 运行: cd /opt/rockzero && ./scripts/setup.sh"
 echo "  3. 启动服务: docker-compose up -d"
+echo ""
+echo "系统服务:"
+echo "  • 自动挂载服务: systemctl status rockzero-automount"
+echo "  • 安全关机服务: systemctl status rockzero-safe-shutdown"
+echo "  • 手动挂载磁盘: /opt/rockzero/scripts/auto-mount-disks.sh"
+echo "  • 安全关机: /opt/rockzero/scripts/safe-shutdown.sh"
 echo ""
 echo "如果使用 Tailscale:"
 echo "  1. 运行: tailscale up"

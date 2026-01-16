@@ -233,6 +233,12 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                 let mount_point = partition.mount_point.clone().unwrap_or_else(|| "Not mounted".to_string());
                 let file_system = partition.file_system.clone().unwrap_or_else(|| "Unknown".to_string());
                 
+                // 跳过 VFAT/FAT 格式的磁盘（通常是 /boot 分区）
+                let fs_upper = file_system.to_uppercase();
+                if fs_upper == "VFAT" || fs_upper == "FAT32" || fs_upper == "FAT16" || fs_upper == "FAT" {
+                    continue;
+                }
+                
                 // 跳过系统虚拟文件系统
                 if mount_point.starts_with("/sys")
                     || mount_point.starts_with("/proc")
@@ -298,12 +304,6 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
             return std::cmp::Ordering::Less;
         }
         if b.mount_point == "/" {
-            return std::cmp::Ordering::Greater;
-        }
-        if a.mount_point == "/boot" {
-            return std::cmp::Ordering::Less;
-        }
-        if b.mount_point == "/boot" {
             return std::cmp::Ordering::Greater;
         }
         if a.mount_point == "Not mounted" && b.mount_point != "Not mounted" {
