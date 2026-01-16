@@ -519,6 +519,26 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
             )));
         }
 
+        // 检查设备是否已经挂载
+        let mount_check = Command::new("findmnt")
+            .args(["-n", "-o", "TARGET", device])
+            .output();
+        
+        if let Ok(output) = mount_check {
+            if output.status.success() {
+                let mount_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !mount_point.is_empty() {
+                    return Ok(HttpResponse::Ok().json(serde_json::json!({
+                        "success": true,
+                        "message": "Disk is already mounted",
+                        "device": device,
+                        "mount_point": mount_point,
+                        "already_mounted": true,
+                    })));
+                }
+            }
+        }
+
         // 检查是否是整盘设备（没有分区号）
         let device_name = device.split('/').last().unwrap_or("");
         let is_whole_disk = is_whole_disk_device(device_name);

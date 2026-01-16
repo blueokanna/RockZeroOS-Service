@@ -330,10 +330,19 @@ async fn main() -> std::io::Result<()> {
                     .route("/initialize", web::post().to(handlers::disk_manager::initialize_disk))
                     .route("/rename", web::post().to(handlers::disk_manager::rename_disk))
                     .route("/scan", web::post().to(handlers::disk_manager::scan_disks))
-                    .route("/zfs", web::get().to(handlers::disk_manager::get_zfs_status))
                     .route("/details/{device:.*}", web::get().to(handlers::disk_manager::get_disk_details))
+                    .route("/zfs-status", web::get().to(handlers::disk_manager::get_zfs_status))
                     .route("/eject/{device:.*}", web::post().to(handlers::disk_manager::eject_disk))
                     .route("/health/{device:.*}", web::get().to(handlers::disk_manager::check_disk_health)),
+            )
+            // Speed test API - no auth required for testing
+            .service(
+                web::scope("/api/v1/speedtest")
+                    .route("/ping", web::get().to(handlers::speedtest::ping_test))
+                    .route("/download", web::get().to(handlers::speedtest::download_test))
+                    .route("/upload", web::post().to(handlers::speedtest::upload_test))
+                    .route("/server-info", web::get().to(handlers::speedtest::server_info))
+                    .route("/empty", web::get().to(handlers::speedtest::empty_response)),
             )
             // WebDAV 支持
             .service(
@@ -353,16 +362,6 @@ async fn main() -> std::io::Result<()> {
                     .route("/{path:.*}", web::method(actix_web::http::Method::from_bytes(b"UNLOCK").unwrap()).to(handlers::webdav::webdav_unlock))
                     .route("/{path:.*}", web::method(actix_web::http::Method::from_bytes(b"PROPPATCH").unwrap()).to(handlers::webdav::webdav_proppatch)),
             )
-            // 测速 API (参考 OpenSpeedTest)
-            .service(
-                web::scope("/api/v1/speedtest")
-                    .wrap(middleware::JwtAuth)
-                    .route("/info", web::get().to(handlers::speedtest::server_info))
-                    .route("/ping", web::get().to(handlers::speedtest::ping_test))
-                    .route("/download", web::get().to(handlers::speedtest::download_test))
-                    .route("/upload", web::post().to(handlers::speedtest::upload_test))
-                    .route("/empty", web::get().to(handlers::speedtest::empty_response)),
-            )
             // 媒体流播放
             .service(
                 web::scope("/api/v1/streaming")
@@ -373,10 +372,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/extended-info/{path:.*}", web::get().to(handlers::streaming::get_extended_media_info))
                     .route("/play/{path:.*}", web::get().to(handlers::streaming::stream_media))
                     .route("/hls/{path:.*}", web::get().to(handlers::streaming::generate_hls_playlist))
-                    .route("/thumbnail/{path:.*}", web::get().to(handlers::streaming::get_thumbnail))
-                    // Audio transcoding for DTS/AC3/TrueHD
-                    .route("/transcode/{path:.*}", web::get().to(handlers::streaming::transcode_stream))
-                    .route("/check-transcode/{path:.*}", web::get().to(handlers::streaming::check_transcode_needed)),
+                    .route("/thumbnail/{path:.*}", web::get().to(handlers::streaming::get_thumbnail)),
             )
             // 存储管理 (底层硬件访问)
             .service(
@@ -639,10 +635,19 @@ async fn main() -> std::io::Result<()> {
                     .route("/initialize", web::post().to(handlers::disk_manager::initialize_disk))
                     .route("/rename", web::post().to(handlers::disk_manager::rename_disk))
                     .route("/scan", web::post().to(handlers::disk_manager::scan_disks))
-                    .route("/zfs", web::get().to(handlers::disk_manager::get_zfs_status))
                     .route("/details/{device:.*}", web::get().to(handlers::disk_manager::get_disk_details))
+                    .route("/zfs-status", web::get().to(handlers::disk_manager::get_zfs_status))
                     .route("/eject/{device:.*}", web::post().to(handlers::disk_manager::eject_disk))
                     .route("/health/{device:.*}", web::get().to(handlers::disk_manager::check_disk_health)),
+            )
+            // Speed test API - no auth required for testing
+            .service(
+                web::scope("/api/v1/speedtest")
+                    .route("/ping", web::get().to(handlers::speedtest::ping_test))
+                    .route("/download", web::get().to(handlers::speedtest::download_test))
+                    .route("/upload", web::post().to(handlers::speedtest::upload_test))
+                    .route("/server-info", web::get().to(handlers::speedtest::server_info))
+                    .route("/empty", web::get().to(handlers::speedtest::empty_response)),
             )
             .service(
                 web::scope("/webdav")
@@ -670,10 +675,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/extended-info/{path:.*}", web::get().to(handlers::streaming::get_extended_media_info))
                     .route("/play/{path:.*}", web::get().to(handlers::streaming::stream_media))
                     .route("/hls/{path:.*}", web::get().to(handlers::streaming::generate_hls_playlist))
-                    .route("/thumbnail/{path:.*}", web::get().to(handlers::streaming::get_thumbnail))
-                    // Audio transcoding for DTS/AC3/TrueHD
-                    .route("/transcode/{path:.*}", web::get().to(handlers::streaming::transcode_stream))
-                    .route("/check-transcode/{path:.*}", web::get().to(handlers::streaming::check_transcode_needed)),
+                    .route("/thumbnail/{path:.*}", web::get().to(handlers::streaming::get_thumbnail)),
             )
             .service(
                 web::scope("/api/v1/storage")
