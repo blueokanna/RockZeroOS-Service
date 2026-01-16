@@ -348,6 +348,16 @@ async fn main() -> std::io::Result<()> {
                     .route("/{path:.*}", web::method(actix_web::http::Method::from_bytes(b"UNLOCK").unwrap()).to(handlers::webdav::webdav_unlock))
                     .route("/{path:.*}", web::method(actix_web::http::Method::from_bytes(b"PROPPATCH").unwrap()).to(handlers::webdav::webdav_proppatch)),
             )
+            // 测速 API (参考 OpenSpeedTest)
+            .service(
+                web::scope("/api/v1/speedtest")
+                    .wrap(middleware::JwtAuth)
+                    .route("/info", web::get().to(handlers::speedtest::server_info))
+                    .route("/ping", web::get().to(handlers::speedtest::ping_test))
+                    .route("/download", web::get().to(handlers::speedtest::download_test))
+                    .route("/upload", web::post().to(handlers::speedtest::upload_test))
+                    .route("/empty", web::get().to(handlers::speedtest::empty_response)),
+            )
             // 媒体流播放
             .service(
                 web::scope("/api/v1/streaming")

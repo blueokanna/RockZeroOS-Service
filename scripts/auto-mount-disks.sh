@@ -77,6 +77,25 @@ mount_device() {
         log "Skipping $device (swap partition)"
         return 0
     fi
+
+    # Skip eMMC boot partitions (mmcblk*boot0, mmcblk*boot1, mmcblk*rpmb)
+    local dev_name=$(basename "$device")
+    if [[ "$dev_name" == *"boot0"* ]] || [[ "$dev_name" == *"boot1"* ]] || [[ "$dev_name" == *"rpmb"* ]]; then
+        warn "Skipping $device (eMMC boot/rpmb partition)"
+        return 0
+    fi
+
+    # Skip system partitions that might cause issues
+    if [[ "$device" == "/dev/mmcblk"*"p1" ]]; then
+        # Check if this is likely a boot partition by size (< 512MB)
+        local size_sectors=$(cat /sys/class/block/$dev_name/size 2>/dev/null || echo "0")
+        local size_bytes=$((size_sectors * 512))
+        local size_mb=$((size_bytes / 1024 / 1024))
+        if [[ $size_mb -lt 512 ]]; then
+            warn "Skipping $device (small partition, likely boot - ${size_mb}MB)"
+            return 0
+        fi
+    fi
     
     # Determine mount point
     local mount_point

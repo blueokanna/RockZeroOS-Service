@@ -7,6 +7,7 @@ pub mod files;
 pub mod health;
 pub mod media;
 pub mod secure_storage;
+pub mod speedtest;
 pub mod storage;
 pub mod streaming;
 pub mod system;

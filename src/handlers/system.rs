@@ -221,6 +221,13 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
             continue;
         }
 
+        // 跳过 eMMC boot 分区 (mmcblk*boot0, mmcblk*boot1)
+        if block_dev.name.contains("boot0") 
+            || block_dev.name.contains("boot1")
+            || block_dev.name.contains("rpmb") {
+            continue;
+        }
+
         // 如果设备有分区，添加分区信息
         if !block_dev.partitions.is_empty() {
             for partition in &block_dev.partitions {
@@ -239,6 +246,11 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                     continue;
                 }
                 
+                // 跳过 /boot 分区
+                if mount_point == "/boot" || mount_point.starts_with("/boot/") {
+                    continue;
+                }
+                
                 // 跳过系统虚拟文件系统
                 if mount_point.starts_with("/sys")
                     || mount_point.starts_with("/proc")
@@ -249,6 +261,13 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                     || file_system == "tmpfs"
                     || file_system == "devtmpfs"
                     || file_system == "overlay" {
+                    continue;
+                }
+
+                // 跳过 eMMC boot 分区
+                if partition.name.contains("boot0") 
+                    || partition.name.contains("boot1")
+                    || partition.name.contains("rpmb") {
                     continue;
                 }
 
