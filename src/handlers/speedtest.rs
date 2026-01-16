@@ -7,6 +7,7 @@ use crate::error::AppError;
 
 /// 测速结果
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct SpeedTestResult {
     pub download_speed_mbps: f64,
     pub upload_speed_mbps: f64,

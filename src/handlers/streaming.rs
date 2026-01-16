@@ -13,20 +13,18 @@ use crate::error::AppError;
 use crate::media_processor::{MediaProcessor, needs_audio_transcode, StreamingTranscoder};
 
 const MEDIA_BASE: &str = "./media";
-const SMALL_CHUNK_SIZE: u64 = 256 * 1024;
-const MEDIUM_CHUNK_SIZE: u64 = 1024 * 1024;
-const LARGE_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
-const HUGE_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
-// Dynamic max range based on file size
-const DEFAULT_MAX_RANGE_CHUNK: u64 = 8 * 1024 * 1024;
-const LARGE_FILE_MAX_RANGE: u64 = 16 * 1024 * 1024;
-const HUGE_FILE_MAX_RANGE: u64 = 32 * 1024 * 1024;
+// Optimized chunk sizes for smooth playback
+const INITIAL_CHUNK_SIZE: u64 = 512 * 1024;      // 512KB for initial request (fast start)
+const STREAMING_CHUNK_SIZE: u64 = 2 * 1024 * 1024; // 2MB for streaming
+const SEEK_CHUNK_SIZE: u64 = 4 * 1024 * 1024;    // 4MB for seek operations
+
+// Max range sizes - allow larger ranges for better buffering
+const DEFAULT_MAX_RANGE: u64 = 10 * 1024 * 1024;  // 10MB default
+const LARGE_FILE_MAX_RANGE: u64 = 20 * 1024 * 1024; // 20MB for large files
 
 // File size thresholds
-const LARGE_FILE_THRESHOLD: u64 = 1024 * 1024 * 1024;
-const HUGE_FILE_THRESHOLD: u64 = 10 * 1024 * 1024 * 1024;
-const MASSIVE_FILE_THRESHOLD: u64 = 20 * 1024 * 1024 * 1024;
+const HUGE_FILE_THRESHOLD: u64 = 2 * 1024 * 1024 * 1024; // 2GB
 
 #[derive(Debug, Serialize)]
 pub struct MediaStreamInfo {
@@ -255,11 +253,12 @@ struct ChunkedFileStream {
 
 impl ChunkedFileStream {
     fn new(file: File, total_size: u64) -> Self {
-        let chunk_size = Self::calculate_optimal_chunk_size(total_size);
+        // Use larger buffer for smoother streaming
+        let chunk_size = STREAMING_CHUNK_SIZE;
         let buffer_capacity = chunk_size as usize;
 
         Self {
-            reader: BufReader::with_capacity(buffer_capacity, file),
+            reader: BufReader::with_capacity(buffer_capacity * 2, file), // Double buffer
             remaining: total_size,
             chunk_size,
             buffer: vec![0u8; buffer_capacity],
@@ -270,23 +269,10 @@ impl ChunkedFileStream {
         let buffer_capacity = chunk_size as usize;
 
         Self {
-            reader: BufReader::with_capacity(buffer_capacity, file),
+            reader: BufReader::with_capacity(buffer_capacity * 2, file),
             remaining: total_size,
             chunk_size,
             buffer: vec![0u8; buffer_capacity],
-        }
-    }
-
-    /// Calculate optimal chunk size based on file size for smooth streaming
-    fn calculate_optimal_chunk_size(file_size: u64) -> u64 {
-        if file_size >= MASSIVE_FILE_THRESHOLD {
-            HUGE_CHUNK_SIZE
-        } else if file_size >= HUGE_FILE_THRESHOLD {
-            LARGE_CHUNK_SIZE
-        } else if file_size >= LARGE_FILE_THRESHOLD {
-            MEDIUM_CHUNK_SIZE
-        } else {
-            SMALL_CHUNK_SIZE
         }
     }
 }
@@ -355,36 +341,30 @@ pub async fn stream_media(
         "avi" => "video/x-msvideo".to_string(),
         "mov" => "video/quicktime".to_string(),
         "m2ts" | "ts" => "video/mp2t".to_string(),
+        "mp4" | "m4v" => "video/mp4".to_string(),
         _ => content_type.clone(),
     };
 
-    let max_range_chunk = if file_size >= MASSIVE_FILE_THRESHOLD {
-        HUGE_FILE_MAX_RANGE
-    } else if file_size >= HUGE_FILE_THRESHOLD {
+    // Determine max range based on file size
+    let max_range = if file_size >= HUGE_FILE_THRESHOLD {
         LARGE_FILE_MAX_RANGE
-    } else if file_size >= LARGE_FILE_THRESHOLD {
-        DEFAULT_MAX_RANGE_CHUNK
     } else {
-        DEFAULT_MAX_RANGE_CHUNK / 2
+        DEFAULT_MAX_RANGE
     };
 
-    let stream_chunk_size = ChunkedFileStream::calculate_optimal_chunk_size(file_size);
     if let Some(range) = range_header {
-        let (start, mut end) = parse_range(range, file_size)?;
-        let effective_max = if start == 0 {
-            if file_size >= MASSIVE_FILE_THRESHOLD {
-                MEDIUM_CHUNK_SIZE
-            } else {
-                SMALL_CHUNK_SIZE
-            }
+        let (start, requested_end) = parse_range(range, file_size)?;
+        
+        // Calculate end position - respect client's request but cap at max_range
+        let mut end = if requested_end == file_size - 1 {
+            // Client requested to end of file, give them a reasonable chunk
+            std::cmp::min(start + max_range - 1, file_size - 1)
         } else {
-            max_range_chunk
+            // Client specified an end, respect it but cap
+            std::cmp::min(requested_end, start + max_range - 1)
         };
-
-        if end - start + 1 > effective_max && start != 0 {
-            end = start + effective_max - 1;
-        }
-
+        
+        // Ensure end doesn't exceed file size
         if end >= file_size {
             end = file_size - 1;
         }
@@ -395,13 +375,14 @@ pub async fn stream_media(
         file.seek(SeekFrom::Start(start))
             .map_err(|_| AppError::InternalError)?;
 
-        let adaptive_chunk_size = if content_length > LARGE_CHUNK_SIZE {
-            stream_chunk_size
+        // Use appropriate chunk size based on request type
+        let chunk_size = if start == 0 {
+            INITIAL_CHUNK_SIZE // Smaller chunks for initial load (faster start)
         } else {
-            std::cmp::min(stream_chunk_size, content_length)
+            SEEK_CHUNK_SIZE // Larger chunks for seek operations
         };
 
-        let stream = ChunkedFileStream::with_chunk_size(file, content_length, adaptive_chunk_size);
+        let stream = ChunkedFileStream::with_chunk_size(file, content_length, chunk_size);
 
         let mut response = HttpResponse::PartialContent();
         response.insert_header(("Content-Type", effective_content_type.clone()));
@@ -412,48 +393,42 @@ pub async fn stream_media(
         ));
         response.insert_header(("Accept-Ranges", "bytes"));
 
-        // Optimized caching headers for streaming
-        response.insert_header(("Cache-Control", "private, max-age=3600"));
+        // Caching headers - allow caching for better performance
+        response.insert_header(("Cache-Control", "private, max-age=86400"));
 
         // CORS headers for cross-origin requests
         response.insert_header(("Access-Control-Allow-Origin", "*"));
         response.insert_header(("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS"));
         response.insert_header((
             "Access-Control-Allow-Headers",
-            "Range, Accept-Ranges, Content-Range",
+            "Range, Accept-Ranges, Content-Range, Authorization",
         ));
         response.insert_header((
             "Access-Control-Expose-Headers",
-            "Content-Range, Accept-Ranges, Content-Length, Content-Duration, X-Audio-Codec, X-Has-Audio, X-Audio-Tracks",
+            "Content-Range, Accept-Ranges, Content-Length, Content-Duration, X-Audio-Codec, X-Has-Audio, X-Audio-Tracks, X-Video-Codec",
         ));
 
-        // For container formats with complex audio (MKV, AVI, etc.)
-        if is_container_format {
-            response.insert_header(("X-Content-Type-Options", "nosniff"));
-            // Hint for duration if available
-            if let Some(duration) = media_details.duration {
-                response.insert_header(("Content-Duration", duration.to_string()));
-            }
-            // Audio info headers for client-side handling
-            response.insert_header(("X-Has-Audio", media_details.has_audio.to_string()));
-            response.insert_header(("X-Audio-Tracks", media_details.audio_tracks.len().to_string()));
+        // Add media info headers
+        if let Some(duration) = media_details.duration {
+            response.insert_header(("Content-Duration", duration.to_string()));
         }
+        if let Some(ref video_codec) = media_details.video_codec {
+            response.insert_header(("X-Video-Codec", video_codec.clone()));
+        }
+        if let Some(ref audio_codec) = media_details.audio_codec {
+            response.insert_header(("X-Audio-Codec", audio_codec.clone()));
+        }
+        response.insert_header(("X-Has-Audio", media_details.has_audio.to_string()));
 
-        if is_mkv {
-            if let Some(ref codec) = media_details.audio_codec {
-                response.insert_header(("X-Audio-Codec", codec.clone()));
-            }
-            // Add audio track info for MKV files
-            if !media_details.audio_tracks.is_empty() {
-                let audio_info: Vec<String> = media_details.audio_tracks.iter()
-                    .map(|t| format!("{}:{}:{}:{}", t.index, t.codec, t.channels, t.sample_rate))
-                    .collect();
-                response.insert_header(("X-Audio-Info", audio_info.join(",")));
-            }
+        // For container formats with complex audio (MKV, AVI, etc.)
+        if is_container_format || is_mkv {
+            response.insert_header(("X-Content-Type-Options", "nosniff"));
+            response.insert_header(("X-Audio-Tracks", media_details.audio_tracks.len().to_string()));
         }
 
         Ok(response.streaming(stream))
     } else {
+        // No range header - return full file (not recommended for large files)
         let file = File::open(&file_path).map_err(|_| AppError::InternalError)?;
         let stream = ChunkedFileStream::new(file, file_size);
 
@@ -461,11 +436,11 @@ pub async fn stream_media(
         response.insert_header(("Content-Type", effective_content_type));
         response.insert_header(("Content-Length", file_size.to_string()));
         response.insert_header(("Accept-Ranges", "bytes"));
-        response.insert_header(("Cache-Control", "private, max-age=3600"));
+        response.insert_header(("Cache-Control", "private, max-age=86400"));
         response.insert_header(("Access-Control-Allow-Origin", "*"));
         response.insert_header((
             "Access-Control-Expose-Headers",
-            "Content-Range, Accept-Ranges, Content-Length, Content-Duration, X-Audio-Codec, X-Has-Audio",
+            "Content-Range, Accept-Ranges, Content-Length, Content-Duration, X-Audio-Codec, X-Has-Audio, X-Video-Codec",
         ));
 
         // Add duration hint for full file requests
@@ -473,13 +448,14 @@ pub async fn stream_media(
             response.insert_header(("Content-Duration", duration.to_string()));
         }
         
-        // Audio info for container formats
-        if is_container_format || is_mkv {
-            response.insert_header(("X-Has-Audio", media_details.has_audio.to_string()));
-            if let Some(ref codec) = media_details.audio_codec {
-                response.insert_header(("X-Audio-Codec", codec.clone()));
-            }
+        // Media info headers
+        if let Some(ref video_codec) = media_details.video_codec {
+            response.insert_header(("X-Video-Codec", video_codec.clone()));
         }
+        if let Some(ref audio_codec) = media_details.audio_codec {
+            response.insert_header(("X-Audio-Codec", audio_codec.clone()));
+        }
+        response.insert_header(("X-Has-Audio", media_details.has_audio.to_string()));
 
         Ok(response.streaming(stream))
     }
@@ -658,23 +634,35 @@ fn parse_range(range: &str, file_size: u64) -> Result<(u64, u64), AppError> {
     }
 
     let start: u64 = if parts[0].is_empty() {
-        0
+        // Suffix range like "-500" means last 500 bytes
+        let suffix_len: u64 = parts[1]
+            .parse()
+            .map_err(|_| AppError::BadRequest("Invalid range suffix".to_string()))?;
+        file_size.saturating_sub(suffix_len)
     } else {
         parts[0]
             .parse()
             .map_err(|_| AppError::BadRequest("Invalid range start".to_string()))?
     };
 
-    let optimal_chunk = ChunkedFileStream::calculate_optimal_chunk_size(file_size);
-    let end: u64 = if parts[1].is_empty() {
-        std::cmp::min(start + optimal_chunk - 1, file_size - 1)
+    let end: u64 = if parts[1].is_empty() || parts[0].is_empty() {
+        // Open-ended range like "500-" means from 500 to end
+        file_size - 1
     } else {
         parts[1]
             .parse()
             .map_err(|_| AppError::BadRequest("Invalid range end".to_string()))?
     };
 
-    if start >= file_size || end >= file_size || start > end {
+    // Validate range
+    if start >= file_size {
+        return Err(AppError::RangeNotSatisfiable(file_size));
+    }
+
+    // Clamp end to file size
+    let end = std::cmp::min(end, file_size - 1);
+
+    if start > end {
         return Err(AppError::RangeNotSatisfiable(file_size));
     }
 

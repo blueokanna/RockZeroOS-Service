@@ -327,6 +327,11 @@ async fn main() -> std::io::Result<()> {
                     .route("/mount", web::post().to(handlers::disk_manager::mount_disk))
                     .route("/unmount", web::post().to(handlers::disk_manager::unmount_disk))
                     .route("/format", web::post().to(handlers::disk_manager::format_disk))
+                    .route("/initialize", web::post().to(handlers::disk_manager::initialize_disk))
+                    .route("/rename", web::post().to(handlers::disk_manager::rename_disk))
+                    .route("/scan", web::post().to(handlers::disk_manager::scan_disks))
+                    .route("/zfs", web::get().to(handlers::disk_manager::get_zfs_status))
+                    .route("/details/{device:.*}", web::get().to(handlers::disk_manager::get_disk_details))
                     .route("/eject/{device:.*}", web::post().to(handlers::disk_manager::eject_disk))
                     .route("/health/{device:.*}", web::get().to(handlers::disk_manager::check_disk_health)),
             )
@@ -631,6 +636,11 @@ async fn main() -> std::io::Result<()> {
                     .route("/mount", web::post().to(handlers::disk_manager::mount_disk))
                     .route("/unmount", web::post().to(handlers::disk_manager::unmount_disk))
                     .route("/format", web::post().to(handlers::disk_manager::format_disk))
+                    .route("/initialize", web::post().to(handlers::disk_manager::initialize_disk))
+                    .route("/rename", web::post().to(handlers::disk_manager::rename_disk))
+                    .route("/scan", web::post().to(handlers::disk_manager::scan_disks))
+                    .route("/zfs", web::get().to(handlers::disk_manager::get_zfs_status))
+                    .route("/details/{device:.*}", web::get().to(handlers::disk_manager::get_disk_details))
                     .route("/eject/{device:.*}", web::post().to(handlers::disk_manager::eject_disk))
                     .route("/health/{device:.*}", web::get().to(handlers::disk_manager::check_disk_health)),
             )

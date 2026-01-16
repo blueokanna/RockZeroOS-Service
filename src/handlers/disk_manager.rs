@@ -7,6 +7,12 @@ use std::process::Command;
 
 use crate::error::AppError;
 
+/// Supported file systems for formatting
+#[allow(dead_code)]
+pub const SUPPORTED_FILESYSTEMS: &[&str] = &[
+    "ext4", "ext3", "ext2", "xfs", "btrfs", "f2fs", "fat32", "exfat", "ntfs",
+];
+
 #[derive(Debug, Serialize)]
 pub struct DiskDetail {
     pub name: String,
@@ -84,6 +90,44 @@ pub struct FormatRequest {
     pub label: Option<String>,
     #[allow(dead_code)]
     pub quick: Option<bool>,
+}
+
+/// Request to initialize a new disk (create partition table and format)
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct InitializeDiskRequest {
+    pub device: String,
+    pub file_system: String,
+    pub label: Option<String>,
+    /// Partition table type: "gpt" or "msdos" (default: gpt)
+    pub partition_table: Option<String>,
+}
+
+/// Request to rename a disk label
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct RenameDiskRequest {
+    pub device: String,
+    pub new_label: String,
+}
+
+/// Request to resize a partition
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct ResizePartitionRequest {
+    pub device: String,
+    /// New size in bytes, or "max" to use all available space
+    pub new_size: String,
+}
+
+/// Disk operation result
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+pub struct DiskOperationResult {
+    pub success: bool,
+    pub message: String,
+    pub device: String,
+    pub operation: String,
 }
 
 pub async fn list_disks() -> Result<impl Responder, AppError> {
@@ -626,4 +670,385 @@ pub async fn get_supported_filesystems() -> Result<impl Responder, AppError> {
     ];
 
     Ok(HttpResponse::Ok().json(filesystems))
+}
+
+
+/// Initialize a new disk - create partition table and format
+/// This is for new/unpartitioned disks
+pub async fn initialize_disk(
+    body: web::Json<InitializeDiskRequest>,
+    req: actix_web::HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    // 验证FIDO2认证 - 初始化磁盘是危险操作
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+    
+    #[cfg(target_os = "linux")]
+    {
+        let device = &body.device;
+        let partition_table = body.partition_table.as_deref().unwrap_or("gpt");
+        
+        // Validate file system
+        let fs_lower = body.file_system.to_lowercase();
+        if !SUPPORTED_FILESYSTEMS.contains(&fs_lower.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "Unsupported file system: {}. Supported: {:?}",
+                body.file_system, SUPPORTED_FILESYSTEMS
+            )));
+        }
+        
+        // Step 1: Create partition table using parted
+        let parted_output = Command::new("parted")
+            .args(["-s", device, "mklabel", partition_table])
+            .output()
+            .map_err(|e| AppError::BadRequest(format!("Failed to run parted: {}", e)))?;
+        
+        if !parted_output.status.success() {
+            let error = String::from_utf8_lossy(&parted_output.stderr);
+            return Err(AppError::BadRequest(format!("Failed to create partition table: {}", error)));
+        }
+        
+        // Step 2: Create a single partition using all space
+        let parted_mkpart = Command::new("parted")
+            .args(["-s", device, "mkpart", "primary", "0%", "100%"])
+            .output()
+            .map_err(|e| AppError::BadRequest(format!("Failed to create partition: {}", e)))?;
+        
+        if !parted_mkpart.status.success() {
+            let error = String::from_utf8_lossy(&parted_mkpart.stderr);
+            return Err(AppError::BadRequest(format!("Failed to create partition: {}", error)));
+        }
+        
+        // Wait for kernel to recognize the new partition
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        
+        // Determine partition device name
+        let partition_device = if device.contains("nvme") || device.contains("mmcblk") {
+            format!("{}p1", device)
+        } else {
+            format!("{}1", device)
+        };
+        
+        // Step 3: Format the partition
+        let mkfs_cmd = match fs_lower.as_str() {
+            "ext4" => "mkfs.ext4",
+            "ext3" => "mkfs.ext3",
+            "ext2" => "mkfs.ext2",
+            "xfs" => "mkfs.xfs",
+            "btrfs" => "mkfs.btrfs",
+            "f2fs" => "mkfs.f2fs",
+            "fat32" | "vfat" => "mkfs.vfat",
+            "exfat" => "mkfs.exfat",
+            "ntfs" => "mkfs.ntfs",
+            _ => return Err(AppError::BadRequest(format!("Unsupported file system: {}", body.file_system))),
+        };
+        
+        let mut format_cmd = Command::new(mkfs_cmd);
+        
+        // Add label if provided
+        if let Some(label) = &body.label {
+            match fs_lower.as_str() {
+                "ext4" | "ext3" | "ext2" | "xfs" | "btrfs" | "ntfs" => {
+                    format_cmd.arg("-L").arg(label);
+                }
+                "fat32" | "vfat" | "exfat" => {
+                    format_cmd.arg("-n").arg(label);
+                }
+                "f2fs" => {
+                    format_cmd.arg("-l").arg(label);
+                }
+                _ => {}
+            }
+        }
+        
+        // Add force flag for certain filesystems
+        match fs_lower.as_str() {
+            "ext4" | "ext3" | "ext2" => { format_cmd.arg("-F"); }
+            "xfs" | "btrfs" => { format_cmd.arg("-f"); }
+            "ntfs" => { format_cmd.arg("-Q"); } // Quick format
+            _ => {}
+        }
+        
+        format_cmd.arg(&partition_device);
+        
+        let format_output = format_cmd.output()
+            .map_err(|e| AppError::BadRequest(format!("Failed to format: {}", e)))?;
+        
+        if !format_output.status.success() {
+            let error = String::from_utf8_lossy(&format_output.stderr);
+            return Err(AppError::BadRequest(format!("Format failed: {}", error)));
+        }
+        
+        return Ok(HttpResponse::Ok().json(DiskOperationResult {
+            success: true,
+            message: format!("Disk initialized successfully with {} filesystem", body.file_system),
+            device: partition_device,
+            operation: "initialize".to_string(),
+        }));
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &body;
+        Err(AppError::BadRequest("Initialize disk operation not supported on this platform".to_string()))
+    }
+}
+
+/// Rename disk label
+pub async fn rename_disk(
+    body: web::Json<RenameDiskRequest>,
+    req: actix_web::HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    // 验证FIDO2认证
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+    
+    #[cfg(target_os = "linux")]
+    {
+        let device = &body.device;
+        let new_label = &body.new_label;
+        
+        // First, detect the filesystem type
+        let blkid_output = Command::new("blkid")
+            .args(["-s", "TYPE", "-o", "value", device])
+            .output()
+            .map_err(|_| AppError::InternalError)?;
+        
+        if !blkid_output.status.success() {
+            return Err(AppError::BadRequest("Failed to detect filesystem type".to_string()));
+        }
+        
+        let fs_type = String::from_utf8_lossy(&blkid_output.stdout).trim().to_lowercase();
+        
+        // Use appropriate tool to change label based on filesystem
+        let result = match fs_type.as_str() {
+            "ext4" | "ext3" | "ext2" => {
+                Command::new("e2label")
+                    .args([device, new_label])
+                    .output()
+            }
+            "xfs" => {
+                Command::new("xfs_admin")
+                    .args(["-L", new_label, device])
+                    .output()
+            }
+            "btrfs" => {
+                Command::new("btrfs")
+                    .args(["filesystem", "label", device, new_label])
+                    .output()
+            }
+            "vfat" | "fat32" | "fat16" => {
+                Command::new("fatlabel")
+                    .args([device, new_label])
+                    .output()
+            }
+            "exfat" => {
+                Command::new("exfatlabel")
+                    .args([device, new_label])
+                    .output()
+            }
+            "ntfs" => {
+                Command::new("ntfslabel")
+                    .args([device, new_label])
+                    .output()
+            }
+            "f2fs" => {
+                // f2fs doesn't have a direct label change tool, need to use tune.f2fs
+                return Err(AppError::BadRequest("F2FS label change not supported".to_string()));
+            }
+            _ => {
+                return Err(AppError::BadRequest(format!("Unsupported filesystem for label change: {}", fs_type)));
+            }
+        };
+        
+        match result {
+            Ok(output) if output.status.success() => {
+                Ok(HttpResponse::Ok().json(DiskOperationResult {
+                    success: true,
+                    message: format!("Disk label changed to '{}'", new_label),
+                    device: device.clone(),
+                    operation: "rename".to_string(),
+                }))
+            }
+            Ok(output) => {
+                let error = String::from_utf8_lossy(&output.stderr);
+                Err(AppError::BadRequest(format!("Failed to change label: {}", error)))
+            }
+            Err(e) => {
+                Err(AppError::BadRequest(format!("Failed to run label command: {}", e)))
+            }
+        }
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &body;
+        Err(AppError::BadRequest("Rename disk operation not supported on this platform".to_string()))
+    }
+}
+
+/// Get detailed disk information including SMART data
+pub async fn get_disk_details(device: web::Path<String>) -> Result<HttpResponse, AppError> {
+    let device_path = if device.starts_with("/dev/") {
+        device.to_string()
+    } else {
+        format!("/dev/{}", device.as_str())
+    };
+    
+    #[cfg(target_os = "linux")]
+    {
+        // Get basic info from lsblk
+        let lsblk_output = Command::new("lsblk")
+            .args(["-J", "-o", "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,UUID,MODEL,SERIAL,RM,RO,TRAN", &device_path])
+            .output();
+        
+        let mut details = serde_json::json!({
+            "device": device_path,
+        });
+        
+        if let Ok(output) = lsblk_output {
+            if output.status.success() {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                    details["lsblk"] = json;
+                }
+            }
+        }
+        
+        // Get SMART info
+        let smart_output = Command::new("smartctl")
+            .args(["-i", "-H", &device_path])
+            .output();
+        
+        if let Ok(output) = smart_output {
+            if output.status.success() || output.status.code() == Some(4) {
+                let smart_text = String::from_utf8_lossy(&output.stdout);
+                details["smart_info"] = serde_json::json!({
+                    "available": true,
+                    "raw_output": smart_text.to_string(),
+                });
+            } else {
+                details["smart_info"] = serde_json::json!({
+                    "available": false,
+                    "reason": "SMART not supported or smartctl not installed",
+                });
+            }
+        }
+        
+        // Get filesystem usage if mounted
+        let df_output = Command::new("df")
+            .args(["-B1", &device_path])
+            .output();
+        
+        if let Ok(output) = df_output {
+            if output.status.success() {
+                let df_text = String::from_utf8_lossy(&output.stdout);
+                let lines: Vec<&str> = df_text.lines().collect();
+                if lines.len() >= 2 {
+                    let parts: Vec<&str> = lines[1].split_whitespace().collect();
+                    if parts.len() >= 6 {
+                        details["usage"] = serde_json::json!({
+                            "total": parts[1].parse::<u64>().unwrap_or(0),
+                            "used": parts[2].parse::<u64>().unwrap_or(0),
+                            "available": parts[3].parse::<u64>().unwrap_or(0),
+                            "use_percent": parts[4].trim_end_matches('%'),
+                            "mount_point": parts[5],
+                        });
+                    }
+                }
+            }
+        }
+        
+        return Ok(HttpResponse::Ok().json(details));
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "device": device_path,
+            "error": "Detailed disk info not available on this platform",
+        })))
+    }
+}
+
+/// Scan for new disks (useful after hot-plugging)
+pub async fn scan_disks() -> Result<HttpResponse, AppError> {
+    #[cfg(target_os = "linux")]
+    {
+        // Trigger kernel to rescan for new devices
+        let _ = Command::new("partprobe").output();
+        
+        // Also try udevadm trigger
+        let _ = Command::new("udevadm")
+            .args(["trigger", "--subsystem-match=block"])
+            .output();
+        
+        // Wait a moment for devices to be recognized
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        
+        // Return updated disk list
+        return list_disks().await;
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(AppError::BadRequest("Disk scan not supported on this platform".to_string()))
+    }
+}
+
+/// Check if ZFS is available and list ZFS pools
+pub async fn get_zfs_status() -> Result<HttpResponse, AppError> {
+    #[cfg(target_os = "linux")]
+    {
+        // Check if ZFS is available
+        let zfs_check = Command::new("which")
+            .arg("zpool")
+            .output();
+        
+        let zfs_available = zfs_check.map(|o| o.status.success()).unwrap_or(false);
+        
+        if !zfs_available {
+            return Ok(HttpResponse::Ok().json(serde_json::json!({
+                "available": false,
+                "message": "ZFS is not installed. Install zfsutils-linux to use ZFS.",
+                "pools": [],
+            })));
+        }
+        
+        // List ZFS pools
+        let zpool_output = Command::new("zpool")
+            .args(["list", "-H", "-o", "name,size,alloc,free,health"])
+            .output();
+        
+        let mut pools = Vec::new();
+        
+        if let Ok(output) = zpool_output {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines() {
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() >= 5 {
+                        pools.push(serde_json::json!({
+                            "name": parts[0],
+                            "size": parts[1],
+                            "allocated": parts[2],
+                            "free": parts[3],
+                            "health": parts[4],
+                        }));
+                    }
+                }
+            }
+        }
+        
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "available": true,
+            "pools": pools,
+        })));
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "available": false,
+            "message": "ZFS is not supported on this platform",
+            "pools": [],
+        })))
+    }
 }
