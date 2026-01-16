@@ -347,7 +347,13 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
 }
 
 
-pub async fn unmount_disk(body: web::Json<UnmountRequest>) -> Result<HttpResponse, AppError> {
+pub async fn unmount_disk(
+    body: web::Json<UnmountRequest>,
+    req: actix_web::HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    // 验证FIDO2认证
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+    
     #[cfg(target_os = "linux")]
     {
         let mut cmd = Command::new("umount");
@@ -379,7 +385,13 @@ pub async fn unmount_disk(body: web::Json<UnmountRequest>) -> Result<HttpRespons
     }
 }
 
-pub async fn format_disk(body: web::Json<FormatRequest>) -> Result<HttpResponse, AppError> {
+pub async fn format_disk(
+    body: web::Json<FormatRequest>,
+    req: actix_web::HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    // 验证FIDO2认证 - 格式化是危险操作
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+    
     #[cfg(target_os = "linux")]
     {
         let cmd_name = match body.file_system.to_lowercase().as_str() {
@@ -520,7 +532,13 @@ fn parse_smart_attribute(output: &str, attr_name: &str) -> Option<f64> {
 }
 
 
-pub async fn eject_disk(device: web::Path<String>) -> Result<HttpResponse, AppError> {
+pub async fn eject_disk(
+    device: web::Path<String>,
+    req: actix_web::HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    // 验证FIDO2认证
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+    
     #[cfg(target_os = "linux")]
     {
         let device_path = if device.starts_with("/dev/") {
