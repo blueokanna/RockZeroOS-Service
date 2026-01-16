@@ -216,6 +216,9 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
                 continue;
             }
             
+            // Detect disk type (SSD/HDD/NVMe)
+            let disk_type = detect_disk_type(device_name);
+            
             // Check if this is a raw disk without partitions
             let has_children = device.get("children").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
             let fs_type = device.get("fstype").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -249,7 +252,7 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
                     used_space: 0,
                     usage_percentage: 0.0,
                     is_removable,
-                    disk_type: "HDD".to_string(),
+                    disk_type: disk_type.clone(),
                     is_mounted: false,
                     read_only,
                     label,
@@ -281,6 +284,9 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
 
                         let size_str = child.get("size").and_then(|v| v.as_str()).unwrap_or("0");
                         let total_space = parse_size_string(size_str);
+                        
+                        // 使用父设备的类型
+                        let partition_disk_type = format!("{} 分区", disk_type);
 
                         disks.push(DiskDetail {
                             name: name.clone(),
@@ -292,7 +298,7 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
                             used_space: 0,
                             usage_percentage: 0.0,
                             is_removable,
-                            disk_type: "Partition".to_string(),
+                            disk_type: partition_disk_type,
                             is_mounted: false,
                             read_only,
                             label,
@@ -413,13 +419,74 @@ pub async fn get_disk_io_stats() -> Result<impl Responder, AppError> {
 pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, AppError> {
     #[cfg(target_os = "linux")]
     {
+        let device = &body.device;
+        
+        // 检查设备是否存在
+        if !std::path::Path::new(device).exists() {
+            return Err(AppError::BadRequest(format!("Device {} does not exist", device)));
+        }
+        
+        // 检查是否是整盘设备（没有分区号）
+        let device_name = device.split('/').last().unwrap_or("");
+        let is_whole_disk = is_whole_disk_device(device_name);
+        
+        // 如果是整盘设备，尝试找到第一个分区
+        let actual_device = if is_whole_disk {
+            // 检查是否有分区
+            let partition1 = if device.contains("nvme") || device.contains("mmcblk") {
+                format!("{}p1", device)
+            } else {
+                format!("{}1", device)
+            };
+            
+            if std::path::Path::new(&partition1).exists() {
+                partition1
+            } else {
+                // 没有分区，检查整盘是否有文件系统
+                let blkid_output = Command::new("blkid")
+                    .args(["-s", "TYPE", "-o", "value", device])
+                    .output();
+                
+                if let Ok(output) = blkid_output {
+                    if output.status.success() {
+                        let fs_type = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if !fs_type.is_empty() {
+                            // 整盘有文件系统，可以直接挂载
+                            device.clone()
+                        } else {
+                            return Err(AppError::BadRequest(format!(
+                                "Device {} has no partitions and no filesystem. Please initialize the disk first.",
+                                device
+                            )));
+                        }
+                    } else {
+                        return Err(AppError::BadRequest(format!(
+                            "Device {} has no partitions. Please initialize the disk first.",
+                            device
+                        )));
+                    }
+                } else {
+                    return Err(AppError::BadRequest(format!(
+                        "Cannot detect filesystem on {}. Please initialize the disk first.",
+                        device
+                    )));
+                }
+            }
+        } else {
+            device.clone()
+        };
+        
+        // 创建挂载点目录
         std::fs::create_dir_all(&body.mount_point)
-            .map_err(|_| AppError::BadRequest("Failed to create mount point".to_string()))?;
+            .map_err(|e| AppError::BadRequest(format!("Failed to create mount point: {}", e)))?;
 
         let mut cmd = Command::new("mount");
 
+        // 如果指定了文件系统类型且不是 "auto"
         if let Some(fs) = &body.file_system {
-            cmd.arg("-t").arg(fs);
+            if fs != "auto" && !fs.is_empty() {
+                cmd.arg("-t").arg(fs);
+            }
         }
 
         if let Some(options) = &body.options {
@@ -428,15 +495,15 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
             }
         }
 
-        cmd.arg(&body.device).arg(&body.mount_point);
+        cmd.arg(&actual_device).arg(&body.mount_point);
 
-        let output = cmd.output().map_err(|_| AppError::InternalError)?;
+        let output = cmd.output().map_err(|e| AppError::BadRequest(format!("Failed to execute mount: {}", e)))?;
 
         if output.status.success() {
             return Ok(HttpResponse::Ok().json(serde_json::json!({
                 "success": true,
                 "message": "Disk mounted successfully",
-                "device": body.device,
+                "device": actual_device,
                 "mount_point": body.mount_point,
             })));
         } else {
@@ -450,6 +517,63 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
         let _ = &body;
         Err(AppError::BadRequest("Mount operation not supported on this platform".to_string()))
     }
+}
+
+/// 检查是否是整盘设备（而不是分区）
+#[cfg(target_os = "linux")]
+fn is_whole_disk_device(device_name: &str) -> bool {
+    // sd[a-z] 是整盘，sd[a-z][0-9]+ 是分区
+    if device_name.starts_with("sd") && device_name.len() == 3 {
+        return device_name.chars().nth(2).map(|c| c.is_alphabetic()).unwrap_or(false);
+    }
+    // vd[a-z] 是整盘
+    if device_name.starts_with("vd") && device_name.len() == 3 {
+        return device_name.chars().nth(2).map(|c| c.is_alphabetic()).unwrap_or(false);
+    }
+    // hd[a-z] 是整盘
+    if device_name.starts_with("hd") && device_name.len() == 3 {
+        return device_name.chars().nth(2).map(|c| c.is_alphabetic()).unwrap_or(false);
+    }
+    // nvme0n1 是整盘，nvme0n1p1 是分区
+    if device_name.starts_with("nvme") {
+        return !device_name.contains('p') || device_name.ends_with("n1") || device_name.ends_with("n2");
+    }
+    // mmcblk0 是整盘，mmcblk0p1 是分区
+    if device_name.starts_with("mmcblk") {
+        return !device_name.contains('p');
+    }
+    false
+}
+
+/// 检测磁盘类型 (SSD/HDD/NVMe)
+#[cfg(target_os = "linux")]
+fn detect_disk_type(device_name: &str) -> String {
+    // NVMe 设备
+    if device_name.starts_with("nvme") {
+        return "NVMe SSD".to_string();
+    }
+    
+    // 尝试读取 rotational 属性来判断是 SSD 还是 HDD
+    // 0 = SSD, 1 = HDD
+    let base_device = if device_name.chars().last().map(|c| c.is_numeric()).unwrap_or(false) {
+        // 这是分区，获取基础设备名
+        device_name.trim_end_matches(|c: char| c.is_numeric())
+    } else {
+        device_name
+    };
+    
+    let rotational_path = format!("/sys/block/{}/queue/rotational", base_device);
+    if let Ok(content) = std::fs::read_to_string(&rotational_path) {
+        let rotational = content.trim();
+        if rotational == "0" {
+            return "SSD".to_string();
+        } else if rotational == "1" {
+            return "HDD".to_string();
+        }
+    }
+    
+    // 默认返回 HDD
+    "HDD".to_string()
 }
 
 
