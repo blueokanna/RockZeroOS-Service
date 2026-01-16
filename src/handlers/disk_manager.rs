@@ -130,7 +130,7 @@ pub struct DiskOperationResult {
     pub operation: String,
 }
 
-pub async fn list_disks() -> Result<impl Responder, AppError> {
+pub async fn list_disks() -> Result<HttpResponse, AppError> {
     let disks_info = Disks::new_with_refreshed_list();
     let mut disks = Vec::new();
 
