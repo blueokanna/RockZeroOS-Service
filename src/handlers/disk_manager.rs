@@ -202,11 +202,69 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
 
     if let Some(blockdevices) = parsed.get("blockdevices").and_then(|v| v.as_array()) {
         for device in blockdevices {
+            let device_type = device.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            
+            // Skip non-disk devices (like loop, rom, etc.)
+            if device_type != "disk" {
+                continue;
+            }
+            
+            let device_name = device.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            
+            // Skip system disks (mmcblk0, mmcblk1 are typically eMMC/SD boot devices)
+            if device_name.starts_with("mmcblk") || device_name.starts_with("loop") {
+                continue;
+            }
+            
+            // Check if this is a raw disk without partitions
+            let has_children = device.get("children").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+            let fs_type = device.get("fstype").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let mount_point = device.get("mountpoint").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            
+            // If disk has no partitions and no filesystem, it's a raw unpartitioned disk
+            if !has_children && fs_type.is_empty() && mount_point.is_empty() {
+                let name = device_name.to_string();
+                let device_path = format!("/dev/{}", name);
+                let label = device.get("label").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let uuid = device.get("uuid").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let model = device.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let serial = device.get("serial").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let is_removable = device.get("rm").and_then(|v| v.as_bool())
+                    .or_else(|| device.get("rm").and_then(|v| v.as_str()).map(|s| s == "1" || s == "true"))
+                    .unwrap_or(false);
+                let read_only = device.get("ro").and_then(|v| v.as_bool())
+                    .or_else(|| device.get("ro").and_then(|v| v.as_str()).map(|s| s == "1" || s == "true"))
+                    .unwrap_or(false);
+
+                let size_str = device.get("size").and_then(|v| v.as_str()).unwrap_or("0");
+                let total_space = parse_size_string(size_str);
+
+                disks.push(DiskDetail {
+                    name: name.clone(),
+                    device_path,
+                    mount_point: String::new(),
+                    file_system: String::new(), // Empty means unpartitioned/unformatted
+                    total_space,
+                    available_space: total_space,
+                    used_space: 0,
+                    usage_percentage: 0.0,
+                    is_removable,
+                    disk_type: "HDD".to_string(),
+                    is_mounted: false,
+                    read_only,
+                    label,
+                    uuid,
+                    serial,
+                    model,
+                });
+            }
+            
+            // Also check partitions (children) that are unmounted
             if let Some(children) = device.get("children").and_then(|v| v.as_array()) {
                 for child in children {
-                    let mount_point = child.get("mountpoint").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let child_mount = child.get("mountpoint").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-                    if mount_point.is_empty() {
+                    if child_mount.is_empty() {
                         let name = child.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let device_path = format!("/dev/{}", name);
                         let fs_type = child.get("fstype").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -214,8 +272,12 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
                         let uuid = child.get("uuid").and_then(|v| v.as_str()).map(|s| s.to_string());
                         let model = child.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
                         let serial = child.get("serial").and_then(|v| v.as_str()).map(|s| s.to_string());
-                        let is_removable = child.get("rm").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let read_only = child.get("ro").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let is_removable = child.get("rm").and_then(|v| v.as_bool())
+                            .or_else(|| child.get("rm").and_then(|v| v.as_str()).map(|s| s == "1" || s == "true"))
+                            .unwrap_or(false);
+                        let read_only = child.get("ro").and_then(|v| v.as_bool())
+                            .or_else(|| child.get("ro").and_then(|v| v.as_str()).map(|s| s == "1" || s == "true"))
+                            .unwrap_or(false);
 
                         let size_str = child.get("size").and_then(|v| v.as_str()).unwrap_or("0");
                         let total_space = parse_size_string(size_str);
@@ -230,7 +292,7 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
                             used_space: 0,
                             usage_percentage: 0.0,
                             is_removable,
-                            disk_type: "Unknown".to_string(),
+                            disk_type: "Partition".to_string(),
                             is_mounted: false,
                             read_only,
                             label,
@@ -687,6 +749,16 @@ pub async fn initialize_disk(
         let device = &body.device;
         let partition_table = body.partition_table.as_deref().unwrap_or("gpt");
         
+        // Validate device path
+        if !device.starts_with("/dev/") {
+            return Err(AppError::BadRequest("Invalid device path".to_string()));
+        }
+        
+        // Safety check: don't allow initializing system disks
+        if device.contains("mmcblk0") || device.contains("mmcblk1") {
+            return Err(AppError::BadRequest("Cannot initialize system disk".to_string()));
+        }
+        
         // Validate file system
         let fs_lower = body.file_system.to_lowercase();
         if !SUPPORTED_FILESYSTEMS.contains(&fs_lower.as_str()) {
@@ -695,6 +767,11 @@ pub async fn initialize_disk(
                 body.file_system, SUPPORTED_FILESYSTEMS
             )));
         }
+        
+        // Step 0: Wipe any existing partition table signatures
+        let _ = Command::new("wipefs")
+            .args(["-a", device])
+            .output();
         
         // Step 1: Create partition table using parted
         let parted_output = Command::new("parted")
@@ -709,7 +786,7 @@ pub async fn initialize_disk(
         
         // Step 2: Create a single partition using all space
         let parted_mkpart = Command::new("parted")
-            .args(["-s", device, "mkpart", "primary", "0%", "100%"])
+            .args(["-s", device, "mkpart", "primary", "1MiB", "100%"])
             .output()
             .map_err(|e| AppError::BadRequest(format!("Failed to create partition: {}", e)))?;
         
@@ -718,8 +795,16 @@ pub async fn initialize_disk(
             return Err(AppError::BadRequest(format!("Failed to create partition: {}", error)));
         }
         
+        // Step 3: Notify kernel about partition table changes
+        let _ = Command::new("partprobe").arg(device).output();
+        
         // Wait for kernel to recognize the new partition
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        
+        // Also trigger udev
+        let _ = Command::new("udevadm")
+            .args(["settle", "--timeout=5"])
+            .output();
         
         // Determine partition device name
         let partition_device = if device.contains("nvme") || device.contains("mmcblk") {
@@ -728,7 +813,18 @@ pub async fn initialize_disk(
             format!("{}1", device)
         };
         
-        // Step 3: Format the partition
+        // Verify partition exists
+        if !std::path::Path::new(&partition_device).exists() {
+            // Try waiting a bit more
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            if !std::path::Path::new(&partition_device).exists() {
+                return Err(AppError::BadRequest(format!(
+                    "Partition {} was not created. Please try again.", partition_device
+                )));
+            }
+        }
+        
+        // Step 4: Format the partition
         let mkfs_cmd = match fs_lower.as_str() {
             "ext4" => "mkfs.ext4",
             "ext3" => "mkfs.ext3",
