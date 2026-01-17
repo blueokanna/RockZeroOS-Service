@@ -120,6 +120,12 @@ async fn main() -> std::io::Result<()> {
     let secure_storage = Arc::new(SecureStorageManager::new(secure_storage_path));
     info!("Secure Storage: ZKP + WPA3-SAE + CRC32 + Reed-Solomon enabled");
 
+    // 初始化 HLS 会话管理器
+    let hls_base_dir = std::path::PathBuf::from(&config.data_dir).join("hls_cache");
+    std::fs::create_dir_all(&hls_base_dir).ok();
+    let hls_manager = Arc::new(handlers::media::HlsSessionManager::new(hls_base_dir.to_str().unwrap_or("./hls_cache")));
+    info!("HLS streaming: FFmpeg real-time transcoding enabled");
+
     let pool_data = web::Data::new(pool);
     let crypto_data = web::Data::new(crypto_ctx);
     let zkp_data = web::Data::new(zkp_ctx);
@@ -129,12 +135,13 @@ async fn main() -> std::io::Result<()> {
     let fido_data = web::Data::new(fido_manager);
     let media_data = web::Data::new(media_processor);
     let config_data = web::Data::new(config.clone());
+    let hls_data = web::Data::from(hls_manager);
 
     let bind_addr = format!("{}:{}", config.host, config.port);
 
     info!("Service ready, waiting for connections...");
 
-    // 克隆数据用于第二个 HttpServer 闭包
+    // 克隆数据用于第二�?HttpServer 闭包
     let pool_data2 = pool_data.clone();
     let crypto_data2 = crypto_data.clone();
     let zkp_data2 = zkp_data.clone();
@@ -142,6 +149,7 @@ async fn main() -> std::io::Result<()> {
     let secure_storage_data2 = secure_storage_data.clone();
     let media_data2 = media_data.clone();
     let config_data2 = config_data.clone();
+    let hls_data2 = hls_data.clone();
     #[cfg(feature = "fido")]
     let fido_data2 = fido_data.clone();
 
@@ -179,7 +187,8 @@ async fn main() -> std::io::Result<()> {
             .app_data(invite_data.clone())
             .app_data(secure_storage_data.clone())
             .app_data(media_data.clone())
-            .app_data(config_data.clone());
+            .app_data(config_data.clone())
+            .app_data(hls_data.clone());
 
         #[cfg(feature = "fido")]
         let app = app.app_data(fido_data.clone());
@@ -197,7 +206,7 @@ async fn main() -> std::io::Result<()> {
                         web::post().to(handlers::auth::login_zkp_enhanced),
                     )
                     .route("/refresh", web::post().to(handlers::auth::refresh_token))
-                    // ZKP 工具 API（公开）
+                    // ZKP 工具 API（公开�?
                     .route(
                         "/zkp/proof",
                         web::post().to(handlers::auth::generate_zkp_proof),
@@ -275,7 +284,7 @@ async fn main() -> std::io::Result<()> {
                     )
                     .route("/{id}", web::delete().to(handlers::files::delete_file)),
             )
-            // 安全存储 API - 零知识加密 + CRC32 + Reed-Solomon
+            // 安全存储 API - 零知识加�?+ CRC32 + Reed-Solomon
             .service(
                 web::scope("/api/v1/secure-storage")
                     .wrap(middleware::JwtAuth)
@@ -417,7 +426,14 @@ async fn main() -> std::io::Result<()> {
                     .route(
                         "/transcode",
                         web::post().to(handlers::media::transcode_media),
-                    ),
+                    )
+                    // HLS 流式传输 - 支持所有视频格�?
+                    .route("/hls/start", web::post().to(handlers::media::start_hls_stream))
+                    .route("/hls/{session_id}/master.m3u8", web::get().to(handlers::media::get_hls_playlist))
+                    .route("/hls/{session_id}/audio-tracks", web::get().to(handlers::media::get_hls_audio_tracks))
+                    .route("/hls/{session_id}/switch-audio", web::post().to(handlers::media::switch_hls_audio_track))
+                    .route("/hls/{session_id}/{segment}", web::get().to(handlers::media::get_hls_segment))
+                    .route("/hls/{session_id}/stop", web::post().to(handlers::media::stop_hls_stream)),
             )
             .service(
                 web::scope("/api/v1/widgets")
@@ -650,7 +666,7 @@ async fn main() -> std::io::Result<()> {
                             .to(handlers::webdav::webdav_proppatch),
                     ),
             )
-            // 媒体流播放
+            // 媒体流播�?
             .service(
                 web::scope("/api/v1/streaming")
                     .wrap(middleware::JwtAuth)
@@ -798,7 +814,7 @@ async fn main() -> std::io::Result<()> {
     });
 
     // 根据系统内存动态调整worker数量，防止OOM
-    // 低内存设备（<2GB）使用2个worker，正常设备使用4个
+    // 低内存设备（<2GB）使�?个worker，正常设备使�?�?
     let worker_count = if hardware_info.total_memory < 2 * 1024 * 1024 * 1024 {
         info!(
             "Low memory detected ({} MB), using 2 workers",
@@ -822,7 +838,7 @@ async fn main() -> std::io::Result<()> {
             .into()
         });
 
-    // 重新创建server以应用配置
+    // 重新创建server以应用配�?
     let server = HttpServer::new(move || {
         let cors = Cors::default()
             .allowed_origin_fn(|origin, _req_head| {
@@ -859,7 +875,8 @@ async fn main() -> std::io::Result<()> {
             .app_data(invite_data2.clone())
             .app_data(secure_storage_data2.clone())
             .app_data(media_data2.clone())
-            .app_data(config_data2.clone());
+            .app_data(config_data2.clone())
+            .app_data(hls_data2.clone());
 
         #[cfg(feature = "fido")]
         let app = app.app_data(fido_data2.clone());
@@ -1092,7 +1109,14 @@ async fn main() -> std::io::Result<()> {
                     .route(
                         "/transcode",
                         web::post().to(handlers::media::transcode_media),
-                    ),
+                    )
+                    // HLS 流式传输 - 支持所有视频格�?
+                    .route("/hls/start", web::post().to(handlers::media::start_hls_stream))
+                    .route("/hls/{session_id}/master.m3u8", web::get().to(handlers::media::get_hls_playlist))
+                    .route("/hls/{session_id}/audio-tracks", web::get().to(handlers::media::get_hls_audio_tracks))
+                    .route("/hls/{session_id}/switch-audio", web::post().to(handlers::media::switch_hls_audio_track))
+                    .route("/hls/{session_id}/{segment}", web::get().to(handlers::media::get_hls_segment))
+                    .route("/hls/{session_id}/stop", web::post().to(handlers::media::stop_hls_stream)),
             )
             .service(
                 web::scope("/api/v1/widgets")

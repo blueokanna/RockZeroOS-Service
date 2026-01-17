@@ -767,34 +767,39 @@ pub async fn install_app(
 
     let container_name = format!("rockzero-{}-{}", body.name, &Uuid::new_v4().to_string()[..8]);
     
-    let mut docker_args = vec!["run", "-d", "--name", &container_name, "--restart", "unless-stopped"];
+    let mut docker_args: Vec<String> = vec![
+        "run".to_string(),
+        "-d".to_string(),
+        "--name".to_string(),
+        container_name.clone(),
+        "--restart".to_string(),
+        "unless-stopped".to_string(),
+    ];
 
-    let port_args: Vec<String> = body.ports.iter()
-        .map(|p| format!("-p {}:{}/{}", p.host_port, p.container_port, p.protocol))
-        .collect();
-    for arg in &port_args {
-        docker_args.push(arg);
+    // Add port mappings: -p host_port:container_port/protocol
+    for p in &body.ports {
+        docker_args.push("-p".to_string());
+        docker_args.push(format!("{}:{}/{}", p.host_port, p.container_port, p.protocol));
     }
 
-    let volume_args: Vec<String> = body.volumes.iter()
-        .map(|v| format!("-v {}:{}:{}", v.host_path, v.container_path, v.mode))
-        .collect();
-    for arg in &volume_args {
-        docker_args.push(arg);
+    // Add volume mappings: -v host_path:container_path:mode
+    for v in &body.volumes {
+        docker_args.push("-v".to_string());
+        docker_args.push(format!("{}:{}:{}", v.host_path, v.container_path, v.mode));
     }
 
-    let env_args: Vec<String> = body.environment.iter()
-        .map(|e| format!("-e {}={}", e.key, e.value))
-        .collect();
-    for arg in &env_args {
-        docker_args.push(arg);
+    // Add environment variables: -e key=value
+    for e in &body.environment {
+        docker_args.push("-e".to_string());
+        docker_args.push(format!("{}={}", e.key, e.value));
     }
 
-    docker_args.push(&full_image);
+    docker_args.push(full_image.clone());
 
-    info!("Starting container: {}", container_name);
+    info!("Starting container: {} with args: {:?}", container_name, docker_args);
+    let args_refs: Vec<&str> = docker_args.iter().map(|s| s.as_str()).collect();
     let run_output = Command::new("docker")
-        .args(&docker_args)
+        .args(&args_refs)
         .output()
         .map_err(|e| {
             error!("Failed to start container: {}", e);
