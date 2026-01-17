@@ -827,9 +827,58 @@ fn run_docker_compose(compose_dir: &str, args: &[&str]) -> Result<std::process::
 
 fn ensure_docker_available() -> Result<(), AppError> {
     if !is_docker_available() {
-        return Err(AppError::BadRequest("Docker is not available. Please install Docker first.".to_string()));
+        // 提供更详细的错误信息
+        let error_msg = check_docker_installation_status();
+        return Err(AppError::BadRequest(error_msg));
     }
     Ok(())
+}
+
+/// 检查 Docker 安装状态并返回详细错误信息
+fn check_docker_installation_status() -> String {
+    // 检查 docker 命令是否存在
+    let docker_exists = Command::new("which")
+        .arg("docker")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    
+    if !docker_exists {
+        return "Docker 未安装。请先安装 Docker: 运行 'curl -fsSL https://get.docker.com | sh' 或使用系统包管理器安装。".to_string();
+    }
+    
+    // Docker 命令存在，检查守护进程是否运行
+    let daemon_running = Command::new("docker")
+        .args(["info"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    
+    if !daemon_running {
+        // 检查是否是权限问题
+        let permission_issue = Command::new("docker")
+            .args(["info"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                if stderr.contains("permission denied") || stderr.contains("Cannot connect to the Docker daemon") {
+                    Some(true)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false);
+        
+        if permission_issue {
+            return "Docker 守护进程未运行或权限不足。请确保: 1) Docker 服务已启动 (systemctl start docker), 2) 当前用户在 docker 组中 (sudo usermod -aG docker $USER)。".to_string();
+        }
+        
+        return "Docker 守护进程未运行。请启动 Docker 服务: sudo systemctl start docker".to_string();
+    }
+    
+    // 默认错误
+    "Docker 不可用。请检查 Docker 安装和服务状态。".to_string()
 }
 
 fn get_all_containers() -> Result<Vec<Container>, AppError> {
