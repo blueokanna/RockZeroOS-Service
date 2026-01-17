@@ -636,6 +636,17 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
             .map_err(|e| AppError::BadRequest(format!("Failed to execute mount: {}", e)))?;
 
         if output.status.success() {
+            // 挂载成功后，设置挂载点权限为 755，允许所有用户读取和执行
+            let _ = Command::new("chmod")
+                .args(["755", &body.mount_point])
+                .output();
+            
+            // 尝试设置所有者为当前用户（如果有权限的话）
+            // 这样可以确保用户可以在挂载点中创建文件
+            let _ = Command::new("chown")
+                .args(["-R", "1000:1000", &body.mount_point])
+                .output();
+
             return Ok(HttpResponse::Ok().json(serde_json::json!({
                 "success": true,
                 "message": "Disk mounted successfully",
@@ -1259,6 +1270,17 @@ pub async fn initialize_disk(
         let _ = Command::new("udevadm")
             .args(["trigger", "--subsystem-match=block"])
             .output();
+        
+        // Wait for udev to settle
+        let _ = Command::new("udevadm")
+            .args(["settle", "--timeout=5"])
+            .output();
+        
+        // Force kernel to re-scan the partition
+        let _ = Command::new("partprobe").arg(device).output();
+        
+        // Additional wait to ensure filesystem is recognized
+        std::thread::sleep(std::time::Duration::from_millis(1000));
 
         return Ok(HttpResponse::Ok().json(DiskOperationResult {
             success: true,
