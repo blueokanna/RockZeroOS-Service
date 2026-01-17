@@ -574,7 +574,7 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
                         }
                     } else {
                         return Err(AppError::BadRequest(format!(
-                            "Device {} has no partitions. Please initialize the disk first.",
+                            "Device {} has no partitions and no filesystem. Please initialize the disk first.",
                             device
                         )));
                     }
@@ -586,6 +586,27 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
                 }
             }
         } else {
+            // 这是分区设备，检查是否有文件系统
+            let blkid_output = Command::new("blkid")
+                .args(["-s", "TYPE", "-o", "value", device])
+                .output();
+
+            if let Ok(output) = blkid_output {
+                if output.status.success() {
+                    let fs_type = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if fs_type.is_empty() {
+                        return Err(AppError::BadRequest(format!(
+                            "Device {} has no filesystem. Please format the partition first.",
+                            device
+                        )));
+                    }
+                } else {
+                    return Err(AppError::BadRequest(format!(
+                        "Cannot detect filesystem on {}. Please format the partition first.",
+                        device
+                    )));
+                }
+            }
             device.clone()
         };
 
