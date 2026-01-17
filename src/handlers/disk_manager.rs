@@ -881,28 +881,69 @@ pub async fn format_disk(
             }
         };
 
+        // 检查命令是否存在
+        let which_check = Command::new("which").arg(cmd_name).output();
+        if let Ok(output) = which_check {
+            if !output.status.success() {
+                return Err(AppError::BadRequest(format!(
+                    "Command '{}' not found. Please install the required package (e.g., xfsprogs for XFS)",
+                    cmd_name
+                )));
+            }
+        }
+
         let mut cmd = Command::new(cmd_name);
 
+        // 添加标签参数
         if let Some(label) = &body.label {
             if !label.is_empty() {
                 match body.file_system.to_lowercase().as_str() {
-                    "ext4" | "ext3" | "ext2" | "ntfs" | "xfs" | "btrfs" => {
+                    "ext4" | "ext3" | "ext2" => {
                         cmd.arg("-L").arg(label);
                     }
-                    "vfat" | "fat32" | "exfat" => {
+                    "xfs" => {
+                        cmd.arg("-L").arg(label);
+                    }
+                    "btrfs" => {
+                        cmd.arg("-L").arg(label);
+                    }
+                    "ntfs" => {
+                        cmd.arg("-L").arg(label);
+                    }
+                    "vfat" | "fat32" => {
                         cmd.arg("-n").arg(label);
+                    }
+                    "exfat" => {
+                        cmd.arg("-n").arg(label);
+                    }
+                    "f2fs" => {
+                        cmd.arg("-l").arg(label);
                     }
                     _ => {}
                 }
             }
         }
 
+        // 添加强制格式化参数
         match body.file_system.to_lowercase().as_str() {
             "ext4" | "ext3" | "ext2" => {
-                cmd.arg("-F");
+                cmd.arg("-F"); // Force
             }
-            "xfs" | "btrfs" => {
-                cmd.arg("-f");
+            "xfs" => {
+                cmd.arg("-f"); // Force
+            }
+            "btrfs" => {
+                cmd.arg("-f"); // Force
+            }
+            "ntfs" => {
+                cmd.arg("-Q"); // Quick format
+                cmd.arg("-F"); // Force
+            }
+            "fat32" | "vfat" => {
+                cmd.arg("-F").arg("32"); // FAT32
+            }
+            "f2fs" => {
+                cmd.arg("-f"); // Force
             }
             _ => {}
         }
@@ -910,7 +951,7 @@ pub async fn format_disk(
         cmd.arg(device);
 
         let output = cmd.output().map_err(|e| {
-            AppError::BadRequest(format!("Failed to run mkfs command: {}", e))
+            AppError::BadRequest(format!("Failed to run mkfs command '{}': {}. Make sure the package is installed.", cmd_name, e))
         })?;
 
         if output.status.success() {
@@ -1680,5 +1721,326 @@ pub async fn get_zfs_status() -> Result<HttpResponse, AppError> {
             "message": "ZFS is not supported on this platform",
             "pools": [],
         })))
+    }
+}
+
+// ============ TrueNAS级别的高级磁盘管理功能 ============
+
+/// ZFS池配置（TrueNAS风格）
+#[allow(dead_code)]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ZfsPoolConfig {
+    pub name: String,
+    pub vdev_type: String, // "stripe", "mirror", "raidz1", "raidz2", "raidz3"
+    pub devices: Vec<String>,
+    pub ashift: Option<u8>,
+    pub compression: Option<String>,
+    pub dedup: Option<bool>,
+}
+
+/// SMART测试类型
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct SmartTestRequest {
+    pub test_type: String, // "short", "long", "conveyance"
+}
+
+/// 磁盘擦除请求
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct WipeDiskRequest {
+    pub method: String, // "quick", "full", "secure"
+}
+
+/// 创建ZFS池（TrueNAS风格）
+#[allow(dead_code)]
+pub async fn create_zfs_pool(
+    body: web::Json<ZfsPoolConfig>,
+    req: actix_web::HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+
+    #[cfg(target_os = "linux")]
+    {
+        // 检查ZFS是否可用
+        let zfs_check = Command::new("which").arg("zpool").output();
+        if zfs_check.is_err() || !zfs_check.unwrap().status.success() {
+            return Err(AppError::BadRequest(
+                "ZFS is not installed. Please install zfsutils-linux".to_string()
+            ));
+        }
+
+        let mut cmd = Command::new("zpool");
+        cmd.arg("create");
+        
+        if let Some(ashift) = body.ashift {
+            cmd.arg("-o").arg(format!("ashift={}", ashift));
+        }
+        
+        cmd.arg(&body.name);
+        
+        // 添加VDEV类型
+        match body.vdev_type.as_str() {
+            "mirror" => { cmd.arg("mirror"); }
+            "raidz1" => { cmd.arg("raidz1"); }
+            "raidz2" => { cmd.arg("raidz2"); }
+            "raidz3" => { cmd.arg("raidz3"); }
+            _ => {} // stripe不需要额外参数
+        }
+        
+        for device in &body.devices {
+            cmd.arg(device);
+        }
+        
+        let output = cmd.output()
+            .map_err(|e| AppError::BadRequest(format!("Failed to create ZFS pool: {}", e)))?;
+        
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            return Err(AppError::BadRequest(format!("ZFS pool creation failed: {}", error)));
+        }
+        
+        // 设置压缩
+        if let Some(compression) = &body.compression {
+            let _ = Command::new("zfs")
+                .args(["set", &format!("compression={}", compression), &body.name])
+                .output();
+        }
+        
+        // 设置去重
+        if let Some(true) = body.dedup {
+            let _ = Command::new("zfs")
+                .args(["set", "dedup=on", &body.name])
+                .output();
+        }
+        
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": format!("ZFS pool '{}' created successfully", body.name),
+            "pool": body.name,
+        })))
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &body;
+        Err(AppError::BadRequest("ZFS is only supported on Linux".to_string()))
+    }
+}
+
+/// 获取ZFS池状态
+#[allow(dead_code)]
+pub async fn get_zfs_pool_status(
+    pool_name: web::Path<String>,
+) -> Result<HttpResponse, AppError> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("zpool")
+            .args(["status", "-v", &pool_name])
+            .output()
+            .map_err(|_| AppError::InternalError)?;
+        
+        if !output.status.success() {
+            return Err(AppError::NotFound(format!("Pool '{}' not found", pool_name)));
+        }
+        
+        let status = String::from_utf8_lossy(&output.stdout).to_string();
+        
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "pool": pool_name.as_str(),
+            "status": status,
+        })))
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &pool_name;
+        Err(AppError::BadRequest("ZFS is only supported on Linux".to_string()))
+    }
+}
+
+/// 运行SMART测试（TrueNAS风格）
+#[allow(dead_code)]
+pub async fn run_smart_test(
+    device: web::Path<String>,
+    body: web::Json<SmartTestRequest>,
+    req: actix_web::HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+    
+    #[cfg(target_os = "linux")]
+    {
+        let test_arg = match body.test_type.as_str() {
+            "short" => "short",
+            "long" => "long",
+            "conveyance" => "conveyance",
+            _ => return Err(AppError::BadRequest("Invalid test type".to_string())),
+        };
+        
+        let device_path = if device.starts_with("/dev/") {
+            device.to_string()
+        } else {
+            format!("/dev/{}", device.as_str())
+        };
+        
+        let output = Command::new("smartctl")
+            .args(["-t", test_arg, &device_path])
+            .output()
+            .map_err(|_| AppError::BadRequest("smartctl not found. Please install smartmontools".to_string()))?;
+        
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            return Err(AppError::BadRequest(format!("SMART test failed: {}", error)));
+        }
+        
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": format!("{} SMART test started on {}", test_arg, device),
+            "device": device.as_str(),
+        })))
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (&device, &body);
+        Err(AppError::BadRequest("SMART tests are only supported on Linux".to_string()))
+    }
+}
+
+/// 安全擦除磁盘（TrueNAS风格）
+#[allow(dead_code)]
+pub async fn wipe_disk(
+    device: web::Path<String>,
+    body: web::Json<WipeDiskRequest>,
+    req: actix_web::HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+    
+    #[cfg(target_os = "linux")]
+    {
+        let device_path = format!("/dev/{}", device.as_str());
+        
+        // 检查设备是否已挂载
+        let mount_check = Command::new("findmnt")
+            .args(["-n", "-o", "TARGET", &device_path])
+            .output();
+        
+        if let Ok(output) = mount_check {
+            if output.status.success() {
+                let mount_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !mount_point.is_empty() {
+                    return Err(AppError::BadRequest(format!(
+                        "Device {} is mounted at '{}'. Please unmount first.",
+                        device, mount_point
+                    )));
+                }
+            }
+        }
+        
+        match body.method.as_str() {
+            "quick" => {
+                // 快速擦除：写零到开头1MB和结尾1MB
+                let _ = Command::new("dd")
+                    .args([
+                        "if=/dev/zero",
+                        &format!("of={}", device_path),
+                        "bs=1M",
+                        "count=1",
+                        "conv=notrunc",
+                    ])
+                    .output();
+            }
+            "full" => {
+                // 完全擦除：写零到整个磁盘
+                let _ = Command::new("dd")
+                    .args([
+                        "if=/dev/zero",
+                        &format!("of={}", device_path),
+                        "bs=1M",
+                    ])
+                    .output();
+            }
+            "secure" => {
+                // 安全擦除：使用shred进行多次随机写入
+                let output = Command::new("shred")
+                    .args([
+                        "-v",
+                        "-n", "3",  // 3次覆写
+                        "-z",       // 最后写零
+                        &device_path,
+                    ])
+                    .output()
+                    .map_err(|_| AppError::BadRequest("shred command not found".to_string()))?;
+                
+                if !output.status.success() {
+                    let error = String::from_utf8_lossy(&output.stderr);
+                    return Err(AppError::BadRequest(format!("Secure wipe failed: {}", error)));
+                }
+            }
+            _ => return Err(AppError::BadRequest("Invalid wipe method".to_string())),
+        }
+        
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": format!("Disk {} wiped successfully", device),
+            "device": device.as_str(),
+        })))
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (&device, &body);
+        Err(AppError::BadRequest("Disk wipe is only supported on Linux".to_string()))
+    }
+}
+
+/// 获取磁盘温度（TrueNAS风格）
+#[allow(dead_code)]
+pub async fn get_disk_temperature(
+    device: web::Path<String>,
+) -> Result<HttpResponse, AppError> {
+    #[cfg(target_os = "linux")]
+    {
+        let device_path = if device.starts_with("/dev/") {
+            device.to_string()
+        } else {
+            format!("/dev/{}", device.as_str())
+        };
+        
+        let output = Command::new("smartctl")
+            .args(["-A", &device_path])
+            .output()
+            .map_err(|_| AppError::InternalError)?;
+        
+        if !output.status.success() {
+            return Err(AppError::BadRequest("Failed to read SMART data".to_string()));
+        }
+        
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        let mut temperature: Option<i32> = None;
+        
+        // 解析温度
+        for line in output_str.lines() {
+            if line.contains("Temperature") || line.contains("Airflow_Temperature") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 10 {
+                    if let Ok(temp) = parts[9].parse::<i32>() {
+                        temperature = Some(temp);
+                        break;
+                    }
+                }
+            }
+        }
+        
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "device": device.as_str(),
+            "temperature_celsius": temperature,
+        })))
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &device;
+        Err(AppError::BadRequest("Temperature reading is only supported on Linux".to_string()))
     }
 }

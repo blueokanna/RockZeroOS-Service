@@ -178,7 +178,16 @@ install_system_tools() {
             lsof \
             htop \
             net-tools \
-            sysstat
+            sysstat \
+            xfsprogs \
+            btrfs-progs \
+            e2fsprogs \
+            dosfstools \
+            exfatprogs \
+            ntfs-3g \
+            f2fs-tools \
+            parted \
+            gdisk
             
     elif command -v yum &> /dev/null; then
         sudo yum install -y \
@@ -193,7 +202,16 @@ install_system_tools() {
             usbutils \
             pciutils \
             lsof \
-            htop
+            htop \
+            xfsprogs \
+            btrfs-progs \
+            e2fsprogs \
+            dosfstools \
+            exfat-utils \
+            ntfs-3g \
+            f2fs-tools \
+            parted \
+            gdisk
             
     elif command -v pacman &> /dev/null; then
         sudo pacman -S --noconfirm \
@@ -206,7 +224,16 @@ install_system_tools() {
             usbutils \
             pciutils \
             lsof \
-            htop
+            htop \
+            xfsprogs \
+            btrfs-progs \
+            e2fsprogs \
+            dosfstools \
+            exfatprogs \
+            ntfs-3g \
+            f2fs-tools \
+            parted \
+            gptfdisk
     fi
     
     echo "✓ 系统工具安装完成"

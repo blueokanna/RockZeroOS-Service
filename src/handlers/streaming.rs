@@ -946,6 +946,7 @@ fn get_hw_accel_info() -> serde_json::Value {
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct TranscodeQuery {
     /// Seek position in seconds
     pub seek: Option<f64>,
@@ -956,6 +957,7 @@ pub struct TranscodeQuery {
 }
 
 /// Stream for reading from ffmpeg transcode process
+#[allow(dead_code)]
 struct TranscodeStream {
     child: std::process::Child,
     buffer: Vec<u8>,
@@ -1000,6 +1002,7 @@ impl Drop for TranscodeStream {
 
 /// Transcode media with DTS/AC3/TrueHD audio to AAC for playback
 /// This endpoint streams the transcoded video in real-time
+#[allow(dead_code)]
 pub async fn transcode_stream(
     path: web::Path<String>,
     query: web::Query<TranscodeQuery>,
@@ -1060,6 +1063,7 @@ pub async fn transcode_stream(
 }
 
 /// Check if a file needs audio transcoding
+#[allow(dead_code)]
 pub async fn check_transcode_needed(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let file_path = get_media_path(&path.into_inner())?;
     

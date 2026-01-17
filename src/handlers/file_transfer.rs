@@ -1,0 +1,321 @@
+use actix_multipart::Multipart;
+use actix_web::{web, HttpRequest, HttpResponse, Error as ActixError};
+use futures_util::StreamExt;
+use std::io::Write;
+use std::path::PathBuf;
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
+
+use crate::error::AppError;
+use crate::streaming::chunk_manager::ChunkManager;
+use crate::streaming::secure_transport::{SecureStreamTransport, EncryptedChunk, ChunkType};
+
+/// 文件上传请求
+#[derive(Debug, Deserialize)]
+pub struct UploadRequest {
+    pub path: String,
+    pub filename: String,
+    pub total_size: u64,
+    pub chunk_size: usize,
+}
+
+/// 文件下载请求
+#[derive(Debug, Deserialize)]
+pub struct DownloadRequest {
+    pub path: String,
+    pub range: Option<String>, // 支持断点续传
+}
+
+/// 文件传输状态
+#[derive(Debug, Serialize)]
+pub struct TransferStatus {
+    pub filename: String,
+    pub total_size: u64,
+    pub transferred: u64,
+    pub percentage: f32,
+    pub speed_mbps: f32,
+    pub eta_seconds: u64,
+    pub checksum: Option<String>,
+}
+
+/// 文件上传处理器（支持断点续传）
+pub async fn upload_file(
+    mut payload: Multipart,
+    query: web::Query<UploadRequest>,
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    // 验证认证
+    crate::middleware::verify_auth(&req).await?;
+
+    let upload_path = PathBuf::from(&query.path);
+    let file_path = upload_path.join(&query.filename);
+
+    // 确保目录存在
+    if let Some(parent) = file_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&file_path)
+        .await?;
+
+    let mut total_written = 0u64;
+    let mut hasher = Sha256::new();
+    let start_time = std::time::Instant::now();
+
+    // 处理分块上传
+    while let Some(item) = payload.next().await {
+        let mut field = item?;
+        
+        while let Some(chunk) = field.next().await {
+            let data = chunk?;
+            
+            // 写入文件
+            file.write_all(&data).await?;
+            
+            // 更新哈希
+            hasher.update(&data);
+            
+            total_written += data.len() as u64;
+        }
+    }
+
+    file.flush().await?;
+    
+    // 计算校验和
+    let checksum = format!("{:x}", hasher.finalize());
+    
+    // 计算传输速度
+    let elapsed = start_time.elapsed().as_secs_f32();
+    let speed_mbps = (total_written as f32 / 1024.0 / 1024.0) / elapsed;
+
+    Ok(HttpResponse::Ok().json(TransferStatus {
+        filename: query.filename.clone(),
+        total_size: query.total_size,
+        transferred: total_written,
+        percentage: (total_written as f32 / query.total_size as f32) * 100.0,
+        speed_mbps,
+        eta_seconds: 0,
+        checksum: Some(checksum),
+    }))
+}
+
+/// 文件下载处理器（支持断点续传和Range请求）
+pub async fn download_file(
+    query: web::Query<DownloadRequest>,
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    // 验证认证
+    crate::middleware::verify_auth(&req).await?;
+
+    let file_path = PathBuf::from(&query.path);
+    
+    if !file_path.exists() {
+        return Err(AppError::NotFound("File not found".to_string()));
+    }
+
+    let metadata = tokio::fs::metadata(&file_path).await?;
+    let file_size = metadata.len();
+
+    // 解析Range头
+    let (start, end) = if let Some(range) = &query.range {
+        parse_range(range, file_size)?
+    } else if let Some(range_header) = req.headers().get("Range") {
+        let range_str = range_header.to_str().unwrap_or("");
+        parse_range(range_str, file_size)?
+    } else {
+        (0, file_size - 1)
+    };
+
+    let content_length = end - start + 1;
+
+    // 打开文件
+    let mut file = File::open(&file_path).await?;
+    
+    // 跳转到起始位置
+    if start > 0 {
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+    }
+
+    // 读取数据
+    let mut buffer = vec![0u8; content_length as usize];
+    file.read_exact(&mut buffer).await?;
+
+    // 构建响应
+    let mut response = if start > 0 || end < file_size - 1 {
+        HttpResponse::PartialContent()
+    } else {
+        HttpResponse::Ok()
+    };
+
+    response
+        .insert_header(("Content-Length", content_length.to_string()))
+        .insert_header(("Content-Range", format!("bytes {}-{}/{}", start, end, file_size)))
+        .insert_header(("Accept-Ranges", "bytes"))
+        .insert_header(("Content-Type", "application/octet-stream"))
+        .body(buffer);
+
+    Ok(response.finish())
+}
+
+/// 分块上传（使用UDP/TCP混合传输）
+pub async fn chunked_upload(
+    payload: web::Bytes,
+    query: web::Query<ChunkedUploadRequest>,
+    transport: web::Data<SecureStreamTransport>,
+    chunk_manager: web::Data<ChunkManager>,
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    // 验证认证
+    crate::middleware::verify_auth(&req).await?;
+
+    // 加密数据块
+    let chunk_type = if query.is_keyframe {
+        ChunkType::KeyFrame
+    } else {
+        ChunkType::NormalFrame
+    };
+
+    let encrypted_chunk = transport.encrypt_chunk(&payload, chunk_type).await
+        .map_err(|e| AppError::InternalError)?;
+
+    // 添加到发送队列
+    chunk_manager.enqueue_for_send(encrypted_chunk).await;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "sequence": query.sequence,
+        "size": payload.len(),
+    })))
+}
+
+/// 分块下载（使用UDP/TCP混合传输）
+pub async fn chunked_download(
+    query: web::Query<ChunkedDownloadRequest>,
+    transport: web::Data<SecureStreamTransport>,
+    chunk_manager: web::Data<ChunkManager>,
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    // 验证认证
+    crate::middleware::verify_auth(&req).await?
+
+;
+
+    // 如果是随点随播，跳转到指定位置
+    if let Some(seek_to) = query.seek_to {
+        chunk_manager.seek_to(seek_to).await
+            .map_err(|_| AppError::InternalError)?;
+    }
+
+    // 等待数据块（带超时）
+    let chunk = chunk_manager.get_next_chunk_with_timeout(query.timeout_ms.unwrap_or(1000)).await
+        .ok_or_else(|| AppError::NotFound("Chunk not available".to_string()))?;
+
+    // 解密数据块
+    let decrypted = transport.decrypt_chunk(&chunk).await
+        .map_err(|_| AppError::InternalError)?;
+
+    Ok(HttpResponse::Ok()
+        .insert_header(("X-Chunk-Sequence", chunk.sequence.to_string()))
+        .insert_header(("X-Chunk-Type", chunk.chunk_type))
+        .body(decrypted))
+}
+
+/// 分块上传请求
+#[derive(Debug, Deserialize)]
+pub struct ChunkedUploadRequest {
+    pub sequence: u64,
+    pub is_keyframe: bool,
+}
+
+/// 分块下载请求
+#[derive(Debug, Deserialize)]
+pub struct ChunkedDownloadRequest {
+    pub seek_to: Option<u64>,
+    pub timeout_ms: Option<u64>,
+}
+
+/// 解析Range头
+fn parse_range(range: &str, file_size: u64) -> Result<(u64, u64), AppError> {
+    // 格式: "bytes=start-end" 或 "bytes=start-"
+    let range = range.trim_start_matches("bytes=");
+    let parts: Vec<&str> = range.split('-').collect();
+
+    if parts.len() != 2 {
+        return Err(AppError::BadRequest("Invalid range format".to_string()));
+    }
+
+    let start = if parts[0].is_empty() {
+        0
+    } else {
+        parts[0].parse::<u64>()
+            .map_err(|_| AppError::BadRequest("Invalid start position".to_string()))?
+    };
+
+    let end = if parts[1].is_empty() {
+        file_size - 1
+    } else {
+        parts[1].parse::<u64>()
+            .map_err(|_| AppError::BadRequest("Invalid end position".to_string()))?
+    };
+
+    if start > end || end >= file_size {
+        return Err(AppError::BadRequest("Invalid range".to_string()));
+    }
+
+    Ok((start, end))
+}
+
+/// 获取文件校验和
+pub async fn get_file_checksum(
+    query: web::Query<DownloadRequest>,
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    // 验证认证
+    crate::middleware::verify_auth(&req).await?;
+
+    let file_path = PathBuf::from(&query.path);
+    
+    if !file_path.exists() {
+        return Err(AppError::NotFound("File not found".to_string()));
+    }
+
+    // 计算SHA256校验和
+    let mut file = File::open(&file_path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 8192];
+
+    loop {
+        let n = file.read(&mut buffer).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+
+    let checksum = format!("{:x}", hasher.finalize());
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "path": query.path,
+        "checksum": checksum,
+        "algorithm": "SHA256",
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_range() {
+        assert_eq!(parse_range("bytes=0-999", 1000).unwrap(), (0, 999));
+        assert_eq!(parse_range("bytes=500-", 1000).unwrap(), (500, 999));
+        assert_eq!(parse_range("bytes=0-499", 1000).unwrap(), (0, 499));
+    }
+}
