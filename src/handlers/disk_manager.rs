@@ -146,6 +146,31 @@ pub async fn list_disks() -> Result<HttpResponse, AppError> {
         let mount_point = disk.mount_point().to_string_lossy().to_string();
         let is_removable = disk.is_removable();
         let disk_type = format!("{:?}", disk.kind());
+        
+        // 获取文件系统类型 - 优先使用 blkid 获取准确信息
+        let file_system = disk.file_system().to_string_lossy().to_string();
+        
+        #[cfg(target_os = "linux")]
+        let file_system = {
+            // 使用 blkid 获取更准确的文件系统类型
+            if let Ok(output) = Command::new("blkid")
+                .args(["-s", "TYPE", "-o", "value", &device_path])
+                .output()
+            {
+                if output.status.success() {
+                    let fs_from_blkid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !fs_from_blkid.is_empty() {
+                        fs_from_blkid
+                    } else {
+                        file_system
+                    }
+                } else {
+                    file_system
+                }
+            } else {
+                file_system
+            }
+        };
 
         let (label, uuid, serial, model) = get_disk_metadata(&device_path);
 
@@ -153,7 +178,7 @@ pub async fn list_disks() -> Result<HttpResponse, AppError> {
             name: device_path.clone(),
             device_path,
             mount_point,
-            file_system: disk.file_system().to_string_lossy().to_string(),
+            file_system,
             total_space,
             available_space,
             used_space,
@@ -318,11 +343,29 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
                             .unwrap_or("")
                             .to_string();
                         let device_path = format!("/dev/{}", name);
-                        let fs_type = child
+                        
+                        // 获取文件系统类型 - 优先使用 blkid
+                        let mut fs_type = child
                             .get("fstype")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
+                        
+                        // 如果 lsblk 没有返回文件系统类型，使用 blkid 再次检查
+                        if fs_type.is_empty() {
+                            if let Ok(output) = Command::new("blkid")
+                                .args(["-s", "TYPE", "-o", "value", &device_path])
+                                .output()
+                            {
+                                if output.status.success() {
+                                    let fs_from_blkid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                                    if !fs_from_blkid.is_empty() {
+                                        fs_type = fs_from_blkid;
+                                    }
+                                }
+                            }
+                        }
+                        
                         let label = child
                             .get("label")
                             .and_then(|v| v.as_str())
@@ -793,6 +836,33 @@ pub async fn format_disk(
 
     #[cfg(target_os = "linux")]
     {
+        let device = &body.device;
+        
+        // 检查设备是否存在
+        if !std::path::Path::new(device).exists() {
+            return Err(AppError::BadRequest(format!(
+                "Device {} does not exist",
+                device
+            )));
+        }
+
+        // 检查设备是否已挂载 - 如果已挂载则拒绝格式化
+        let mount_check = Command::new("findmnt")
+            .args(["-n", "-o", "TARGET", device])
+            .output();
+        
+        if let Ok(output) = mount_check {
+            if output.status.success() {
+                let mount_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !mount_point.is_empty() {
+                    return Err(AppError::BadRequest(format!(
+                        "Device {} is currently mounted at '{}'. Please unmount it first before formatting.",
+                        device, mount_point
+                    )));
+                }
+            }
+        }
+
         let cmd_name = match body.file_system.to_lowercase().as_str() {
             "ext4" => "mkfs.ext4",
             "ext3" => "mkfs.ext3",
@@ -814,14 +884,16 @@ pub async fn format_disk(
         let mut cmd = Command::new(cmd_name);
 
         if let Some(label) = &body.label {
-            match body.file_system.to_lowercase().as_str() {
-                "ext4" | "ext3" | "ext2" | "ntfs" | "xfs" | "btrfs" => {
-                    cmd.arg("-L").arg(label);
+            if !label.is_empty() {
+                match body.file_system.to_lowercase().as_str() {
+                    "ext4" | "ext3" | "ext2" | "ntfs" | "xfs" | "btrfs" => {
+                        cmd.arg("-L").arg(label);
+                    }
+                    "vfat" | "fat32" | "exfat" => {
+                        cmd.arg("-n").arg(label);
+                    }
+                    _ => {}
                 }
-                "vfat" | "fat32" | "exfat" => {
-                    cmd.arg("-n").arg(label);
-                }
-                _ => {}
             }
         }
 
@@ -835,15 +907,33 @@ pub async fn format_disk(
             _ => {}
         }
 
-        cmd.arg(&body.device);
+        cmd.arg(device);
 
-        let output = cmd.output().map_err(|_| AppError::InternalError)?;
+        let output = cmd.output().map_err(|e| {
+            AppError::BadRequest(format!("Failed to run mkfs command: {}", e))
+        })?;
 
         if output.status.success() {
+            // 格式化成功后，触发 udev 更新设备信息
+            let _ = Command::new("udevadm")
+                .args(["trigger", "--subsystem-match=block"])
+                .output();
+            
+            // 等待 udev 处理完成
+            let _ = Command::new("udevadm")
+                .args(["settle", "--timeout=5"])
+                .output();
+            
+            // 强制重新扫描分区表
+            let _ = Command::new("partprobe").arg(device).output();
+            
+            // 额外等待确保文件系统信息已更新
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+
             return Ok(HttpResponse::Ok().json(serde_json::json!({
                 "success": true,
-                "message": "Disk formatted successfully",
-                "device": body.device,
+                "message": format!("Disk formatted successfully with {} filesystem", body.file_system),
+                "device": device,
                 "file_system": body.file_system,
             })));
         } else {
@@ -1219,7 +1309,10 @@ pub async fn initialize_disk(
         if let Some(label) = &body.label {
             if !label.is_empty() {
                 match fs_lower.as_str() {
-                    "ext4" | "ext3" | "ext2" | "xfs" | "btrfs" | "ntfs" => {
+                    "ext4" | "ext3" | "ext2" => {
+                        format_cmd.arg("-L").arg(label);
+                    }
+                    "xfs" | "btrfs" | "ntfs" => {
                         format_cmd.arg("-L").arg(label);
                     }
                     "fat32" | "vfat" | "exfat" => {
@@ -1233,24 +1326,36 @@ pub async fn initialize_disk(
             }
         }
 
-        // Add force flag for certain filesystems
+        // Add force flag and filesystem-specific options
         match fs_lower.as_str() {
             "ext4" => {
-                format_cmd.arg("-F");
+                format_cmd.arg("-F"); // Force
                 format_cmd.arg("-m").arg("1"); // Reserve 1% for root
+                format_cmd.arg("-O").arg("^has_journal"); // Disable journal for faster formatting (optional)
             }
             "ext3" | "ext2" => {
                 format_cmd.arg("-F");
             }
-            "xfs" | "btrfs" | "f2fs" => {
-                format_cmd.arg("-f");
+            "xfs" => {
+                format_cmd.arg("-f"); // Force
+                format_cmd.arg("-K"); // Don't send discard/TRIM commands
+            }
+            "btrfs" => {
+                format_cmd.arg("-f"); // Force
+            }
+            "f2fs" => {
+                format_cmd.arg("-f"); // Force
             }
             "ntfs" => {
                 format_cmd.arg("-Q"); // Quick format
-                format_cmd.arg("-F");
+                format_cmd.arg("-F"); // Force
             }
             "fat32" | "vfat" => {
-                format_cmd.arg("-F").arg("32");
+                format_cmd.arg("-F").arg("32"); // FAT32
+                format_cmd.arg("-I"); // Allow whole disk format
+            }
+            "exfat" => {
+                // exfat-utils doesn't need special flags
             }
             _ => {}
         }
@@ -1266,27 +1371,48 @@ pub async fn initialize_disk(
             return Err(AppError::BadRequest(format!("Format failed: {}", error)));
         }
 
+        // Step 6: Comprehensive device info refresh
         // Trigger udev to update device info
         let _ = Command::new("udevadm")
             .args(["trigger", "--subsystem-match=block"])
             .output();
         
-        // Wait for udev to settle
+        // Wait for udev to settle with longer timeout
         let _ = Command::new("udevadm")
-            .args(["settle", "--timeout=5"])
+            .args(["settle", "--timeout=10"])
             .output();
         
         // Force kernel to re-scan the partition
         let _ = Command::new("partprobe").arg(device).output();
         
+        // Use blkid to force cache refresh
+        let _ = Command::new("blkid")
+            .args(["-p", &partition_device])
+            .output();
+        
         // Additional wait to ensure filesystem is recognized
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        
+        // Verify the filesystem was created correctly
+        let verify_output = Command::new("blkid")
+            .args(["-s", "TYPE", "-o", "value", &partition_device])
+            .output();
+        
+        let actual_fs = if let Ok(output) = verify_output {
+            if output.status.success() {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            } else {
+                "unknown".to_string()
+            }
+        } else {
+            "unknown".to_string()
+        };
 
         return Ok(HttpResponse::Ok().json(DiskOperationResult {
             success: true,
             message: format!(
-                "Disk initialized successfully with {} filesystem on {}",
-                body.file_system, partition_device
+                "Disk initialized successfully with {} filesystem on {} (verified: {})",
+                body.file_system, partition_device, actual_fs
             ),
             device: partition_device,
             operation: "initialize".to_string(),
