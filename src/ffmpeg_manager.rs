@@ -2,6 +2,7 @@
 //! 
 //! 自动检测系统架构并下载对应的 FFmpeg 静态二进制文件
 
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::io;
@@ -134,14 +135,31 @@ impl FfmpegManager {
             ));
         }
         
+        let arch_slug = match arch {
+            Architecture::Aarch64 => "arm64",
+            Architecture::Armhf => "armhf",
+            Architecture::X86_64 => "amd64",
+            Architecture::Unknown => "unknown",
+        };
+
         // 创建安装目录
         fs::create_dir_all(&self.install_dir)?;
+
+        // 优先使用本地离线包（用户预置的 ffmpeg-release-<arch>-static.tar.xz）
+        let archive_name = format!("ffmpeg-release-{}-static.tar.xz", arch_slug);
+        if let Some(local_archive) = self.locate_local_archive(&archive_name) {
+            info!("Using local FFmpeg archive: {}", local_archive.display());
+            match self.install_from_archive(&local_archive) {
+                Ok(_) => return Ok(()),
+                Err(err) => warn!("Failed to install FFmpeg from local archive: {}. Will try online download...", err),
+            }
+        }
         
         // 根据架构选择下载源
         let download_result = match arch {
-            Architecture::Aarch64 => self.download_from_johnvansickle("arm64").await,
-            Architecture::Armhf => self.download_from_johnvansickle("armhf").await,
-            Architecture::X86_64 => self.download_from_johnvansickle("amd64").await,
+            Architecture::Aarch64 => self.download_from_johnvansickle(arch_slug).await,
+            Architecture::Armhf => self.download_from_johnvansickle(arch_slug).await,
+            Architecture::X86_64 => self.download_from_johnvansickle(arch_slug).await,
             Architecture::Unknown => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Unknown architecture"
@@ -179,45 +197,7 @@ impl FfmpegManager {
             ));
         }
         
-        // 解压文件
-        info!("Extracting FFmpeg...");
-        self.extract_tar_xz(&archive_path, &temp_dir)?;
-        
-        // 查找解压后的 ffmpeg 二进制文件
-        let extracted_dir = self.find_extracted_ffmpeg_dir(&temp_dir)?;
-        
-        // 移动二进制文件到安装目录
-        let ffmpeg_src = extracted_dir.join("ffmpeg");
-        let ffprobe_src = extracted_dir.join("ffprobe");
-        let ffmpeg_dst = self.install_dir.join("ffmpeg");
-        let ffprobe_dst = self.install_dir.join("ffprobe");
-        
-        if ffmpeg_src.exists() {
-            fs::copy(&ffmpeg_src, &ffmpeg_dst)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&ffmpeg_dst, fs::Permissions::from_mode(0o755))?;
-            }
-            self.ffmpeg_path = Some(ffmpeg_dst);
-            info!("FFmpeg installed successfully");
-        }
-        
-        if ffprobe_src.exists() {
-            fs::copy(&ffprobe_src, &ffprobe_dst)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&ffprobe_dst, fs::Permissions::from_mode(0o755))?;
-            }
-            self.ffprobe_path = Some(ffprobe_dst);
-            info!("FFprobe installed successfully");
-        }
-        
-        // 清理临时文件
-        let _ = fs::remove_dir_all(&temp_dir);
-        
-        Ok(())
+        self.install_from_archive(&archive_path)
     }
     
     /// 使用系统下载工具下载文件
@@ -442,6 +422,97 @@ impl FfmpegManager {
         
         let version_str = String::from_utf8_lossy(&output.stdout);
         version_str.lines().next().map(|s| s.to_string())
+    }
+
+    /// 从本地或下载好的压缩包安装 FFmpeg
+    fn install_from_archive(&mut self, archive_path: &Path) -> io::Result<()> {
+        let temp_dir = self.install_dir.join("temp");
+
+        if temp_dir.exists() {
+            let _ = fs::remove_dir_all(&temp_dir);
+        }
+        fs::create_dir_all(&temp_dir)?;
+
+        // 将压缩包放到安装临时目录，避免跨分区解压失败
+        let archive_in_temp = temp_dir.join(
+            archive_path
+                .file_name()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Archive file name missing"))?
+        );
+
+        if archive_path != archive_in_temp {
+            fs::copy(archive_path, &archive_in_temp)?;
+        }
+
+        info!("Extracting FFmpeg from archive: {}", archive_in_temp.display());
+        self.extract_tar_xz(&archive_in_temp, &temp_dir)?;
+
+        let extracted_dir = self.find_extracted_ffmpeg_dir(&temp_dir)?;
+
+        let ffmpeg_src = extracted_dir.join("ffmpeg");
+        let ffprobe_src = extracted_dir.join("ffprobe");
+        let ffmpeg_dst = self.install_dir.join("ffmpeg");
+        let ffprobe_dst = self.install_dir.join("ffprobe");
+
+        if ffmpeg_src.exists() {
+            fs::copy(&ffmpeg_src, &ffmpeg_dst)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&ffmpeg_dst, fs::Permissions::from_mode(0o755))?;
+            }
+            self.ffmpeg_path = Some(ffmpeg_dst);
+            info!("FFmpeg installed successfully");
+        } else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "ffmpeg binary missing in archive"));
+        }
+
+        if ffprobe_src.exists() {
+            fs::copy(&ffprobe_src, &ffprobe_dst)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&ffprobe_dst, fs::Permissions::from_mode(0o755))?;
+            }
+            self.ffprobe_path = Some(ffprobe_dst);
+            info!("FFprobe installed successfully");
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    /// 查找本地预置的 FFmpeg 压缩包
+    fn locate_local_archive(&self, filename: &str) -> Option<PathBuf> {
+        // 1) 显式环境变量
+        if let Some(path) = env::var_os("FFMPEG_ARCHIVE_PATH") {
+            let candidate = PathBuf::from(path);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+
+        // 2) 安装目录下
+        let candidate = self.install_dir.join(filename);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+
+        // 3) 数据目录下（install_dir 的上一级）
+        if let Some(parent) = self.install_dir.parent() {
+            let candidate = parent.join(filename);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+
+        // 4) 当前工作目录
+        let candidate = PathBuf::from(filename);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+
+        None
     }
 }
 
