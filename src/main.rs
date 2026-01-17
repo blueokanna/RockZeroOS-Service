@@ -448,13 +448,18 @@ async fn main() -> std::io::Result<()> {
                         "/transcode",
                         web::post().to(handlers::media::transcode_media),
                     )
-                    // HLS 流式传输 - 支持所有视频格�?
+                    // HLS 流式传输 - 需要认证的端点
                     .route("/hls/start", web::post().to(handlers::media::start_hls_stream))
-                    .route("/hls/{session_id}/master.m3u8", web::get().to(handlers::media::get_hls_playlist))
-                    .route("/hls/{session_id}/audio-tracks", web::get().to(handlers::media::get_hls_audio_tracks))
-                    .route("/hls/{session_id}/switch-audio", web::post().to(handlers::media::switch_hls_audio_track))
-                    .route("/hls/{session_id}/{segment}", web::get().to(handlers::media::get_hls_segment))
-                    .route("/hls/{session_id}/stop", web::post().to(handlers::media::stop_hls_stream)),
+                    .route("/hls/{session_id}/stop", web::post().to(handlers::media::stop_hls_stream))
+                    .route("/hls/{session_id}/switch-audio", web::post().to(handlers::media::switch_hls_audio_track)),
+            )
+            // HLS 播放列表和分片 - 不需要 JWT 认证（使用 session_id 作为授权凭证）
+            // ExoPlayer/AVPlayer 等播放器无法在子请求中传递 HTTP headers
+            .service(
+                web::scope("/api/v1/media/hls")
+                    .route("/{session_id}/master.m3u8", web::get().to(handlers::media::get_hls_playlist))
+                    .route("/{session_id}/audio-tracks", web::get().to(handlers::media::get_hls_audio_tracks))
+                    .route("/{session_id}/{segment}", web::get().to(handlers::media::get_hls_segment)),
             )
             .service(
                 web::scope("/api/v1/widgets")
@@ -1131,13 +1136,18 @@ async fn main() -> std::io::Result<()> {
                         "/transcode",
                         web::post().to(handlers::media::transcode_media),
                     )
-                    // HLS 流式传输 - 支持所有视频格�?
+                    // HLS 流式传输 - 需要认证的端点
                     .route("/hls/start", web::post().to(handlers::media::start_hls_stream))
-                    .route("/hls/{session_id}/master.m3u8", web::get().to(handlers::media::get_hls_playlist))
-                    .route("/hls/{session_id}/audio-tracks", web::get().to(handlers::media::get_hls_audio_tracks))
-                    .route("/hls/{session_id}/switch-audio", web::post().to(handlers::media::switch_hls_audio_track))
-                    .route("/hls/{session_id}/{segment}", web::get().to(handlers::media::get_hls_segment))
-                    .route("/hls/{session_id}/stop", web::post().to(handlers::media::stop_hls_stream)),
+                    .route("/hls/{session_id}/stop", web::post().to(handlers::media::stop_hls_stream))
+                    .route("/hls/{session_id}/switch-audio", web::post().to(handlers::media::switch_hls_audio_track)),
+            )
+            // HLS 播放列表和分片 - 不需要 JWT 认证（使用 session_id 作为授权凭证）
+            // ExoPlayer/AVPlayer 等播放器无法在子请求中传递 HTTP headers
+            .service(
+                web::scope("/api/v1/media/hls")
+                    .route("/{session_id}/master.m3u8", web::get().to(handlers::media::get_hls_playlist))
+                    .route("/{session_id}/audio-tracks", web::get().to(handlers::media::get_hls_audio_tracks))
+                    .route("/{session_id}/{segment}", web::get().to(handlers::media::get_hls_segment)),
             )
             .service(
                 web::scope("/api/v1/widgets")
