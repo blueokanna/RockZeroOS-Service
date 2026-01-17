@@ -1,23 +1,32 @@
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use std::process::{Command, Stdio, Child};
 use std::io::Read;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use tracing::{error, info, warn};
 
 use crate::error::AppError;
 
-/// Audio codecs that require transcoding for mobile/web playback
 pub const UNSUPPORTED_AUDIO_CODECS: &[&str] = &[
-    "dts", "dca", "dts-hd", "dtshd", "dts_hd",
-    "truehd", "mlp",
-    "ac3", "eac3", "ac-3", "e-ac-3",
-    "pcm_bluray", "pcm_dvd",
+    "dts",
+    "dca",
+    "dts-hd",
+    "dtshd",
+    "dts_hd",
+    "truehd",
+    "mlp",
+    "ac3",
+    "eac3",
+    "ac-3",
+    "e-ac-3",
+    "pcm_bluray",
+    "pcm_dvd",
 ];
 
-/// Check if audio codec needs transcoding
 pub fn needs_audio_transcode(codec: &str) -> bool {
     let codec_lower = codec.to_lowercase();
-    UNSUPPORTED_AUDIO_CODECS.iter().any(|&c| codec_lower.contains(c))
+    UNSUPPORTED_AUDIO_CODECS
+        .iter()
+        .any(|&c| codec_lower.contains(c))
 }
 
 #[allow(dead_code)]
@@ -89,8 +98,10 @@ impl MediaProcessor {
     pub fn get_media_info(&self, file_path: &str) -> Result<MediaInfo, AppError> {
         let output = Command::new(&self.ffprobe_path)
             .args([
-                "-v", "quiet",
-                "-print_format", "json",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
                 "-show_format",
                 "-show_streams",
                 file_path,
@@ -102,12 +113,17 @@ impl MediaProcessor {
             })?;
 
         if !output.status.success() {
-            error!("ffprobe failed: {}", String::from_utf8_lossy(&output.stderr));
-            return Err(AppError::BadRequest("Failed to analyze media file".to_string()));
+            error!(
+                "ffprobe failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Err(AppError::BadRequest(
+                "Failed to analyze media file".to_string(),
+            ));
         }
 
-        let json: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .map_err(|_| AppError::InternalError)?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&output.stdout).map_err(|_| AppError::InternalError)?;
 
         let mut media_info = MediaInfo {
             duration: None,
@@ -134,15 +150,22 @@ impl MediaProcessor {
         if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
             for stream in streams {
                 let codec_type = stream.get("codec_type").and_then(|t| t.as_str());
-                
+
                 match codec_type {
                     Some("video") => {
-                        media_info.video_codec = stream.get("codec_name")
+                        media_info.video_codec = stream
+                            .get("codec_name")
                             .and_then(|c| c.as_str())
                             .map(|s| s.to_string());
-                        media_info.width = stream.get("width").and_then(|w| w.as_u64()).map(|w| w as u32);
-                        media_info.height = stream.get("height").and_then(|h| h.as_u64()).map(|h| h as u32);
-                        
+                        media_info.width = stream
+                            .get("width")
+                            .and_then(|w| w.as_u64())
+                            .map(|w| w as u32);
+                        media_info.height = stream
+                            .get("height")
+                            .and_then(|h| h.as_u64())
+                            .map(|h| h as u32);
+
                         if let Some(fps_str) = stream.get("r_frame_rate").and_then(|f| f.as_str()) {
                             if let Some((num, den)) = fps_str.split_once('/') {
                                 if let (Ok(n), Ok(d)) = (num.parse::<f64>(), den.parse::<f64>()) {
@@ -154,11 +177,16 @@ impl MediaProcessor {
                         }
                     }
                     Some("audio") => {
-                        media_info.audio_codec = stream.get("codec_name")
+                        media_info.audio_codec = stream
+                            .get("codec_name")
                             .and_then(|c| c.as_str())
                             .map(|s| s.to_string());
-                        media_info.audio_channels = stream.get("channels").and_then(|c| c.as_u64()).map(|c| c as u32);
-                        media_info.audio_sample_rate = stream.get("sample_rate")
+                        media_info.audio_channels = stream
+                            .get("channels")
+                            .and_then(|c| c.as_u64())
+                            .map(|c| c as u32);
+                        media_info.audio_sample_rate = stream
+                            .get("sample_rate")
                             .and_then(|s| s.as_str())
                             .and_then(|s| s.parse::<u32>().ok());
                     }
@@ -208,7 +236,7 @@ impl MediaProcessor {
 
         if let Some(video_codec) = &options.video_codec {
             args.push("-c:v".to_string());
-            
+
             let codec = match (&options.hardware_accel, video_codec.as_str()) {
                 (Some(HardwareAccel::VAAPI), "h264") => "h264_vaapi",
                 (Some(HardwareAccel::VAAPI), "hevc") => "hevc_vaapi",
@@ -221,7 +249,7 @@ impl MediaProcessor {
                 (Some(HardwareAccel::V4L2M2M), "h264") => "h264_v4l2m2m",
                 _ => video_codec.as_str(),
             };
-            
+
             args.push(codec.to_string());
         }
 
@@ -280,10 +308,14 @@ impl MediaProcessor {
     ) -> Result<(), AppError> {
         let output = Command::new(&self.ffmpeg_path)
             .args([
-                "-ss", &timestamp.to_string(),
-                "-i", input_path,
-                "-vframes", "1",
-                "-q:v", "2",
+                "-ss",
+                &timestamp.to_string(),
+                "-i",
+                input_path,
+                "-vframes",
+                "1",
+                "-q:v",
+                "2",
                 "-y",
                 output_path,
             ])
@@ -294,8 +326,13 @@ impl MediaProcessor {
             })?;
 
         if !output.status.success() {
-            error!("Thumbnail extraction failed: {}", String::from_utf8_lossy(&output.stderr));
-            return Err(AppError::BadRequest("Failed to extract thumbnail".to_string()));
+            error!(
+                "Thumbnail extraction failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Err(AppError::BadRequest(
+                "Failed to extract thumbnail".to_string(),
+            ));
         }
 
         Ok(())
@@ -390,15 +427,15 @@ impl AudioTranscodeStream {
         hardware_accel: Option<&HardwareAccel>,
     ) -> Result<Self, AppError> {
         let mut args: Vec<String> = Vec::new();
-        
+
         // Hardware acceleration for decoding
         match hardware_accel {
             Some(HardwareAccel::VAAPI) => {
                 args.extend_from_slice(&[
-                    "-hwaccel".to_string(), 
-                    "vaapi".to_string(), 
-                    "-hwaccel_device".to_string(), 
-                    "/dev/dri/renderD128".to_string()
+                    "-hwaccel".to_string(),
+                    "vaapi".to_string(),
+                    "-hwaccel_device".to_string(),
+                    "/dev/dri/renderD128".to_string(),
                 ]);
             }
             Some(HardwareAccel::NVENC) => {
@@ -412,31 +449,38 @@ impl AudioTranscodeStream {
             }
             _ => {}
         }
-        
+
         // Seek position if specified
         if let Some(pos) = start_position {
             args.push("-ss".to_string());
             args.push(pos.to_string());
         }
-        
+
         // Input file
         args.push("-i".to_string());
         args.push(input_path.to_string());
-        
+
         // Copy video stream, transcode audio to AAC
         args.extend_from_slice(&[
-            "-c:v".to_string(), "copy".to_string(),           // Copy video without re-encoding
-            "-c:a".to_string(), "aac".to_string(),            // Transcode audio to AAC
-            "-b:a".to_string(), "256k".to_string(),           // Audio bitrate
-            "-ac".to_string(), "2".to_string(),               // Stereo output (for compatibility)
-            "-ar".to_string(), "48000".to_string(),           // Sample rate
-            "-movflags".to_string(), "frag_keyframe+empty_moov+faststart".to_string(), // Streaming-friendly MP4
-            "-f".to_string(), "mp4".to_string(),              // Output format
-            "-".to_string(),                                   // Output to stdout
+            "-c:v".to_string(),
+            "copy".to_string(), // Copy video without re-encoding
+            "-c:a".to_string(),
+            "aac".to_string(), // Transcode audio to AAC
+            "-b:a".to_string(),
+            "256k".to_string(), // Audio bitrate
+            "-ac".to_string(),
+            "2".to_string(), // Stereo output (for compatibility)
+            "-ar".to_string(),
+            "48000".to_string(), // Sample rate
+            "-movflags".to_string(),
+            "frag_keyframe+empty_moov+faststart".to_string(), // Streaming-friendly MP4
+            "-f".to_string(),
+            "mp4".to_string(), // Output format
+            "-".to_string(),   // Output to stdout
         ]);
-        
+
         info!("Starting audio transcode with args: {:?}", args);
-        
+
         let child = Command::new("ffmpeg")
             .args(&args)
             .stdout(Stdio::piped())
@@ -446,13 +490,13 @@ impl AudioTranscodeStream {
                 error!("Failed to start ffmpeg transcode: {}", e);
                 AppError::InternalError
             })?;
-        
+
         Ok(Self {
             child,
             buffer: vec![0u8; 64 * 1024], // 64KB buffer
         })
     }
-    
+
     /// Read next chunk from the transcoding stream
     pub fn read_chunk(&mut self) -> Option<Vec<u8>> {
         if let Some(ref mut stdout) = self.child.stdout {
@@ -468,7 +512,7 @@ impl AudioTranscodeStream {
             None
         }
     }
-    
+
     /// Check if the process is still running
     pub fn is_running(&mut self) -> bool {
         match self.child.try_wait() {
@@ -496,7 +540,7 @@ impl StreamingTranscoder {
             ffmpeg_path: "ffmpeg".to_string(),
         }
     }
-    
+
     /// Start a streaming transcode process for DTS/AC3 audio
     /// Returns a Child process with stdout as the transcoded stream
     pub fn start_audio_transcode(
@@ -508,51 +552,51 @@ impl StreamingTranscoder {
     ) -> Result<Child, AppError> {
         let mut args: Vec<String> = vec![
             "-hide_banner".to_string(),
-            "-loglevel".to_string(), 
+            "-loglevel".to_string(),
             "error".to_string(),
         ];
-        
+
         // Seek position
         if let Some(pos) = seek_seconds {
             args.push("-ss".to_string());
             args.push(pos.to_string());
         }
-        
+
         // Input
         args.push("-i".to_string());
         args.push(input_path.to_string());
-        
+
         // Video: copy (no re-encoding)
         args.push("-c:v".to_string());
         args.push("copy".to_string());
-        
+
         // Audio: transcode to AAC
         args.push("-c:a".to_string());
         args.push("aac".to_string());
-        
+
         // Audio bitrate
         args.push("-b:a".to_string());
         args.push(audio_bitrate.unwrap_or("256k").to_string());
-        
+
         // Channels (default to stereo for compatibility)
         args.push("-ac".to_string());
         args.push(channels.unwrap_or(2).to_string());
-        
+
         // Sample rate
         args.push("-ar".to_string());
         args.push("48000".to_string());
-        
+
         // Streaming-optimized MP4
         args.push("-movflags".to_string());
         args.push("frag_keyframe+empty_moov+faststart+default_base_moof".to_string());
-        
+
         // Output format and destination
         args.push("-f".to_string());
         args.push("mp4".to_string());
         args.push("-".to_string());
-        
+
         info!("Starting streaming transcode: ffmpeg {:?}", args);
-        
+
         Command::new(&self.ffmpeg_path)
             .args(&args)
             .stdout(Stdio::piped())
@@ -563,7 +607,7 @@ impl StreamingTranscoder {
                 AppError::InternalError
             })
     }
-    
+
     /// Start HLS transcode for better seeking support
     #[allow(dead_code)]
     pub fn start_hls_transcode(
@@ -575,25 +619,36 @@ impl StreamingTranscoder {
         let playlist_path = format!("{}/playlist.m3u8", output_dir);
         let segment_pattern = format!("{}/segment_%03d.ts", output_dir);
         let segment_duration_str = segment_duration.to_string();
-        
+
         let args: Vec<&str> = vec![
             "-hide_banner",
-            "-loglevel", "error",
-            "-i", input_path,
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-b:a", "256k",
-            "-ac", "2",
-            "-ar", "48000",
-            "-f", "hls",
-            "-hls_time", &segment_duration_str,
-            "-hls_list_size", "0",
-            "-hls_segment_filename", &segment_pattern,
+            "-loglevel",
+            "error",
+            "-i",
+            input_path,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "256k",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            "-f",
+            "hls",
+            "-hls_time",
+            &segment_duration_str,
+            "-hls_list_size",
+            "0",
+            "-hls_segment_filename",
+            &segment_pattern,
             &playlist_path,
         ];
-        
+
         info!("Starting HLS transcode: ffmpeg {:?}", args);
-        
+
         Command::new(&self.ffmpeg_path)
             .args(&args)
             .stdout(Stdio::null())
