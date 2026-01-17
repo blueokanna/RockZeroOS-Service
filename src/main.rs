@@ -4,6 +4,7 @@ mod crypto;
 mod db;
 mod error;
 mod fido;
+mod ffmpeg_manager;
 mod handlers;
 mod hardware;
 mod invite;
@@ -18,7 +19,7 @@ use actix_cors::Cors;
 use actix_web::{middleware::Logger, web, App, HttpServer};
 use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::AppConfig;
@@ -102,6 +103,26 @@ async fn main() -> std::io::Result<()> {
         info!("Hardware acceleration: {:?}", hw_caps);
     } else {
         info!("FFmpeg not available - Media processing disabled");
+    }
+
+    // 初始化 FFmpeg 管理器（自动下载如果需要）
+    let mut ffmpeg_manager = ffmpeg_manager::FfmpegManager::new(&config.data_dir);
+    match ffmpeg_manager.ensure_available().await {
+        Ok(_) => {
+            if let Some(path) = ffmpeg_manager.ffmpeg_path() {
+                info!("FFmpeg ready: {}", path.display());
+                ffmpeg_manager::set_global_ffmpeg_path(Some(path.to_string_lossy().to_string()));
+            }
+            if let Some(path) = ffmpeg_manager.ffprobe_path() {
+                ffmpeg_manager::set_global_ffprobe_path(Some(path.to_string_lossy().to_string()));
+            }
+            if let Some(version) = ffmpeg_manager.get_version() {
+                info!("FFmpeg version: {}", version);
+            }
+        }
+        Err(e) => {
+            warn!("FFmpeg setup failed: {}. HLS streaming will not work.", e);
+        }
     }
 
     let hardware_info = hardware::detect_hardware();

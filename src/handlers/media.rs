@@ -5,13 +5,79 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::db;
 use crate::error::AppError;
+use crate::ffmpeg_manager;
 use crate::models::{MediaItem, MediaResponse};
 
+/// 查找 FFmpeg 可执行文件路径
+fn find_ffmpeg() -> Option<String> {
+    // 首先检查全局缓存的路径（由 ffmpeg_manager 设置）
+    if let Some(path) = ffmpeg_manager::get_global_ffmpeg_path() {
+        return Some(path);
+    }
+    
+    // 常见的 FFmpeg 路径
+    let possible_paths = [
+        "ffmpeg",                           // PATH 中
+        "/usr/bin/ffmpeg",                  // Linux 标准
+        "/usr/local/bin/ffmpeg",            // macOS/Linux 本地安装
+        "/opt/ffmpeg/bin/ffmpeg",           // 自定义安装
+        "/snap/bin/ffmpeg",                 // Ubuntu Snap
+        "C:\\ffmpeg\\bin\\ffmpeg.exe",      // Windows
+        "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
+    ];
+
+    for path in possible_paths {
+        let result = Command::new(path)
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        
+        if result.is_ok() && result.unwrap().success() {
+            info!("Found FFmpeg at: {}", path);
+            return Some(path.to_string());
+        }
+    }
+    
+    None
+}
+
+/// 查找 FFprobe 可执行文件路径
+fn find_ffprobe() -> Option<String> {
+    // 首先检查全局缓存的路径
+    if let Some(path) = ffmpeg_manager::get_global_ffprobe_path() {
+        return Some(path);
+    }
+    
+    let possible_paths = [
+        "ffprobe",
+        "/usr/bin/ffprobe",
+        "/usr/local/bin/ffprobe",
+        "/opt/ffmpeg/bin/ffprobe",
+        "/snap/bin/ffprobe",
+        "C:\\ffmpeg\\bin\\ffprobe.exe",
+        "C:\\Program Files\\ffmpeg\\bin\\ffprobe.exe",
+    ];
+
+    for path in possible_paths {
+        let result = Command::new(path)
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        
+        if result.is_ok() && result.unwrap().success() {
+            return Some(path.to_string());
+        }
+    }
+    
+    None
+}
 #[derive(Debug, Serialize)]
 pub struct MediaCodecInfo {
     pub ffmpeg_available: bool,
@@ -303,25 +369,41 @@ impl HlsSessionManager {
     }
 
     /// 创建 HLS 会话并开始转码
-    /// 支持: 任意视频格式 → HLS fMP4 (兼容所有平台)
+    /// 支持: 任意视频格式 → HLS MPEG-TS (兼容所有平台)
     /// 音频强制转码为 AAC (兼容 DTS/AC3 等不支持的格式)
     pub fn create_session(&self, file_path: &str, quality: Option<&str>, audio_track: Option<u32>) -> Result<(String, Vec<AudioTrackInfo>), AppError> {
+        info!("Creating HLS session for: {}", file_path);
+        
+        // 首先检查输入文件是否存在
+        if !Path::new(file_path).exists() {
+            error!("Input file does not exist: {}", file_path);
+            return Err(AppError::NotFound(format!("Video file not found: {}", file_path)));
+        }
+        info!("Input file exists: {}", file_path);
+        
+        // 检查 FFmpeg 是否可用
+        let ffmpeg_path = find_ffmpeg().ok_or_else(|| {
+            error!("FFmpeg is not installed or not in PATH. Please install FFmpeg.");
+            AppError::BadRequest("FFmpeg is not installed on the server. Please install FFmpeg first. On Ubuntu: apt install ffmpeg".to_string())
+        })?;
+        info!("Found FFmpeg at: {}", ffmpeg_path);
+        
         let session_id = Uuid::new_v4().to_string();
         let output_dir = format!("{}/{}", self.hls_base_dir, session_id);
         
         // 创建输出目录
         std::fs::create_dir_all(&output_dir).map_err(|e| {
-            error!("Failed to create HLS output dir: {}", e);
+            error!("Failed to create HLS output dir {}: {}", output_dir, e);
             AppError::InternalError
         })?;
+        info!("Created output directory: {}", output_dir);
 
         // 探测媒体信息（获取音轨列表）
         let audio_tracks = probe_audio_tracks(file_path);
         let selected_audio = audio_track.unwrap_or(0);
 
         let playlist_path = format!("{}/master.m3u8", output_dir);
-        let segment_pattern = format!("{}/seg_%05d.m4s", output_dir);
-        let _init_segment = format!("{}/init.mp4", output_dir);
+        let segment_pattern = format!("{}/seg_%05d.ts", output_dir);
 
         // 获取视频信息决定是否需要转码
         let video_info = probe_video_info(file_path);
@@ -399,7 +481,7 @@ impl HlsSessionManager {
             "48000".to_string(),
         ]);
 
-        // HLS fMP4 输出参数（更好的浏览器兼容性）
+        // HLS MPEG-TS 输出参数（最大兼容性）
         args.extend(vec![
             "-f".to_string(),
             "hls".to_string(),
@@ -408,31 +490,29 @@ impl HlsSessionManager {
             "-hls_list_size".to_string(),
             "0".to_string(),  // 保留所有片段（支持完整 seek）
             "-hls_flags".to_string(),
-            "independent_segments+single_file".to_string(),
+            "independent_segments+delete_segments+append_list".to_string(),
             "-hls_segment_type".to_string(),
-            "fmp4".to_string(),  // 使用 fMP4 而非 MPEG-TS
-            "-hls_fmp4_init_filename".to_string(),
-            "init.mp4".to_string(),
+            "mpegts".to_string(),  // 使用 MPEG-TS 格式（最大兼容性）
             "-hls_segment_filename".to_string(),
             segment_pattern,
             "-start_number".to_string(),
             "0".to_string(),
-            "-movflags".to_string(),
-            "+faststart".to_string(),
             playlist_path.clone(),
         ]);
 
-        info!("Starting HLS fMP4 transcode for session {}", session_id);
+        info!("Starting HLS MPEG-TS transcode for session {}", session_id);
         info!("Video transcode needed: {}, Audio tracks: {}", needs_video_transcode, audio_tracks.len());
+        info!("FFmpeg args: {:?}", args);
+        info!("Using FFmpeg: {}", ffmpeg_path);
 
-        let child = Command::new("ffmpeg")
+        let child = Command::new(&ffmpeg_path)
             .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
-                error!("Failed to start HLS transcode: {}", e);
-                AppError::InternalError
+                error!("Failed to start HLS transcode: {} - Command: {} {:?}", e, ffmpeg_path, args);
+                AppError::BadRequest(format!("Failed to start FFmpeg: {}", e))
             })?;
 
         let session = HlsSession {
@@ -576,7 +656,9 @@ struct VideoInfo {
 }
 
 fn probe_video_info(file_path: &str) -> Option<VideoInfo> {
-    let output = Command::new("ffprobe")
+    let ffprobe = find_ffprobe()?;
+    
+    let output = Command::new(&ffprobe)
         .args([
             "-v", "quiet",
             "-select_streams", "v:0",
@@ -603,7 +685,20 @@ fn probe_video_info(file_path: &str) -> Option<VideoInfo> {
 
 /// 探测音轨信息
 fn probe_audio_tracks(file_path: &str) -> Vec<AudioTrackInfo> {
-    let output = Command::new("ffprobe")
+    let ffprobe = match find_ffprobe() {
+        Some(p) => p,
+        None => {
+            warn!("FFprobe not found, returning default audio track");
+            return vec![AudioTrackInfo {
+                index: 0,
+                language: "und".to_string(),
+                title: "默认音轨".to_string(),
+                codec: "unknown".to_string(),
+            }];
+        }
+    };
+
+    let output = Command::new(&ffprobe)
         .args([
             "-v", "quiet",
             "-select_streams", "a",
