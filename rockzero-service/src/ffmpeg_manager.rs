@@ -218,6 +218,7 @@ impl FfmpegManager {
 
             // Find the extracted ffmpeg and ffprobe binaries
             self.find_and_setup_extracted_binaries()?;
+            return Ok(());
         }
 
         #[cfg(not(target_family = "unix"))]
