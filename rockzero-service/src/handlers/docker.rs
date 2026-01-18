@@ -2,6 +2,11 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use rockzero_common::AppError;
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "linux")]
+use std::process::Command;
+#[cfg(target_os = "linux")]
+use serde_json::Value;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DockerImage {
     pub id: String,
@@ -92,7 +97,7 @@ pub async fn inspect_container(
         let output = Command::new("docker")
             .args(&["inspect", &_container_id])
             .output()
-            .map_err(|_| AppError::InternalError)?;;
+            .map_err(|_| AppError::InternalError)?;
 
         if !output.status.success() {
             return Err(AppError::NotFound("Container not found".to_string()));
