@@ -45,6 +45,7 @@ impl FfmpegManager {
     }
 
     pub async fn ensure_available(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // First, try to find FFmpeg in system PATH
         if let Some(path) = self.find_system_ffmpeg() {
             info!("Using system FFmpeg: {}", path.display());
             self.ffmpeg_path = Some(path.clone());
@@ -52,10 +53,34 @@ impl FfmpegManager {
                 self.version = Some(version);
             }
         } else {
-            warn!("FFmpeg not found in system PATH");
-            let downloaded = self.download_ffmpeg().await?;
-            if downloaded {
-                info!("FFmpeg downloaded successfully");
+            // Check if we have a local archive to extract
+            let archive_path = PathBuf::from("ffmpeg-release-arm64-static.tar.xz");
+            if archive_path.exists() {
+                info!("Found local FFmpeg archive: {}", archive_path.display());
+                if let Err(e) = self.extract_ffmpeg_archive(&archive_path).await {
+                    error!("Failed to extract FFmpeg archive: {}", e);
+                    warn!("Attempting to download FFmpeg...");
+                    let downloaded = self.download_ffmpeg().await?;
+                    if downloaded {
+                        info!("FFmpeg downloaded successfully");
+                    }
+                } else {
+                    info!("FFmpeg extracted successfully");
+                }
+            } else {
+                warn!("FFmpeg not found in system PATH or local directory");
+                let downloaded = self.download_ffmpeg().await?;
+                if downloaded {
+                    info!("FFmpeg downloaded successfully");
+                }
+            }
+            
+            // After extraction/download, try to find it again
+            if let Some(path) = self.find_system_ffmpeg() {
+                self.ffmpeg_path = Some(path.clone());
+                if let Some(version) = self.get_ffmpeg_version(&path) {
+                    self.version = Some(version);
+                }
             }
         }
 
@@ -171,6 +196,80 @@ impl FfmpegManager {
         info!("Download complete, extracting...");
         
         Ok(true)
+    }
+
+    async fn extract_ffmpeg_archive(&mut self, archive_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        info!("Extracting FFmpeg from: {}", archive_path.display());
+
+        // For tar.xz files, we need to use tar command on Unix systems
+        #[cfg(target_family = "unix")]
+        {
+            let output = Command::new("tar")
+                .arg("-xJf")
+                .arg(archive_path)
+                .arg("-C")
+                .arg(&self.base_dir)
+                .output()?;
+
+            if !output.status.success() {
+                let error_msg = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("Failed to extract archive: {}", error_msg).into());
+            }
+
+            // Find the extracted ffmpeg and ffprobe binaries
+            self.find_and_setup_extracted_binaries()?;
+        }
+
+        #[cfg(not(target_family = "unix"))]
+        {
+            let _ = archive_path; // Suppress unused variable warning
+            return Err("Archive extraction on this platform requires manual extraction".into());
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    fn find_and_setup_extracted_binaries(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use walkdir::WalkDir;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Walk through the base_dir to find ffmpeg and ffprobe
+        for entry in WalkDir::new(&self.base_dir)
+            .follow_links(false)
+            .max_depth(5)
+        {
+            if let Ok(entry) = entry {
+                let file_name = entry.file_name().to_string_lossy();
+                
+                if file_name == "ffmpeg" && entry.path().is_file() {
+                    info!("Found ffmpeg at: {}", entry.path().display());
+                    
+                    // Set executable permissions
+                    let metadata = std::fs::metadata(entry.path())?;
+                    let mut permissions = metadata.permissions();
+                    permissions.set_mode(0o755);
+                    std::fs::set_permissions(entry.path(), permissions)?;
+                    
+                    self.ffmpeg_path = Some(entry.path().to_path_buf());
+                } else if file_name == "ffprobe" && entry.path().is_file() {
+                    info!("Found ffprobe at: {}", entry.path().display());
+                    
+                    // Set executable permissions
+                    let metadata = std::fs::metadata(entry.path())?;
+                    let mut permissions = metadata.permissions();
+                    permissions.set_mode(0o755);
+                    std::fs::set_permissions(entry.path(), permissions)?;
+                    
+                    self.ffprobe_path = Some(entry.path().to_path_buf());
+                }
+            }
+        }
+
+        if self.ffmpeg_path.is_some() {
+            info!("FFmpeg binaries configured successfully");
+            Ok(())
+        } else {
+            Err("Could not find ffmpeg binary in extracted archive".into())
+        }
     }
 
     pub fn ffmpeg_path(&self) -> Option<&Path> {
