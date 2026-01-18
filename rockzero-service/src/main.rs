@@ -93,8 +93,20 @@ async fn main() -> std::io::Result<()> {
     let bind_addr = format!("{}:{}", host, port);
     info!("Listening on: {}", bind_addr);
 
-    let pool = SqlitePool::connect_lazy("sqlite::memory:")
-        .expect("create in-memory sqlite pool for metadata");
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| format!("{}/rockzero.db", data_dir));
+    
+    info!("Connecting to database: {}", database_url);
+    let pool = SqlitePool::connect(&database_url)
+        .await
+        .expect("Failed to connect to database");
+
+    // Initialize database tables
+    info!("Initializing database tables...");
+    db::initialize_database(&pool)
+        .await
+        .expect("Failed to initialize database");
+    info!("Database initialized successfully");
 
     let secure_base = std::env::var("SECURE_STORAGE_PATH")
         .unwrap_or_else(|_| "./data/secure_storage".to_string());
@@ -153,6 +165,12 @@ async fn main() -> std::io::Result<()> {
             .route("/health", web::get().to(handlers::health::health_check))
             .service(
                 web::scope("/api/v1")
+                    .service(
+                        web::scope("/auth")
+                            .route("/register", web::post().to(handlers::auth::register))
+                            .route("/login", web::post().to(handlers::auth::login))
+                            .route("/me", web::get().to(handlers::auth::me)),
+                    )
                     .service(
                         web::scope("/system")
                             .route("/hardware", web::get().to(hardware_info_endpoint))

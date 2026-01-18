@@ -347,3 +347,149 @@ mod tests {
         assert_ne!(key1, key2);
     }
 }
+
+// HTTP Request/Response structures
+use actix_web::{web, HttpResponse, Responder};
+use sqlx::SqlitePool;
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterRequest {
+    pub username: String,
+    pub email: String,
+    pub password: String,
+    pub invite_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoginRequest {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthResponse {
+    pub success: bool,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<TokenResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<UserInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserInfo {
+    pub id: String,
+    pub username: String,
+    pub email: String,
+    pub role: String,
+}
+
+/// Register a new user
+pub async fn register(
+    pool: web::Data<SqlitePool>,
+    body: web::Json<RegisterRequest>,
+) -> Result<impl Responder, AppError> {
+    // Validate input
+    if body.username.is_empty() || body.email.is_empty() || body.password.is_empty() {
+        return Err(AppError::BadRequest("All fields are required".to_string()));
+    }
+
+    if body.password.len() < 8 {
+        return Err(AppError::BadRequest(
+            "Password must be at least 8 characters".to_string(),
+        ));
+    }
+
+    // Check if username already exists
+    if let Some(_) = crate::db::find_user_by_username(&pool, &body.username).await? {
+        return Err(AppError::BadRequest("Username already exists".to_string()));
+    }
+
+    // Check if email already exists
+    if let Some(_) = crate::db::find_user_by_email(&pool, &body.email).await? {
+        return Err(AppError::BadRequest("Email already exists".to_string()));
+    }
+
+    // Create password credentials
+    let password_handler = SecurePasswordHandler::new();
+    let credentials = password_handler.create_password_credentials(&body.password)?;
+
+    // Create user
+    let user = crate::db::create_user(
+        &pool,
+        &body.username,
+        &body.email,
+        &credentials.password_hash,
+        &credentials.zkp_commitment,
+        "user",
+    )
+    .await?;
+
+    // Generate JWT tokens
+    let jwt_config = AppConfig::from_env();
+    let jwt_handler = JwtHandler::new(&jwt_config);
+    let tokens = jwt_handler.generate_tokens(&user.id, &user.email, &user.role)?;
+
+    Ok(HttpResponse::Ok().json(AuthResponse {
+        success: true,
+        message: "Registration successful".to_string(),
+        tokens: Some(tokens),
+        user: Some(UserInfo {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            role: user.role,
+        }),
+    }))
+}
+
+/// Login with username and password
+pub async fn login(
+    pool: web::Data<SqlitePool>,
+    body: web::Json<LoginRequest>,
+) -> Result<impl Responder, AppError> {
+    // Find user
+    let user = crate::db::find_user_by_username(&pool, &body.username)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("Invalid credentials".to_string()))?;
+
+    // Verify password
+    let password_handler = SecurePasswordHandler::new();
+    if !password_handler.verify_password(&body.password, &user.password_hash)? {
+        return Err(AppError::Unauthorized("Invalid credentials".to_string()));
+    }
+
+    // Generate JWT tokens
+    let jwt_config = AppConfig::from_env();
+    let jwt_handler = JwtHandler::new(&jwt_config);
+    let tokens = jwt_handler.generate_tokens(&user.id, &user.email, &user.role)?;
+
+    Ok(HttpResponse::Ok().json(AuthResponse {
+        success: true,
+        message: "Login successful".to_string(),
+        tokens: Some(tokens),
+        user: Some(UserInfo {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            role: user.role,
+        }),
+    }))
+}
+
+/// Get current user info (requires authentication)
+pub async fn me(
+    pool: web::Data<SqlitePool>,
+    claims: web::ReqData<Claims>,
+) -> Result<impl Responder, AppError> {
+    let user = crate::db::find_user_by_id(&pool, &claims.sub)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    Ok(HttpResponse::Ok().json(UserInfo {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+    }))
+}

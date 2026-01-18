@@ -2,7 +2,267 @@
 
 use rockzero_common::AppError;
 use rockzero_common::models::{FileMetadata, Widget};
-use sqlx::SqlitePool;
+use sqlx::{SqlitePool, Row};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub id: String,
+    pub username: String,
+    pub email: String,
+    pub password_hash: String,
+    pub zkp_commitment: String,
+    pub role: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Initialize database tables
+pub async fn initialize_database(pool: &SqlitePool) -> Result<(), AppError> {
+    // Users table
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY NOT NULL,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            zkp_commitment TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    // FIDO sessions table
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS fido_sessions (
+            id TEXT PRIMARY KEY NOT NULL,
+            user_id TEXT NOT NULL,
+            session_type TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            expires_at DATETIME NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    // FIDO credentials table
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS fido_credentials (
+            id TEXT PRIMARY KEY NOT NULL,
+            user_id TEXT NOT NULL,
+            credential_id BLOB NOT NULL,
+            public_key BLOB NOT NULL,
+            counter INTEGER NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    // Invite codes table
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS invite_codes (
+            code TEXT PRIMARY KEY NOT NULL,
+            created_by TEXT,
+            max_uses INTEGER NOT NULL DEFAULT 1,
+            current_uses INTEGER NOT NULL DEFAULT 0,
+            expires_at DATETIME,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Create a new user
+pub async fn create_user(
+    pool: &SqlitePool,
+    username: &str,
+    email: &str,
+    password_hash: &str,
+    zkp_commitment: &str,
+    role: &str,
+) -> Result<User, AppError> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now();
+
+    sqlx::query(
+        r#"
+        INSERT INTO users (id, username, email, password_hash, zkp_commitment, role, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&id)
+    .bind(username)
+    .bind(email)
+    .bind(password_hash)
+    .bind(zkp_commitment)
+    .bind(role)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE constraint failed") {
+            AppError::BadRequest("Username or email already exists".to_string())
+        } else {
+            AppError::DatabaseError(e.to_string())
+        }
+    })?;
+
+    Ok(User {
+        id,
+        username: username.to_string(),
+        email: email.to_string(),
+        password_hash: password_hash.to_string(),
+        zkp_commitment: zkp_commitment.to_string(),
+        role: role.to_string(),
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+/// Find user by ID
+pub async fn find_user_by_id(pool: &SqlitePool, user_id: &str) -> Result<Option<User>, AppError> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, username, email, password_hash, zkp_commitment, role, 
+               created_at, updated_at
+        FROM users WHERE id = ?
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    match row {
+        Some(r) => {
+            let user = User {
+                id: r.try_get("id").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                username: r.try_get("username").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                email: r.try_get("email").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                password_hash: r.try_get("password_hash").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                zkp_commitment: r.try_get("zkp_commitment").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                role: r.try_get("role").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                created_at: r.try_get("created_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                updated_at: r.try_get("updated_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+            };
+            Ok(Some(user))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Find user by username
+pub async fn find_user_by_username(pool: &SqlitePool, username: &str) -> Result<Option<User>, AppError> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, username, email, password_hash, zkp_commitment, role,
+               created_at, updated_at
+        FROM users WHERE username = ?
+        "#,
+    )
+    .bind(username)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    match row {
+        Some(r) => {
+            let user = User {
+                id: r.try_get("id").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                username: r.try_get("username").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                email: r.try_get("email").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                password_hash: r.try_get("password_hash").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                zkp_commitment: r.try_get("zkp_commitment").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                role: r.try_get("role").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                created_at: r.try_get("created_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                updated_at: r.try_get("updated_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+            };
+            Ok(Some(user))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Find user by email
+pub async fn find_user_by_email(pool: &SqlitePool, email: &str) -> Result<Option<User>, AppError> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, username, email, password_hash, zkp_commitment, role,
+               created_at, updated_at
+        FROM users WHERE email = ?
+        "#,
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    match row {
+        Some(r) => {
+            let user = User {
+                id: r.try_get("id").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                username: r.try_get("username").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                email: r.try_get("email").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                password_hash: r.try_get("password_hash").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                zkp_commitment: r.try_get("zkp_commitment").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                role: r.try_get("role").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                created_at: r.try_get("created_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                updated_at: r.try_get("updated_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+            };
+            Ok(Some(user))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Update user password
+pub async fn update_user_password(
+    pool: &SqlitePool,
+    user_id: &str,
+    password_hash: &str,
+    zkp_commitment: &str,
+) -> Result<(), AppError> {
+    let now = chrono::Utc::now();
+
+    sqlx::query(
+        r#"
+        UPDATE users 
+        SET password_hash = ?, zkp_commitment = ?, updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(password_hash)
+    .bind(zkp_commitment)
+    .bind(now)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    Ok(())
+}
 
 pub async fn create_file_metadata(
     _pool: &SqlitePool,
