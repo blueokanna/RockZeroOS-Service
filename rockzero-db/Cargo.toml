@@ -1,0 +1,38 @@
+[package]
+name = "rockzero-db"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "RockZero Secure Database Management"
+
+[dependencies]
+# Internal dependencies (alphabetically sorted)
+rockzero-common = { path = "../rockzero-common", features = ["db"] }
+rockzero-crypto = { path = "../rockzero-crypto" }
+rockzero-sae = { path = "../rockzero-sae" }
+
+# Cryptography (alphabetically sorted)
+aes-gcm = { workspace = true }
+base64 = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
+
+# Serialization (alphabetically sorted)
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities (alphabetically sorted)
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "fs"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+tempfile = "3.8"

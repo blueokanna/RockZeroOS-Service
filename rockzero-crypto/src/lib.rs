@@ -1,0 +1,19 @@
+pub mod aes;
+pub mod crypto;
+pub mod hash;
+pub mod signature;
+pub mod tls;
+pub mod utils;
+pub mod zkp;
+
+pub use aes::{decrypt_aes256_gcm, encrypt_aes256_gcm};
+pub use hash::{blake3_hash, sha256_hash, sha512_hash};
+pub use signature::{generate_keypair, sign, verify};
+pub use tls::{load_rustls_config, TlsConfig};
+pub use utils::{
+    constant_time_compare, crc32_checksum, crc32_verify, secure_random_base64, secure_random_bytes,
+    secure_random_hex, secure_zero, secure_zero_key,
+};
+pub use zkp::{EnhancedPasswordProof, PasswordProofData, RangeProofData, ZkpContext};
+
+pub use rockzero_sae::{KeyDerivation, SaeClient, SaeCommit, SaeConfirm, SaeServer};
