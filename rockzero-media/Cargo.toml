@@ -28,6 +28,9 @@ log = { workspace = true }
 tracing = { workspace = true }
 blake3 = { workspace = true }
 
+# System
+libc = { workspace = true }
+
 # Internal dependencies
 rockzero-common = { path = "../rockzero-common" }
 rockzero-sae = { path = "../rockzero-sae" }

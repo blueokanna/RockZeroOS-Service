@@ -3308,6 +3308,7 @@ dependencies = [
  "blake3",
  "chrono",
  "hex",
+ "libc",
  "log",
  "rand 0.8.5",
  "rockzero-common",
