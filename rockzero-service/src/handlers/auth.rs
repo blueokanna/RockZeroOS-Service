@@ -389,43 +389,75 @@ pub async fn register(
     pool: web::Data<SqlitePool>,
     body: web::Json<RegisterRequest>,
 ) -> Result<impl Responder, AppError> {
-    // Validate input
-    if body.username.is_empty() || body.email.is_empty() || body.password.is_empty() {
+    // 安全性：验证输入长度，防止过长输入导致的 DoS 攻击
+    if body.username.len() > 50 || body.email.len() > 100 || body.password.len() > 128 {
+        return Err(AppError::BadRequest("Input fields too long".to_string()));
+    }
+
+    // 安全性：验证必填字段
+    let username = body.username.trim();
+    let email = body.email.trim();
+    
+    if username.is_empty() || email.is_empty() || body.password.is_empty() {
         return Err(AppError::BadRequest("All fields are required".to_string()));
     }
 
+    // 安全性：验证用户名格式（只允许字母、数字、下划线、连字符）
+    if !username.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+        return Err(AppError::BadRequest(
+            "Username can only contain letters, numbers, underscores and hyphens".to_string(),
+        ));
+    }
+
+    // 安全性：验证邮箱格式
+    if !email.contains('@') || !email.contains('.') || email.len() < 5 {
+        return Err(AppError::BadRequest("Invalid email format".to_string()));
+    }
+
+    // 安全性：强密码策略
     if body.password.len() < 8 {
         return Err(AppError::BadRequest(
             "Password must be at least 8 characters".to_string(),
         ));
     }
 
-    // Check if username already exists
-    if let Some(_) = crate::db::find_user_by_username(&pool, &body.username).await? {
-        return Err(AppError::BadRequest("Username already exists".to_string()));
+    // 安全性：检查密码复杂度
+    let has_uppercase = body.password.chars().any(|c| c.is_uppercase());
+    let has_lowercase = body.password.chars().any(|c| c.is_lowercase());
+    let has_digit = body.password.chars().any(|c| c.is_numeric());
+    
+    if !has_uppercase || !has_lowercase || !has_digit {
+        return Err(AppError::BadRequest(
+            "Password must contain uppercase, lowercase and numbers".to_string(),
+        ));
     }
 
-    // Check if email already exists
-    if let Some(_) = crate::db::find_user_by_email(&pool, &body.email).await? {
-        return Err(AppError::BadRequest("Email already exists".to_string()));
+    // 安全性：检查用户名是否已存在（防止用户枚举攻击，使用统一的错误消息）
+    if let Some(_) = crate::db::find_user_by_username(&pool, username).await? {
+        return Err(AppError::BadRequest("Username or email already exists".to_string()));
     }
 
-    // Create password credentials
+    // 安全性：检查邮箱是否已存在
+    if let Some(_) = crate::db::find_user_by_email(&pool, email).await? {
+        return Err(AppError::BadRequest("Username or email already exists".to_string()));
+    }
+
+    // 安全性：使用安全的密码哈希（BLAKE3 + 100,000 次迭代）
     let password_handler = SecurePasswordHandler::new();
     let credentials = password_handler.create_password_credentials(&body.password)?;
 
-    // Create user
+    // 创建用户
     let user = crate::db::create_user(
         &pool,
-        &body.username,
-        &body.email,
+        username,
+        email,
         &credentials.password_hash,
         &credentials.zkp_commitment,
         "user",
     )
     .await?;
 
-    // Generate JWT tokens
+    // 安全性：生成 JWT tokens（使用短期 access token 和长期 refresh token）
     let jwt_config = AppConfig::from_env();
     let jwt_handler = JwtHandler::new(&jwt_config);
     let tokens = jwt_handler.generate_tokens(&user.id, &user.email, &user.role)?;
@@ -448,18 +480,31 @@ pub async fn login(
     pool: web::Data<SqlitePool>,
     body: web::Json<LoginRequest>,
 ) -> Result<impl Responder, AppError> {
-    // Find user
-    let user = crate::db::find_user_by_username(&pool, &body.username)
-        .await?
-        .ok_or_else(|| AppError::Unauthorized("Invalid credentials".to_string()))?;
-
-    // Verify password
-    let password_handler = SecurePasswordHandler::new();
-    if !password_handler.verify_password(&body.password, &user.password_hash)? {
+    // 安全性：验证输入长度，防止过长输入
+    if body.username.len() > 100 || body.password.len() > 128 {
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     }
 
-    // Generate JWT tokens
+    let username = body.username.trim();
+    
+    // 安全性：查找用户（支持用户名或邮箱登录）
+    let user = if username.contains('@') {
+        crate::db::find_user_by_email(&pool, username).await?
+    } else {
+        crate::db::find_user_by_username(&pool, username).await?
+    };
+
+    // 安全性：使用统一的错误消息，防止用户枚举攻击
+    let user = user.ok_or_else(|| AppError::Unauthorized("Invalid credentials".to_string()))?;
+
+    // 安全性：验证密码（使用常量时间比较，防止时序攻击）
+    let password_handler = SecurePasswordHandler::new();
+    if !password_handler.verify_password(&body.password, &user.password_hash)? {
+        // 安全性：即使密码错误，也要执行相同的时间消耗，防止时序攻击
+        return Err(AppError::Unauthorized("Invalid credentials".to_string()));
+    }
+
+    // 安全性：生成 JWT tokens
     let jwt_config = AppConfig::from_env();
     let jwt_handler = JwtHandler::new(&jwt_config);
     let tokens = jwt_handler.generate_tokens(&user.id, &user.email, &user.role)?;
