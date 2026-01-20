@@ -88,7 +88,8 @@ uuid = { version = "1.6", features = ["v4", "serde"] }
 dotenvy = "0.15"
 image = "0.24"
 mime_guess = "2.0"
-reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json"] }
+num_cpus = "1.16"
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "native-tls", "json", "gzip", "brotli", "deflate"] }
 urlencoding = "2.1"
 walkdir = "2.4"
 wasmtime = { version = "18", features = ["async"] }

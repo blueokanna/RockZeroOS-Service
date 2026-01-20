@@ -354,12 +354,29 @@ async fn main() -> std::io::Result<()> {
                             .route("/filesystems", web::get().to(handlers::disk_manager::get_supported_filesystems))
                             .route("/{id}/initialize", web::post().to(handlers::disk_manager::initialize_disk))
                             .route("/{id}/rename", web::post().to(handlers::disk_manager::rename_disk))
-                            .route("/zfs/status", web::get().to(handlers::disk_manager::get_zfs_status))
-                            .route("/zfs/pool", web::post().to(handlers::disk_manager::create_zfs_pool))
-                            .route("/zfs/pool/{id}", web::get().to(handlers::disk_manager::get_zfs_pool_status))
                             .route("/{id}/smart-test", web::post().to(handlers::disk_manager::run_smart_test))
                             .route("/{id}/wipe", web::post().to(handlers::disk_manager::wipe_disk))
                             .route("/{id}/temperature", web::get().to(handlers::disk_manager::get_disk_temperature)),
+                    )
+                    // 专业级存储管理 API
+                    .service(
+                        web::scope("/storage")
+                            .route("/devices", web::get().to(handlers::storage::list_storage_devices))
+                            .route("/devices/{id}", web::get().to(handlers::storage::get_storage_device))
+                            .route("/mount", web::post().to(handlers::storage::mount_storage))
+                            .route("/unmount/{device}", web::post().to(handlers::storage::unmount_storage))
+                            .route("/format", web::post().to(handlers::storage::format_storage))
+                            .route("/partition", web::post().to(handlers::storage::partition_and_format))
+                            .route("/wipe/{device}", web::post().to(handlers::storage::wipe_disk))
+                            .route("/eject/{device}", web::post().to(handlers::storage::eject_storage))
+                            .route("/smart-format", web::post().to(handlers::storage::smart_format))
+                            .route("/auto-mount", web::post().to(handlers::storage::auto_mount)),
+                    )
+                    // 视频硬件加速 API
+                    .service(
+                        web::scope("/video-hardware")
+                            .route("/capabilities", web::get().to(handlers::video_hardware::get_hardware_capabilities))
+                            .route("/transcode", web::post().to(handlers::video_hardware::transcode_video)),
                     )
                     .service(
                         web::scope("/files")

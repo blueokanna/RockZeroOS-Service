@@ -25,8 +25,6 @@ const ISTOREOS_STORE_URL: &str = "https://fw.koolcenter.com/iStoreOS/apps";
 #[serde(rename_all = "lowercase")]
 pub enum AppPackageKind {
     Wasm,
-    Casaos,
-    Istoreos,
     Docker,
     Ipk,
 }
@@ -35,10 +33,24 @@ impl AppPackageKind {
     fn dir_name(&self) -> &'static str {
         match self {
             AppPackageKind::Wasm => "wasm",
-            AppPackageKind::Casaos => "casaos",
-            AppPackageKind::Istoreos => "istoreos",
             AppPackageKind::Docker => "docker",
             AppPackageKind::Ipk => "ipk",
+        }
+    }
+    
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            AppPackageKind::Wasm => "WASM Application",
+            AppPackageKind::Docker => "Docker Container (CasaOS)",
+            AppPackageKind::Ipk => "IPK Package (iStoreOS/OpenWRT)",
+        }
+    }
+    
+    pub fn description(&self) -> &'static str {
+        match self {
+            AppPackageKind::Wasm => "Custom WASM-based online application with flexible rules",
+            AppPackageKind::Docker => "Docker-based application from CasaOS App Store",
+            AppPackageKind::Ipk => "OpenWRT IPK package from iStoreOS",
         }
     }
 }
@@ -105,8 +117,18 @@ pub struct AppStoreItem {
 pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
     info!("🔍 Fetching CasaOS app store...");
 
+    // 使用原生 TLS 和更宽松的配置
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30)) // 增加超时时间到30秒
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(10)
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .gzip(true)
+        .brotli(true)
+        .deflate(true)
+        .use_rustls_tls() // 使用 rustls
+        .danger_accept_invalid_certs(false) // 不接受无效证书
         .build()
         .map_err(|e| {
             error!("❌ Failed to create HTTP client: {}", e);
@@ -116,49 +138,108 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
     // 尝试多次请求，增加重试机制
     let mut last_error = String::new();
     for attempt in 1..=3 {
-        info!("🔄 Attempt {} to fetch CasaOS store", attempt);
-        
-        match client.get(CASAOS_STORE_URL).send().await {
+        info!(
+            "🔄 Attempt {} to fetch CasaOS store from {}",
+            attempt, CASAOS_STORE_URL
+        );
+
+        match client
+            .get(CASAOS_STORE_URL)
+            .header("Accept", "application/json, text/plain, */*")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Cache-Control", "no-cache")
+            .header("Connection", "keep-alive")
+            .send()
+            .await
+        {
             Ok(response) => {
-                if !response.status().is_success() {
-                    error!("❌ CasaOS store returned error: {}", response.status());
-                    last_error = format!("CasaOS store returned status: {}", response.status());
+                let status = response.status();
+                info!("📡 Response status: {}", status);
+
+                if !status.is_success() {
+                    error!("❌ CasaOS store returned error: {}", status);
+                    last_error = format!("CasaOS store returned status: {}", status);
                     if attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(1000 * attempt as u64))
+                            .await;
                         continue;
                     }
                 } else {
-                    match response.json::<Value>().await {
-                        Ok(apps_json) => {
-                            let installed_packages = load_packages()?;
-                            let installed_ids: HashMap<String, bool> = installed_packages
-                                .iter()
-                                .map(|p| (p.id.clone(), true))
-                                .collect();
+                    // 先获取文本，然后解析
+                    match response.text().await {
+                        Ok(text) => {
+                            info!("📦 Received {} bytes of data", text.len());
 
-                            let mut apps = Vec::new();
-                            if let Some(app_list) = apps_json.as_array() {
-                                for app in app_list {
-                                    if let Some(item) = parse_casaos_app(app, &installed_ids) {
-                                        apps.push(item);
+                            match serde_json::from_str::<Value>(&text) {
+                                Ok(apps_json) => {
+                                    let installed_packages = load_packages()?;
+                                    let installed_ids: HashMap<String, bool> = installed_packages
+                                        .iter()
+                                        .map(|p| (p.id.clone(), true))
+                                        .collect();
+
+                                    let mut apps = Vec::new();
+                                    if let Some(app_list) = apps_json.as_array() {
+                                        info!(
+                                            "📋 Processing {} apps from CasaOS store",
+                                            app_list.len()
+                                        );
+                                        for app in app_list {
+                                            if let Some(item) =
+                                                parse_casaos_app(app, &installed_ids)
+                                            {
+                                                apps.push(item);
+                                            }
+                                        }
+                                    } else if let Some(data) =
+                                        apps_json.get("data").and_then(|d| d.as_array())
+                                    {
+                                        info!(
+                                            "📋 Processing {} apps from CasaOS store (nested data)",
+                                            data.len()
+                                        );
+                                        for app in data {
+                                            if let Some(item) =
+                                                parse_casaos_app(app, &installed_ids)
+                                            {
+                                                apps.push(item);
+                                            }
+                                        }
+                                    } else {
+                                        warn!("⚠️ Unexpected JSON structure from CasaOS store");
+                                    }
+
+                                    let total = apps.len();
+                                    info!("✅ Successfully parsed {} CasaOS apps", total);
+
+                                    return Ok(HttpResponse::Ok().json(AppStoreList {
+                                        apps,
+                                        total,
+                                        source: "casaos".to_string(),
+                                    }));
+                                }
+                                Err(e) => {
+                                    error!("❌ Failed to parse JSON: {}", e);
+                                    error!("📄 Response preview: {}", &text[..text.len().min(500)]);
+                                    last_error = format!("Invalid JSON from CasaOS store: {}", e);
+                                    if attempt < 3 {
+                                        tokio::time::sleep(std::time::Duration::from_millis(
+                                            1000 * attempt as u64,
+                                        ))
+                                        .await;
+                                        continue;
                                     }
                                 }
                             }
-
-                            let total = apps.len();
-                            info!("✅ Found {} CasaOS apps", total);
-
-                            return Ok(HttpResponse::Ok().json(AppStoreList {
-                                apps,
-                                total,
-                                source: "casaos".to_string(),
-                            }));
                         }
                         Err(e) => {
-                            error!("❌ Failed to parse CasaOS response: {}", e);
-                            last_error = format!("Invalid response from CasaOS store: {}", e);
+                            error!("❌ Failed to read response text: {}", e);
+                            last_error = format!("Failed to read response: {}", e);
                             if attempt < 3 {
-                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    1000 * attempt as u64,
+                                ))
+                                .await;
                                 continue;
                             }
                         }
@@ -166,23 +247,26 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
                 }
             }
             Err(e) => {
-                error!("❌ Failed to fetch CasaOS store (attempt {}): {}", attempt, e);
-                last_error = format!("Failed to fetch CasaOS store: {}. This may be due to network issues or the CasaOS server being unavailable.", e);
+                error!("❌ Network error (attempt {}): {}", attempt, e);
+                last_error = format!("Network error: {}. Check your internet connection.", e);
                 if attempt < 3 {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1000 * attempt as u64))
+                        .await;
                     continue;
                 }
             }
         }
     }
 
-    // 所有重试都失败，返回空列表而不是错误
-    warn!("⚠️ CasaOS store unavailable after 3 attempts: {}", last_error);
-    Ok(HttpResponse::Ok().json(AppStoreList {
-        apps: Vec::new(),
-        total: 0,
-        source: "casaos".to_string(),
-    }))
+    // 所有重试都失败，返回错误信息而不是空列表
+    error!(
+        "❌ CasaOS store completely unavailable after 3 attempts: {}",
+        last_error
+    );
+    Err(AppError::BadRequest(format!(
+        "Unable to connect to CasaOS App Store. Please check your internet connection. Error: {}",
+        last_error
+    )))
 }
 
 fn parse_casaos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<AppStoreItem> {

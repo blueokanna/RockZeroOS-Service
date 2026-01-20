@@ -11,7 +11,8 @@ pub mod storage_management;
 
 // 占位符模块 - 待实现
 pub mod system;
-pub mod storage;
+pub mod storage; // 专业级存储管理（已合并）
+pub mod video_hardware; // 视频硬件加速
 pub mod speedtest;
 pub mod appstore;
 pub mod appstore_enhanced;
