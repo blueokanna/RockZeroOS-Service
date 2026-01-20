@@ -3,6 +3,8 @@ use std::path::Path;
 use sysinfo::{Disks, Networks, System};
 
 #[cfg(target_os = "linux")]
+use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::fs;
 
 #[cfg(target_os = "linux")]
