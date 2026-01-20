@@ -1,12 +1,3 @@
-//! 安全存储处理器 - 加密数据存储 API
-//!
-//! 提供安全的数据存储功能：
-//! - 零知识加密存储
-//! - CRC32 完整性校验
-//! - Reed-Solomon 自动修复
-//! - 文件加密/解密
-//! - 安全密钥派生
-
 use actix_web::{web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

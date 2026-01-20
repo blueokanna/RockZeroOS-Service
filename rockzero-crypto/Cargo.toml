@@ -21,6 +21,7 @@ ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
+lazy_static = "1.4"
 merlin = { workspace = true }
 rand = { workspace = true }
 sha3 = { workspace = true }

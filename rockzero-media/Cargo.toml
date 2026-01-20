@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 # Internal dependencies
 rockzero-common = { path = "../rockzero-common" }
+rockzero-crypto = { path = "../rockzero-crypto" }
 rockzero-sae = { path = "../rockzero-sae" }
 
 # Async runtime

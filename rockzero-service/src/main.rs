@@ -10,8 +10,10 @@ mod secure_db;
 mod ffmpeg_manager;
 mod media_processor;
 mod storage_manager;
+mod event_notifier;
+mod secure_video_access;
 
-use rockzero_common as _;
+use rockzero_common::{self as _, AppConfig};
 use rockzero_crypto as _;
 use rockzero_sae as _;
 
@@ -132,6 +134,18 @@ async fn main() -> std::io::Result<()> {
     info!("Storage cleanup tasks started");
 
     let invite_manager = Arc::new(InviteCodeManager::new());
+    
+    // 初始化 AppConfig
+    let app_config = Arc::new(AppConfig::from_env());
+    info!("App configuration loaded");
+    
+    // 初始化事件通知器（200ms去抖动）
+    let _event_notifier = event_notifier::init_global_notifier(200);
+    info!("Event notifier initialized");
+    
+    // 初始化视频访问管理器
+    let _video_access_manager = secure_video_access::init_global_video_access_manager();
+    info!("Video access manager initialized");
 
     HttpServer::new(move || {
         let pool = pool.clone();
@@ -140,6 +154,7 @@ async fn main() -> std::io::Result<()> {
         let media_processor_data = media_processor.clone();
         let hls_manager_data = hls_manager.clone();
         let storage_manager_data = storage_manager.clone();
+        let app_config_data = app_config.clone();
         let cors = Cors::default()
             .allow_any_origin()
             .allowed_methods(vec![
@@ -176,6 +191,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(media_processor_data))
             .app_data(web::Data::new(hls_manager_data))
             .app_data(web::Data::new(storage_manager_data))
+            .app_data(web::Data::from(app_config_data))
             .route("/health", web::get().to(handlers::health::health_check))
             .service(
                 web::scope("/api/v1")

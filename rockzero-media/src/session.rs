@@ -3,6 +3,7 @@ use crate::{
     HlsEncryptor,
 };
 use chrono::{DateTime, Duration, Utc};
+use rockzero_crypto::PasswordRegistration;
 use rockzero_sae::SaeServer;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -11,6 +12,12 @@ use hkdf::Hkdf;
 use sha3::Sha3_256;
 
 /// HLS 会话
+/// 
+/// 包含完整的会话状态，支持：
+/// - SAE 密钥交换派生的 PMK
+/// - ZKP 密码验证所需的注册数据
+/// - AES-256-GCM 加密密钥
+/// - 每段独立的加密密钥（密钥轮换）
 pub struct HlsSession {
     pub session_id: String,
     pub user_id: String,
@@ -21,14 +28,42 @@ pub struct HlsSession {
     pub encryption_key: [u8; 32],
     pub encryptor: HlsEncryptor,
     pub segment_keys: Vec<[u8; 32]>,
+    /// 用户密码注册数据（用于验证 ZKP 证明）
+    pub zkp_registration: Option<PasswordRegistration>,
 }
 
 impl HlsSession {
+    /// 创建新的 HLS 会话
+    /// 
+    /// # 参数
+    /// - `user_id`: 用户标识
+    /// - `file_path`: 视频文件路径
+    /// - `pmk`: SAE 握手派生的主密钥 (Pairwise Master Key)
+    /// - `max_segments`: 预生成的最大分片密钥数量
+    /// - `zkp_registration`: 可选的 ZKP 密码注册数据，用于验证客户端证明
+    /// 
+    /// # 密钥派生
+    /// 使用 HKDF-SHA3-256 从 PMK 派生：
+    /// - 主加密密钥（用于 AES-256-GCM）
+    /// - 每个分片的独立密钥（支持密钥轮换）
     pub fn new(
         user_id: String,
         file_path: String,
         pmk: [u8; 32],
         max_segments: usize,
+    ) -> Result<Self> {
+        Self::new_with_registration(user_id, file_path, pmk, max_segments, None)
+    }
+
+    /// 创建带有 ZKP 注册数据的 HLS 会话
+    /// 
+    /// 当需要验证客户端的 ZKP 证明时，必须使用此方法创建会话
+    pub fn new_with_registration(
+        user_id: String,
+        file_path: String,
+        pmk: [u8; 32],
+        max_segments: usize,
+        zkp_registration: Option<PasswordRegistration>,
     ) -> Result<Self> {
         let session_id = Uuid::new_v4().to_string();
         let created_at = Utc::now();
@@ -42,7 +77,7 @@ impl HlsSession {
         hk.expand(b"hls-master-key", &mut encryption_key)
             .map_err(|e| HlsError::EncryptionError(format!("HKDF expand failed: {}", e)))?;
         
-        // 派生分片密钥
+        // 派生分片密钥（每段使用独立密钥，支持密钥轮换）
         let mut segment_keys = Vec::with_capacity(max_segments);
         for i in 0..max_segments {
             let mut key = [0u8; 32];
@@ -64,7 +99,18 @@ impl HlsSession {
             encryption_key,
             encryptor,
             segment_keys,
+            zkp_registration,
         })
+    }
+
+    /// 设置 ZKP 注册数据
+    pub fn set_zkp_registration(&mut self, registration: PasswordRegistration) {
+        self.zkp_registration = Some(registration);
+    }
+
+    /// 获取 ZKP 注册数据的引用
+    pub fn get_zkp_registration(&self) -> Option<&PasswordRegistration> {
+        self.zkp_registration.as_ref()
     }
 
     pub fn is_expired(&self) -> bool {
@@ -119,11 +165,33 @@ impl HlsSessionManager {
         Ok(temp_session_id)
     }
 
+    /// 完成 SAE 握手并创建 HLS 会话
+    /// 
+    /// # 参数
+    /// - `temp_session_id`: 临时会话ID（由 init_sae_handshake 返回）
+    /// - `user_id`: 用户标识
+    /// - `file_path`: 视频文件路径
+    /// 
+    /// # 返回
+    /// 成功时返回新创建的会话ID
     pub fn complete_sae_handshake(
         &self,
         temp_session_id: &str,
         user_id: String,
         file_path: String,
+    ) -> Result<String> {
+        self.complete_sae_handshake_with_registration(temp_session_id, user_id, file_path, None)
+    }
+
+    /// 完成 SAE 握手并创建带有 ZKP 注册数据的 HLS 会话
+    /// 
+    /// 当需要验证客户端的 ZKP 证明时，使用此方法
+    pub fn complete_sae_handshake_with_registration(
+        &self,
+        temp_session_id: &str,
+        user_id: String,
+        file_path: String,
+        zkp_registration: Option<PasswordRegistration>,
     ) -> Result<String> {
         let mut servers = self.sae_servers.lock().unwrap();
         let sae_server = servers
@@ -138,7 +206,13 @@ impl HlsSessionManager {
         }
 
         let pmk = sae_server.get_pmk()?;
-        let session = HlsSession::new(user_id, file_path, pmk, 1000)?;
+        let session = HlsSession::new_with_registration(
+            user_id, 
+            file_path, 
+            pmk, 
+            1000,
+            zkp_registration,
+        )?;
         let session_id = session.session_id.clone();
 
         let mut sessions = self.sessions.lock().unwrap();
@@ -147,6 +221,26 @@ impl HlsSessionManager {
         Ok(session_id)
     }
 
+    /// 为现有会话设置 ZKP 注册数据
+    /// 
+    /// 用于在会话创建后添加 ZKP 验证能力
+    pub fn set_session_zkp_registration(
+        &self,
+        session_id: &str,
+        registration: PasswordRegistration,
+    ) -> Result<()> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| HlsError::SessionNotFound(session_id.to_string()))?;
+        
+        session.set_zkp_registration(registration);
+        Ok(())
+    }
+
+    /// 获取会话的克隆
+    /// 
+    /// 注意：这会创建会话的完整副本，包括 ZKP 注册数据
     pub fn get_session(&self, session_id: &str) -> Result<HlsSession> {
         let sessions = self.sessions.lock().unwrap();
         let session = sessions
@@ -167,6 +261,7 @@ impl HlsSessionManager {
             encryption_key: session.encryption_key,
             encryptor: HlsEncryptor::new(&session.encryption_key)?,
             segment_keys: session.segment_keys.clone(),
+            zkp_registration: session.zkp_registration.clone(),
         })
     }
 

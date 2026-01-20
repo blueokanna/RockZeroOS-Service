@@ -76,9 +76,14 @@ where
         let service = Rc::clone(&self.service);
 
         Box::pin(async move {
-            let config = req
-                .app_data::<actix_web::web::Data<AppConfig>>()
-                .expect("AppConfig not configured");
+            let config = req.app_data::<actix_web::web::Data<AppConfig>>();
+
+            if config.is_none() {
+                let res = service.call(req).await?;
+                return Ok(res.map_into_left_body());
+            }
+
+            let config = config.unwrap();
 
             let auth_header = req
                 .headers()

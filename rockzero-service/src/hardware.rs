@@ -1050,8 +1050,6 @@ fn detect_usb_devices_linux() -> Vec<UsbDeviceInfo> {
                 .map(|s| format!("{} Mbps", s.trim()));
 
             let device_class = detect_usb_device_class(&path);
-
-            // 使用设备路径查找挂载点，支持多个相同型号设备
             let mount_point =
                 find_usb_device_mount_by_path(&dir_name, &vendor_id, &product_id, &serial);
 
@@ -1159,7 +1157,7 @@ fn find_usb_device_mount(vendor_id: &str, product_id: &str) -> Option<String> {
     None
 }
 
-/// 通过 USB 设备路径查找挂载点，支持多个相同型号的设备
+#[allow(dead_code)]
 #[cfg(target_os = "linux")]
 fn find_usb_device_mount_by_path(
     usb_path: &str,
@@ -1167,10 +1165,8 @@ fn find_usb_device_mount_by_path(
     product_id: &str,
     serial: &Option<String>,
 ) -> Option<String> {
-    // 查找该 USB 设备下的所有块设备
     let usb_sys_path = format!("/sys/bus/usb/devices/{}", usb_path);
 
-    // 遍历查找 block 设备
     fn find_block_device(path: &std::path::Path) -> Option<String> {
         if let Ok(entries) = fs::read_dir(path) {
             for entry in entries.flatten() {
@@ -1193,7 +1189,6 @@ fn find_usb_device_mount_by_path(
         None
     }
 
-    // 尝试从 USB 设备路径找到对应的块设备
     if let Some(block_dev) = find_block_device(std::path::Path::new(&usb_sys_path)) {
         if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
             for line in mounts.lines() {
@@ -1211,7 +1206,6 @@ fn find_usb_device_mount_by_path(
         }
     }
 
-    // 备用方案：通过 vendor/product ID 和序列号匹配
     if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
         for line in mounts.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -1226,7 +1220,6 @@ fn find_usb_device_mount_by_path(
                         .take_while(|c| !c.is_ascii_digit())
                         .collect();
 
-                    // 检查设备的 vendor/product ID
                     let usb_device_path = format!("/sys/block/{}/device/../../../", base_dev);
                     if let Ok(vid) = fs::read_to_string(format!("{}idVendor", usb_device_path)) {
                         if let Ok(pid) = fs::read_to_string(format!("{}idProduct", usb_device_path))
@@ -1256,7 +1249,6 @@ fn find_usb_device_mount_by_path(
 
 // ============ 公开 API 函数 ============
 
-/// 获取所有块设备信息（包括未挂载的）
 pub fn get_all_block_devices() -> Vec<BlockDeviceInfo> {
     #[cfg(target_os = "linux")]
     {

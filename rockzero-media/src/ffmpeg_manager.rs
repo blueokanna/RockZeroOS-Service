@@ -1,7 +1,3 @@
-//! FFmpeg 自动下载和管理模块
-//! 
-//! 自动检测系统架构并下载对应的 FFmpeg 静态二进制文件
-
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;

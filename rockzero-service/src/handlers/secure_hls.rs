@@ -1,6 +1,6 @@
 use actix_web::{web, HttpResponse, Responder};
 use rockzero_common::AppError;
-use rockzero_crypto::{EnhancedPasswordProof, ZkpContext};
+use rockzero_crypto::{EnhancedPasswordProof, PasswordRegistration, ZkpContext};
 use rockzero_media::{HlsSession, HlsSessionManager};
 use rockzero_sae::{SaeCommit, SaeConfirm};
 use serde::Deserialize;
@@ -136,10 +136,20 @@ pub async fn complete_sae_handshake(
 /// 步骤 3: 创建 HLS 会话
 /// 
 /// SAE 握手完成后，创建实际的 HLS 会话
+/// 
+/// # 安全流程
+/// 1. 验证用户身份（通过 JWT claims）
+/// 2. 验证文件访问权限
+/// 3. 获取用户的 ZKP 注册数据（用于后续的 ZKP 验证）
+/// 4. 完成 SAE 握手并创建会话
+/// 5. 将 ZKP 注册数据关联到会话
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
     pub temp_session_id: String,
     pub file_id: String,
+    /// 可选的 ZKP 注册数据（JSON 序列化）
+    /// 如果未提供，将从数据库中获取用户的注册数据
+    pub zkp_registration: Option<String>,
 }
 
 pub async fn create_hls_session(
@@ -150,29 +160,89 @@ pub async fn create_hls_session(
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
     
-    // 获取文件信息
+    // 1. 获取文件信息并验证访问权限
     let file = crate::db::find_file_by_id(&pool, &body.file_id, &user_id)
         .await?
         .ok_or_else(|| AppError::NotFound("File not found".to_string()))?;
     
-    // 完成 SAE 握手并创建会话
+    // 2. 获取用户的 ZKP 注册数据
+    let zkp_registration: Option<PasswordRegistration> = if let Some(ref reg_json) = body.zkp_registration {
+        // 从请求中解析
+        Some(serde_json::from_str(reg_json).map_err(|e| {
+            AppError::BadRequest(format!("Invalid ZKP registration format: {}", e))
+        })?)
+    } else {
+        // 从数据库获取用户的 ZKP 注册数据
+        // 这需要在用户注册/登录时存储
+        match get_user_zkp_registration(&pool, &user_id).await {
+            Ok(Some(reg)) => Some(reg),
+            Ok(None) => {
+                warn!("User {} does not have ZKP registration data stored", user_id);
+                None
+            }
+            Err(e) => {
+                warn!("Failed to get ZKP registration for user {}: {}", user_id, e);
+                None
+            }
+        }
+    };
+    
+    // 3. 完成 SAE 握手并创建会话（带 ZKP 注册数据）
     let manager = hls_manager.read().await;
-    let session_id = manager.complete_sae_handshake(
+    let session_id = manager.complete_sae_handshake_with_registration(
         &body.temp_session_id,
         user_id.clone(),
         file.file_path.clone(),
+        zkp_registration.clone(),
     ).map_err(convert_hls_error)?;
     
-    // 获取会话信息
+    // 4. 获取会话信息
     let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
     
-    info!("Created HLS session {} for user {} - file {}", session_id, user_id, file.file_path);
+    // 5. 记录日志
+    let has_zkp = zkp_registration.is_some();
+    info!(
+        "Created HLS session {} for user {} - file {} (ZKP enabled: {})", 
+        session_id, user_id, file.file_path, has_zkp
+    );
     
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "session_id": session_id,
         "expires_at": session.expires_at.timestamp(),
         "playlist_url": format!("/api/v1/secure-hls/{}/playlist.m3u8", session_id),
+        "zkp_enabled": has_zkp,
+        "encryption_method": "AES-256-GCM",
     })))
+}
+
+/// 从数据库获取用户的 ZKP 注册数据
+/// 
+/// 注意：这需要在数据库中添加相应的表和字段来存储用户的 ZKP 注册数据
+/// 这通常在用户注册或首次登录时创建
+async fn get_user_zkp_registration(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> Result<Option<PasswordRegistration>, AppError> {
+    // 查询用户的 ZKP 注册数据
+    // 假设数据库中有 users 表，包含 zkp_registration 字段（JSON 格式）
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT zkp_registration FROM users WHERE id = $1"
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to query ZKP registration: {}", e)))?;
+    
+    match row {
+        Some((Some(json_str),)) => {
+            let registration: PasswordRegistration = serde_json::from_str(&json_str)
+                .map_err(|e| AppError::InternalServerError(format!(
+                    "Invalid ZKP registration data in database: {}", e
+                )))?;
+            Ok(Some(registration))
+        }
+        _ => Ok(None),
+    }
 }
 
 // ============ 安全播放列表和段获取 ============
@@ -263,66 +333,255 @@ fn generate_secure_m3u8(segment_count: usize, segment_duration: f32) -> String {
 }
 
 /// 验证客户端的 ZKP 证明
+/// 
+/// 这是生产级实现，使用会话中存储的 PasswordRegistration 进行验证。
+/// 
+/// # 安全性说明
+/// - 使用存储在会话中的 PasswordRegistration（在用户注册/登录时创建）
+/// - ZKP 证明验证确保客户端知道正确的密码，而不需要传输密码本身
+/// - 包含时间戳和 nonce 防止重放攻击
+/// - 上下文绑定防止证明在不同场景中被重用
+/// 
 fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, AppError> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
     
-    // 解码 ZKP 证明
+    // 1. 检查会话是否有 ZKP 注册数据
+    let registration = session.get_zkp_registration()
+        .ok_or_else(|| AppError::CryptoError(
+            "Session does not have ZKP registration data. \
+             Ensure the session was created with PasswordRegistration.".to_string()
+        ))?;
+    
+    // 2. 解码 Base64 编码的证明
     let proof_bytes = BASE64
         .decode(proof_base64)
-        .map_err(|_| AppError::BadRequest("Invalid proof format".to_string()))?;
+        .map_err(|e| AppError::BadRequest(format!(
+            "Invalid Base64 encoding in ZKP proof: {}", e
+        )))?;
     
-    // 解析 ZKP 证明
+    // 3. 解析 ZKP 证明结构
     let proof: EnhancedPasswordProof = serde_json::from_slice(&proof_bytes)
-        .map_err(|_| AppError::BadRequest("Invalid proof structure".to_string()))?;
+        .map_err(|e| AppError::BadRequest(format!(
+            "Invalid ZKP proof structure: {}. Expected EnhancedPasswordProof JSON.", e
+        )))?;
     
-    // 验证证明
+    // 4. 验证上下文 - 确保证明是为视频段访问生成的
+    const EXPECTED_CONTEXT: &str = "hls_segment_access";
+    if proof.context != EXPECTED_CONTEXT {
+        warn!(
+            "ZKP proof context mismatch: expected '{}', got '{}'",
+            EXPECTED_CONTEXT, proof.context
+        );
+        return Ok(false);
+    }
+    
+    // 5. 创建 ZKP 上下文并验证证明
     let zkp_context = ZkpContext::new();
     
-    // 使用会话的 PMK 生成 commitment
-    let pmk_hex = hex::encode(session.pmk);
-    
-    // 验证增强证明（300秒有效期）
-    zkp_context.verify_enhanced_proof(&proof, &pmk_hex, 300)
-        .map_err(|e| AppError::CryptoError(format!("ZKP verification failed: {}", e)))
+    // 6. 验证增强证明
+    // - 300秒有效期（5分钟，适合流媒体场景）
+    // - 使用存储的 registration 验证 commitment 匹配
+    // - 验证 Schnorr 证明（知识证明）
+    // - 验证范围证明（密码强度证明）
+    // - 检查 nonce 防止重放
+    // - 检查时间戳防止延迟重放
+    match zkp_context.verify_enhanced_proof(&proof, registration, EXPECTED_CONTEXT, 300) {
+        Ok(valid) => {
+            if !valid {
+                warn!(
+                    "ZKP proof verification failed for session {} (mathematical verification failed)",
+                    session.session_id
+                );
+            }
+            Ok(valid)
+        }
+        Err(e) => {
+            warn!(
+                "ZKP proof verification error for session {}: {}",
+                session.session_id, e
+            );
+            Err(AppError::CryptoError(format!(
+                "ZKP verification failed: {}", e
+            )))
+        }
+    }
+}
+
+/// 视频段缓存目录配置
+/// 
+/// 在生产环境中，这应该从配置文件读取
+fn get_hls_cache_dir() -> std::path::PathBuf {
+    // 优先使用环境变量，否则使用默认路径
+    std::env::var("ROCKZERO_HLS_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            // 默认使用 /var/cache/rockzero/hls（Linux）
+            // 或 temp 目录下的 rockzero-hls
+            #[cfg(target_os = "linux")]
+            {
+                std::path::PathBuf::from("/var/cache/rockzero/hls")
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                std::env::temp_dir().join("rockzero-hls")
+            }
+        })
 }
 
 /// 读取视频段数据
 /// 
-/// 注意：这是简化版本，实际应该从 FFmpeg 转码输出读取
+/// 生产级实现：
+/// 1. 首先尝试从 HLS 缓存目录读取预转码的段
+/// 2. 如果缓存不存在，触发实时转码（通过 FFmpeg）
+/// 3. 支持段索引验证和路径遍历保护
 fn read_video_segment(file_path: &str, segment_name: &str) -> Result<Vec<u8>, AppError> {
     use std::fs;
     use std::path::PathBuf;
     
-    // 解析段索引
+    // 1. 验证段名称格式（防止路径遍历攻击）
+    if !segment_name.starts_with("segment_") || !segment_name.ends_with(".ts") {
+        return Err(AppError::BadRequest(format!(
+            "Invalid segment name format: '{}'. Expected 'segment_N.ts'", segment_name
+        )));
+    }
+    
+    // 2. 解析段索引
     let segment_index: usize = segment_name
         .trim_start_matches("segment_")
         .trim_end_matches(".ts")
         .parse()
-        .map_err(|_| AppError::BadRequest("Invalid segment name".to_string()))?;
+        .map_err(|_| AppError::BadRequest(format!(
+            "Invalid segment index in name: '{}'", segment_name
+        )))?;
     
-    // 构建段文件路径（假设已经转码）
-    // 实际应该从 HLS 缓存目录读取
-    let segment_path = PathBuf::from(file_path)
-        .parent()
-        .ok_or(AppError::InternalError)?
-        .join(format!("segment_{}.ts", segment_index));
-    
-    // 如果段不存在，需要实时转码
-    if !segment_path.exists() {
-        // TODO: 实时转码逻辑
-        // 这里返回模拟数据
-        warn!("Segment {} not found, returning mock data", segment_name);
-        return Ok(vec![0u8; 1024 * 64]); // 64KB 模拟数据
+    // 3. 验证段索引范围（防止过大的索引导致问题）
+    const MAX_SEGMENT_INDEX: usize = 100_000;
+    if segment_index > MAX_SEGMENT_INDEX {
+        return Err(AppError::BadRequest(format!(
+            "Segment index {} exceeds maximum allowed ({})", segment_index, MAX_SEGMENT_INDEX
+        )));
     }
     
-    // 读取段文件
-    fs::read(&segment_path)
-        .map_err(|e| AppError::IoError(format!("Failed to read segment: {}", e)))
+    // 4. 计算视频文件的唯一标识符（用于缓存目录）
+    let video_hash = blake3::hash(file_path.as_bytes());
+    let video_id = hex::encode(&video_hash.as_bytes()[..8]); // 使用前 8 字节作为 ID
+    
+    // 5. 构建缓存目录路径
+    let cache_dir = get_hls_cache_dir().join(&video_id);
+    let cached_segment_path = cache_dir.join(segment_name);
+    
+    // 6. 尝试从缓存读取
+    if cached_segment_path.exists() {
+        return fs::read(&cached_segment_path)
+            .map_err(|e| AppError::IoError(format!(
+                "Failed to read cached segment {}: {}", segment_name, e
+            )));
+    }
+    
+    // 7. 缓存不存在，检查原始视频文件
+    let original_video = PathBuf::from(file_path);
+    if !original_video.exists() {
+        return Err(AppError::NotFound(format!(
+            "Original video file not found: {}", file_path
+        )));
+    }
+    
+    // 8. 触发实时转码
+    // 注意：在生产环境中，这应该调用 FFmpegManager 进行异步转码
+    // 这里提供一个同步的备用实现
+    info!(
+        "Cache miss for segment {} of video {}, triggering transcode",
+        segment_name, video_id
+    );
+    
+    // 创建缓存目录
+    if !cache_dir.exists() {
+        fs::create_dir_all(&cache_dir).map_err(|e| AppError::IoError(format!(
+            "Failed to create cache directory: {}", e
+        )))?;
+    }
+    
+    // 调用 FFmpeg 进行转码（同步版本，生产环境应使用异步）
+    match transcode_segment(&original_video, &cache_dir, segment_index) {
+        Ok(segment_data) => {
+            // 将转码结果写入缓存
+            if let Err(e) = fs::write(&cached_segment_path, &segment_data) {
+                warn!("Failed to cache segment {}: {}", segment_name, e);
+                // 继续返回数据，缓存失败不阻塞响应
+            }
+            Ok(segment_data)
+        }
+        Err(e) => {
+            warn!("Transcode failed for segment {}: {}", segment_name, e);
+            Err(e)
+        }
+    }
 }
 
-// ============ 会话管理扩展 ============
-
-// 注意：不能为外部类型实现方法，这些方法已经在 rockzero-media/src/session.rs 中实现
+/// 使用 FFmpeg 转码单个视频段
+/// 
+/// 这是一个同步实现，用于按需转码。
+/// 在高负载场景下，应该使用预转码或异步转码。
+/// 
+/// # FFmpeg 参数说明
+/// - `-ss`: 起始时间（基于段索引计算）
+/// - `-t`: 段持续时间（默认 10 秒）
+/// - `-c:v libx264`: 使用 H.264 编码
+/// - `-c:a aac`: 使用 AAC 音频编码
+/// - `-f mpegts`: 输出 MPEG-TS 格式
+fn transcode_segment(
+    video_path: &std::path::Path,
+    output_dir: &std::path::Path,
+    segment_index: usize,
+) -> Result<Vec<u8>, AppError> {
+    use std::process::Command;
+    
+    const SEGMENT_DURATION: f64 = 10.0; // 每段 10 秒
+    let start_time = segment_index as f64 * SEGMENT_DURATION;
+    
+    let output_path = output_dir.join(format!("segment_{}.ts", segment_index));
+    
+    // 检测 FFmpeg 可执行文件路径
+    let ffmpeg_path = std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string());
+    
+    // 构建 FFmpeg 命令
+    // 针对 ARM (A311D) 和 x86_64 优化的参数
+    let output = Command::new(&ffmpeg_path)
+        .args([
+            "-y",                           // 覆盖输出文件
+            "-ss", &format!("{:.3}", start_time),
+            "-i", video_path.to_str().unwrap_or(""),
+            "-t", &format!("{:.3}", SEGMENT_DURATION),
+            "-c:v", "libx264",              // H.264 视频编码
+            "-preset", "veryfast",          // 快速编码预设（适合实时）
+            "-tune", "zerolatency",         // 低延迟调优
+            "-profile:v", "main",           // Main Profile（兼容性好）
+            "-level", "4.0",                // Level 4.0（支持 1080p）
+            "-c:a", "aac",                  // AAC 音频编码
+            "-b:a", "128k",                 // 音频码率
+            "-ac", "2",                     // 立体声
+            "-ar", "44100",                 // 采样率
+            "-f", "mpegts",                 // MPEG-TS 容器
+            "-movflags", "+faststart",      // 快速启动
+            output_path.to_str().unwrap_or(""),
+        ])
+        .output()
+        .map_err(|e| AppError::IoError(format!(
+            "Failed to execute FFmpeg: {}. Ensure FFmpeg is installed and in PATH.", e
+        )))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::InternalServerError(format!(
+            "FFmpeg transcode failed: {}", stderr
+        )));
+    }
+    
+    // 读取生成的段文件
+    std::fs::read(&output_path).map_err(|e| AppError::IoError(format!(
+        "Failed to read transcoded segment: {}", e
+    )))
+}
 
 #[cfg(test)]
 mod tests {
@@ -337,5 +596,18 @@ mod tests {
         assert!(playlist.contains("segment_4.ts"));
         assert!(!playlist.contains("#EXT-X-KEY")); // 不应该包含密钥 URL
         assert!(playlist.contains("AES-256-GCM"));
+    }
+    
+    #[test]
+    fn test_segment_name_validation() {
+        // 有效的段名称
+        assert!(read_video_segment("/nonexistent/video.mp4", "segment_0.ts").is_err());
+        
+        // 无效的段名称格式
+        let result = read_video_segment("/video.mp4", "../../../etc/passwd");
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+        
+        let result = read_video_segment("/video.mp4", "segment_-1.ts");
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
     }
 }

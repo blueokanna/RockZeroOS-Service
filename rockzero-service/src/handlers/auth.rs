@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 
 use rockzero_common::{AppConfig, AppError, TokenResponse};
 use rockzero_crypto::{blake3_hash, constant_time_compare};
-use rockzero_crypto::{EnhancedPasswordProof, PasswordProofData, ZkpContext};
+use rockzero_crypto::{EnhancedPasswordProof, PasswordRegistration, ZkpContext};
 
 const HASH_ITERATIONS: u32 = 100_000;
 const SALT_LENGTH: usize = 32;
@@ -153,16 +153,17 @@ impl SecurePasswordHandler {
         }
     }
 
+    /// Register a new password and return credentials for storage
     pub fn create_password_credentials(
         &self,
         password: &str,
     ) -> Result<PasswordCredentials, AppError> {
         let password_hash = hash_password(password)?;
-        let (commitment, _blinding) = self.zkp_context.generate_commitment(password)?;
+        let registration = self.zkp_context.register_password(password)?;
 
         Ok(PasswordCredentials {
             password_hash,
-            zkp_commitment: commitment,
+            zkp_registration: registration,
         })
     }
 
@@ -170,19 +171,12 @@ impl SecurePasswordHandler {
         verify_password(password, stored_hash)
     }
 
-    pub fn verify_zkp_proof(
-        &self,
-        proof: &PasswordProofData,
-        stored_commitment: &str,
-    ) -> Result<bool, AppError> {
-        self.zkp_context
-            .verify_password_proof(proof, stored_commitment)
-    }
-
+    /// Verify an enhanced ZKP proof against stored registration
     pub async fn verify_enhanced_proof(
         &self,
         proof: &EnhancedPasswordProof,
-        stored_commitment: &str,
+        registration: &PasswordRegistration,
+        context: &str,
     ) -> Result<bool, AppError> {
         {
             let nonces = self.used_nonces.read().await;
@@ -193,7 +187,8 @@ impl SecurePasswordHandler {
 
         let result = self.zkp_context.verify_enhanced_proof(
             proof,
-            stored_commitment,
+            registration,
+            context,
             NONCE_EXPIRY_SECONDS,
         )?;
 
@@ -208,15 +203,14 @@ impl SecurePasswordHandler {
         Ok(result)
     }
 
-    pub fn generate_proof(&self, password: &str) -> Result<PasswordProofData, AppError> {
-        self.zkp_context.generate_password_proof(password)
-    }
-
+    /// Generate an enhanced proof for authentication
     pub fn generate_enhanced_proof(
         &self,
         password: &str,
+        registration: &PasswordRegistration,
+        context: &str,
     ) -> Result<EnhancedPasswordProof, AppError> {
-        self.zkp_context.generate_enhanced_proof(password)
+        self.zkp_context.generate_enhanced_proof(password, registration, context)
     }
 
     pub fn derive_encryption_key(&self, password: &str, context: &str) -> [u8; 32] {
@@ -240,7 +234,7 @@ impl Default for SecurePasswordHandler {
 #[derive(Debug, Clone)]
 pub struct PasswordCredentials {
     pub password_hash: String,
-    pub zkp_commitment: String,
+    pub zkp_registration: PasswordRegistration,
 }
 
 pub fn hash_password(password: &str) -> Result<String, AppError> {
@@ -312,11 +306,12 @@ mod tests {
             .verify_password(password, &credentials.password_hash)
             .unwrap());
 
-        let proof = handler.generate_proof(password).unwrap();
+        // Test enhanced proof generation and verification
+        let proof = handler.generate_enhanced_proof(password, &credentials.zkp_registration, "login").unwrap();
         
-        assert!(handler
-            .verify_zkp_proof(&proof, &proof.commitment)
-            .unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(handler.verify_enhanced_proof(&proof, &credentials.zkp_registration, "login")).unwrap();
+        assert!(result);
     }
 
     #[test]
@@ -327,11 +322,9 @@ mod tests {
 
         let credentials = handler.create_password_credentials(password).unwrap();
 
-        let proof = handler.generate_proof(wrong_password).unwrap();
-
-        assert!(!handler
-            .verify_zkp_proof(&proof, &credentials.zkp_commitment)
-            .unwrap());
+        // Trying to generate a proof with wrong password should fail
+        let result = handler.generate_enhanced_proof(wrong_password, &credentials.zkp_registration, "login");
+        assert!(result.is_err());
     }
 
     #[test]
@@ -446,13 +439,17 @@ pub async fn register(
     let password_handler = SecurePasswordHandler::new();
     let credentials = password_handler.create_password_credentials(&body.password)?;
 
+    // 序列化 ZKP registration 为 JSON 存储
+    let zkp_registration_json = serde_json::to_string(&credentials.zkp_registration)
+        .map_err(|e| AppError::InternalServerError(format!("Failed to serialize ZKP registration: {}", e)))?;
+
     // 创建用户
     let user = crate::db::create_user(
         &pool,
         username,
         email,
         &credentials.password_hash,
-        &credentials.zkp_commitment,
+        &zkp_registration_json,
         "user",
     )
     .await?;

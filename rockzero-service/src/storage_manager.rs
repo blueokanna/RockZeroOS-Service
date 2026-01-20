@@ -404,8 +404,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_directory_size() {
-        let temp_dir = std::env::temp_dir();
+        // 创建一个受控的临时目录用于测试
+        let temp_dir = std::env::temp_dir().join(format!(
+            "rockzero_test_dir_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_dir).await.expect("Failed to create test directory");
+        
+        // 创建一些测试文件
+        let test_file = temp_dir.join("test_file.txt");
+        fs::write(&test_file, "Hello, World!").await.expect("Failed to write test file");
+        
         let size = get_directory_size(&temp_dir).await;
         assert!(size.is_ok());
+        assert!(size.unwrap() >= 13); // "Hello, World!" 有 13 字节
+        
+        // 清理
+        fs::remove_dir_all(&temp_dir).await.ok();
     }
 }

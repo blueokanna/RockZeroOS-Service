@@ -5,6 +5,7 @@ use actix_web::http::header::{
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use bytes::Bytes;
 use futures::StreamExt;
+use rockzero_common::AppError;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -13,10 +14,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tracing::info;
 use walkdir::WalkDir;
-use rockzero_common::AppError;
 
 const BASE_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
-const MAX_FILE_SIZE: usize = 10 * 1024 * 1024 * 1024;
+const MAX_FILE_SIZE: usize = 100 * 1024 * 1024 * 1024;
 const MAX_TEXT_PREVIEW_SIZE: usize = 1024 * 1024;
 const STREAM_CHUNK_SIZE: u64 = 128 * 1024;
 const MAX_RANGE_SIZE: u64 = 1024 * 1024;
@@ -162,8 +162,12 @@ pub async fn list_directory(
     let decoded_path = urlencoding::decode(requested_path)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| requested_path.to_string());
-    
-    tracing::info!("Listing directory: {:?} (decoded: {:?})", requested_path, decoded_path);
+
+    tracing::info!(
+        "Listing directory: {:?} (decoded: {:?})",
+        requested_path,
+        decoded_path
+    );
 
     let full_path = sanitize_path(&decoded_path)?;
     tracing::info!("Full path: {:?}", full_path);
@@ -324,7 +328,7 @@ pub async fn create_directory(
     let decoded_name = urlencoding::decode(&body.name)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| body.name.clone());
-    
+
     let parent_path = sanitize_path(&decoded_path)?;
     let new_dir_path = parent_path.join(&decoded_name);
 
@@ -343,23 +347,67 @@ pub async fn create_directory(
     })))
 }
 
+/// 上传进度跟踪
+#[derive(Debug, Clone, Serialize)]
+pub struct UploadProgress {
+    pub filename: String,
+    pub total_bytes: usize,
+    pub uploaded_bytes: usize,
+    pub speed_mbps: f64,
+    pub percentage: f64,
+    #[serde(skip)]
+    pub started_at: std::time::Instant,
+}
+
 pub async fn upload_files(
     query: web::Query<ListDirectoryQuery>,
     mut payload: Multipart,
+    req: actix_web::HttpRequest,
 ) -> Result<impl Responder, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+
     let target_path = query.path.as_deref().unwrap_or("");
-    // URL-decode the path to handle UTF-8 characters
     let decoded_target_path = urlencoding::decode(target_path)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| target_path.to_string());
-    
+
     let full_path = sanitize_path(&decoded_target_path)?;
 
     if !full_path.exists() || !full_path.is_dir() {
         return Err(AppError::BadRequest("Invalid target directory".to_string()));
     }
 
+    // 检查目标路径是否在 eMMC 上，如果是则拒绝上传
+    let canonical_path = full_path
+        .canonicalize()
+        .map_err(|_| AppError::BadRequest("Cannot resolve target path".to_string()))?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let path_str = canonical_path.to_string_lossy();
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+            for line in mounts.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let device = parts[0];
+                    let mount_point = parts[1];
+
+                    if path_str.starts_with(mount_point) {
+                        if device.contains("mmcblk")
+                            && (mount_point == "/" || mount_point.starts_with("/boot"))
+                        {
+                            return Err(AppError::BadRequest(
+                                "Cannot upload to eMMC storage. Please select an external storage device.".to_string()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut uploaded_files = Vec::new();
+    let start_time = std::time::Instant::now();
 
     while let Some(item) = payload.next().await {
         let mut field = item.map_err(|_| AppError::BadRequest("Invalid file data".to_string()))?;
@@ -369,17 +417,32 @@ pub async fn upload_files(
             .get_filename()
             .ok_or_else(|| AppError::BadRequest("Missing filename".to_string()))?
             .to_string();
-        
+
         // URL-decode filename to handle UTF-8 characters
         let decoded_filename = urlencoding::decode(&filename)
             .map(|s| s.into_owned())
             .unwrap_or_else(|_| filename.clone());
 
         let file_path = full_path.join(&decoded_filename);
+
+        #[cfg(target_os = "linux")]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_SYNC)
+                .open(&file_path)
+                .map_err(|_| AppError::InternalError)?
+        };
+
+        #[cfg(not(target_os = "linux"))]
         let mut file = fs::File::create(&file_path).map_err(|_| AppError::InternalError)?;
 
         let mut hasher = blake3::Hasher::new();
         let mut file_size = 0usize;
+        let file_start_time = std::time::Instant::now();
 
         while let Some(chunk) = field.next().await {
             let data = chunk.map_err(|_| AppError::InternalError)?;
@@ -392,22 +455,71 @@ pub async fn upload_files(
 
             hasher.update(&data);
             file.write_all(&data).map_err(|_| AppError::InternalError)?;
+
+            // 计算上传速度（每1MB报告一次）
+            if file_size.is_multiple_of(1024 * 1024) {
+                let elapsed = file_start_time.elapsed().as_secs_f64();
+                if elapsed > 0.0 {
+                    let speed_mbps = (file_size as f64 * 8.0) / (elapsed * 1_000_000.0);
+                    info!(
+                        "Upload progress: {} - {:.2} MB - {:.2} Mbps",
+                        decoded_filename,
+                        file_size as f64 / (1024.0 * 1024.0),
+                        speed_mbps
+                    );
+                }
+            }
         }
+
+        // 确保数据写入磁盘
+        file.sync_all().map_err(|_| AppError::InternalError)?;
 
         let checksum = hasher.finalize().to_hex().to_string();
 
-        info!("File uploaded: {} ({} bytes)", decoded_filename, file_size);
+        // 计算最终速度
+        let elapsed = file_start_time.elapsed().as_secs_f64();
+        let speed_mbps = if elapsed > 0.0 {
+            (file_size as f64 * 8.0) / (elapsed * 1_000_000.0)
+        } else {
+            0.0
+        };
+
+        info!(
+            "File uploaded to {}: {} ({} bytes, {:.2} Mbps)",
+            canonical_path.display(),
+            decoded_filename,
+            file_size,
+            speed_mbps
+        );
 
         uploaded_files.push(serde_json::json!({
             "filename": decoded_filename,
             "size": file_size,
             "checksum": checksum,
+            "path": file_path.to_string_lossy(),
+            "speed_mbps": format!("{:.2}", speed_mbps),
+            "duration_seconds": format!("{:.2}", elapsed),
         }));
     }
+
+    let total_elapsed = start_time.elapsed().as_secs_f64();
+    let total_size: usize = uploaded_files
+        .iter()
+        .filter_map(|f| f.get("size").and_then(|s| s.as_u64()))
+        .map(|s| s as usize)
+        .sum();
+    let avg_speed_mbps = if total_elapsed > 0.0 {
+        (total_size as f64 * 8.0) / (total_elapsed * 1_000_000.0)
+    } else {
+        0.0
+    };
 
     Ok(HttpResponse::Created().json(serde_json::json!({
         "message": "Files uploaded successfully",
         "files": uploaded_files,
+        "total_size": total_size,
+        "total_duration_seconds": format!("{:.2}", total_elapsed),
+        "average_speed_mbps": format!("{:.2}", avg_speed_mbps),
     })))
 }
 
@@ -418,7 +530,7 @@ pub async fn download_file(
         .path
         .as_deref()
         .ok_or_else(|| AppError::BadRequest("Missing file path".to_string()))?;
-    
+
     // URL-decode the path to handle UTF-8 characters
     let decoded_file_path = urlencoding::decode(file_path)
         .map(|s| s.into_owned())
@@ -442,15 +554,13 @@ pub async fn download_file(
         .map_err(|_| AppError::InternalError)?
         .set_content_disposition(actix_web::http::header::ContentDisposition {
             disposition: actix_web::http::header::DispositionType::Attachment,
-            parameters: vec![
-                actix_web::http::header::DispositionParam::FilenameExt(
-                    actix_web::http::header::ExtendedValue {
-                        charset: actix_web::http::header::Charset::Ext("UTF-8".to_string()),
-                        language_tag: None,
-                        value: file_name.as_bytes().to_vec(),
-                    }
-                ),
-            ],
+            parameters: vec![actix_web::http::header::DispositionParam::FilenameExt(
+                actix_web::http::header::ExtendedValue {
+                    charset: actix_web::http::header::Charset::Ext("UTF-8".to_string()),
+                    language_tag: None,
+                    value: file_name.as_bytes().to_vec(),
+                },
+            )],
         }))
 }
 
@@ -462,7 +572,7 @@ pub async fn rename_file(body: web::Json<RenameRequest>) -> Result<impl Responde
     let decoded_new_name = urlencoding::decode(&body.new_name)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| body.new_name.clone());
-    
+
     let old_path = sanitize_path(&decoded_old_path)?;
     let new_path = old_path
         .parent()
@@ -490,7 +600,7 @@ pub async fn move_files(body: web::Json<MoveRequest>) -> Result<impl Responder, 
     let decoded_dest = urlencoding::decode(&body.destination)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| body.destination.clone());
-    
+
     let source_path = sanitize_path(&decoded_source)?;
     let dest_path = sanitize_path(&decoded_dest)?;
 
@@ -525,7 +635,7 @@ pub async fn copy_files(body: web::Json<CopyRequest>) -> Result<impl Responder, 
     let decoded_dest = urlencoding::decode(&body.destination)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| body.destination.clone());
-    
+
     let source_path = sanitize_path(&decoded_source)?;
     let dest_path = sanitize_path(&decoded_dest)?;
 
@@ -560,7 +670,7 @@ pub async fn delete_files(body: web::Json<DeleteRequest>) -> Result<impl Respond
         let decoded_path = urlencoding::decode(path_str)
             .map(|s| s.into_owned())
             .unwrap_or_else(|_| path_str.clone());
-        
+
         let path = sanitize_path(&decoded_path)?;
 
         if !path.exists() {
@@ -703,7 +813,7 @@ fn sanitize_path(path: &str) -> Result<PathBuf, AppError> {
     let decoded_path = urlencoding::decode(path)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| path.to_string());
-    
+
     // If path is absolute and in allowed directories, use it directly
     if decoded_path.starts_with('/') {
         let abs_path = Path::new(&decoded_path);
