@@ -3,8 +3,8 @@
   "title": "RockZero Secure Service",
   "name": "rockzero-service",
   "icon": "https://cdn.jsdelivr.net/gh/IceWhaleTech/CasaOS-AppStore@main/Apps/rockzero/icon.png",
-  "tagline": "Cross-platform secure service with hardware detection, media playback, and app store",
-  "overview": "Production-grade secure service built with Rust. Features: Zero-knowledge proof authentication, Blake3 password hashing, hardware detection (CPU/Memory/Disk/USB), FFmpeg media transcoding with hardware acceleration (Rockchip MPP, Amlogic, Intel QSV, NVIDIA NVENC), Docker app store, file manager, and widget system. Supports aarch64, armv7, x86_64.",
+  "tagline": "Enterprise-grade secure service with disk management, app store, and hardware acceleration",
+  "overview": "Production-grade secure service built with Rust. Features: Zero-knowledge proof authentication, FIDO2/Passkey support, Blake3 password hashing, hardware detection (CPU/Memory/Disk/USB), disk management (mount/format/unmount), FFmpeg media transcoding with hardware acceleration (Rockchip MPP, Amlogic, Intel QSV, NVIDIA NVENC), Docker app store (CasaOS/iStoreOS), file manager with preview, and widget system. Supports aarch64, armv7, x86_64. Fixed: Disk operation 404 errors, App Store network issues, wallpaper theme system.",
   "thumbnail": "https://cdn.jsdelivr.net/gh/IceWhaleTech/CasaOS-AppStore@main/Apps/rockzero/thumbnail.png",
   "screenshots": [],
   "category": "Security",
@@ -17,7 +17,7 @@
     "name": "RockZero",
     "image": "rockzero/rockzero-service:latest",
     "index": "/",
-    "port": "8443",
+    "port": "8080",
     "scheme": "http"
   },
   "support": "https://github.com/rockzero/rockzero-service/issues",
@@ -25,13 +25,13 @@
   "container": {
     "image": "rockzero/rockzero-service:latest",
     "shell": "bash",
-    "privileged": false,
-    "network_mode": "bridge",
+    "privileged": true,
+    "network_mode": "host",
     "web_ui": {
-      "http": "8443",
+      "http": "8080",
       "path": "/"
     },
-    "health_check": "curl -f http://localhost:8443/health || exit 1",
+    "health_check": "curl -f http://localhost:8080/health || exit 1",
     "envs": [
       {
         "key": "RUST_LOG",
@@ -56,12 +56,30 @@
         "value": "false",
         "configurable": "yes",
         "description": "Enable TLS (true/false)"
+      },
+      {
+        "key": "BIND_ADDRESS",
+        "value": "0.0.0.0:8080",
+        "configurable": "yes",
+        "description": "Service bind address"
+      },
+      {
+        "key": "DATABASE_URL",
+        "value": "sqlite:///app/data/rockzero.db",
+        "configurable": "no",
+        "description": "Database path"
+      },
+      {
+        "key": "ENABLE_HARDWARE_ACCEL",
+        "value": "true",
+        "configurable": "yes",
+        "description": "Enable hardware acceleration for video transcoding"
       }
     ],
     "ports": [
       {
-        "container": "8443",
-        "host": "8443",
+        "container": "8080",
+        "host": "8080",
         "type": "tcp",
         "allocation": "automatic",
         "configurable": "advanced",
@@ -75,7 +93,7 @@
         "mode": "rw",
         "allocation": "automatic",
         "configurable": "advanced",
-        "description": "Database storage"
+        "description": "Database and configuration storage"
       },
       {
         "container": "/app/uploads",
@@ -94,20 +112,36 @@
         "description": "File manager storage"
       },
       {
+        "container": "/app/media",
+        "host": "/DATA/Media",
+        "mode": "rw",
+        "allocation": "automatic",
+        "configurable": "advanced",
+        "description": "Media files storage"
+      },
+      {
         "container": "/var/run/docker.sock",
         "host": "/var/run/docker.sock",
         "mode": "rw",
         "allocation": "automatic",
         "configurable": "no",
-        "description": "Docker socket for app store"
+        "description": "Docker socket for app store (required)"
       },
       {
-        "container": "/media",
-        "host": "/media",
-        "mode": "ro",
+        "container": "/mnt",
+        "host": "/mnt",
+        "mode": "rw",
         "allocation": "automatic",
-        "configurable": "advanced",
-        "description": "Media files"
+        "configurable": "no",
+        "description": "Mount points access (required for disk management)"
+      },
+      {
+        "container": "/dev",
+        "host": "/dev",
+        "mode": "rw",
+        "allocation": "automatic",
+        "configurable": "no",
+        "description": "Device access (required for disk management)"
       }
     ],
     "devices": [
@@ -128,14 +162,14 @@
       }
     ],
     "constraints": {
-      "min_memory": 256,
+      "min_memory": 512,
       "min_storage": 2048
     },
     "restart_policy": "unless-stopped",
     "sysctls": [],
-    "cap_add": ["NET_BIND_SERVICE", "SYS_ADMIN"],
-    "cap_drop": ["ALL"],
-    "security_opt": ["no-new-privileges:true"]
+    "cap_add": ["NET_BIND_SERVICE", "SYS_ADMIN", "DAC_OVERRIDE", "MKNOD"],
+    "cap_drop": [],
+    "security_opt": []
   },
   "abilities": {
     "notification": false,
@@ -159,18 +193,26 @@
         "value": "info"
       },
       {
+        "content": "💾 Disk management requires privileged mode and host network",
+        "value": "info"
+      },
+      {
+        "content": "🐳 App store requires Docker socket mount",
+        "value": "info"
+      },
+      {
         "content": "🎬 Hardware acceleration: Rockchip MPP, Amlogic, Intel QSV, NVIDIA NVENC",
         "value": "info"
       },
       {
-        "content": "🐳 Docker app store: Install Nextcloud, Jellyfin, Portainer, Home Assistant",
-        "value": "info"
+        "content": "🔧 Fixed: Disk mount/format 404 errors, App Store network retry, wallpaper theme",
+        "value": "success"
       }
     ]
   },
   "changelog": {
-    "latest_updates": "v0.1.0 - Production release: Hardware detection, FFmpeg transcoding, Docker app store, file manager, widgets"
+    "latest_updates": "v0.1.1 - Fixed disk management 404 errors, improved App Store network handling with retry mechanism, added wallpaper theme system with color blending and glassmorphic effects"
   },
-  "latest_update_date": "2026-01-12",
+  "latest_update_date": "2026-01-20",
   "architectures": ["amd64", "arm64", "arm/v7"]
 }

@@ -80,7 +80,12 @@ pub async fn get_storage_device(path: web::Path<String>) -> Result<HttpResponse,
 }
 
 /// 挂载存储设备
-pub async fn mount_storage(body: web::Json<MountOptions>) -> Result<HttpResponse, AppError> {
+pub async fn mount_storage(
+    body: web::Json<MountOptions>,
+    req: actix_web::HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+    
     let opts = body.into_inner();
     
     #[cfg(target_os = "windows")]
@@ -104,7 +109,12 @@ pub async fn mount_storage(body: web::Json<MountOptions>) -> Result<HttpResponse
 }
 
 /// 卸载存储设备
-pub async fn unmount_storage(path: web::Path<String>) -> Result<HttpResponse, AppError> {
+pub async fn unmount_storage(
+    path: web::Path<String>,
+    req: actix_web::HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+    
     let device_or_mount = path.into_inner();
     
     #[cfg(target_os = "windows")]
@@ -126,7 +136,12 @@ pub async fn unmount_storage(path: web::Path<String>) -> Result<HttpResponse, Ap
 }
 
 /// 格式化存储设备
-pub async fn format_storage(body: web::Json<FormatOptions>) -> Result<HttpResponse, AppError> {
+pub async fn format_storage(
+    body: web::Json<FormatOptions>,
+    req: actix_web::HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+    
     let opts = body.into_inner();
     
     #[cfg(target_os = "windows")]

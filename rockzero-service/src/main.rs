@@ -336,6 +336,11 @@ async fn main() -> std::io::Result<()> {
                                 "/{id}/partitions",
                                 web::get().to(handlers::disk_manager::list_partitions),
                             )
+                            // 添加不带ID的路由，用于直接传递device参数
+                            .route("/mount", web::post().to(handlers::disk_manager::mount_disk))
+                            .route("/unmount", web::post().to(handlers::disk_manager::unmount_disk))
+                            .route("/format", web::post().to(handlers::disk_manager::format_disk))
+                            // 保留带ID的路由以兼容旧代码
                             .route("/{id}/mount", web::post().to(handlers::disk_manager::mount_disk))
                             .route("/{id}/unmount", web::post().to(handlers::disk_manager::unmount_disk))
                             .route("/{id}/format", web::post().to(handlers::disk_manager::format_disk))
