@@ -1,7 +1,6 @@
 use actix_multipart::Multipart;
 use actix_web::{web, HttpResponse, Responder};
 use futures::StreamExt;
-use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::path::PathBuf;
@@ -45,7 +44,7 @@ pub async fn upload_file(
         let mut file = std::fs::File::create(&file_path)
             .map_err(|_| AppError::InternalError)?;
 
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         let mut file_size = 0usize;
 
         while let Some(chunk) = field.next().await {
@@ -61,7 +60,7 @@ pub async fn upload_file(
             file.write_all(&data).map_err(|_| AppError::InternalError)?;
         }
 
-        let checksum = format!("{:x}", hasher.finalize());
+        let checksum = hasher.finalize().to_hex().to_string();
         let mime_type = mime_guess::from_path(&original_filename)
             .first_or_octet_stream()
             .to_string();

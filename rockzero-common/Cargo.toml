@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 description = "RockZero Common Types and Utilities"
+license.workspace = true
 
 [dependencies]
 chrono = { workspace = true }
@@ -11,9 +12,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
-validator = { version = "0.16", features = ["derive"] }
-jsonwebtoken = { version = "9.2", optional = true }
-sqlx = { version = "0.7", features = ["sqlite", "chrono"], optional = true }
+validator = { workspace = true }
+jsonwebtoken = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
 actix-web = { workspace = true, optional = true }
 actix-multipart = { workspace = true, optional = true }
 

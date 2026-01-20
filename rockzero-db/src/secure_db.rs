@@ -447,7 +447,6 @@ impl RecoveryData {
     }
 }
 
-/// 数据库统计信息
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DatabaseStats {
     pub total_blocks: usize,
@@ -471,14 +470,12 @@ pub struct SecureDatabase {
 }
 
 impl SecureDatabase {
-    /// 创建新的安全数据库
     pub fn new(db_path: &Path, master_password: &str) -> Result<Self, AppError> {
-        // 使用 HKDF 从主密码派生数据库密钥
         use hkdf::Hkdf;
-        use sha2::Sha256;
+        use sha3::Sha3_256;
 
         let db_identifier = db_path.to_string_lossy().to_string();
-        let hkdf = Hkdf::<Sha256>::new(Some(db_identifier.as_bytes()), master_password.as_bytes());
+        let hkdf = Hkdf::<Sha3_256>::new(Some(db_identifier.as_bytes()), master_password.as_bytes());
 
         let mut key = [0u8; 32];
         hkdf.expand(b"rockzero-secure-database-v1", &mut key)
@@ -502,13 +499,10 @@ impl SecureDatabase {
 
     /// 加密并存储数据
     pub async fn store(&self, data: &[u8]) -> Result<u64, AppError> {
-        // 使用 crypto 模块生成随机 nonce
         let nonce_vec = secure_random_bytes(12)?;
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes.copy_from_slice(&nonce_vec);
         let nonce = Nonce::from_slice(&nonce_bytes);
-
-        // 加密数据
         let encrypted_data = self
             .cipher
             .encrypt(nonce, data)
@@ -537,22 +531,16 @@ impl SecureDatabase {
             parity_shards,
         };
 
-        // 存储到内存
         {
             let mut blocks = self.blocks.write().await;
             blocks.insert(block_id, block.clone());
         }
-
-        // 持久化到文件
         self.persist_block(&block).await?;
-
-        // 更新恢复文件
         self.update_recovery_file(&block).await?;
 
         Ok(block_id)
     }
 
-    /// 读取并解密数据
     pub async fn retrieve(&self, block_id: u64) -> Result<Vec<u8>, AppError> {
         let blocks = self.blocks.read().await;
         let block = blocks
@@ -561,7 +549,6 @@ impl SecureDatabase {
 
         // 验证 CRC32
         if !self.crc.verify(&block.encrypted_data, block.crc32) {
-            // CRC 校验失败，尝试修复
             drop(blocks);
             return self.repair_and_retrieve(block_id).await;
         }
@@ -591,8 +578,6 @@ impl SecureDatabase {
         // 准备分片用于重建
         let shard_size = block.encrypted_data.len().div_ceil(DATA_SHARDS);
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
-
-        // 尝试使用现有数据分片
         for (i, chunk) in block.encrypted_data.chunks(shard_size).enumerate() {
             if i < DATA_SHARDS {
                 // 验证每个分片的局部 CRC
@@ -857,17 +842,18 @@ mod tests {
 
     #[test]
     fn test_reed_solomon() {
-        let rs = ReedSolomon::new(4, 2);
+        let rs = ReedSolomon::new(5, 3);
         let data = b"Hello, World! This is a test of Reed-Solomon encoding.";
 
         // 编码
         let shards = rs.encode(data).unwrap();
-        assert_eq!(shards.len(), 6);
+        assert_eq!(shards.len(), 8);
 
-        // 模拟丢失两个分片
+        // 模拟丢失三个分片
         let mut recovery_shards: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
         recovery_shards[0] = None;
         recovery_shards[1] = None;
+        recovery_shards[2] = None;
 
         // 重建
         let reconstructed = rs.reconstruct(&mut recovery_shards).unwrap();

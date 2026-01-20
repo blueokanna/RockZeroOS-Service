@@ -6,7 +6,6 @@ use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -379,7 +378,7 @@ pub async fn upload_files(
         let file_path = full_path.join(&decoded_filename);
         let mut file = fs::File::create(&file_path).map_err(|_| AppError::InternalError)?;
 
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         let mut file_size = 0usize;
 
         while let Some(chunk) = field.next().await {
@@ -395,7 +394,7 @@ pub async fn upload_files(
             file.write_all(&data).map_err(|_| AppError::InternalError)?;
         }
 
-        let checksum = format!("{:x}", hasher.finalize());
+        let checksum = hasher.finalize().to_hex().to_string();
 
         info!("File uploaded: {} ({} bytes)", decoded_filename, file_size);
 

@@ -283,13 +283,6 @@ struct HlsSession {
 }
 
 impl HlsSessionManager {
-    pub fn new(base_dir: &str) -> Self {
-        Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            hls_base_dir: base_dir.to_string(),
-        }
-    }
-
     /// 创建 HLS 会话并开始转码
     /// 支持: 任意视频格式 → HLS MPEG-TS (兼容所有平台)
     /// 音频强制转码为 AAC (兼容 DTS/AC3 等不支持的格式)

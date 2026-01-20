@@ -8,12 +8,13 @@ use rockzero_common::AppError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use tracing::warn;
 use std::path::{Path, PathBuf};
 use std::{fs, time::SystemTime};
 
 #[cfg(target_os = "linux")]
 use std::process::Command;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 const DEFAULT_APPSTORE_ROOT: &str = "./data/appstore";
@@ -103,7 +104,7 @@ pub struct AppStoreItem {
 /// 获取 CasaOS 应用商店列表（无需认证）
 pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
     info!("🔍 Fetching CasaOS app store...");
-    
+
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -112,14 +113,10 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
             AppError::InternalServerError(e.to_string())
         })?;
 
-    let response = client
-        .get(CASAOS_STORE_URL)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("❌ Failed to fetch CasaOS store: {}", e);
-            AppError::BadRequest(format!("Failed to fetch CasaOS store: {}", e))
-        })?;
+    let response = client.get(CASAOS_STORE_URL).send().await.map_err(|e| {
+        error!("❌ Failed to fetch CasaOS store: {}", e);
+        AppError::BadRequest(format!("Failed to fetch CasaOS store: {}", e))
+    })?;
 
     if !response.status().is_success() {
         error!("❌ CasaOS store returned error: {}", response.status());
@@ -162,11 +159,21 @@ fn parse_casaos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<Ap
     let title = app.get("title")?.as_str()?.to_string();
     let description = app.get("description")?.as_str().unwrap_or("").to_string();
     let version = app.get("version")?.as_str()?.to_string();
-    let icon = app.get("icon").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let category = app.get("category").and_then(|v| v.as_str()).unwrap_or("Other").to_string();
-    let author = app.get("author").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let icon = app
+        .get("icon")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let category = app
+        .get("category")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Other")
+        .to_string();
+    let author = app
+        .get("author")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let install_url = app.get("compose_url")?.as_str()?.to_string();
-    
+
     let architectures = app
         .get("arch")
         .and_then(|v| v.as_array())
@@ -197,7 +204,7 @@ fn parse_casaos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<Ap
 /// 获取 iStoreOS 应用商店列表（无需认证）
 pub async fn list_istoreos_apps() -> Result<HttpResponse, AppError> {
     info!("🔍 Fetching iStoreOS app store...");
-    
+
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -210,7 +217,9 @@ pub async fn list_istoreos_apps() -> Result<HttpResponse, AppError> {
         .map_err(|e| AppError::BadRequest(format!("Failed to fetch iStoreOS store: {}", e)))?;
 
     if !response.status().is_success() {
-        return Err(AppError::BadRequest("iStoreOS store unavailable".to_string()));
+        return Err(AppError::BadRequest(
+            "iStoreOS store unavailable".to_string(),
+        ));
     }
 
     let apps_json: Value = response.json().await.map_err(|e| {
@@ -245,14 +254,28 @@ pub async fn list_istoreos_apps() -> Result<HttpResponse, AppError> {
 fn parse_istoreos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<AppStoreItem> {
     let name = app.get("name")?.as_str()?.to_string();
     let id = format!("istoreos_{}", name);
-    let title = app.get("title").and_then(|v| v.as_str()).unwrap_or(&name).to_string();
+    let title = app
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&name)
+        .to_string();
     let description = app.get("summary")?.as_str()?.to_string();
     let version = app.get("version")?.as_str()?.to_string();
-    let icon = app.get("icon").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let category = app.get("category").and_then(|v| v.as_str()).unwrap_or("Other").to_string();
-    let author = app.get("maintainer").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let icon = app
+        .get("icon")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let category = app
+        .get("category")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Other")
+        .to_string();
+    let author = app
+        .get("maintainer")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let install_url = app.get("download_url")?.as_str()?.to_string();
-    
+
     let architectures = app
         .get("platforms")
         .and_then(|v| v.as_array())
@@ -300,7 +323,9 @@ pub async fn install_ipk_package(
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     if !response.status().is_success() {
-        return Err(AppError::BadRequest("Failed to download IPK package".to_string()));
+        return Err(AppError::BadRequest(
+            "Failed to download IPK package".to_string(),
+        ));
     }
 
     let bytes = response
@@ -316,10 +341,13 @@ pub async fn install_ipk_package(
     }
 
     let dir = ensure_storage(&AppPackageKind::Ipk)?;
-    let filename = body
-        .name
-        .clone()
-        .unwrap_or_else(|| body.url.rsplit('/').next().unwrap_or("package.ipk").to_string());
+    let filename = body.name.clone().unwrap_or_else(|| {
+        body.url
+            .rsplit('/')
+            .next()
+            .unwrap_or("package.ipk")
+            .to_string()
+    });
     let safe_filename = sanitize_filename(&filename);
     let target = dir.join(&safe_filename);
 
@@ -337,7 +365,10 @@ pub async fn install_ipk_package(
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
             error!("❌ IPK installation failed: {}", err);
-            return Err(AppError::BadRequest(format!("IPK installation failed: {}", err)));
+            return Err(AppError::BadRequest(format!(
+                "IPK installation failed: {}",
+                err
+            )));
         }
     }
 

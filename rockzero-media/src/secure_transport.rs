@@ -4,7 +4,6 @@ use aes_gcm::{
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -92,11 +91,12 @@ impl SecureStreamTransport {
         OsRng.fill_bytes(&mut commit_scalar);
         OsRng.fill_bytes(&mut commit_element);
 
-        let mut hasher = Sha256::new();
+        // 使用 Blake3 计算共享密钥
+        let mut hasher = blake3::Hasher::new();
         hasher.update(&commit_scalar);
         hasher.update(&commit_element);
         hasher.update(peer_id.as_bytes());
-        let shared_secret = hasher.finalize().to_vec();
+        let shared_secret = hasher.finalize().as_bytes().to_vec();
 
         let auth_state = SaeAuthState {
             session_id: uuid::Uuid::new_v4().to_string(),
@@ -116,8 +116,8 @@ impl SecureStreamTransport {
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let mut auth = self.auth_state.write().await;
         if let Some(ref mut state) = *auth {
-            // 验证peer的commit（简化版）
-            let mut hasher = Sha256::new();
+            // 验证peer的commit（简化版，使用 Blake3）
+            let mut hasher = blake3::Hasher::new();
             hasher.update(&state.commit_scalar);
             hasher.update(peer_commit);
             let _confirm_hash = hasher.finalize();
@@ -155,12 +155,12 @@ impl SecureStreamTransport {
         let sequence = *seq;
         *seq += 1;
 
-        // 生成MAC
-        let mut hasher = Sha256::new();
-        hasher.update(sequence.to_le_bytes());
+        // 生成MAC（使用 Blake3）
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&sequence.to_le_bytes());
         hasher.update(&encrypted);
-        hasher.update(nonce_bytes);
-        let mac = hasher.finalize().to_vec();
+        hasher.update(&nonce_bytes);
+        let mac = hasher.finalize().as_bytes().to_vec();
 
         // 生成零知识证明（如果启用）
         let zkp_proof = if self.config.enable_zkp {
@@ -182,7 +182,7 @@ impl SecureStreamTransport {
         })
     }
 
-    /// 生成Bulletproofs风格的零知识证明
+    /// 生成Bulletproofs风格的零知识证明（使用 Blake3）
     async fn generate_zkp_proof(
         &self,
         data: &[u8],
@@ -190,31 +190,31 @@ impl SecureStreamTransport {
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         // 简化版Bulletproofs证明
         // 证明：我知道数据的哈希值，但不透露数据本身
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(data);
-        hasher.update(sequence.to_le_bytes());
+        hasher.update(&sequence.to_le_bytes());
 
         // 添加随机盲化因子
         let mut blinding_factor = [0u8; 32];
         OsRng.fill_bytes(&mut blinding_factor);
-        hasher.update(blinding_factor);
+        hasher.update(&blinding_factor);
 
-        let proof = hasher.finalize().to_vec();
+        let proof = hasher.finalize().as_bytes().to_vec();
         Ok(proof)
     }
 
-    /// 验证零知识证明
+    /// 验证零知识证明（使用 Blake3）
     pub async fn verify_zkp_proof(
         &self,
         chunk: &EncryptedChunk,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         if let Some(ref _proof) = chunk.zkp_proof {
             // 验证MAC
-            let mut hasher = Sha256::new();
-            hasher.update(chunk.sequence.to_le_bytes());
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&chunk.sequence.to_le_bytes());
             hasher.update(&chunk.data);
             hasher.update(&chunk.nonce);
-            let computed_mac = hasher.finalize().to_vec();
+            let computed_mac = hasher.finalize().as_bytes().to_vec();
 
             Ok(computed_mac == chunk.mac)
         } else {

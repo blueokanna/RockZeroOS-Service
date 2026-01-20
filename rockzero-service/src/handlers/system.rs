@@ -381,9 +381,9 @@ pub async fn get_block_devices() -> Result<impl Responder, AppError> {
 }
 
 pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
-    use tracing::{info, error};
+    use tracing::debug;
     
-    info!("🔍 Starting hardware info collection...");
+    debug!("Starting hardware info collection");
     
     let mut sys = System::new_all();
     sys.refresh_all();
@@ -406,11 +406,9 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
         architecture,
         uptime,
     };
-    info!("✅ System info collected");
 
     let cpus = sys.cpus();
     if cpus.is_empty() {
-        error!("❌ No CPU information available");
         return Err(AppError::InternalError);
     }
     
@@ -451,7 +449,6 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
         per_core_usage,
         core_types,
     };
-    info!("✅ CPU info collected: {} cores, {:.1}% usage", cpus.len(), total_usage);
 
     let total_mem = sys.total_memory();
     let used_mem = sys.used_memory();
@@ -470,7 +467,6 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
         swap_total: sys.total_swap(),
         swap_used: sys.used_swap(),
     };
-    info!("✅ Memory info collected: {:.1}% used", usage_percentage);
 
     let disks_info = Disks::new_with_refreshed_list();
     let mut disks = Vec::new();
@@ -496,13 +492,9 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
             disk_type: format!("{:?}", disk.kind()),
         });
     }
-    info!("✅ Disk info collected: {} disks", disks.len());
 
     let usb_devices = detect_usb_devices();
-    info!("✅ USB devices collected: {} devices", usb_devices.len());
-    
     let network_interfaces = detect_network_interfaces();
-    info!("✅ Network interfaces collected: {} interfaces", network_interfaces.len());
 
     let hardware_info = HardwareInfo {
         system: system_info,
@@ -513,7 +505,7 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
         network_interfaces,
     };
 
-    info!("✅ Hardware info collection complete");
+    debug!("Hardware info collection complete");
     Ok(HttpResponse::Ok().json(hardware_info))
 }
 

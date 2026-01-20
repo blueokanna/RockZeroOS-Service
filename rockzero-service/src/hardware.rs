@@ -1,18 +1,13 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::Path;
 use sysinfo::{Disks, Networks, System};
 
 #[cfg(target_os = "linux")]
 use std::fs;
 
-// ============ ARM CPU Part ID 映射表 ============
-
-/// ARM CPU Part ID 到核心名称的映射
-#[allow(dead_code)]
+#[cfg(target_os = "linux")]
 fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
     let mut map = HashMap::new();
-    // ARM Holdings - 早期架构
     map.insert(0x810, "ARM810");
     map.insert(0x920, "ARM920");
     map.insert(0x922, "ARM922");
@@ -27,7 +22,7 @@ fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
     map.insert(0xb36, "ARM1136");
     map.insert(0xb56, "ARM1156");
     map.insert(0xb76, "ARM1176");
-    
+
     // Cortex-A 系列
     map.insert(0xc05, "Cortex-A5");
     map.insert(0xc07, "Cortex-A7");
@@ -36,13 +31,13 @@ fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
     map.insert(0xc0d, "Cortex-A17");
     map.insert(0xc0e, "Cortex-A17");
     map.insert(0xc0f, "Cortex-A15");
-    
+
     // Cortex-R 系列
     map.insert(0xc14, "Cortex-R4");
     map.insert(0xc15, "Cortex-R5");
     map.insert(0xc17, "Cortex-R7");
     map.insert(0xc18, "Cortex-R8");
-    
+
     // Cortex-M 系列
     map.insert(0xc20, "Cortex-M0");
     map.insert(0xc21, "Cortex-M1");
@@ -50,7 +45,7 @@ fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
     map.insert(0xc24, "Cortex-M4");
     map.insert(0xc27, "Cortex-M7");
     map.insert(0xc60, "Cortex-M0+");
-    
+
     // ARMv8 Cortex-A 系列 (64位)
     map.insert(0xd01, "Cortex-A32");
     map.insert(0xd02, "Cortex-A34");
@@ -66,14 +61,14 @@ fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
     map.insert(0xd0c, "Neoverse-N1");
     map.insert(0xd0d, "Cortex-A77");
     map.insert(0xd0e, "Cortex-A76AE");
-    
+
     // Cortex-R 系列 (ARMv8)
     map.insert(0xd13, "Cortex-R52");
-    
+
     // Cortex-M 系列 (ARMv8)
     map.insert(0xd20, "Cortex-M23");
     map.insert(0xd21, "Cortex-M33");
-    
+
     // Neoverse 和最新 Cortex 系列
     map.insert(0xd40, "Neoverse-V1");
     map.insert(0xd41, "Cortex-A78");
@@ -90,7 +85,7 @@ fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
     map.insert(0xd4d, "Cortex-A715");
     map.insert(0xd4e, "Cortex-X3");
     map.insert(0xd4f, "Neoverse-V2");
-    
+
     // 最新一代 (2023+)
     map.insert(0xd80, "Cortex-A520");
     map.insert(0xd81, "Cortex-A720");
@@ -99,7 +94,7 @@ fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
     map.insert(0xd85, "Cortex-X925");
     map.insert(0xd87, "Cortex-A725");
     map.insert(0xd8e, "Neoverse-N3");
-    
+
     map
 }
 
@@ -108,17 +103,11 @@ fn get_arm_cpu_part_map() -> HashMap<u64, &'static str> {
 /// CPU 核心信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CpuCoreInfo {
-    /// 核心架构名称 (如 Cortex-A55, Cortex-A76)
     pub core_name: String,
-    /// CPU Part ID (十六进制)
     pub part_id: String,
-    /// 该类型核心的数量
     pub count: usize,
-    /// CPU 实现者
     pub implementer: Option<String>,
-    /// CPU 变体
     pub variant: Option<String>,
-    /// CPU 修订版本
     pub revision: Option<String>,
 }
 
@@ -226,12 +215,13 @@ pub fn detect_hardware() -> HardwareCapabilities {
     sys.refresh_all();
 
     let architecture = std::env::consts::ARCH.to_string();
-    
-    let cpu_model = sys.cpus()
+
+    let cpu_model = sys
+        .cpus()
         .first()
         .map(|cpu| cpu.brand().to_string())
         .unwrap_or_else(|| "Unknown".to_string());
-    
+
     let cpu_cores = sys.cpus().len();
     let total_memory = sys.total_memory();
 
@@ -259,8 +249,6 @@ pub fn detect_hardware() -> HardwareCapabilities {
 }
 
 // ============ CPU 核心类型检测 ============
-
-/// 检测 CPU 核心类型（主要用于 ARM 架构）
 fn detect_cpu_core_types(arch: &str) -> Vec<CpuCoreInfo> {
     match arch {
         "aarch64" | "arm" | "armv7" => {
@@ -273,10 +261,7 @@ fn detect_cpu_core_types(arch: &str) -> Vec<CpuCoreInfo> {
                 Vec::new()
             }
         }
-        "x86_64" | "x86" => {
-            // x86 架构返回简单信息
-            detect_x86_cpu_info()
-        }
+        "x86_64" | "x86" => detect_x86_cpu_info(),
         _ => Vec::new(),
     }
 }
@@ -285,20 +270,30 @@ fn detect_cpu_core_types(arch: &str) -> Vec<CpuCoreInfo> {
 #[cfg(target_os = "linux")]
 fn detect_arm_cpu_cores_linux() -> Vec<CpuCoreInfo> {
     use std::collections::HashMap;
-    
-    let mut core_counts: HashMap<String, (String, String, Option<String>, Option<String>, Option<String>, usize)> = HashMap::new();
+
+    let mut core_counts: HashMap<
+        String,
+        (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            usize,
+        ),
+    > = HashMap::new();
     let arm_part_map = get_arm_cpu_part_map();
-    
+
     // 读取 /proc/cpuinfo
     if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
         let mut current_part: Option<String> = None;
         let mut current_implementer: Option<String> = None;
         let mut current_variant: Option<String> = None;
         let mut current_revision: Option<String> = None;
-        
+
         for line in cpuinfo.lines() {
             let line = line.trim();
-            
+
             if line.starts_with("CPU implementer") {
                 if let Some(value) = line.split(':').nth(1) {
                     current_implementer = Some(value.trim().to_string());
@@ -316,16 +311,15 @@ fn detect_arm_cpu_cores_linux() -> Vec<CpuCoreInfo> {
                     current_revision = Some(value.trim().to_string());
                 }
             } else if line.is_empty() {
-                // 处理器条目结束，记录信息
                 if let Some(ref part) = current_part {
                     let part_id = part.trim_start_matches("0x");
                     let part_num = u64::from_str_radix(part_id, 16).unwrap_or(0);
-                    
+
                     let core_name = arm_part_map
                         .get(&part_num)
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| format!("Unknown (0x{:x})", part_num));
-                    
+
                     let key = part.clone();
                     let entry = core_counts.entry(key).or_insert((
                         core_name,
@@ -337,7 +331,7 @@ fn detect_arm_cpu_cores_linux() -> Vec<CpuCoreInfo> {
                     ));
                     entry.5 += 1;
                 }
-                
+
                 // 重置当前处理器信息
                 current_part = None;
                 current_implementer = None;
@@ -345,17 +339,16 @@ fn detect_arm_cpu_cores_linux() -> Vec<CpuCoreInfo> {
                 current_revision = None;
             }
         }
-        
-        // 处理最后一个处理器（如果没有空行结尾）
+
         if let Some(ref part) = current_part {
             let part_id = part.trim_start_matches("0x");
             let part_num = u64::from_str_radix(part_id, 16).unwrap_or(0);
-            
+
             let core_name = arm_part_map
                 .get(&part_num)
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("Unknown (0x{:x})", part_num));
-            
+
             let key = part.clone();
             let entry = core_counts.entry(key).or_insert((
                 core_name,
@@ -368,25 +361,22 @@ fn detect_arm_cpu_cores_linux() -> Vec<CpuCoreInfo> {
             entry.5 += 1;
         }
     }
-    
-    // 转换为 Vec 并按核心数量排序
+
     let mut cores: Vec<CpuCoreInfo> = core_counts
         .into_iter()
-        .map(|(_, (core_name, part_id, implementer, variant, revision, count))| {
-            CpuCoreInfo {
+        .map(
+            |(_, (core_name, part_id, implementer, variant, revision, count))| CpuCoreInfo {
                 core_name,
                 part_id,
                 count,
                 implementer: implementer.map(|i| get_implementer_name(&i)),
                 variant,
                 revision,
-            }
-        })
+            },
+        )
         .collect();
-    
-    // 按核心数量降序排序
     cores.sort_by(|a, b| b.count.cmp(&a.count));
-    
+
     cores
 }
 
@@ -395,7 +385,7 @@ fn detect_arm_cpu_cores_linux() -> Vec<CpuCoreInfo> {
 fn get_implementer_name(implementer: &str) -> String {
     let code = implementer.trim_start_matches("0x");
     let num = u64::from_str_radix(code, 16).unwrap_or(0);
-    
+
     match num {
         0x41 => "ARM".to_string(),
         0x42 => "Broadcom".to_string(),
@@ -424,11 +414,11 @@ fn get_implementer_name(implementer: &str) -> String {
 fn detect_x86_cpu_info() -> Vec<CpuCoreInfo> {
     let mut sys = System::new_all();
     sys.refresh_all();
-    
+
     if let Some(cpu) = sys.cpus().first() {
         let brand = cpu.brand().to_string();
         let core_count = sys.cpus().len();
-        
+
         vec![CpuCoreInfo {
             core_name: brand,
             part_id: "x86_64".to_string(),
@@ -455,8 +445,11 @@ fn detect_video_accelerators(arch: &str) -> Vec<VideoAccelerator> {
                     name: "Rockchip MPP".to_string(),
                     device_path: "/dev/mpp_service".to_string(),
                     codec_support: vec![
-                        "H.264".to_string(), "H.265".to_string(),
-                        "VP8".to_string(), "VP9".to_string(), "AV1".to_string(),
+                        "H.264".to_string(),
+                        "H.265".to_string(),
+                        "VP8".to_string(),
+                        "VP9".to_string(),
+                        "AV1".to_string(),
                     ],
                     max_resolution: "8K@30fps / 4K@120fps".to_string(),
                 });
@@ -468,8 +461,10 @@ fn detect_video_accelerators(arch: &str) -> Vec<VideoAccelerator> {
                     name: "Amlogic VDEC".to_string(),
                     device_path: "/dev/amvideo".to_string(),
                     codec_support: vec![
-                        "H.264".to_string(), "H.265".to_string(),
-                        "VP9".to_string(), "AV1".to_string(),
+                        "H.264".to_string(),
+                        "H.265".to_string(),
+                        "VP9".to_string(),
+                        "AV1".to_string(),
                     ],
                     max_resolution: "4K@60fps".to_string(),
                 });
@@ -499,8 +494,11 @@ fn detect_video_accelerators(arch: &str) -> Vec<VideoAccelerator> {
                     name: "Intel/AMD VAAPI".to_string(),
                     device_path: "/dev/dri/renderD128".to_string(),
                     codec_support: vec![
-                        "H.264".to_string(), "H.265".to_string(),
-                        "VP8".to_string(), "VP9".to_string(), "AV1".to_string(),
+                        "H.264".to_string(),
+                        "H.265".to_string(),
+                        "VP8".to_string(),
+                        "VP9".to_string(),
+                        "AV1".to_string(),
                     ],
                     max_resolution: "8K@60fps".to_string(),
                 });
@@ -512,7 +510,9 @@ fn detect_video_accelerators(arch: &str) -> Vec<VideoAccelerator> {
                     name: "NVIDIA NVENC/NVDEC".to_string(),
                     device_path: "/dev/nvidia0".to_string(),
                     codec_support: vec![
-                        "H.264".to_string(), "H.265".to_string(), "AV1".to_string(),
+                        "H.264".to_string(),
+                        "H.265".to_string(),
+                        "AV1".to_string(),
                     ],
                     max_resolution: "8K@60fps".to_string(),
                 });
@@ -527,8 +527,13 @@ fn detect_video_accelerators(arch: &str) -> Vec<VideoAccelerator> {
 #[cfg(target_os = "linux")]
 fn is_v4l2_m2m_device(path: &str) -> bool {
     // 检查是否是 M2M 设备
-    let caps_path = format!("/sys/class/video4linux/{}/device/capabilities", 
-        Path::new(path).file_name().unwrap_or_default().to_string_lossy());
+    let caps_path = format!(
+        "/sys/class/video4linux/{}/device/capabilities",
+        Path::new(path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    );
     if let Ok(caps) = fs::read_to_string(&caps_path) {
         return caps.contains("m2m") || caps.contains("codec");
     }
@@ -553,15 +558,16 @@ fn detect_audio_devices() -> Vec<AudioDevice> {
             for entry in entries.flatten() {
                 let path = entry.path();
                 let name = path.file_name().unwrap().to_string_lossy().to_string();
-                
+
                 if name.starts_with("pcmC") && name.contains("D") && name.ends_with("p") {
-                    let card_num = name.chars()
+                    let card_num = name
+                        .chars()
                         .skip(4)
                         .take_while(|c| c.is_ascii_digit())
                         .collect::<String>();
-                    
+
                     let card_name = get_alsa_card_name(&card_num);
-                    
+
                     devices.push(AudioDevice {
                         name: card_name,
                         device_path: path.to_string_lossy().to_string(),
@@ -573,7 +579,9 @@ fn detect_audio_devices() -> Vec<AudioDevice> {
         }
 
         // 检测 PulseAudio/PipeWire
-        if Path::new("/run/user/1000/pulse").exists() || Path::new("/run/user/1000/pipewire-0").exists() {
+        if Path::new("/run/user/1000/pulse").exists()
+            || Path::new("/run/user/1000/pipewire-0").exists()
+        {
             devices.push(AudioDevice {
                 name: "PulseAudio/PipeWire".to_string(),
                 device_path: "pulse".to_string(),
@@ -649,12 +657,16 @@ fn detect_storage_devices() -> Vec<StorageDevice> {
 }
 
 #[cfg(target_os = "linux")]
-fn get_storage_details(name: &str, is_removable: bool) -> (String, Option<String>, Option<String>, StorageType) {
-    let base_name = name.trim_start_matches("/dev/")
+fn get_storage_details(
+    name: &str,
+    is_removable: bool,
+) -> (String, Option<String>, Option<String>, StorageType) {
+    let base_name = name
+        .trim_start_matches("/dev/")
         .chars()
         .take_while(|c| !c.is_ascii_digit())
         .collect::<String>();
-    
+
     let device_path = if name.starts_with("/dev/") {
         name.to_string()
     } else {
@@ -662,13 +674,13 @@ fn get_storage_details(name: &str, is_removable: bool) -> (String, Option<String
     };
 
     let sys_path = format!("/sys/block/{}", base_name);
-    
+
     // 读取序列号
     let serial = fs::read_to_string(format!("{}/device/serial", sys_path))
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    
+
     // 读取型号
     let model = fs::read_to_string(format!("{}/device/model", sys_path))
         .ok()
@@ -702,7 +714,10 @@ fn get_storage_details(name: &str, is_removable: bool) -> (String, Option<String
 }
 
 #[cfg(not(target_os = "linux"))]
-fn get_storage_details(name: &str, is_removable: bool) -> (String, Option<String>, Option<String>, StorageType) {
+fn get_storage_details(
+    name: &str,
+    is_removable: bool,
+) -> (String, Option<String>, Option<String>, StorageType) {
     let device_type = if is_removable {
         StorageType::USB
     } else {
@@ -716,19 +731,22 @@ fn detect_unmounted_block_devices(devices: &mut Vec<StorageDevice>) {
     if let Ok(entries) = fs::read_dir("/sys/block") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            
+
             // 跳过虚拟设备
             if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("dm-") {
                 continue;
             }
 
             // 检查是否已经在列表中
-            if devices.iter().any(|d| d.name.contains(&name) || d.device_path.contains(&name)) {
+            if devices
+                .iter()
+                .any(|d| d.name.contains(&name) || d.device_path.contains(&name))
+            {
                 continue;
             }
 
             let sys_path = format!("/sys/block/{}", name);
-            
+
             // 读取设备大小
             let size = fs::read_to_string(format!("{}/size", sys_path))
                 .ok()
@@ -769,7 +787,7 @@ fn detect_usb_controllers() -> Vec<UsbController> {
             for entry in entries.flatten() {
                 let path = entry.path();
                 let name = path.file_name().unwrap().to_string_lossy().to_string();
-                
+
                 // 只处理根集线器 (usb1, usb2, etc.)
                 if !name.starts_with("usb") {
                     continue;
@@ -777,17 +795,17 @@ fn detect_usb_controllers() -> Vec<UsbController> {
 
                 if let Ok(version) = fs::read_to_string(path.join("version")) {
                     let version = version.trim().to_string();
-                    
+
                     // 避免重复
                     if seen.contains(&version) {
                         continue;
                     }
-                    
+
                     if let Ok(max_child) = fs::read_to_string(path.join("maxchild")) {
                         if let Ok(ports) = max_child.trim().parse::<u32>() {
                             if ports > 0 {
                                 seen.insert(version.clone());
-                                
+
                                 let usb_name = match version.as_str() {
                                     v if v.starts_with("1.") => "USB 1.1 Controller (UHCI/OHCI)",
                                     v if v.starts_with("2.") => "USB 2.0 Controller (EHCI)",
@@ -796,7 +814,7 @@ fn detect_usb_controllers() -> Vec<UsbController> {
                                     v if v.starts_with("3.2") => "USB 3.2 Controller (xHCI)",
                                     _ => "USB Controller",
                                 };
-                                
+
                                 controllers.push(UsbController {
                                     name: usb_name.to_string(),
                                     version,
@@ -832,10 +850,10 @@ fn detect_network_interfaces() -> Vec<NetworkInterface> {
 
     for (name, data) in networks.iter() {
         let mac_address = data.mac_address().to_string();
-        
+
         // 获取 IP 地址
         let ip_addresses = get_interface_ips(name);
-        
+
         // 判断接口类型和状态
         let (interface_type, is_up, speed) = get_interface_details(name);
 
@@ -870,7 +888,7 @@ fn detect_network_interfaces() -> Vec<NetworkInterface> {
 #[cfg(target_os = "linux")]
 fn get_interface_ips(name: &str) -> Vec<String> {
     let mut ips = Vec::new();
-    
+
     // 从 /sys/class/net 读取
     let addr_path = format!("/sys/class/net/{}/address", name);
     if Path::new(&addr_path).exists() {
@@ -898,7 +916,7 @@ fn get_interface_ips(name: &str) -> Vec<String> {
             }
         }
     }
-    
+
     ips
 }
 
@@ -910,18 +928,18 @@ fn get_interface_ips(_name: &str) -> Vec<String> {
 #[cfg(target_os = "linux")]
 fn get_interface_details(name: &str) -> (NetworkType, bool, Option<u64>) {
     let sys_path = format!("/sys/class/net/{}", name);
-    
+
     // 检查接口状态
     let is_up = fs::read_to_string(format!("{}/operstate", sys_path))
         .map(|s| s.trim() == "up")
         .unwrap_or(false);
-    
+
     // 获取速度 (Mbps)
     let speed = fs::read_to_string(format!("{}/speed", sys_path))
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&s| s > 0 && s < 1000000); // 过滤无效值
-    
+
     // 判断接口类型
     let interface_type = if name == "lo" {
         NetworkType::Loopback
@@ -948,7 +966,7 @@ fn get_interface_details(name: &str) -> (NetworkType, bool, Option<u64>) {
             NetworkType::Virtual
         }
     };
-    
+
     (interface_type, is_up, speed)
 }
 
@@ -966,7 +984,7 @@ pub fn detect_usb_devices_detailed() -> Vec<UsbDeviceInfo> {
     {
         detect_usb_devices_linux()
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         Vec::new()
@@ -983,22 +1001,22 @@ fn detect_usb_devices_linux() -> Vec<UsbDeviceInfo> {
         for entry in entries.flatten() {
             let path = entry.path();
             let dir_name = path.file_name().unwrap().to_string_lossy().to_string();
-            
+
             // 跳过根集线器和接口
             if dir_name.starts_with("usb") || dir_name.contains(":") {
                 continue;
             }
-            
+
             let vendor_id = fs::read_to_string(path.join("idVendor"))
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            
+
             let product_id = fs::read_to_string(path.join("idProduct"))
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            
+
             // 跳过无效条目
             if vendor_id.is_empty() || product_id.is_empty() {
                 continue;
@@ -1030,9 +1048,10 @@ fn detect_usb_devices_linux() -> Vec<UsbDeviceInfo> {
                 .map(|s| format!("{} Mbps", s.trim()));
 
             let device_class = detect_usb_device_class(&path);
-            
+
             // 使用设备路径查找挂载点，支持多个相同型号设备
-            let mount_point = find_usb_device_mount_by_path(&dir_name, &vendor_id, &product_id, &serial);
+            let mount_point =
+                find_usb_device_mount_by_path(&dir_name, &vendor_id, &product_id, &serial);
 
             devices.push(UsbDeviceInfo {
                 name: product_name,
@@ -1092,19 +1111,21 @@ fn find_usb_device_mount(vendor_id: &str, product_id: &str) -> Option<String> {
             if parts.len() >= 2 {
                 let device = parts[0];
                 let mount_point = parts[1];
-                
+
                 // 检查是否是 USB 存储设备
                 if device.starts_with("/dev/sd") {
                     // 尝试匹配设备
                     let dev_name = device.trim_start_matches("/dev/");
-                    let base_dev = dev_name.chars()
+                    let base_dev = dev_name
+                        .chars()
                         .take_while(|c| !c.is_ascii_digit())
                         .collect::<String>();
-                    
+
                     // 检查设备的 vendor/product ID
                     let usb_device_path = format!("/sys/block/{}/device/../../../", base_dev);
                     if let Ok(vid) = fs::read_to_string(format!("{}idVendor", usb_device_path)) {
-                        if let Ok(pid) = fs::read_to_string(format!("{}idProduct", usb_device_path)) {
+                        if let Ok(pid) = fs::read_to_string(format!("{}idProduct", usb_device_path))
+                        {
                             if vid.trim() == vendor_id && pid.trim() == product_id {
                                 return Some(mount_point.to_string());
                             }
@@ -1114,7 +1135,7 @@ fn find_usb_device_mount(vendor_id: &str, product_id: &str) -> Option<String> {
             }
         }
     }
-    
+
     // 备用方案：检查 /media 和 /mnt 目录
     for base in &["/media", "/mnt"] {
         if let Ok(entries) = fs::read_dir(base) {
@@ -1132,7 +1153,7 @@ fn find_usb_device_mount(vendor_id: &str, product_id: &str) -> Option<String> {
             }
         }
     }
-    
+
     None
 }
 
@@ -1146,19 +1167,19 @@ fn find_usb_device_mount_by_path(
 ) -> Option<String> {
     // 查找该 USB 设备下的所有块设备
     let usb_sys_path = format!("/sys/bus/usb/devices/{}", usb_path);
-    
+
     // 遍历查找 block 设备
     fn find_block_device(path: &std::path::Path) -> Option<String> {
         if let Ok(entries) = fs::read_dir(path) {
             for entry in entries.flatten() {
                 let entry_path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
-                
+
                 // 检查是否是块设备目录
                 if name.starts_with("sd") && !name.contains(':') {
                     return Some(name);
                 }
-                
+
                 // 递归查找子目录
                 if entry_path.is_dir() && !name.starts_with('.') {
                     if let Some(dev) = find_block_device(&entry_path) {
@@ -1169,17 +1190,16 @@ fn find_usb_device_mount_by_path(
         }
         None
     }
-    
+
     // 尝试从 USB 设备路径找到对应的块设备
     if let Some(block_dev) = find_block_device(std::path::Path::new(&usb_sys_path)) {
-        // 查找该块设备的挂载点
         if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
             for line in mounts.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
                     let device = parts[0];
                     let mount_point = parts[1];
-                    
+
                     // 匹配设备名（包括分区，如 sda1, sdb1）
                     if device.contains(&block_dev) {
                         return Some(mount_point.to_string());
@@ -1188,7 +1208,7 @@ fn find_usb_device_mount_by_path(
             }
         }
     }
-    
+
     // 备用方案：通过 vendor/product ID 和序列号匹配
     if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
         for line in mounts.lines() {
@@ -1196,21 +1216,24 @@ fn find_usb_device_mount_by_path(
             if parts.len() >= 2 {
                 let device = parts[0];
                 let mount_point = parts[1];
-                
+
                 if device.starts_with("/dev/sd") {
                     let dev_name = device.trim_start_matches("/dev/");
-                    let base_dev: String = dev_name.chars()
+                    let base_dev: String = dev_name
+                        .chars()
                         .take_while(|c| !c.is_ascii_digit())
                         .collect();
-                    
+
                     // 检查设备的 vendor/product ID
                     let usb_device_path = format!("/sys/block/{}/device/../../../", base_dev);
                     if let Ok(vid) = fs::read_to_string(format!("{}idVendor", usb_device_path)) {
-                        if let Ok(pid) = fs::read_to_string(format!("{}idProduct", usb_device_path)) {
+                        if let Ok(pid) = fs::read_to_string(format!("{}idProduct", usb_device_path))
+                        {
                             if vid.trim() == vendor_id && pid.trim() == product_id {
-                                // 如果有序列号，进一步验证
                                 if let Some(ref s) = serial {
-                                    if let Ok(dev_serial) = fs::read_to_string(format!("{}serial", usb_device_path)) {
+                                    if let Ok(dev_serial) =
+                                        fs::read_to_string(format!("{}serial", usb_device_path))
+                                    {
                                         if dev_serial.trim() == s {
                                             return Some(mount_point.to_string());
                                         }
@@ -1225,7 +1248,7 @@ fn find_usb_device_mount_by_path(
             }
         }
     }
-    
+
     None
 }
 
@@ -1237,7 +1260,7 @@ pub fn get_all_block_devices() -> Vec<BlockDeviceInfo> {
     {
         get_block_devices_linux()
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         Vec::new()
@@ -1274,16 +1297,12 @@ fn get_block_devices_linux() -> Vec<BlockDeviceInfo> {
     if let Ok(entries) = fs::read_dir("/sys/block") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            
-            // 跳过虚拟设备
             if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("dm-") {
                 continue;
             }
 
             let sys_path = format!("/sys/block/{}", name);
             let device_path = format!("/dev/{}", name);
-            
-            // 读取设备大小
             let size = fs::read_to_string(format!("{}/size", sys_path))
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
@@ -1294,7 +1313,6 @@ fn get_block_devices_linux() -> Vec<BlockDeviceInfo> {
                 continue;
             }
 
-            // 读取设备信息
             let model = fs::read_to_string(format!("{}/device/model", sys_path))
                 .ok()
                 .map(|s| s.trim().to_string())
@@ -1309,7 +1327,6 @@ fn get_block_devices_linux() -> Vec<BlockDeviceInfo> {
                 .map(|s| s.trim() == "1")
                 .unwrap_or(false);
 
-            // 判断设备类型
             let device_type = if name.starts_with("nvme") {
                 "NVMe SSD"
             } else if name.starts_with("mmc") {
@@ -1327,9 +1344,9 @@ fn get_block_devices_linux() -> Vec<BlockDeviceInfo> {
                 }
             } else {
                 "Unknown"
-            }.to_string();
+            }
+            .to_string();
 
-            // 获取分区信息
             let partitions = get_partitions(&name);
 
             devices.push(BlockDeviceInfo {
@@ -1356,25 +1373,20 @@ fn get_partitions(device_name: &str) -> Vec<PartitionInfo> {
     if let Ok(entries) = fs::read_dir(&sys_path) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            
-            // 分区名称以设备名开头
             if !name.starts_with(device_name) {
                 continue;
             }
 
             let part_sys_path = format!("{}/{}", sys_path, name);
             let device_path = format!("/dev/{}", name);
-
-            // 读取分区大小
             let size = fs::read_to_string(format!("{}/size", part_sys_path))
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .map(|sectors| sectors * 512)
                 .unwrap_or(0);
 
-            // 获取挂载点和文件系统信息
             let (mount_point, file_system) = get_mount_info(&device_path);
-            
+
             // 获取 UUID 和 Label
             let (uuid, label) = get_partition_identifiers(&device_path);
 
@@ -1409,34 +1421,30 @@ fn get_mount_info(device_path: &str) -> (Option<String>, Option<String>) {
 #[cfg(target_os = "linux")]
 fn get_partition_identifiers(device_path: &str) -> (Option<String>, Option<String>) {
     let dev_name = device_path.trim_start_matches("/dev/");
-    
+
     // 尝试从 /dev/disk/by-uuid 获取 UUID
-    let uuid = fs::read_dir("/dev/disk/by-uuid")
-        .ok()
-        .and_then(|entries| {
-            for entry in entries.flatten() {
-                if let Ok(link) = fs::read_link(entry.path()) {
-                    if link.to_string_lossy().ends_with(dev_name) {
-                        return Some(entry.file_name().to_string_lossy().to_string());
-                    }
+    let uuid = fs::read_dir("/dev/disk/by-uuid").ok().and_then(|entries| {
+        for entry in entries.flatten() {
+            if let Ok(link) = fs::read_link(entry.path()) {
+                if link.to_string_lossy().ends_with(dev_name) {
+                    return Some(entry.file_name().to_string_lossy().to_string());
                 }
             }
-            None
-        });
+        }
+        None
+    });
 
     // 尝试从 /dev/disk/by-label 获取 Label
-    let label = fs::read_dir("/dev/disk/by-label")
-        .ok()
-        .and_then(|entries| {
-            for entry in entries.flatten() {
-                if let Ok(link) = fs::read_link(entry.path()) {
-                    if link.to_string_lossy().ends_with(dev_name) {
-                        return Some(entry.file_name().to_string_lossy().to_string());
-                    }
+    let label = fs::read_dir("/dev/disk/by-label").ok().and_then(|entries| {
+        for entry in entries.flatten() {
+            if let Ok(link) = fs::read_link(entry.path()) {
+                if link.to_string_lossy().ends_with(dev_name) {
+                    return Some(entry.file_name().to_string_lossy().to_string());
                 }
             }
-            None
-        });
+        }
+        None
+    });
 
     (uuid, label)
 }

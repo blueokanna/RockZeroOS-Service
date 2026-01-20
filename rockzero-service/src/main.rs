@@ -9,6 +9,7 @@ mod middleware;
 mod secure_db;
 mod ffmpeg_manager;
 mod media_processor;
+mod storage_manager;
 
 use rockzero_common as _;
 use rockzero_crypto as _;
@@ -18,13 +19,14 @@ use actix_cors::Cors;
 use actix_web::{middleware::Logger, web, App, HttpServer};
 use sqlx::SqlitePool;
 use std::{path::PathBuf, sync::Arc};
+use tokio::sync::RwLock;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::invite::InviteCodeManager;
 use crate::handlers::secure_storage::SecureStorageManager;
-use crate::handlers::media::HlsSessionManager;
 use crate::media_processor::MediaProcessor;
+use crate::storage_manager::{StorageManager, StorageConfig};
 
 async fn hardware_info_endpoint() -> actix_web::Result<impl actix_web::Responder> {
     let info = hardware::detect_hardware();
@@ -116,8 +118,18 @@ async fn main() -> std::io::Result<()> {
 
     let hls_base_dir = PathBuf::from(&data_dir).join("hls_cache");
     std::fs::create_dir_all(&hls_base_dir).ok();
-    let hls_manager = Arc::new(HlsSessionManager::new(hls_base_dir.to_str().unwrap_or("./hls_cache")));
-    info!("HLS streaming: WPA3-SAE + FFmpeg real-time transcoding enabled");
+    let hls_manager = Arc::new(RwLock::new(rockzero_media::HlsSessionManager::new()));
+    info!("Secure HLS streaming: WPA3-SAE + ZKP + AES-256-GCM enabled");
+
+    // 初始化存储管理器
+    let storage_config = StorageConfig::from_env();
+    storage_config.init_directories().await?;
+    let storage_manager = Arc::new(StorageManager::new(storage_config));
+    info!("Storage Manager initialized");
+    
+    // 启动后台清理任务
+    storage_manager.clone().start_cleanup_tasks();
+    info!("Storage cleanup tasks started");
 
     let invite_manager = Arc::new(InviteCodeManager::new());
 
@@ -127,6 +139,7 @@ async fn main() -> std::io::Result<()> {
         let invite_manager = invite_manager.clone();
         let media_processor_data = media_processor.clone();
         let hls_manager_data = hls_manager.clone();
+        let storage_manager_data = storage_manager.clone();
         let cors = Cors::default()
             .allow_any_origin()
             .allowed_methods(vec![
@@ -162,6 +175,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(invite_manager.clone()))
             .app_data(web::Data::new(media_processor_data))
             .app_data(web::Data::new(hls_manager_data))
+            .app_data(web::Data::new(storage_manager_data))
             .route("/health", web::get().to(handlers::health::health_check))
             .service(
                 web::scope("/api/v1")
@@ -198,6 +212,14 @@ async fn main() -> std::io::Result<()> {
                             .route("/file/{path:.*}", web::get().to(handlers::storage::read_file))
                             .route("/file", web::post().to(handlers::storage::write_file))
                             .route("/delete/{path:.*}", web::delete().to(handlers::storage::delete_path)),
+                    )
+                    .service(
+                        web::scope("/storage-management")
+                            .route("/stats", web::get().to(handlers::storage_management::get_storage_stats))
+                            .route("/cleanup", web::post().to(handlers::storage_management::trigger_cleanup))
+                            .route("/cleanup/hls", web::post().to(handlers::storage_management::cleanup_hls_cache))
+                            .route("/cleanup/temp", web::post().to(handlers::storage_management::cleanup_temp_files))
+                            .route("/check", web::get().to(handlers::storage_management::check_storage_space)),
                     )
                     .service(
                         web::scope("/speedtest")
@@ -390,6 +412,21 @@ async fn main() -> std::io::Result<()> {
                             .route("/string/decrypt", web::post().to(handlers::secure_storage::decrypt_string))
                             .route("/key/wpa3-sae", web::post().to(handlers::secure_storage::derive_wpa3_sae_key))
                             .route("/key/specific", web::post().to(handlers::secure_storage::derive_specific_key)),                    )
+                    // ============ 安全 HLS 流式传输（自定义加密协议）============
+                    .service(
+                        web::scope("/secure-hls")
+                            .wrap(middleware::JwtAuth)
+                            // SAE 握手端点
+                            .route("/sae/init", web::post().to(handlers::secure_hls::init_sae_handshake))
+                            .route("/sae/complete", web::post().to(handlers::secure_hls::complete_sae_handshake))
+                            .route("/session/create", web::post().to(handlers::secure_hls::create_hls_session)),
+                    )
+                    // 安全播放列表和段（需要 ZKP 证明，不需要 JWT）
+                    .service(
+                        web::scope("/secure-hls")
+                            .route("/{session_id}/playlist.m3u8", web::get().to(handlers::secure_hls::get_secure_playlist))
+                            .route("/{session_id}/{segment}", web::post().to(handlers::secure_hls::get_secure_segment)),
+                    )
                     .service(
                         web::scope("/media")
                             .wrap(middleware::JwtAuth)

@@ -4,7 +4,6 @@ use actix_multipart::Multipart;
 use actix_web::{web, HttpRequest, HttpResponse};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -58,7 +57,7 @@ pub async fn upload_file(
         .await?;
 
     let mut total_written = 0u64;
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     let start_time = std::time::Instant::now();
 
     while let Some(item) = payload.next().await {
@@ -74,7 +73,7 @@ pub async fn upload_file(
 
     file.flush().await?;
 
-    let checksum = format!("{:x}", hasher.finalize());
+    let checksum = hasher.finalize().to_hex().to_string();
     let elapsed = start_time.elapsed().as_secs_f32();
     let speed_mbps = (total_written as f32 / 1024.0 / 1024.0) / elapsed;
 
@@ -228,9 +227,9 @@ pub async fn get_file_checksum(
         return Err(AppError::NotFound("File not found".to_string()));
     }
 
-    // 计算SHA256校验和
+    // 计算 Blake3 校验和
     let mut file = File::open(&file_path).await?;
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; 8192];
 
     loop {
@@ -241,12 +240,12 @@ pub async fn get_file_checksum(
         hasher.update(&buffer[..n]);
     }
 
-    let checksum = format!("{:x}", hasher.finalize());
+    let checksum = hasher.finalize().to_hex().to_string();
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "path": query.path,
         "checksum": checksum,
-        "algorithm": "SHA256",
+        "algorithm": "Blake3",
     })))
 }
 

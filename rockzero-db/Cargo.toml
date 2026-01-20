@@ -4,30 +4,31 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 description = "RockZero Secure Database Management"
+license.workspace = true
 
 [dependencies]
-# Internal dependencies (alphabetically sorted)
+# Internal dependencies
 rockzero-common = { path = "../rockzero-common", features = ["db"] }
 rockzero-crypto = { path = "../rockzero-crypto" }
 rockzero-sae = { path = "../rockzero-sae" }
 
-# Cryptography (alphabetically sorted)
+# Cryptography
 aes-gcm = { workspace = true }
 base64 = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 hkdf = { workspace = true }
-sha2 = { workspace = true }
+sha3 = { workspace = true }
 
 # Database
-sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
+sqlx = { workspace = true }
 
-# Serialization (alphabetically sorted)
+# Serialization
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# Utilities (alphabetically sorted)
+# Utilities
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "fs"] }
 tracing = { workspace = true }
@@ -35,4 +36,4 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
-tempfile = "3.8"
+tempfile = { workspace = true }

@@ -7,7 +7,7 @@ pub mod utils;
 pub mod zkp;
 
 pub use aes::{decrypt_aes256_gcm, encrypt_aes256_gcm};
-pub use hash::{blake3_hash, sha256_hash, sha512_hash};
+pub use hash::{blake3_hash, blake3_hash_single, sha3_256_hash, sha3_256_hash_multi};
 pub use signature::{generate_keypair, sign, verify};
 pub use tls::{load_rustls_config, TlsConfig};
 pub use utils::{
@@ -16,4 +16,4 @@ pub use utils::{
 };
 pub use zkp::{EnhancedPasswordProof, PasswordProofData, RangeProofData, ZkpContext};
 
-pub use rockzero_sae::{KeyDerivation, SaeClient, SaeCommit, SaeConfirm, SaeServer};
+pub use rockzero_sae::{SaeClient, SaeCommit, SaeConfirm, SaeServer};

@@ -237,32 +237,7 @@ pub async fn find_user_by_email(pool: &SqlitePool, email: &str) -> Result<Option
     }
 }
 
-/// Update user password
-pub async fn update_user_password(
-    pool: &SqlitePool,
-    user_id: &str,
-    password_hash: &str,
-    zkp_commitment: &str,
-) -> Result<(), AppError> {
-    let now = chrono::Utc::now();
 
-    sqlx::query(
-        r#"
-        UPDATE users 
-        SET password_hash = ?, zkp_commitment = ?, updated_at = ?
-        WHERE id = ?
-        "#,
-    )
-    .bind(password_hash)
-    .bind(zkp_commitment)
-    .bind(now)
-    .bind(user_id)
-    .execute(pool)
-    .await
-    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
-
-    Ok(())
-}
 
 pub async fn create_file_metadata(
     _pool: &SqlitePool,

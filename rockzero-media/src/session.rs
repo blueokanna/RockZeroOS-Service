@@ -3,10 +3,12 @@ use crate::{
     HlsEncryptor,
 };
 use chrono::{DateTime, Duration, Utc};
-use rockzero_sae::{KeyDerivation, SaeServer};
+use rockzero_sae::SaeServer;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+use hkdf::Hkdf;
+use sha3::Sha3_256;
 
 /// HLS 会话
 pub struct HlsSession {
@@ -32,9 +34,23 @@ impl HlsSession {
         let created_at = Utc::now();
         let expires_at = created_at + Duration::hours(3);
 
-        let kd = KeyDerivation::new(pmk);
-        let encryption_key = kd.derive_aes256_key(b"hls-master-key", None)?;
-        let segment_keys = kd.derive_multiple_keys(b"hls-segment", max_segments)?;
+        // 使用 HKDF-SHA3-256 从 PMK 派生密钥
+        let hk = Hkdf::<Sha3_256>::new(None, &pmk);
+        
+        // 派生主加密密钥（AES-256-GCM）
+        let mut encryption_key = [0u8; 32];
+        hk.expand(b"hls-master-key", &mut encryption_key)
+            .map_err(|e| HlsError::EncryptionError(format!("HKDF expand failed: {}", e)))?;
+        
+        // 派生分片密钥
+        let mut segment_keys = Vec::with_capacity(max_segments);
+        for i in 0..max_segments {
+            let mut key = [0u8; 32];
+            let info = format!("hls-segment-{}", i);
+            hk.expand(info.as_bytes(), &mut key)
+                .map_err(|e| HlsError::EncryptionError(format!("HKDF expand failed: {}", e)))?;
+            segment_keys.push(key);
+        }
 
         let encryptor = HlsEncryptor::new(&encryption_key)?;
 
@@ -70,8 +86,8 @@ impl HlsSession {
 
 /// HLS 会话管理器
 pub struct HlsSessionManager {
-    sessions: Arc<Mutex<HashMap<String, HlsSession>>>,
-    sae_servers: Arc<Mutex<HashMap<String, SaeServer>>>,
+    pub sessions: Arc<Mutex<HashMap<String, HlsSession>>>,
+    pub sae_servers: Arc<Mutex<HashMap<String, SaeServer>>>,
 }
 
 impl HlsSessionManager {
@@ -89,8 +105,11 @@ impl HlsSessionManager {
     pub fn init_sae_handshake(&self, user_id: String, password: Vec<u8>) -> Result<String> {
         let temp_session_id = Uuid::new_v4().to_string();
 
-        let server_id = b"rockzero-server".to_vec();
-        let client_id = user_id.as_bytes().to_vec();
+        // 使用 Blake3 从字符串生成 32 字节设备ID
+        let server_id = blake3::hash(b"rockzero-server-device-id").into();
+        
+        // 从 user_id 生成 32 字节设备ID
+        let client_id = blake3::hash(user_id.as_bytes()).into();
 
         let sae_server = SaeServer::new(password, server_id, client_id);
 
@@ -199,21 +218,25 @@ mod tests {
         let password = b"shared_secret_password_123".to_vec();
         let user_id = "user123".to_string();
         let file_path = "/videos/demo.mp4".to_string();
-        let client_mac = b"client_mac_address".to_vec();
-        let server_mac = b"server_mac_address".to_vec();
+        
+        // 使用 32 字节设备ID
+        let client_device_id = [0x01; 32];
+        let server_device_id = [0x02; 32];
 
         // 先完成一次真实 SAE 握手，获取 PMK
-        let mut client = rockzero_sae::SaeClient::new(password.clone(), client_mac.clone(), server_mac.clone());
-        let mut server = rockzero_sae::SaeServer::new(password, server_mac, client_mac);
+        let mut client = rockzero_sae::SaeClient::new(password.clone(), client_device_id, server_device_id);
+        let mut server = rockzero_sae::SaeServer::new(password, server_device_id, client_device_id);
 
         let client_commit = client.generate_commit().unwrap();
-        let (server_commit, server_confirm) = server.process_commit(&client_commit).unwrap();
-        let client_confirm = client.process_commit(&server_commit).unwrap();
+        let (server_commit, server_confirm) = server.process_client_commit(&client_commit).unwrap();
+        client.process_commit(&server_commit).unwrap();
+        let client_confirm = client.generate_confirm().unwrap();
         client.verify_confirm(&server_confirm).unwrap();
-        server.verify_confirm(&client_confirm).unwrap();
+        server.verify_client_confirm(&client_confirm).unwrap();
 
         assert!(client.is_authenticated());
         assert!(server.is_authenticated());
+        
         let pmk = server.get_pmk().unwrap();
 
         let manager = HlsSessionManager::new();

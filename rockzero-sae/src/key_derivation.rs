@@ -1,7 +1,7 @@
-//! 密钥派生 - 从 PMK 派生应用密钥
+//! 密钥派生 - 从 PMK 派生应用密钥（使用 SHA3-256）
 
 use hkdf::Hkdf;
-use sha2::Sha256;
+use sha3::Sha3_256;
 use crate::error::{Result, SaeError};
 
 /// 密钥派生器
@@ -15,28 +15,21 @@ impl KeyDerivation {
         Self { pmk }
     }
 
-    /// 派生 AES-128 密钥
+    /// 派生 AES-256 密钥
     /// 
     /// # 参数
     /// 
     /// * `info` - 上下文信息 (例如: "hls-encryption", "segment-0")
     /// * `salt` - 可选的盐值
-    pub fn derive_aes128_key(&self, info: &[u8], salt: Option<&[u8]>) -> Result<[u8; 16]> {
-        let hkdf = Hkdf::<Sha256>::new(salt, &self.pmk);
-        let mut okm = [0u8; 16];
-        hkdf.expand(info, &mut okm)
-            .map_err(|e| SaeError::KeyDerivationError(format!("HKDF expand failed: {}", e)))?;
-        Ok(okm)
-    }
-
     pub fn derive_aes256_key(&self, info: &[u8], salt: Option<&[u8]>) -> Result<[u8; 32]> {
-        let hkdf = Hkdf::<Sha256>::new(salt, &self.pmk);
+        let hkdf = Hkdf::<Sha3_256>::new(salt, &self.pmk);
         let mut okm = [0u8; 32];
         hkdf.expand(info, &mut okm)
             .map_err(|e| SaeError::KeyDerivationError(format!("HKDF expand failed: {}", e)))?;
         Ok(okm)
     }
 
+    /// 派生多个 AES-256 密钥
     pub fn derive_multiple_keys(&self, base_info: &[u8], count: usize) -> Result<Vec<[u8; 32]>> {
         let mut keys = Vec::with_capacity(count);
         
@@ -51,10 +44,12 @@ impl KeyDerivation {
         Ok(keys)
     }
 
+    /// 派生 HMAC-SHA3-256 密钥
     pub fn derive_hmac_key(&self, info: &[u8]) -> Result<[u8; 32]> {
         self.derive_aes256_key(info, None)
     }
 
+    /// 派生会话密钥
     pub fn derive_session_key(&self, session_id: &str) -> Result<[u8; 32]> {
         let info = format!("session-key-{}", session_id);
         self.derive_aes256_key(info.as_bytes(), None)
@@ -70,15 +65,15 @@ mod tests {
         let pmk = [0x42u8; 32];
         let kd = KeyDerivation::new(pmk);
 
-        // 测试 AES-128 密钥派生
-        let key1 = kd.derive_aes128_key(b"test-context-1", None).unwrap();
-        let key2 = kd.derive_aes128_key(b"test-context-2", None).unwrap();
+        // 测试 AES-256 密钥派生
+        let key1 = kd.derive_aes256_key(b"test-context-1", None).unwrap();
+        let key2 = kd.derive_aes256_key(b"test-context-2", None).unwrap();
         
         // 不同的 info 应该产生不同的密钥
         assert_ne!(key1, key2);
 
         // 相同的 info 应该产生相同的密钥
-        let key1_again = kd.derive_aes128_key(b"test-context-1", None).unwrap();
+        let key1_again = kd.derive_aes256_key(b"test-context-1", None).unwrap();
         assert_eq!(key1, key1_again);
     }
 

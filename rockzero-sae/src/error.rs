@@ -2,14 +2,32 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum SaeError {
+    #[error("Crypto error: {0}")]
+    CryptoError(String),
+
+    #[error("Invalid state: {0}")]
+    InvalidState(String),
+
+    #[error("Invalid commit: {0}")]
+    InvalidCommit(String),
+
+    #[error("Unsupported group: {0}")]
+    UnsupportedGroup(u16),
+
+    #[error("Confirm verification failed")]
+    ConfirmVerificationFailed,
+
+    #[error("Maximum sync attempts reached")]
+    MaxSyncReached,
+
+    #[error("IO error: {0}")]
+    IoError(String),
+
     #[error("Invalid password or credentials")]
     InvalidCredentials,
 
     #[error("Commit verification failed")]
     CommitVerificationFailed,
-
-    #[error("Confirm verification failed")]
-    ConfirmVerificationFailed,
 
     #[error("Invalid scalar value")]
     InvalidScalar,
@@ -19,9 +37,6 @@ pub enum SaeError {
 
     #[error("Protocol state error: {0}")]
     ProtocolState(String),
-
-    #[error("Cryptographic error: {0}")]
-    CryptoError(String),
 
     #[error("Serialization error: {0}")]
     SerializationError(String),

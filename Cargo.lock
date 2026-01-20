@@ -3269,7 +3269,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "sha2",
+ "sha3",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -3289,7 +3289,7 @@ dependencies = [
  "rockzero-sae",
  "serde",
  "serde_json",
- "sha2",
+ "sha3",
  "sqlx",
  "tempfile",
  "thiserror 1.0.69",
@@ -3308,6 +3308,7 @@ dependencies = [
  "blake3",
  "chrono",
  "hex",
+ "hkdf",
  "libc",
  "log",
  "rand 0.8.5",
@@ -3315,7 +3316,7 @@ dependencies = [
  "rockzero-sae",
  "serde",
  "serde_json",
- "sha2",
+ "sha3",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -3327,21 +3328,17 @@ dependencies = [
 name = "rockzero-sae"
 version = "0.1.0"
 dependencies = [
- "base64 0.21.7",
  "blake3",
  "curve25519-dalek",
- "ed25519-dalek",
- "group",
  "hex",
  "hkdf",
  "hmac",
  "rand 0.8.5",
- "rockzero-common",
  "serde",
  "serde_json",
- "sha2",
+ "sha3",
+ "subtle",
  "thiserror 1.0.69",
- "tokio",
 ]
 
 [[package]]
@@ -3380,7 +3377,7 @@ dependencies = [
  "rockzero-sae",
  "serde",
  "serde_json",
- "sha2",
+ "sha3",
  "sqlx",
  "symphonia",
  "sysinfo",
@@ -3398,6 +3395,7 @@ dependencies = [
  "wasmtime-wasi",
  "webauthn-rs",
  "webauthn-rs-proto",
+ "winapi",
 ]
 
 [[package]]
