@@ -381,6 +381,10 @@ pub async fn get_block_devices() -> Result<impl Responder, AppError> {
 }
 
 pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
+    use tracing::{info, error};
+    
+    info!("🔍 Starting hardware info collection...");
+    
     let mut sys = System::new_all();
     sys.refresh_all();
 
@@ -402,9 +406,15 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
         architecture,
         uptime,
     };
+    info!("✅ System info collected");
 
     let cpus = sys.cpus();
-    let cpu = cpus.first().ok_or(AppError::InternalError)?;
+    if cpus.is_empty() {
+        error!("❌ No CPU information available");
+        return Err(AppError::InternalError);
+    }
+    
+    let cpu = cpus.first().unwrap();
     let total_usage: f32 = cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32;
 
     // 获取每个核心的使用率
@@ -441,11 +451,16 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
         per_core_usage,
         core_types,
     };
+    info!("✅ CPU info collected: {} cores, {:.1}% usage", cpus.len(), total_usage);
 
     let total_mem = sys.total_memory();
     let used_mem = sys.used_memory();
     let available_mem = sys.available_memory();
-    let usage_percentage = (used_mem as f64 / total_mem as f64) * 100.0;
+    let usage_percentage = if total_mem > 0 {
+        (used_mem as f64 / total_mem as f64) * 100.0
+    } else {
+        0.0
+    };
 
     let memory_info = MemoryInfo {
         total: total_mem,
@@ -455,13 +470,14 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
         swap_total: sys.total_swap(),
         swap_used: sys.used_swap(),
     };
+    info!("✅ Memory info collected: {:.1}% used", usage_percentage);
 
     let disks_info = Disks::new_with_refreshed_list();
     let mut disks = Vec::new();
     for disk in disks_info.list() {
         let total_space = disk.total_space();
         let available_space = disk.available_space();
-        let used_space = total_space - available_space;
+        let used_space = total_space.saturating_sub(available_space);
         let disk_usage_percentage = if total_space > 0 {
             (used_space as f64 / total_space as f64) * 100.0
         } else {
@@ -480,9 +496,13 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
             disk_type: format!("{:?}", disk.kind()),
         });
     }
+    info!("✅ Disk info collected: {} disks", disks.len());
 
     let usb_devices = detect_usb_devices();
+    info!("✅ USB devices collected: {} devices", usb_devices.len());
+    
     let network_interfaces = detect_network_interfaces();
+    info!("✅ Network interfaces collected: {} interfaces", network_interfaces.len());
 
     let hardware_info = HardwareInfo {
         system: system_info,
@@ -493,6 +513,7 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
         network_interfaces,
     };
 
+    info!("✅ Hardware info collection complete");
     Ok(HttpResponse::Ok().json(hardware_info))
 }
 

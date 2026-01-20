@@ -264,9 +264,9 @@ async fn execute_wasm_module(
     )))
 }
 
-pub async fn list_packages(req: HttpRequest) -> Result<HttpResponse, AppError> {
-    crate::middleware::verify_fido2_or_passkey(&req).await?;
-
+pub async fn list_packages(_req: HttpRequest) -> Result<HttpResponse, AppError> {
+    // Allow listing packages without FIDO2 - read-only operation
+    // JWT authentication is handled by middleware if configured
     let packages = load_packages()?;
     Ok(HttpResponse::Ok().json(packages))
 }
@@ -435,8 +435,9 @@ pub struct PullImageRequest {
     pub tag: Option<String>,
 }
 
-pub async fn list_containers(req: HttpRequest) -> Result<HttpResponse, AppError> {
-    crate::middleware::verify_fido2_or_passkey(&req).await?;
+pub async fn list_containers(_req: HttpRequest) -> Result<HttpResponse, AppError> {
+    // Allow listing containers without FIDO2 - read-only operation
+    // JWT authentication is handled by middleware if configured
 
     #[cfg(target_os = "linux")]
     {
@@ -464,8 +465,9 @@ pub async fn list_containers(req: HttpRequest) -> Result<HttpResponse, AppError>
     }
 }
 
-pub async fn list_images(req: HttpRequest) -> Result<HttpResponse, AppError> {
-    crate::middleware::verify_fido2_or_passkey(&req).await?;
+pub async fn list_images(_req: HttpRequest) -> Result<HttpResponse, AppError> {
+    // Allow listing images without FIDO2 - read-only operation
+    // JWT authentication is handled by middleware if configured
 
     #[cfg(target_os = "linux")]
     {

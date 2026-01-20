@@ -1,4 +1,5 @@
 pub mod appstore;
+pub mod appstore_enhanced;
 pub mod auth;
 pub mod disk_manager;
 pub mod docker;

@@ -11,7 +11,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use rockzero_common::AppError;
 
-/// 文件上传请求
 #[derive(Debug, Deserialize)]
 pub struct UploadRequest {
     pub path: String,
@@ -20,14 +19,12 @@ pub struct UploadRequest {
     pub chunk_size: usize,
 }
 
-/// 文件下载请求
 #[derive(Debug, Deserialize)]
 pub struct DownloadRequest {
     pub path: String,
-    pub range: Option<String>, // 支持断点续传
+    pub range: Option<String>,
 }
 
-/// 文件传输状态
 #[derive(Debug, Serialize)]
 pub struct TransferStatus {
     pub filename: String,
@@ -39,19 +36,16 @@ pub struct TransferStatus {
     pub checksum: Option<String>,
 }
 
-/// 文件上传处理器（支持断点续传）
 pub async fn upload_file(
     mut payload: Multipart,
     query: web::Query<UploadRequest>,
     req: HttpRequest,
 ) -> Result<HttpResponse, AppError> {
-    // 验证认证
     crate::middleware::verify_auth(&req).await?;
 
     let upload_path = PathBuf::from(&query.path);
     let file_path = upload_path.join(&query.filename);
 
-    // 确保目录存在
     if let Some(parent) = file_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -67,17 +61,11 @@ pub async fn upload_file(
     let mut hasher = Sha256::new();
     let start_time = std::time::Instant::now();
 
-    // 处理分块上传
     while let Some(item) = payload.next().await {
         let mut field = item?;
-
         while let Some(chunk) = field.next().await {
             let data = chunk?;
-
-            // 写入文件
             file.write_all(&data).await?;
-
-            // 更新哈希
             hasher.update(&data);
 
             total_written += data.len() as u64;
@@ -86,10 +74,7 @@ pub async fn upload_file(
 
     file.flush().await?;
 
-    // 计算校验和
     let checksum = format!("{:x}", hasher.finalize());
-
-    // 计算传输速度
     let elapsed = start_time.elapsed().as_secs_f32();
     let speed_mbps = (total_written as f32 / 1024.0 / 1024.0) / elapsed;
 
@@ -104,24 +89,19 @@ pub async fn upload_file(
     }))
 }
 
-/// 文件下载处理器（支持断点续传和Range请求）
 pub async fn download_file(
     query: web::Query<DownloadRequest>,
     req: HttpRequest,
 ) -> Result<HttpResponse, AppError> {
-    // 验证认证
     crate::middleware::verify_auth(&req).await?;
 
     let file_path = PathBuf::from(&query.path);
-
     if !file_path.exists() {
         return Err(AppError::NotFound("File not found".to_string()));
     }
 
     let metadata = tokio::fs::metadata(&file_path).await?;
     let file_size = metadata.len();
-
-    // 解析Range头
     let (start, end) = if let Some(range) = &query.range {
         parse_range(range, file_size)?
     } else if let Some(range_header) = req.headers().get("Range") {
@@ -132,21 +112,15 @@ pub async fn download_file(
     };
 
     let content_length = end - start + 1;
-
-    // 打开文件
     let mut file = File::open(&file_path).await?;
-
-    // 跳转到起始位置
     if start > 0 {
         use tokio::io::AsyncSeekExt;
         file.seek(std::io::SeekFrom::Start(start)).await?;
     }
 
-    // 读取数据
     let mut buffer = vec![0u8; content_length as usize];
     file.read_exact(&mut buffer).await?;
 
-    // 构建响应
     let mut response = if start > 0 || end < file_size - 1 {
         HttpResponse::PartialContent()
     } else {
@@ -166,7 +140,6 @@ pub async fn download_file(
     Ok(response.finish())
 }
 
-/// 分块上传（使用UDP/TCP混合传输）
 pub async fn chunked_upload(
     payload: web::Bytes,
     query: web::Query<ChunkedUploadRequest>,

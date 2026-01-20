@@ -696,21 +696,46 @@ fn get_linux_devices_fallback() -> Result<Vec<StorageDevice>, AppError> {
 
 #[cfg(target_os = "linux")]
 fn mount_linux(opts: &MountOptions) -> Result<(), AppError> {
+    use tracing::{info, warn};
+    
     // 创建挂载点
     std::fs::create_dir_all(&opts.mount_point)
         .map_err(|e| AppError::BadRequest(format!("Failed to create mount point: {}", e)))?;
     
-    let mut args = vec![opts.device.clone(), opts.mount_point.clone()];
+    // 自动检测文件系统类型
+    let fs_type = if let Some(fs) = &opts.file_system {
+        fs.clone()
+    } else {
+        info!("🔍 Auto-detecting filesystem for {}", opts.device);
+        detect_filesystem(&opts.device).unwrap_or_else(|| {
+            warn!("⚠️ Could not detect filesystem, trying auto mount");
+            "auto".to_string()
+        })
+    };
     
-    if let Some(fs) = &opts.file_system {
-        args.insert(0, "-t".to_string());
-        args.insert(1, fs.clone());
-    }
+    let mut args = vec!["-t".to_string(), fs_type.clone(), opts.device.clone(), opts.mount_point.clone()];
     
     let mut mount_opts = Vec::new();
     if opts.read_only.unwrap_or(false) {
         mount_opts.push("ro".to_string());
     }
+    
+    // 根据文件系统类型添加推荐选项
+    match fs_type.to_lowercase().as_str() {
+        "ntfs" => {
+            mount_opts.push("nls=utf8".to_string());
+            mount_opts.push("umask=0222".to_string());
+        }
+        "vfat" | "fat32" | "exfat" => {
+            mount_opts.push("utf8".to_string());
+            mount_opts.push("umask=0000".to_string());
+        }
+        "ext4" | "ext3" | "ext2" => {
+            mount_opts.push("errors=remount-ro".to_string());
+        }
+        _ => {}
+    }
+    
     if let Some(ref extra_opts) = opts.options {
         mount_opts.extend(extra_opts.clone());
     }
@@ -720,17 +745,73 @@ fn mount_linux(opts: &MountOptions) -> Result<(), AppError> {
         args.push(mount_opts.join(","));
     }
     
+    info!("🔧 Mounting {} to {} with filesystem {}", opts.device, opts.mount_point, fs_type);
+    
     let output = Command::new("mount")
         .args(&args)
         .output()
-        .map_err(|_| AppError::InternalError)?;
+        .map_err(|e| {
+            error!("❌ Failed to execute mount command: {}", e);
+            AppError::InternalError
+        })?;
     
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::BadRequest(format!("Mount failed: {}", err)));
+        error!("❌ Mount failed: {}", err);
+        return Err(AppError::BadRequest(format!("Mount failed: {}. Try specifying filesystem type explicitly.", err)));
     }
     
+    info!("✅ Successfully mounted {} to {}", opts.device, opts.mount_point);
     Ok(())
+}
+
+/// 自动检测文件系统类型
+#[cfg(target_os = "linux")]
+fn detect_filesystem(device: &str) -> Option<String> {
+    // 使用 blkid 检测文件系统
+    let output = Command::new("blkid")
+        .args(["-o", "value", "-s", "TYPE", device])
+        .output()
+        .ok()?;
+    
+    if output.status.success() {
+        let fs_type = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !fs_type.is_empty() {
+            return Some(fs_type);
+        }
+    }
+    
+    // 后备方案：使用 file 命令
+    let output = Command::new("file")
+        .args(["-sL", device])
+        .output()
+        .ok()?;
+    
+    if output.status.success() {
+        let file_output = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        
+        if file_output.contains("ext4") {
+            return Some("ext4".to_string());
+        } else if file_output.contains("ext3") {
+            return Some("ext3".to_string());
+        } else if file_output.contains("ext2") {
+            return Some("ext2".to_string());
+        } else if file_output.contains("xfs") {
+            return Some("xfs".to_string());
+        } else if file_output.contains("btrfs") {
+            return Some("btrfs".to_string());
+        } else if file_output.contains("ntfs") {
+            return Some("ntfs".to_string());
+        } else if file_output.contains("fat") || file_output.contains("vfat") {
+            return Some("vfat".to_string());
+        } else if file_output.contains("exfat") {
+            return Some("exfat".to_string());
+        } else if file_output.contains("f2fs") {
+            return Some("f2fs".to_string());
+        }
+    }
+    
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -767,62 +848,126 @@ fn unmount_linux(device_or_mount: &str) -> Result<(), AppError> {
 
 #[cfg(target_os = "linux")]
 fn format_linux(opts: &FormatOptions) -> Result<(), AppError> {
+    use tracing::{info, warn};
+    
+    info!("🔧 Formatting {} as {}", opts.device, opts.file_system);
+    
     // 确保设备未挂载
+    info!("📤 Unmounting device if mounted...");
     let _ = Command::new("umount").arg(&opts.device).output();
+    let _ = Command::new("umount").args(["-f", &opts.device]).output();
     
-    let mkfs_cmd = match opts.file_system.to_lowercase().as_str() {
-        "ext4" => "mkfs.ext4",
-        "ext3" => "mkfs.ext3",
-        "ext2" => "mkfs.ext2",
-        "xfs" => "mkfs.xfs",
-        "btrfs" => "mkfs.btrfs",
-        "fat32" | "vfat" => "mkfs.vfat",
-        "exfat" => "mkfs.exfat",
-        "ntfs" => "mkfs.ntfs",
-        "f2fs" => "mkfs.f2fs",
-        _ => return Err(AppError::BadRequest(format!("Unsupported filesystem: {}", opts.file_system))),
-    };
+    // 同步文件系统
+    let _ = Command::new("sync").output();
     
-    let mut args = Vec::new();
-    
-    // 添加标签参数
-    if let Some(ref label) = opts.label {
-        match opts.file_system.to_lowercase().as_str() {
-            "ext4" | "ext3" | "ext2" | "xfs" | "btrfs" | "ntfs" => {
+    let (mkfs_cmd, mut args) = match opts.file_system.to_lowercase().as_str() {
+        "ext4" => {
+            let mut args = vec!["-F".to_string()];
+            if let Some(ref label) = opts.label {
                 args.push("-L".to_string());
                 args.push(label.clone());
             }
-            "fat32" | "vfat" | "exfat" => {
+            // 添加推荐的 ext4 选项
+            args.push("-O".to_string());
+            args.push("^metadata_csum,^64bit".to_string()); // 兼容性选项
+            ("mkfs.ext4", args)
+        }
+        "ext3" => {
+            let mut args = vec!["-F".to_string()];
+            if let Some(ref label) = opts.label {
+                args.push("-L".to_string());
+                args.push(label.clone());
+            }
+            ("mkfs.ext3", args)
+        }
+        "ext2" => {
+            let mut args = vec!["-F".to_string()];
+            if let Some(ref label) = opts.label {
+                args.push("-L".to_string());
+                args.push(label.clone());
+            }
+            ("mkfs.ext2", args)
+        }
+        "xfs" => {
+            let mut args = vec!["-f".to_string()];
+            if let Some(ref label) = opts.label {
+                args.push("-L".to_string());
+                args.push(label.clone());
+            }
+            ("mkfs.xfs", args)
+        }
+        "btrfs" => {
+            let mut args = vec!["-f".to_string()];
+            if let Some(ref label) = opts.label {
+                args.push("-L".to_string());
+                args.push(label.clone());
+            }
+            ("mkfs.btrfs", args)
+        }
+        "fat32" | "vfat" => {
+            let mut args = vec!["-F".to_string(), "32".to_string()];
+            if let Some(ref label) = opts.label {
                 args.push("-n".to_string());
                 args.push(label.clone());
             }
-            _ => {}
+            ("mkfs.vfat", args)
         }
-    }
-    
-    // 添加强制/快速格式化参数
-    match opts.file_system.to_lowercase().as_str() {
-        "ext4" | "ext3" | "ext2" => args.push("-F".to_string()),
-        "xfs" | "btrfs" => args.push("-f".to_string()),
-        "ntfs" => {
-            if opts.quick.unwrap_or(true) {
-                args.push("-Q".to_string());
+        "exfat" => {
+            let mut args = Vec::new();
+            if let Some(ref label) = opts.label {
+                args.push("-n".to_string());
+                args.push(label.clone());
             }
+            ("mkfs.exfat", args)
         }
-        _ => {}
-    }
+        "ntfs" => {
+            let mut args = vec!["-f".to_string()]; // 快速格式化
+            if let Some(ref label) = opts.label {
+                args.push("-L".to_string());
+                args.push(label.clone());
+            }
+            if !opts.quick.unwrap_or(true) {
+                warn!("⚠️ Full NTFS format requested, this may take a long time");
+                args.retain(|a| a != "-f");
+            }
+            ("mkfs.ntfs", args)
+        }
+        "f2fs" => {
+            let mut args = vec!["-f".to_string()];
+            if let Some(ref label) = opts.label {
+                args.push("-l".to_string());
+                args.push(label.clone());
+            }
+            ("mkfs.f2fs", args)
+        }
+        _ => {
+            error!("❌ Unsupported filesystem: {}", opts.file_system);
+            return Err(AppError::BadRequest(format!("Unsupported filesystem: {}. Supported: ext4, ext3, ext2, xfs, btrfs, fat32, vfat, exfat, ntfs, f2fs", opts.file_system)));
+        }
+    };
     
     args.push(opts.device.clone());
+    
+    info!("🔧 Running: {} {}", mkfs_cmd, args.join(" "));
     
     let output = Command::new(mkfs_cmd)
         .args(&args)
         .output()
-        .map_err(|e| AppError::BadRequest(format!("Failed to run {}: {}", mkfs_cmd, e)))?;
+        .map_err(|e| {
+            error!("❌ Failed to run {}: {}", mkfs_cmd, e);
+            AppError::BadRequest(format!("Failed to run {}: {}. Make sure the tool is installed.", mkfs_cmd, e))
+        })?;
     
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
+        error!("❌ Format failed: {}", err);
         return Err(AppError::BadRequest(format!("Format failed: {}", err)));
     }
+    
+    info!("✅ Successfully formatted {} as {}", opts.device, opts.file_system);
+    
+    // 同步文件系统
+    let _ = Command::new("sync").output();
     
     Ok(())
 }

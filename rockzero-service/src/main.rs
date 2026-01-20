@@ -272,6 +272,11 @@ async fn main() -> std::io::Result<()> {
                                 "/packages/{id}/run",
                                 web::post().to(handlers::appstore::run_wasm_package),
                             )
+                            // CasaOS 和 iStoreOS 支持
+                            .route("/casaos", web::get().to(handlers::appstore_enhanced::list_casaos_apps))
+                            .route("/istoreos", web::get().to(handlers::appstore_enhanced::list_istoreos_apps))
+                            .route("/ipk/install", web::post().to(handlers::appstore_enhanced::install_ipk_package))
+                            // Docker 容器管理
                             .route("/containers", web::get().to(handlers::appstore::list_containers))
                             .route("/containers", web::post().to(handlers::appstore::create_container))
                             .route(
