@@ -41,6 +41,7 @@ pub struct GpuInfo {
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum HardwareAccelType {
     VAAPI,        // Video Acceleration API (Intel/AMD on Linux)
     NVENC,        // NVIDIA Encoder
@@ -641,7 +642,7 @@ fn transcode_with_hardware(
 #[allow(dead_code)]
 fn ensure_all_accel_types_used() {
     // 确保所有 HardwareAccelType 变体都被引用
-    let _types = vec![
+    let _types = [
         HardwareAccelType::VAAPI,
         HardwareAccelType::NVENC,
         HardwareAccelType::NVDEC,

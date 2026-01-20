@@ -433,12 +433,12 @@ pub async fn register(
     }
 
     // 安全性：检查用户名是否已存在（防止用户枚举攻击，使用统一的错误消息）
-    if let Some(_) = crate::db::find_user_by_username(&pool, username).await? {
+    if (crate::db::find_user_by_username(&pool, username).await?).is_some() {
         return Err(AppError::BadRequest("Username or email already exists".to_string()));
     }
 
     // 安全性：检查邮箱是否已存在
-    if let Some(_) = crate::db::find_user_by_email(&pool, email).await? {
+    if (crate::db::find_user_by_email(&pool, email).await?).is_some() {
         return Err(AppError::BadRequest("Username or email already exists".to_string()));
     }
 

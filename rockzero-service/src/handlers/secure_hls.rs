@@ -304,7 +304,7 @@ fn read_video_segment(file_path: &str, segment_name: &str) -> Result<Vec<u8>, Ap
     // 实际应该从 HLS 缓存目录读取
     let segment_path = PathBuf::from(file_path)
         .parent()
-        .ok_or_else(|| AppError::InternalError)?
+        .ok_or(AppError::InternalError)?
         .join(format!("segment_{}.ts", segment_index));
     
     // 如果段不存在，需要实时转码

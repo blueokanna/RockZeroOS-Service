@@ -717,59 +717,52 @@ fn detect_hw_encoder() -> Option<String> {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_qsv"))
         .unwrap_or(false)
-    {
-        if Command::new(&ffmpeg_path)
+        && Command::new(&ffmpeg_path)
             .args(["-hide_banner", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1", "-c:v", "h264_qsv", "-f", "null", "-"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
-        {
-            info!("Using Intel QSV hardware encoder");
-            return Some("h264_qsv".to_string());
-        }
+    {
+        info!("Using Intel QSV hardware encoder");
+        return Some("h264_qsv".to_string());
     }
 
     // 检测 VAAPI (Linux)
-    if cfg!(target_os = "linux") {
-        if Path::new("/dev/dri/renderD128").exists() {
-            if Command::new(&ffmpeg_path)
-                .args(["-hide_banner", "-encoders"])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_vaapi"))
-                .unwrap_or(false)
-            {
-                info!("Using VAAPI hardware encoder");
-                return Some("h264_vaapi".to_string());
-            }
-        }
+    if cfg!(target_os = "linux")
+        && Path::new("/dev/dri/renderD128").exists()
+        && Command::new(&ffmpeg_path)
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_vaapi"))
+            .unwrap_or(false)
+    {
+        info!("Using VAAPI hardware encoder");
+        return Some("h264_vaapi".to_string());
     }
 
     // 检测 VideoToolbox (macOS)
-    if cfg!(target_os = "macos") {
-        if Command::new(&ffmpeg_path)
+    if cfg!(target_os = "macos")
+        && Command::new(&ffmpeg_path)
             .args(["-hide_banner", "-encoders"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_videotoolbox"))
             .unwrap_or(false)
-        {
-            info!("Using VideoToolbox hardware encoder");
-            return Some("h264_videotoolbox".to_string());
-        }
+    {
+        info!("Using VideoToolbox hardware encoder");
+        return Some("h264_videotoolbox".to_string());
     }
 
     // 检测 Rockchip MPP (ARM)
-    if cfg!(target_arch = "aarch64") || cfg!(target_arch = "arm") {
-        if Path::new("/dev/video10").exists() {
-            if Command::new(&ffmpeg_path)
-                .args(["-hide_banner", "-encoders"])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_rkmpp"))
-                .unwrap_or(false)
-            {
-                info!("Using Rockchip MPP hardware encoder");
-                return Some("h264_rkmpp".to_string());
-            }
-        }
+    if (cfg!(target_arch = "aarch64") || cfg!(target_arch = "arm"))
+        && Path::new("/dev/video10").exists()
+        && Command::new(&ffmpeg_path)
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_rkmpp"))
+            .unwrap_or(false)
+    {
+        info!("Using Rockchip MPP hardware encoder");
+        return Some("h264_rkmpp".to_string());
     }
 
     info!("No hardware encoder available, using software encoding");

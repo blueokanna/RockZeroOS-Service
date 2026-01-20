@@ -14,12 +14,37 @@ pub struct MediaProcessor {
     hw_capabilities: HardwareCapabilities,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct HardwareCapabilities {
     pub has_rkmpp: bool,
     pub has_vaapi: bool,
     pub has_cuda: bool,
     pub has_videotoolbox: bool,
+}
+
+#[allow(dead_code)]
+impl HardwareCapabilities {
+    pub fn has_any_acceleration(&self) -> bool {
+        self.has_rkmpp || self.has_vaapi || self.has_cuda || self.has_videotoolbox
+    }
+    
+    pub fn get_available_accelerations(&self) -> Vec<&str> {
+        let mut accel = Vec::new();
+        if self.has_rkmpp {
+            accel.push("Rockchip MPP");
+        }
+        if self.has_vaapi {
+            accel.push("VAAPI");
+        }
+        if self.has_cuda {
+            accel.push("CUDA");
+        }
+        if self.has_videotoolbox {
+            accel.push("VideoToolbox");
+        }
+        accel
+    }
 }
 
 impl MediaProcessor {
@@ -54,20 +79,15 @@ impl MediaProcessor {
     }
 
     fn detect_hardware() -> HardwareCapabilities {
-        let mut caps = HardwareCapabilities::default();
-
-        caps.has_rkmpp = cfg!(target_arch = "aarch64") && Path::new("/dev/video10").exists();
-        caps.has_vaapi = Path::new("/dev/dri/renderD128").exists();
-        
-        if cfg!(target_os = "macos") {
-            caps.has_videotoolbox = true;
+        HardwareCapabilities {
+            has_rkmpp: cfg!(target_arch = "aarch64") && Path::new("/dev/video10").exists(),
+            has_vaapi: Path::new("/dev/dri/renderD128").exists(),
+            has_videotoolbox: cfg!(target_os = "macos"),
+            has_cuda: Command::new("nvidia-smi")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false),
         }
-
-        if let Ok(output) = Command::new("nvidia-smi").output() {
-            caps.has_cuda = output.status.success();
-        }
-
-        caps
     }
 
     pub fn is_available(&self) -> bool {
@@ -76,17 +96,6 @@ impl MediaProcessor {
 
     pub fn detect_hardware_capabilities(&self) -> HardwareCapabilities {
         self.hw_capabilities.clone()
-    }
-}
-
-impl Default for HardwareCapabilities {
-    fn default() -> Self {
-        Self {
-            has_rkmpp: false,
-            has_vaapi: false,
-            has_cuda: false,
-            has_videotoolbox: false,
-        }
     }
 }
 

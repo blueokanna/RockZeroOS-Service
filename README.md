@@ -1,4 +1,4 @@
-# 🚀 RockZero - 专业级 NAS 操作系统
+# 🚀 RockZero - NAS 后端服务
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)

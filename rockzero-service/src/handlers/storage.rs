@@ -6,7 +6,6 @@ use tracing::{error, info};
 
 use rockzero_common::AppError;
 
-/// 存储设备详细信息
 #[derive(Debug, Serialize, Clone)]
 pub struct StorageDevice {
     pub id: String,
@@ -84,7 +83,8 @@ impl PartitionSpec {
     // 确保所有字段都被使用（避免 dead_code 警告）
     #[allow(dead_code)]
     fn validate(&self) -> bool {
-        !self.size.is_empty() && !self.file_system.is_empty() && self.label.is_some() || self.label.is_none()
+        !self.size.is_empty() && !self.file_system.is_empty() && self.label.is_some()
+            || self.label.is_none()
     }
 }
 
@@ -110,7 +110,7 @@ impl SmartFormatRequest {
     fn validate(&self) -> bool {
         !self.device.is_empty() && (self.label.is_some() || self.label.is_none())
     }
-    
+
     #[allow(dead_code)]
     fn get_purpose(&self) -> &StoragePurpose {
         &self.purpose
@@ -139,7 +139,7 @@ impl AutoMountRequest {
     // 确保所有字段都被使用（避免 dead_code 警告）
     #[allow(dead_code)]
     fn validate(&self) -> bool {
-        !self.device.is_empty() 
+        !self.device.is_empty()
             && (self.auto_create_mount_point.is_some() || self.auto_create_mount_point.is_none())
             && (self.preferred_mount_base.is_some() || self.preferred_mount_base.is_none())
     }
@@ -163,12 +163,12 @@ pub async fn list_storage_devices() -> Result<HttpResponse, AppError> {
 pub async fn get_storage_device(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let device_id = path.into_inner();
     let devices = get_all_storage_devices()?;
-    
+
     let device = devices
         .into_iter()
         .find(|d| d.id == device_id || d.device_path == device_id)
         .ok_or_else(|| AppError::NotFound("Device not found".to_string()))?;
-    
+
     Ok(HttpResponse::Ok().json(device))
 }
 
@@ -178,21 +178,21 @@ pub async fn mount_storage(
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
-    
+
     let opts = body.into_inner();
-    
+
     #[cfg(target_os = "windows")]
     {
         mount_windows(&opts)?;
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         mount_linux(&opts)?;
     }
-    
+
     info!("Mounted {} to {}", opts.device, opts.mount_point);
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "message": "Device mounted successfully",
@@ -207,21 +207,21 @@ pub async fn unmount_storage(
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
-    
+
     let device_or_mount = path.into_inner();
-    
+
     #[cfg(target_os = "windows")]
     {
         unmount_windows(&device_or_mount)?;
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         unmount_linux(&device_or_mount)?;
     }
-    
+
     info!("Unmounted {}", device_or_mount);
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "message": "Device unmounted successfully"
@@ -234,21 +234,21 @@ pub async fn format_storage(
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
-    
+
     let opts = body.into_inner();
-    
+
     #[cfg(target_os = "windows")]
     {
         format_windows(&opts)?;
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         format_linux(&opts)?;
     }
-    
+
     info!("Formatted {} as {}", opts.device, opts.file_system);
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "message": "Device formatted successfully",
@@ -263,22 +263,23 @@ pub async fn partition_and_format(
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
-    
+
     let _opts = body.into_inner();
-    
+
     #[cfg(target_os = "linux")]
     {
         let result = partition_and_format_linux(&_opts)?;
         return Ok(HttpResponse::Ok().json(result));
     }
-    
+
     #[cfg(target_os = "windows")]
     {
-        return Err(AppError::BadRequest(
-            "Partition creation is not yet supported on Windows. Please use Disk Management.".to_string()
-        ));
+        Err(AppError::BadRequest(
+            "Partition creation is not yet supported on Windows. Please use Disk Management."
+                .to_string(),
+        ))
     }
-    
+
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         Err(AppError::BadRequest("Unsupported platform".to_string()))
@@ -291,9 +292,9 @@ pub async fn wipe_disk(
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
-    
+
     let device = path.into_inner();
-    
+
     #[cfg(target_os = "linux")]
     {
         wipe_disk_linux(&device)?;
@@ -303,15 +304,15 @@ pub async fn wipe_disk(
             "message": "Disk wiped successfully"
         })));
     }
-    
+
     #[cfg(target_os = "windows")]
     {
         let _ = device; // Windows 不支持磁盘擦除
-        return Err(AppError::BadRequest(
-            "Disk wiping is not supported on Windows".to_string()
-        ));
+        Err(AppError::BadRequest(
+            "Disk wiping is not supported on Windows".to_string(),
+        ))
     }
-    
+
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = device;
@@ -322,25 +323,24 @@ pub async fn wipe_disk(
 /// 安全弹出设备
 pub async fn eject_storage(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let device = path.into_inner();
-    
+
     #[cfg(target_os = "windows")]
     {
         eject_windows(&device)?;
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         eject_linux(&device)?;
     }
-    
+
     info!("Ejected {}", device);
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "message": "Device ejected safely"
     })))
 }
-
 
 // ============ 跨平台实现 ============
 
@@ -349,12 +349,12 @@ fn get_all_storage_devices() -> Result<Vec<StorageDevice>, AppError> {
     {
         get_windows_devices()
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         return get_linux_devices();
     }
-    
+
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         Ok(Vec::new())
@@ -366,7 +366,7 @@ fn get_all_storage_devices() -> Result<Vec<StorageDevice>, AppError> {
 #[cfg(target_os = "windows")]
 fn get_windows_devices() -> Result<Vec<StorageDevice>, AppError> {
     let mut devices = Vec::new();
-    
+
     // 使用 PowerShell 获取磁盘信息
     let output = Command::new("powershell")
         .args([
@@ -412,7 +412,7 @@ fn get_windows_devices() -> Result<Vec<StorageDevice>, AppError> {
                 let free_space = json["FreeSpace"].as_u64().unwrap_or(0);
                 let interface_type = json["InterfaceType"].as_str().unwrap_or("");
                 let media_type = json["MediaType"].as_str().unwrap_or("");
-                
+
                 let device_type = match interface_type {
                     "USB" => StorageType::ExternalUSB,
                     "SCSI" | "IDE" => {
@@ -424,7 +424,7 @@ fn get_windows_devices() -> Result<Vec<StorageDevice>, AppError> {
                     }
                     _ => StorageType::Unknown,
                 };
-                
+
                 devices.push(StorageDevice {
                     id: drive_letter.clone(),
                     name: json["Label"].as_str().unwrap_or(&drive_letter).to_string(),
@@ -448,7 +448,7 @@ fn get_windows_devices() -> Result<Vec<StorageDevice>, AppError> {
             }
         }
     }
-    
+
     // 如果 PowerShell 方法失败，使用 sysinfo 作为后备
     if devices.is_empty() {
         let disks = sysinfo::Disks::new_with_refreshed_list();
@@ -456,7 +456,7 @@ fn get_windows_devices() -> Result<Vec<StorageDevice>, AppError> {
             let mount_point = disk.mount_point().to_string_lossy().to_string();
             let total = disk.total_space();
             let available = disk.available_space();
-            
+
             devices.push(StorageDevice {
                 id: mount_point.clone(),
                 name: disk.name().to_string_lossy().to_string(),
@@ -468,7 +468,11 @@ fn get_windows_devices() -> Result<Vec<StorageDevice>, AppError> {
                 total_size: total,
                 used_size: total.saturating_sub(available),
                 available_size: available,
-                device_type: if disk.is_removable() { StorageType::ExternalUSB } else { StorageType::InternalHDD },
+                device_type: if disk.is_removable() {
+                    StorageType::ExternalUSB
+                } else {
+                    StorageType::InternalHDD
+                },
                 is_removable: disk.is_removable(),
                 is_mounted: true,
                 is_readonly: false,
@@ -479,7 +483,7 @@ fn get_windows_devices() -> Result<Vec<StorageDevice>, AppError> {
             });
         }
     }
-    
+
     Ok(devices)
 }
 
@@ -487,23 +491,23 @@ fn get_windows_devices() -> Result<Vec<StorageDevice>, AppError> {
 fn mount_windows(opts: &MountOptions) -> Result<(), AppError> {
     // Windows 使用 mountvol 命令
     let args = vec![opts.mount_point.clone(), opts.device.clone()];
-    
+
     // 注意：Windows mountvol 不支持文件系统类型和选项参数
     // 这些字段在 Windows 上会被忽略，但我们仍然接受它们以保持 API 一致性
     let _ = &opts.file_system;
     let _ = &opts.options;
     let _ = &opts.read_only;
-    
+
     let output = Command::new("mountvol")
         .args(&args)
         .output()
         .map_err(|_| AppError::InternalError)?;
-    
+
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::BadRequest(format!("Mount failed: {}", err)));
     }
-    
+
     Ok(())
 }
 
@@ -513,42 +517,39 @@ fn unmount_windows(device: &str) -> Result<(), AppError> {
         .args([device, "/P"])
         .output()
         .map_err(|_| AppError::InternalError)?;
-    
+
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::BadRequest(format!("Unmount failed: {}", err)));
     }
-    
+
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
 fn format_windows(opts: &FormatOptions) -> Result<(), AppError> {
-    let mut args = vec![
-        opts.device.clone(),
-        format!("/FS:{}", opts.file_system),
-    ];
-    
+    let mut args = vec![opts.device.clone(), format!("/FS:{}", opts.file_system)];
+
     if let Some(label) = &opts.label {
         args.push(format!("/V:{}", label));
     }
-    
+
     if opts.quick.unwrap_or(true) {
         args.push("/Q".to_string());
     }
-    
+
     args.push("/Y".to_string()); // 确认格式化
-    
+
     let output = Command::new("format")
         .args(&args)
         .output()
         .map_err(|_| AppError::InternalError)?;
-    
+
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::BadRequest(format!("Format failed: {}", err)));
     }
-    
+
     Ok(())
 }
 
@@ -564,59 +565,60 @@ fn eject_windows(device: &str) -> Result<(), AppError> {
         "#,
         device
     );
-    
+
     let output = Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
         .output()
         .map_err(|_| AppError::InternalError)?;
-    
+
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::BadRequest(format!("Eject failed: {}", err)));
     }
-    
+
     Ok(())
 }
-
 
 // ============ Linux 实现 (x64/aarch64/armbian) ============
 
 #[cfg(target_os = "linux")]
 pub(crate) fn get_linux_devices() -> Result<Vec<StorageDevice>, AppError> {
     let mut devices = Vec::new();
-    
+
     // 使用 lsblk 获取块设备信息
     let output = Command::new("lsblk")
         .args([
-            "-J", "-b", "-o",
-            "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,UUID,MODEL,SERIAL,TRAN,RM,RO,HOTPLUG,VENDOR"
+            "-J",
+            "-b",
+            "-o",
+            "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,UUID,MODEL,SERIAL,TRAN,RM,RO,HOTPLUG,VENDOR",
         ])
         .output()
         .map_err(|e| {
             error!("Failed to execute lsblk: {}", e);
             AppError::InternalError
         })?;
-    
+
     if !output.status.success() {
         // 后备方案：使用 sysinfo
         return get_linux_devices_fallback();
     }
-    
+
     let json_str = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(&json_str)
-        .map_err(|_| AppError::InternalError)?;
-    
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|_| AppError::InternalError)?;
+
     if let Some(blockdevices) = parsed.get("blockdevices").and_then(|v| v.as_array()) {
         for device in blockdevices {
             // 处理主设备
             let _device_name = device["name"].as_str().unwrap_or("");
             let device_type_str = device["type"].as_str().unwrap_or("");
-            
+
             // 跳过非磁盘设备
             if device_type_str != "disk" {
                 continue;
             }
-            
+
             // 处理分区
             if let Some(children) = device.get("children").and_then(|v| v.as_array()) {
                 for partition in children {
@@ -632,15 +634,18 @@ pub(crate) fn get_linux_devices() -> Result<Vec<StorageDevice>, AppError> {
             }
         }
     }
-    
+
     // 添加未挂载的设备
     add_unmounted_devices(&mut devices)?;
-    
+
     Ok(devices)
 }
 
 #[cfg(target_os = "linux")]
-fn parse_linux_device(partition: &serde_json::Value, parent: &serde_json::Value) -> Option<StorageDevice> {
+fn parse_linux_device(
+    partition: &serde_json::Value,
+    parent: &serde_json::Value,
+) -> Option<StorageDevice> {
     let name = partition["name"].as_str()?;
     let device_path = format!("/dev/{}", name);
     let size = partition["size"].as_u64().unwrap_or(0);
@@ -652,21 +657,21 @@ fn parse_linux_device(partition: &serde_json::Value, parent: &serde_json::Value)
     let serial = parent["serial"].as_str().map(|s| s.to_string());
     let vendor = parent["vendor"].as_str().map(|s| s.to_string());
     let tran = parent["tran"].as_str().unwrap_or("");
-    let is_removable = partition["rm"].as_bool().unwrap_or(false) 
+    let is_removable = partition["rm"].as_bool().unwrap_or(false)
         || parent["rm"].as_bool().unwrap_or(false)
         || partition["hotplug"].as_bool().unwrap_or(false);
     let is_readonly = partition["ro"].as_bool().unwrap_or(false);
-    
+
     // 确定设备类型
     let device_type = determine_device_type(tran, &device_path, is_removable);
-    
+
     // 获取使用空间
     let (used, available) = if let Some(ref mp) = mount_point {
         get_mount_usage(mp)
     } else {
         (0, size)
     };
-    
+
     Some(StorageDevice {
         id: uuid.clone().unwrap_or_else(|| device_path.clone()),
         name: label.clone().unwrap_or_else(|| name.to_string()),
@@ -724,7 +729,7 @@ fn is_ssd(device_path: &str) -> bool {
     let device_name = device_path.trim_start_matches("/dev/");
     let base_device = device_name.trim_end_matches(|c: char| c.is_numeric());
     let rotational_path = format!("/sys/block/{}/queue/rotational", base_device);
-    
+
     if let Ok(content) = std::fs::read_to_string(&rotational_path) {
         return content.trim() == "0";
     }
@@ -734,10 +739,10 @@ fn is_ssd(device_path: &str) -> bool {
 #[cfg(target_os = "linux")]
 fn get_mount_usage(mount_point: &str) -> (u64, u64) {
     use std::mem::MaybeUninit;
-    
+
     let path = std::ffi::CString::new(mount_point).unwrap();
     let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
-    
+
     unsafe {
         if libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) == 0 {
             let stat = stat.assume_init();
@@ -745,25 +750,23 @@ fn get_mount_usage(mount_point: &str) -> (u64, u64) {
             let total_blocks = stat.f_blocks as u64;
             let free_blocks = stat.f_bfree as u64;
             let available_blocks = stat.f_bavail as u64;
-            
+
             let total = total_blocks * block_size;
             let available = available_blocks * block_size;
             let used = total - (free_blocks * block_size);
-            
+
             return (used, available);
         }
     }
-    
+
     (0, 0)
 }
 
 #[cfg(target_os = "linux")]
 fn add_unmounted_devices(devices: &mut Vec<StorageDevice>) -> Result<(), AppError> {
     // 查找未挂载的分区
-    let output = Command::new("blkid")
-        .args(["-o", "export"])
-        .output();
-    
+    let output = Command::new("blkid").args(["-o", "export"]).output();
+
     if let Ok(output) = output {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -771,7 +774,7 @@ fn add_unmounted_devices(devices: &mut Vec<StorageDevice>) -> Result<(), AppErro
             let mut current_uuid: Option<String> = None;
             let mut current_label: Option<String> = None;
             let mut current_fs: Option<String> = None;
-            
+
             for line in stdout.lines() {
                 if line.is_empty() {
                     if let Some(ref dev) = current_device {
@@ -779,7 +782,7 @@ fn add_unmounted_devices(devices: &mut Vec<StorageDevice>) -> Result<(), AppErro
                         if !devices.iter().any(|d| d.device_path == *dev) {
                             // 获取设备大小
                             let size = get_device_size(dev);
-                            
+
                             devices.push(StorageDevice {
                                 id: current_uuid.clone().unwrap_or_else(|| dev.clone()),
                                 name: current_label.clone().unwrap_or_else(|| dev.clone()),
@@ -818,7 +821,7 @@ fn add_unmounted_devices(devices: &mut Vec<StorageDevice>) -> Result<(), AppErro
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -826,7 +829,7 @@ fn add_unmounted_devices(devices: &mut Vec<StorageDevice>) -> Result<(), AppErro
 fn get_device_size(device: &str) -> u64 {
     let device_name = device.trim_start_matches("/dev/");
     let size_path = format!("/sys/class/block/{}/size", device_name);
-    
+
     if let Ok(content) = std::fs::read_to_string(&size_path) {
         if let Ok(sectors) = content.trim().parse::<u64>() {
             return sectors * 512; // 扇区大小通常是 512 字节
@@ -839,13 +842,13 @@ fn get_device_size(device: &str) -> u64 {
 fn get_linux_devices_fallback() -> Result<Vec<StorageDevice>, AppError> {
     let mut devices = Vec::new();
     let disks = sysinfo::Disks::new_with_refreshed_list();
-    
+
     for disk in disks.list() {
         let mount_point = disk.mount_point().to_string_lossy().to_string();
         let total = disk.total_space();
         let available = disk.available_space();
         let name = disk.name().to_string_lossy().to_string();
-        
+
         devices.push(StorageDevice {
             id: mount_point.clone(),
             name: name.clone(),
@@ -857,7 +860,11 @@ fn get_linux_devices_fallback() -> Result<Vec<StorageDevice>, AppError> {
             total_size: total,
             used_size: total.saturating_sub(available),
             available_size: available,
-            device_type: if disk.is_removable() { StorageType::ExternalUSB } else { StorageType::InternalHDD },
+            device_type: if disk.is_removable() {
+                StorageType::ExternalUSB
+            } else {
+                StorageType::InternalHDD
+            },
             is_removable: disk.is_removable(),
             is_mounted: true,
             is_readonly: false,
@@ -867,19 +874,18 @@ fn get_linux_devices_fallback() -> Result<Vec<StorageDevice>, AppError> {
             bus_type: format!("{:?}", disk.kind()),
         });
     }
-    
+
     Ok(devices)
 }
-
 
 #[cfg(target_os = "linux")]
 pub(crate) fn mount_linux(opts: &MountOptions) -> Result<(), AppError> {
     use tracing::{info, warn};
-    
+
     // 创建挂载点
     std::fs::create_dir_all(&opts.mount_point)
         .map_err(|e| AppError::BadRequest(format!("Failed to create mount point: {}", e)))?;
-    
+
     // 自动检测文件系统类型
     let fs_type = if let Some(fs) = &opts.file_system {
         fs.clone()
@@ -890,14 +896,19 @@ pub(crate) fn mount_linux(opts: &MountOptions) -> Result<(), AppError> {
             "auto".to_string()
         })
     };
-    
-    let mut args = vec!["-t".to_string(), fs_type.clone(), opts.device.clone(), opts.mount_point.clone()];
-    
+
+    let mut args = vec![
+        "-t".to_string(),
+        fs_type.clone(),
+        opts.device.clone(),
+        opts.mount_point.clone(),
+    ];
+
     let mut mount_opts = Vec::new();
     if opts.read_only.unwrap_or(false) {
         mount_opts.push("ro".to_string());
     }
-    
+
     // 根据文件系统类型添加推荐选项
     match fs_type.to_lowercase().as_str() {
         "ntfs" => {
@@ -913,33 +924,39 @@ pub(crate) fn mount_linux(opts: &MountOptions) -> Result<(), AppError> {
         }
         _ => {}
     }
-    
+
     if let Some(ref extra_opts) = opts.options {
         mount_opts.extend(extra_opts.clone());
     }
-    
+
     if !mount_opts.is_empty() {
         args.push("-o".to_string());
         args.push(mount_opts.join(","));
     }
-    
-    info!("🔧 Mounting {} to {} with filesystem {}", opts.device, opts.mount_point, fs_type);
-    
-    let output = Command::new("mount")
-        .args(&args)
-        .output()
-        .map_err(|e| {
-            error!("❌ Failed to execute mount command: {}", e);
-            AppError::InternalError
-        })?;
-    
+
+    info!(
+        "🔧 Mounting {} to {} with filesystem {}",
+        opts.device, opts.mount_point, fs_type
+    );
+
+    let output = Command::new("mount").args(&args).output().map_err(|e| {
+        error!("❌ Failed to execute mount command: {}", e);
+        AppError::InternalError
+    })?;
+
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         error!("❌ Mount failed: {}", err);
-        return Err(AppError::BadRequest(format!("Mount failed: {}. Try specifying filesystem type explicitly.", err)));
+        return Err(AppError::BadRequest(format!(
+            "Mount failed: {}. Try specifying filesystem type explicitly.",
+            err
+        )));
     }
-    
-    info!("✅ Successfully mounted {} to {}", opts.device, opts.mount_point);
+
+    info!(
+        "✅ Successfully mounted {} to {}",
+        opts.device, opts.mount_point
+    );
     Ok(())
 }
 
@@ -951,23 +968,20 @@ pub(crate) fn detect_filesystem(device: &str) -> Option<String> {
         .args(["-o", "value", "-s", "TYPE", device])
         .output()
         .ok()?;
-    
+
     if output.status.success() {
         let fs_type = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !fs_type.is_empty() {
             return Some(fs_type);
         }
     }
-    
+
     // 后备方案：使用 file 命令
-    let output = Command::new("file")
-        .args(["-sL", device])
-        .output()
-        .ok()?;
-    
+    let output = Command::new("file").args(["-sL", device]).output().ok()?;
+
     if output.status.success() {
         let file_output = String::from_utf8_lossy(&output.stdout).to_lowercase();
-        
+
         if file_output.contains("ext4") {
             return Some("ext4".to_string());
         } else if file_output.contains("ext3") {
@@ -988,7 +1002,7 @@ pub(crate) fn detect_filesystem(device: &str) -> Option<String> {
             return Some("f2fs".to_string());
         }
     }
-    
+
     None
 }
 
@@ -999,70 +1013,76 @@ fn unmount_linux(device_or_mount: &str) -> Result<(), AppError> {
         .arg(device_or_mount)
         .output()
         .map_err(|_| AppError::InternalError)?;
-    
+
     if !output.status.success() {
         // 尝试强制卸载
         let output = Command::new("umount")
             .args(["-f", device_or_mount])
             .output()
             .map_err(|_| AppError::InternalError)?;
-        
+
         if !output.status.success() {
             // 最后尝试 lazy unmount
             let output = Command::new("umount")
                 .args(["-l", device_or_mount])
                 .output()
                 .map_err(|_| AppError::InternalError)?;
-            
+
             if !output.status.success() {
                 let err = String::from_utf8_lossy(&output.stderr);
                 return Err(AppError::BadRequest(format!("Unmount failed: {}", err)));
             }
         }
     }
-    
+
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn format_linux(opts: &FormatOptions) -> Result<(), AppError> {
     use tracing::{info, warn};
-    
+
     info!("🔧 Formatting {} as {}", opts.device, opts.file_system);
-    
+
     // 检查设备是否存在
     if !std::path::Path::new(&opts.device).exists() {
         error!("❌ Device {} does not exist", opts.device);
-        return Err(AppError::NotFound(format!("Device {} not found", opts.device)));
+        return Err(AppError::NotFound(format!(
+            "Device {} not found",
+            opts.device
+        )));
     }
-    
+
     // 确保设备未挂载
     info!("📤 Unmounting device if mounted...");
     let _ = Command::new("umount").arg(&opts.device).output();
     let _ = Command::new("umount").args(["-f", &opts.device]).output();
     let _ = Command::new("umount").args(["-l", &opts.device]).output(); // lazy unmount
-    
+
     // 同步文件系统
     info!("💾 Syncing filesystem...");
     let _ = Command::new("sync").output();
-    
+
     // 等待一下确保设备完全卸载
     std::thread::sleep(std::time::Duration::from_millis(1000));
-    
+
     // 检查设备是否仍然挂载
     let mount_check = Command::new("mount")
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains(&opts.device))
         .unwrap_or(false);
-    
+
     if mount_check {
-        warn!("⚠️ Device {} is still mounted, attempting force unmount", opts.device);
+        warn!(
+            "⚠️ Device {} is still mounted, attempting force unmount",
+            opts.device
+        );
         let _ = Command::new("fuser").args(["-km", &opts.device]).output();
         std::thread::sleep(std::time::Duration::from_millis(500));
         let _ = Command::new("umount").args(["-l", &opts.device]).output();
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    
+
     let (mkfs_cmd, mut args) = match opts.file_system.to_lowercase().as_str() {
         "ext4" => {
             let mut args = vec!["-F".to_string()]; // Force, 不询问
@@ -1145,13 +1165,12 @@ pub(crate) fn format_linux(opts: &FormatOptions) -> Result<(), AppError> {
             return Err(AppError::BadRequest(format!("Unsupported filesystem: {}. Supported: ext4, ext3, ext2, xfs, btrfs, fat32, vfat, exfat, ntfs, f2fs", opts.file_system)));
         }
     };
-    
+
     args.push(opts.device.clone());
-    
+
     info!("🔧 Running: {} {}", mkfs_cmd, args.join(" "));
-    
-    // 使用 spawn 而不是 output，这样可以实时看到输出
-    let mut child = Command::new(mkfs_cmd)
+
+    let child = Command::new(mkfs_cmd)
         .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1161,70 +1180,70 @@ pub(crate) fn format_linux(opts: &FormatOptions) -> Result<(), AppError> {
             error!("❌ Failed to spawn {}: {}", mkfs_cmd, e);
             AppError::BadRequest(format!("Failed to run {}: {}. Make sure the tool is installed and you have root permissions.", mkfs_cmd, e))
         })?;
-    
-    // 等待命令完成
+
     let output = child.wait_with_output().map_err(|e| {
         error!("❌ Failed to wait for {}: {}", mkfs_cmd, e);
         AppError::InternalError
     })?;
-    
+
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         error!("❌ Format failed - stdout: {}", stdout);
         error!("❌ Format failed - stderr: {}", stderr);
-        
-        // 提供更详细的错误信息
-        let error_msg = if stderr.contains("Permission denied") || stderr.contains("Operation not permitted") {
-            format!("Permission denied. Please run with root/sudo privileges. Error: {}", stderr)
-        } else if stderr.contains("Device or resource busy") {
-            format!("Device is busy. Please unmount all partitions first. Error: {}", stderr)
-        } else if stderr.contains("No such file or directory") {
-            format!("Device not found: {}. Error: {}", opts.device, stderr)
-        } else {
-            format!("Format failed: {}. Stdout: {}", stderr, stdout)
-        };
-        
+
+        let error_msg =
+            if stderr.contains("Permission denied") || stderr.contains("Operation not permitted") {
+                format!(
+                    "Permission denied. Please run with root/sudo privileges. Error: {}",
+                    stderr
+                )
+            } else if stderr.contains("Device or resource busy") {
+                format!(
+                    "Device is busy. Please unmount all partitions first. Error: {}",
+                    stderr
+                )
+            } else if stderr.contains("No such file or directory") {
+                format!("Device not found: {}. Error: {}", opts.device, stderr)
+            } else {
+                format!("Format failed: {}. Stdout: {}", stderr, stdout)
+            };
+
         return Err(AppError::BadRequest(error_msg));
     }
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     info!("📋 Format output: {}", stdout);
-    info!("✅ Successfully formatted {} as {}", opts.device, opts.file_system);
-    
-    // 同步文件系统
+    info!(
+        "✅ Successfully formatted {} as {}",
+        opts.device, opts.file_system
+    );
+
     info!("💾 Final sync...");
     let _ = Command::new("sync").output();
-    
-    // 通知内核重新读取分区表
+
     info!("🔄 Reloading partition table...");
     let _ = Command::new("partprobe").arg(&opts.device).output();
-    let _ = Command::new("blockdev").args(["--rereadpt", &opts.device]).output();
-    
+    let _ = Command::new("blockdev")
+        .args(["--rereadpt", &opts.device])
+        .output();
+
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn eject_linux(device: &str) -> Result<(), AppError> {
-    // 先卸载
     let _ = unmount_linux(device);
-    
-    // 同步文件系统
     let _ = Command::new("sync").output();
-    
-    // 弹出设备
-    let output = Command::new("eject")
-        .arg(device)
-        .output();
-    
+    let output = Command::new("eject").arg(device).output();
+
     match output {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => {
-            // eject 失败，尝试使用 udisksctl
             let output = Command::new("udisksctl")
                 .args(["power-off", "-b", device])
                 .output();
-            
+
             match output {
                 Ok(out) if out.status.success() => Ok(()),
                 _ => {
@@ -1240,65 +1259,71 @@ fn eject_linux(device: &str) -> Result<(), AppError> {
 /// 完整的分区和格式化流程（Linux）
 #[cfg(target_os = "linux")]
 fn partition_and_format_linux(opts: &PartitionOptions) -> Result<PartitionResult, AppError> {
-    use tracing::{info, warn};
-    
+    use tracing::info;
+
     info!("🔧 Starting partition and format for {}", opts.device);
-    
-    // 1. 检查设备是否存在
+
     if !std::path::Path::new(&opts.device).exists() {
-        return Err(AppError::NotFound(format!("Device {} not found", opts.device)));
+        return Err(AppError::NotFound(format!(
+            "Device {} not found",
+            opts.device
+        )));
     }
-    
-    // 2. 卸载所有分区
+
     info!("📤 Unmounting all partitions on {}...", opts.device);
     unmount_all_partitions(&opts.device)?;
-    
-    // 3. 擦除现有分区表
+
     info!("🗑️  Wiping existing partition table...");
     wipe_partition_table(&opts.device)?;
-    
-    // 4. 创建新分区表
+
     info!("📋 Creating {} partition table...", opts.partition_type);
     create_partition_table(&opts.device, &opts.partition_type)?;
-    
+
     // 5. 创建分区
     let mut created_partitions = Vec::new();
     for (idx, partition_spec) in opts.partitions.iter().enumerate() {
         let partition_num = idx + 1;
-        info!("➕ Creating partition {} with size {}...", partition_num, partition_spec.size);
-        
+        info!(
+            "➕ Creating partition {} with size {}...",
+            partition_num, partition_spec.size
+        );
+
         create_partition(&opts.device, partition_num, &partition_spec.size)?;
-        
-        // 等待内核识别新分区
+
         std::thread::sleep(std::time::Duration::from_millis(1000));
-        
-        // 确定分区设备路径
+
         let partition_device = if opts.device.contains("nvme") || opts.device.contains("mmcblk") {
             format!("{}p{}", opts.device, partition_num)
         } else {
             format!("{}{}", opts.device, partition_num)
         };
-        
-        // 6. 格式化分区
-        info!("💾 Formatting {} as {}...", partition_device, partition_spec.file_system);
+
+        info!(
+            "💾 Formatting {} as {}...",
+            partition_device, partition_spec.file_system
+        );
         let format_opts = FormatOptions {
             device: partition_device.clone(),
             file_system: partition_spec.file_system.clone(),
             label: partition_spec.label.clone(),
             quick: Some(true),
         };
-        
+
         format_linux(&format_opts)?;
         created_partitions.push(partition_device);
     }
-    
-    // 7. 重新加载分区表
+
     info!("🔄 Reloading partition table...");
     let _ = Command::new("partprobe").arg(&opts.device).output();
-    let _ = Command::new("blockdev").args(["--rereadpt", &opts.device]).output();
-    
-    info!("✅ Successfully created and formatted {} partitions", created_partitions.len());
-    
+    let _ = Command::new("blockdev")
+        .args(["--rereadpt", &opts.device])
+        .output();
+
+    info!(
+        "✅ Successfully created and formatted {} partitions",
+        created_partitions.len()
+    );
+
     Ok(PartitionResult {
         device: opts.device.clone(),
         partitions: created_partitions,
@@ -1307,18 +1332,17 @@ fn partition_and_format_linux(opts: &PartitionOptions) -> Result<PartitionResult
     })
 }
 
-/// 卸载设备上的所有分区
 #[cfg(target_os = "linux")]
 fn unmount_all_partitions(device: &str) -> Result<(), AppError> {
     use tracing::info;
-    
+
     // 获取所有挂载点
     let output = Command::new("mount")
         .output()
         .map_err(|_| AppError::InternalError)?;
-    
+
     let mount_output = String::from_utf8_lossy(&output.stdout);
-    
+
     // 查找所有相关的挂载点
     for line in mount_output.lines() {
         if line.contains(device) {
@@ -1329,10 +1353,10 @@ fn unmount_all_partitions(device: &str) -> Result<(), AppError> {
             }
         }
     }
-    
+
     // 使用 fuser 强制结束占用进程
     let _ = Command::new("fuser").args(["-km", device]).output();
-    
+
     std::thread::sleep(std::time::Duration::from_millis(500));
     Ok(())
 }
@@ -1341,10 +1365,8 @@ fn unmount_all_partitions(device: &str) -> Result<(), AppError> {
 #[cfg(target_os = "linux")]
 fn wipe_partition_table(device: &str) -> Result<(), AppError> {
     // 使用 wipefs 擦除所有文件系统签名和分区表
-    let output = Command::new("wipefs")
-        .args(["-a", device])
-        .output();
-    
+    let output = Command::new("wipefs").args(["-a", device]).output();
+
     match output {
         Ok(out) if out.status.success() => {
             let _ = Command::new("sync").output();
@@ -1358,7 +1380,12 @@ fn wipe_partition_table(device: &str) -> Result<(), AppError> {
             } else {
                 // wipefs 可能失败，尝试使用 dd
                 let _ = Command::new("dd")
-                    .args(["if=/dev/zero", &format!("of={}", device), "bs=512", "count=1"])
+                    .args([
+                        "if=/dev/zero",
+                        &format!("of={}", device),
+                        "bs=512",
+                        "count=1",
+                    ])
                     .output();
                 Ok(())
             }
@@ -1366,14 +1393,21 @@ fn wipe_partition_table(device: &str) -> Result<(), AppError> {
         Err(_) => {
             // 如果 wipefs 不可用，使用 dd
             let output = Command::new("dd")
-                .args(["if=/dev/zero", &format!("of={}", device), "bs=512", "count=1"])
+                .args([
+                    "if=/dev/zero",
+                    &format!("of={}", device),
+                    "bs=512",
+                    "count=1",
+                ])
                 .output()
                 .map_err(|_| AppError::InternalError)?;
-            
+
             if output.status.success() {
                 Ok(())
             } else {
-                Err(AppError::BadRequest("Failed to wipe partition table".to_string()))
+                Err(AppError::BadRequest(
+                    "Failed to wipe partition table".to_string(),
+                ))
             }
         }
     }
@@ -1385,19 +1419,27 @@ fn create_partition_table(device: &str, partition_type: &str) -> Result<(), AppE
     let label_type = match partition_type.to_lowercase().as_str() {
         "gpt" => "gpt",
         "mbr" | "msdos" => "msdos",
-        _ => return Err(AppError::BadRequest(format!("Unsupported partition type: {}", partition_type))),
+        _ => {
+            return Err(AppError::BadRequest(format!(
+                "Unsupported partition type: {}",
+                partition_type
+            )))
+        }
     };
-    
+
     let output = Command::new("parted")
         .args(["-s", device, "mklabel", label_type])
         .output()
         .map_err(|e| AppError::BadRequest(format!("Failed to create partition table: {}", e)))?;
-    
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::BadRequest(format!("Failed to create partition table: {}", stderr)));
+        return Err(AppError::BadRequest(format!(
+            "Failed to create partition table: {}",
+            stderr
+        )));
     }
-    
+
     let _ = Command::new("sync").output();
     std::thread::sleep(std::time::Duration::from_millis(500));
     Ok(())
@@ -1405,16 +1447,7 @@ fn create_partition_table(device: &str, partition_type: &str) -> Result<(), AppE
 
 /// 创建单个分区
 #[cfg(target_os = "linux")]
-fn create_partition(device: &str, partition_num: usize, size: &str) -> Result<(), AppError> {
-    // 计算起始和结束位置
-    let (start, end) = if partition_num == 1 {
-        ("0%", size.to_string())
-    } else {
-        // 对于后续分区，从上一个分区结束位置开始
-        let prev_end = format!("{}%", (partition_num - 1) * 100 / partition_num);
-        (prev_end.as_str(), size.to_string())
-    };
-    
+fn create_partition(device: &str, _partition_num: usize, size: &str) -> Result<(), AppError> {
     // 如果 size 是百分比，直接使用
     let end_pos = if size.ends_with('%') {
         size.to_string()
@@ -1424,24 +1457,20 @@ fn create_partition(device: &str, partition_num: usize, size: &str) -> Result<()
         // 否则假设是具体大小（如 "50GB"）
         size.to_string()
     };
-    
+
     let output = Command::new("parted")
-        .args([
-            "-s",
-            device,
-            "mkpart",
-            "primary",
-            "0%",
-            &end_pos,
-        ])
+        .args(["-s", device, "mkpart", "primary", "0%", &end_pos])
         .output()
         .map_err(|e| AppError::BadRequest(format!("Failed to create partition: {}", e)))?;
-    
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::BadRequest(format!("Failed to create partition: {}", stderr)));
+        return Err(AppError::BadRequest(format!(
+            "Failed to create partition: {}",
+            stderr
+        )));
     }
-    
+
     let _ = Command::new("sync").output();
     Ok(())
 }
@@ -1450,20 +1479,20 @@ fn create_partition(device: &str, partition_num: usize, size: &str) -> Result<()
 #[cfg(target_os = "linux")]
 fn wipe_disk_linux(device: &str) -> Result<(), AppError> {
     use tracing::{info, warn};
-    
+
     info!("🗑️  Wiping disk {}...", device);
-    
+
     // 检查设备是否存在
     if !std::path::Path::new(device).exists() {
         return Err(AppError::NotFound(format!("Device {} not found", device)));
     }
-    
+
     // 卸载所有分区
     unmount_all_partitions(device)?;
-    
+
     // 使用 dd 写入零（只写入前 100MB 以加快速度）
     warn!("⚠️  This will erase all data on {}!", device);
-    
+
     let output = Command::new("dd")
         .args([
             "if=/dev/zero",
@@ -1474,15 +1503,18 @@ fn wipe_disk_linux(device: &str) -> Result<(), AppError> {
         ])
         .output()
         .map_err(|e| AppError::BadRequest(format!("Failed to wipe disk: {}", e)))?;
-    
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::BadRequest(format!("Failed to wipe disk: {}", stderr)));
+        return Err(AppError::BadRequest(format!(
+            "Failed to wipe disk: {}",
+            stderr
+        )));
     }
-    
+
     // 同步
     let _ = Command::new("sync").output();
-    
+
     info!("✅ Disk wiped successfully");
     Ok(())
 }
@@ -1493,21 +1525,19 @@ fn wipe_disk_linux(device: &str) -> Result<(), AppError> {
 pub async fn read_file(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let file_path = path.into_inner();
     let full_path = PathBuf::from(&file_path);
-    
+
     if !full_path.exists() {
         return Err(AppError::NotFound("File not found".to_string()));
     }
-    
+
     let content = std::fs::read(&full_path)
         .map_err(|e| AppError::IoError(format!("Failed to read file: {}", e)))?;
-    
+
     let content_type = mime_guess::from_path(&full_path)
         .first_or_octet_stream()
         .to_string();
-    
-    Ok(HttpResponse::Ok()
-        .content_type(content_type)
-        .body(content))
+
+    Ok(HttpResponse::Ok().content_type(content_type).body(content))
 }
 
 /// 写入文件内容
@@ -1522,7 +1552,7 @@ pub struct WriteFileRequest {
 pub async fn write_file(body: web::Json<WriteFileRequest>) -> Result<HttpResponse, AppError> {
     let req = body.into_inner();
     let full_path = PathBuf::from(&req.path);
-    
+
     // 创建父目录
     if req.create_dirs.unwrap_or(true) {
         if let Some(parent) = full_path.parent() {
@@ -1530,7 +1560,7 @@ pub async fn write_file(body: web::Json<WriteFileRequest>) -> Result<HttpRespons
                 .map_err(|e| AppError::IoError(format!("Failed to create directories: {}", e)))?;
         }
     }
-    
+
     // 写入文件
     if req.append.unwrap_or(false) {
         use std::io::Write;
@@ -1539,16 +1569,16 @@ pub async fn write_file(body: web::Json<WriteFileRequest>) -> Result<HttpRespons
             .append(true)
             .open(&full_path)
             .map_err(|e| AppError::IoError(format!("Failed to open file: {}", e)))?;
-        
+
         file.write_all(req.content.as_bytes())
             .map_err(|e| AppError::IoError(format!("Failed to write file: {}", e)))?;
     } else {
         std::fs::write(&full_path, &req.content)
             .map_err(|e| AppError::IoError(format!("Failed to write file: {}", e)))?;
     }
-    
+
     info!("File written: {}", req.path);
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "path": req.path
@@ -1559,11 +1589,11 @@ pub async fn write_file(body: web::Json<WriteFileRequest>) -> Result<HttpRespons
 pub async fn delete_path(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let file_path = path.into_inner();
     let full_path = PathBuf::from(&file_path);
-    
+
     if !full_path.exists() {
         return Err(AppError::NotFound("Path not found".to_string()));
     }
-    
+
     if full_path.is_dir() {
         std::fs::remove_dir_all(&full_path)
             .map_err(|e| AppError::IoError(format!("Failed to delete directory: {}", e)))?;
@@ -1571,15 +1601,14 @@ pub async fn delete_path(path: web::Path<String>) -> Result<HttpResponse, AppErr
         std::fs::remove_file(&full_path)
             .map_err(|e| AppError::IoError(format!("Failed to delete file: {}", e)))?;
     }
-    
+
     info!("Deleted: {}", file_path);
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "deleted": file_path
     })))
 }
-
 
 // ============ 智能格式化和自动挂载 ============
 
@@ -1589,25 +1618,27 @@ pub async fn smart_format(
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
-    
+
     let request = body.into_inner();
-    
+
     #[cfg(target_os = "linux")]
     {
         let recommendation = get_fs_recommendation(&request.purpose);
-        
-        info!("🎯 Smart format: {} for {:?} -> {}", 
-            request.device, request.purpose, recommendation.recommended_fs);
-        
+
+        info!(
+            "🎯 Smart format: {} for {:?} -> {}",
+            request.device, request.purpose, recommendation.recommended_fs
+        );
+
         let format_opts = FormatOptions {
             device: request.device.clone(),
             file_system: recommendation.recommended_fs.clone(),
             label: request.label.clone(),
             quick: Some(true),
         };
-        
+
         format_linux(&format_opts)?;
-        
+
         return Ok(HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "device": request.device,
@@ -1616,12 +1647,12 @@ pub async fn smart_format(
             "recommendation": recommendation,
         })));
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = request;
         Err(AppError::BadRequest(
-            "Smart format is currently only supported on Linux".to_string()
+            "Smart format is currently only supported on Linux".to_string(),
         ))
     }
 }
@@ -1632,13 +1663,13 @@ pub async fn auto_mount(
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
-    
+
     let request = body.into_inner();
-    
+
     #[cfg(target_os = "linux")]
     {
         let mount_point = auto_mount_linux(&request)?;
-        
+
         Ok(HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "device": request.device,
@@ -1646,11 +1677,13 @@ pub async fn auto_mount(
             "message": "Device mounted successfully",
         })))
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = request;
-        Err(AppError::BadRequest("Auto mount is only supported on Linux".to_string()))
+        Err(AppError::BadRequest(
+            "Auto mount is only supported on Linux".to_string(),
+        ))
     }
 }
 
@@ -1666,13 +1699,21 @@ fn get_fs_recommendation(purpose: &StoragePurpose) -> StorageRecommendation {
         StoragePurpose::DataStorage => (
             "xfs",
             "XFS excels at handling large files and provides excellent performance",
-            vec!["defaults".to_string(), "noatime".to_string(), "nodiratime".to_string()],
+            vec![
+                "defaults".to_string(),
+                "noatime".to_string(),
+                "nodiratime".to_string(),
+            ],
             vec!["XFS is great for large files and parallel I/O".to_string()],
         ),
         StoragePurpose::MediaLibrary => (
             "xfs",
             "XFS is optimized for large media files with excellent streaming performance",
-            vec!["defaults".to_string(), "noatime".to_string(), "largeio".to_string()],
+            vec![
+                "defaults".to_string(),
+                "noatime".to_string(),
+                "largeio".to_string(),
+            ],
             vec!["XFS handles large video files efficiently".to_string()],
         ),
         StoragePurpose::DatabaseServer => (
@@ -1684,7 +1725,11 @@ fn get_fs_recommendation(purpose: &StoragePurpose) -> StorageRecommendation {
         StoragePurpose::BackupArchive => (
             "btrfs",
             "Btrfs offers compression and snapshots, ideal for backup storage",
-            vec!["defaults".to_string(), "noatime".to_string(), "compress=zstd".to_string()],
+            vec![
+                "defaults".to_string(),
+                "noatime".to_string(),
+                "compress=zstd".to_string(),
+            ],
             vec!["Enable compression to save space".to_string()],
         ),
         StoragePurpose::SharedFolder => (
@@ -1700,7 +1745,7 @@ fn get_fs_recommendation(purpose: &StoragePurpose) -> StorageRecommendation {
             vec!["ext4 provides the best balance of performance and reliability".to_string()],
         ),
     };
-    
+
     StorageRecommendation {
         recommended_fs: fs.to_string(),
         reason: reason.to_string(),
@@ -1711,24 +1756,25 @@ fn get_fs_recommendation(purpose: &StoragePurpose) -> StorageRecommendation {
 
 #[cfg(target_os = "linux")]
 fn auto_mount_linux(request: &AutoMountRequest) -> Result<String, AppError> {
-    let fs_type = detect_filesystem(&request.device)
-        .unwrap_or_else(|| "auto".to_string());
-    
+    let fs_type = detect_filesystem(&request.device).unwrap_or_else(|| "auto".to_string());
+
     let mount_point = generate_mount_point(
         &request.device,
         request.preferred_mount_base.as_deref().unwrap_or("/mnt"),
     )?;
-    
+
     if request.auto_create_mount_point.unwrap_or(true) {
         std::fs::create_dir_all(&mount_point)
             .map_err(|e| AppError::IoError(format!("Failed to create mount point: {}", e)))?;
     }
-    
+
     let mount_options = get_optimal_mount_options(&fs_type);
-    
-    info!("📌 Auto mounting {} to {} with options: {:?}", 
-        request.device, mount_point, mount_options);
-    
+
+    info!(
+        "📌 Auto mounting {} to {} with options: {:?}",
+        request.device, mount_point, mount_options
+    );
+
     let mount_opts = MountOptions {
         device: request.device.clone(),
         mount_point: mount_point.clone(),
@@ -1736,9 +1782,9 @@ fn auto_mount_linux(request: &AutoMountRequest) -> Result<String, AppError> {
         options: Some(mount_options),
         read_only: Some(false),
     };
-    
+
     mount_linux(&mount_opts)?;
-    
+
     Ok(mount_point)
 }
 
@@ -1746,7 +1792,7 @@ fn auto_mount_linux(request: &AutoMountRequest) -> Result<String, AppError> {
 fn generate_mount_point(device: &str, base: &str) -> Result<String, AppError> {
     let label = get_device_label(device);
     let uuid = get_device_uuid(device);
-    
+
     let mount_name = if let Some(label) = label {
         sanitize_mount_name(&label)
     } else if let Some(uuid) = uuid {
@@ -1754,16 +1800,16 @@ fn generate_mount_point(device: &str, base: &str) -> Result<String, AppError> {
     } else {
         device.trim_start_matches("/dev/").replace('/', "_")
     };
-    
+
     let mount_point = format!("{}/{}", base, mount_name);
-    
+
     let mut final_mount_point = mount_point.clone();
     let mut counter = 1;
     while std::path::Path::new(&final_mount_point).exists() {
         final_mount_point = format!("{}_{}", mount_point, counter);
         counter += 1;
     }
-    
+
     Ok(final_mount_point)
 }
 
@@ -1773,7 +1819,7 @@ fn get_device_label(device: &str) -> Option<String> {
         .args(["-o", "value", "-s", "LABEL", device])
         .output()
         .ok()?;
-    
+
     if output.status.success() {
         let label = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !label.is_empty() {
@@ -1789,7 +1835,7 @@ fn get_device_uuid(device: &str) -> Option<String> {
         .args(["-o", "value", "-s", "UUID", device])
         .output()
         .ok()?;
-    
+
     if output.status.success() {
         let uuid = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !uuid.is_empty() {
@@ -1802,14 +1848,20 @@ fn get_device_uuid(device: &str) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn sanitize_mount_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
 #[cfg(target_os = "linux")]
 fn get_optimal_mount_options(fs_type: &str) -> Vec<String> {
     let mut options = vec!["defaults".to_string()];
-    
+
     match fs_type {
         "ext4" | "ext3" | "ext2" => {
             options.push("noatime".to_string());
@@ -1838,10 +1890,9 @@ fn get_optimal_mount_options(fs_type: &str) -> Vec<String> {
         }
         _ => {}
     }
-    
+
     options
 }
-
 
 // ============ 辅助函数：确保所有类型都被使用 ============
 
@@ -1850,7 +1901,7 @@ fn get_optimal_mount_options(fs_type: &str) -> Vec<String> {
 #[allow(dead_code)]
 fn ensure_all_types_used() {
     // 确保所有 StorageType 变体都被引用
-    let _types = vec![
+    let _types = [
         StorageType::InternalHDD,
         StorageType::InternalSSD,
         StorageType::InternalNVMe,
@@ -1860,7 +1911,7 @@ fn ensure_all_types_used() {
         StorageType::NetworkShare,
         StorageType::Unknown,
     ];
-    
+
     // 确保 PartitionResult 被引用
     let _result = PartitionResult {
         device: String::new(),
@@ -1868,7 +1919,7 @@ fn ensure_all_types_used() {
         success: true,
         message: String::new(),
     };
-    
+
     // 确保 StorageRecommendation 被引用
     let _recommendation = StorageRecommendation {
         recommended_fs: String::new(),

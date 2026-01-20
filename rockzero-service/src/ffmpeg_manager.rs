@@ -224,7 +224,7 @@ impl FfmpegManager {
         #[cfg(not(target_family = "unix"))]
         {
             let _ = archive_path; // Suppress unused variable warning
-            return Err("Archive extraction on this platform requires manual extraction".into());
+            Err("Archive extraction on this platform requires manual extraction".into())
         }
     }
 
