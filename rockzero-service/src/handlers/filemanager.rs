@@ -156,7 +156,6 @@ pub struct StreamQuery {
 pub async fn list_directory(
     query: web::Query<ListDirectoryQuery>,
 ) -> Result<impl Responder, AppError> {
-    // URL-decode the path to handle UTF-8 encoded characters (e.g., Chinese, Japanese, etc.)
     let requested_path = query.path.as_deref().unwrap_or("");
     let decoded_path = urlencoding::decode(requested_path)
         .map(|s| s.into_owned())
@@ -201,7 +200,6 @@ pub async fn list_directory(
             }
         };
 
-        // Skip entries whose metadata can't be read (broken symlinks, permission issues, etc.)
         let metadata = match entry.metadata() {
             Ok(m) => m,
             Err(e) => {
@@ -214,25 +212,14 @@ pub async fn list_directory(
             }
         };
 
-        // Use OsStr to properly handle UTF-8 file names
         let file_name = match entry.file_name().into_string() {
             Ok(name) => name,
-            Err(os_str) => {
-                // Fallback to lossy conversion for non-UTF8 names
-                os_str.to_string_lossy().to_string()
-            }
+            Err(os_str) => os_str.to_string_lossy().to_string(),
         };
 
-        // Build the relative path - ensure it matches the format expected by the frontend
-        // Use the original (decoded) path for consistency
         let relative_path = if decoded_path.is_empty() {
-            // When at base directory, just use the filename
             file_name.clone()
-        } else if decoded_path.starts_with('/') {
-            // Absolute path - append filename
-            format!("{}/{}", decoded_path, file_name)
         } else {
-            // Relative path - append filename
             format!("{}/{}", decoded_path, file_name)
         };
 
@@ -320,7 +307,6 @@ pub async fn list_directory(
 pub async fn create_directory(
     body: web::Json<CreateDirectoryRequest>,
 ) -> Result<impl Responder, AppError> {
-    // URL-decode paths to handle UTF-8 characters
     let decoded_path = urlencoding::decode(&body.path)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| body.path.clone());
@@ -346,6 +332,7 @@ pub async fn create_directory(
     })))
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub struct UploadProgress {
     pub filename: String,
@@ -362,24 +349,24 @@ pub async fn upload_files(
     mut payload: Multipart,
     req: actix_web::HttpRequest,
 ) -> Result<impl Responder, AppError> {
-    // 先记录请求信息
     tracing::info!("📤 Upload request received");
-    tracing::info!("  - Authorization header: {:?}", req.headers().get("authorization"));
+    tracing::info!(
+        "  - Authorization header: {:?}",
+        req.headers().get("authorization")
+    );
     tracing::info!("  - Content-Type: {:?}", req.headers().get("content-type"));
-    
-    // 检查认证
+
     if let Err(e) = crate::middleware::verify_fido2_or_passkey(&req).await {
         tracing::error!("❌ Authentication failed: {:?}", e);
         return Err(e);
     }
-    
+
     tracing::info!("✅ Authentication successful");
 
     let target_path = query.path.as_deref().unwrap_or("");
     tracing::info!("  - Target path: {:?}", target_path);
 
     let decoded_target_path = if target_path.is_empty() {
-        // 如果路径为空，使用基础目录
         tracing::info!("  - Using base directory (empty path)");
         String::new()
     } else {
@@ -398,7 +385,6 @@ pub async fn upload_files(
 
     tracing::info!("📂 Resolved upload path: {:?}", full_path);
 
-    // 确保目录存在，如果不存在则创建
     if !full_path.exists() {
         tracing::info!("📁 Creating upload directory: {:?}", full_path);
         std::fs::create_dir_all(&full_path).map_err(|e| {
@@ -415,7 +401,6 @@ pub async fn upload_files(
         )));
     }
 
-    // 获取规范化路径用于日志记录
     let canonical_path = full_path
         .canonicalize()
         .unwrap_or_else(|_| full_path.clone());
@@ -444,7 +429,6 @@ pub async fn upload_files(
         file_count += 1;
         tracing::info!("Processing file {}: {}", file_count, filename);
 
-        // URL-decode filename to handle UTF-8 characters
         let decoded_filename = urlencoding::decode(&filename)
             .map(|s| s.into_owned())
             .unwrap_or_else(|_| filename.clone());
@@ -496,7 +480,6 @@ pub async fn upload_files(
                 AppError::InternalError
             })?;
 
-            // 计算上传速度（每1MB报告一次）
             if file_size.is_multiple_of(1024 * 1024) {
                 let elapsed = file_start_time.elapsed().as_secs_f64();
                 if elapsed > 0.0 {
@@ -511,14 +494,12 @@ pub async fn upload_files(
             }
         }
 
-        // 确保数据写入磁盘
         file.sync_all().map_err(|e| {
             tracing::error!("Failed to sync file {}: {}", decoded_filename, e);
             fs::remove_file(&file_path).ok();
             AppError::InternalError
         })?;
 
-        // 显式关闭文件句柄
         drop(file);
 
         let checksum = hasher.finalize().to_hex().to_string();

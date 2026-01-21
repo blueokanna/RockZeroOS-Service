@@ -1,6 +1,6 @@
 use actix_web::{web, HttpResponse, Responder};
 use rand::Rng;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
