@@ -14,6 +14,10 @@ pub use bulletproof_auth::BulletproofAuthenticator;
 pub use chunk_manager::ChunkManager;
 pub use encryptor::HlsEncryptor;
 pub use error::{HlsError, Result};
+pub use ffmpeg_manager::{
+    get_global_ffmpeg_path, get_global_ffprobe_path, set_global_ffmpeg_path,
+    set_global_ffprobe_path, FfmpegManager,
+};
 pub use playlist::PlaylistGenerator;
 pub use secure_transport::SecureStreamTransport;
 pub use session::{HlsSession, HlsSessionManager};

@@ -241,7 +241,7 @@ fn get_media_duration(file_path: &str) -> Option<i64> {
 
 // ============================================================
 // HLS 实时流式传输 - 支持所有视频格式
-// 设计理念：任意格式输入 → FFmpeg 转封装/转码 → HLS fMP4 分段输出
+// 设计理念：任意格式输入 → FFmpeg 转封装/转码 → HLS MPEG-TS 分段输出
 // ============================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,14 +264,9 @@ pub struct VideoQuality {
     pub bitrate: String,    // "4M", "2M", "1M", "500k"
 }
 
-/// HLS 会话管理器
-pub struct HlsSessionManager {
-    sessions: Arc<Mutex<HashMap<String, HlsSession>>>,
-    hls_base_dir: String,
-}
-
+/// 简单 HLS 会话（不加密）
 #[allow(dead_code)]
-struct HlsSession {
+struct SimpleHlsSession {
     file_path: String,
     session_id: String,
     output_dir: String,
@@ -282,7 +277,20 @@ struct HlsSession {
     current_audio_track: u32,
 }
 
-impl HlsSessionManager {
+/// 简单 HLS 会话管理器（不加密）
+pub struct SimpleHlsSessionManager {
+    sessions: Arc<Mutex<HashMap<String, SimpleHlsSession>>>,
+    hls_base_dir: String,
+}
+
+impl SimpleHlsSessionManager {
+    pub fn new(hls_base_dir: String) -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            hls_base_dir,
+        }
+    }
+
     /// 创建 HLS 会话并开始转码
     /// 支持: 任意视频格式 → HLS MPEG-TS (兼容所有平台)
     /// 音频强制转码为 AAC (兼容 DTS/AC3 等不支持的格式)
@@ -430,7 +438,7 @@ impl HlsSessionManager {
                 AppError::BadRequest(format!("Failed to start FFmpeg: {}", e))
             })?;
 
-        let session = HlsSession {
+        let session = SimpleHlsSession {
             file_path: file_path.to_string(),
             session_id: session_id.clone(),
             output_dir: output_dir.clone(),
@@ -788,7 +796,7 @@ pub struct HlsStartRequest {
 /// 开始 HLS 流式传输
 pub async fn start_hls_stream(
     pool: web::Data<SqlitePool>,
-    hls_manager: web::Data<HlsSessionManager>,
+    hls_manager: web::Data<SimpleHlsSessionManager>,
     claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<HlsStartRequest>,
 ) -> Result<impl Responder, AppError> {
@@ -829,7 +837,7 @@ pub async fn start_hls_stream(
 
 /// 获取 HLS 播放列表
 pub async fn get_hls_playlist(
-    hls_manager: web::Data<HlsSessionManager>,
+    hls_manager: web::Data<SimpleHlsSessionManager>,
     path: web::Path<String>,
 ) -> Result<impl Responder, AppError> {
     let session_id = path.into_inner();
@@ -844,7 +852,7 @@ pub async fn get_hls_playlist(
 
 /// 获取 HLS 片段（支持 fMP4 和 TS）
 pub async fn get_hls_segment(
-    hls_manager: web::Data<HlsSessionManager>,
+    hls_manager: web::Data<SimpleHlsSessionManager>,
     path: web::Path<(String, String)>,
 ) -> Result<impl Responder, AppError> {
     let (session_id, segment_name) = path.into_inner();
@@ -866,7 +874,7 @@ pub async fn get_hls_segment(
 
 /// 获取音轨列表
 pub async fn get_hls_audio_tracks(
-    hls_manager: web::Data<HlsSessionManager>,
+    hls_manager: web::Data<SimpleHlsSessionManager>,
     path: web::Path<String>,
 ) -> Result<impl Responder, AppError> {
     let session_id = path.into_inner();
@@ -874,14 +882,13 @@ pub async fn get_hls_audio_tracks(
     Ok(HttpResponse::Ok().json(tracks))
 }
 
-/// 切换音轨
 #[derive(Deserialize)]
 pub struct SwitchAudioRequest {
     pub audio_track: u32,
 }
 
 pub async fn switch_hls_audio_track(
-    hls_manager: web::Data<HlsSessionManager>,
+    hls_manager: web::Data<SimpleHlsSessionManager>,
     path: web::Path<String>,
     body: web::Json<SwitchAudioRequest>,
 ) -> Result<impl Responder, AppError> {
@@ -895,8 +902,8 @@ pub async fn switch_hls_audio_track(
 
 /// 停止 HLS 会话
 pub async fn stop_hls_stream(
-    hls_manager: web::Data<HlsSessionManager>,
-    path: web::Path<String>,
+    hls_manager: web::Data<SimpleHlsSessionManager>,
+    path: web::Path<String>
 ) -> Result<impl Responder, AppError> {
     let session_id = path.into_inner();
     hls_manager.cleanup_session(&session_id);

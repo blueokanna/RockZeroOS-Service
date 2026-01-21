@@ -120,8 +120,12 @@ async fn main() -> std::io::Result<()> {
 
     let hls_base_dir = PathBuf::from(&data_dir).join("hls_cache");
     std::fs::create_dir_all(&hls_base_dir).ok();
-    let hls_manager = Arc::new(RwLock::new(rockzero_media::HlsSessionManager::new()));
+    let secure_hls_manager = Arc::new(RwLock::new(rockzero_media::HlsSessionManager::new()));
+    let simple_hls_manager = Arc::new(handlers::media::SimpleHlsSessionManager::new(
+        hls_base_dir.to_string_lossy().to_string()
+    ));
     info!("Secure HLS streaming: WPA3-SAE + ZKP + AES-256-GCM enabled");
+    info!("Simple HLS streaming: MPEG-TS format enabled");
 
     // 初始化存储管理器
     let storage_config = StorageConfig::from_env();
@@ -157,7 +161,8 @@ async fn main() -> std::io::Result<()> {
         let secure_storage = secure_storage.clone();
         let invite_manager = invite_manager.clone();
         let media_processor_data = media_processor.clone();
-        let hls_manager_data = hls_manager.clone();
+        let secure_hls_manager_data = secure_hls_manager.clone();
+        let simple_hls_manager_data = simple_hls_manager.clone();
         let storage_manager_data = storage_manager.clone();
         let app_config_data = app_config.clone();
         let cors = Cors::default()
@@ -196,7 +201,8 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(secure_storage.clone()))
             .app_data(web::Data::new(invite_manager.clone()))
             .app_data(web::Data::new(media_processor_data))
-            .app_data(web::Data::new(hls_manager_data))
+            .app_data(web::Data::new(secure_hls_manager_data))
+            .app_data(web::Data::from(simple_hls_manager_data))
             .app_data(web::Data::new(storage_manager_data))
             .app_data(web::Data::from(app_config_data))
             .route("/health", web::get().to(handlers::health::health_check))
