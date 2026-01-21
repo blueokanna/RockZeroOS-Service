@@ -224,35 +224,30 @@ pub async fn create_hls_session(
 
 /// 从数据库获取用户的 ZKP 注册数据
 ///
-/// 注意：这需要在数据库中添加相应的表和字段来存储用户的 ZKP 注册数据
-/// 这通常在用户注册或首次登录时创建
+/// 从数据库中的 zkp_registration 字段读取用户的 ZKP 注册数据
 async fn get_user_zkp_registration(
     pool: &SqlitePool,
     user_id: &str,
 ) -> Result<Option<PasswordRegistration>, AppError> {
     // 查询用户的 ZKP 注册数据
-    // 假设数据库中有 users 表，包含 zkp_registration 字段（JSON 格式）
-    let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT zkp_registration FROM users WHERE id = $1")
-            .bind(user_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| {
-                AppError::DatabaseError(format!("Failed to query ZKP registration: {}", e))
-            })?;
-
-    match row {
-        Some((Some(json_str),)) => {
-            let registration: PasswordRegistration =
-                serde_json::from_str(&json_str).map_err(|e| {
-                    AppError::InternalServerError(format!(
-                        "Invalid ZKP registration data in database: {}",
-                        e
-                    ))
-                })?;
-            Ok(Some(registration))
+    let user = crate::db::find_user_by_id(pool, user_id).await?;
+    
+    match user {
+        Some(u) => {
+            if let Some(zkp_reg_json) = u.zkp_registration {
+                let registration: PasswordRegistration =
+                    serde_json::from_str(&zkp_reg_json).map_err(|e| {
+                        AppError::InternalServerError(format!(
+                            "Invalid ZKP registration data in database: {}",
+                            e
+                        ))
+                    })?;
+                Ok(Some(registration))
+            } else {
+                Ok(None)
+            }
         }
-        _ => Ok(None),
+        None => Ok(None),
     }
 }
 
@@ -721,17 +716,17 @@ enum HardwareAccel {
 async fn detect_hardware_acceleration() -> HardwareAccel {
     use tokio::fs;
 
-    if fs::metadata("/dev/dri/renderD128").await.is_ok() {
-        if check_ffmpeg_encoder("h264_vaapi").await {
-            return HardwareAccel::Vaapi;
-        }
+    if fs::metadata("/dev/dri/renderD128").await.is_ok()
+        && check_ffmpeg_encoder("h264_vaapi").await
+    {
+        return HardwareAccel::Vaapi;
     }
 
     // 检测 V4L2 设备（ARM SoC）
-    if fs::metadata("/dev/video10").await.is_ok() || fs::metadata("/dev/video11").await.is_ok() {
-        if check_ffmpeg_encoder("h264_v4l2m2m").await {
-            return HardwareAccel::V4l2;
-        }
+    if (fs::metadata("/dev/video10").await.is_ok() || fs::metadata("/dev/video11").await.is_ok())
+        && check_ffmpeg_encoder("h264_v4l2m2m").await
+    {
+        return HardwareAccel::V4l2;
     }
 
     HardwareAccel::None

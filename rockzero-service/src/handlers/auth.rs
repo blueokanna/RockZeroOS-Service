@@ -447,10 +447,10 @@ pub async fn register(
     // Check if this is the first user (will be super admin)
     let user_count = crate::db::count_users(&pool).await?;
     let is_first_user = user_count == 0;
-    
+
     // Determine role: first user is admin, others are regular users
     let role = if is_first_user { "admin" } else { "user" };
-    
+
     // Non-first users MUST provide a valid invite code
     if !is_first_user {
         match &body.invite_code {
@@ -466,7 +466,7 @@ pub async fn register(
                         "Invite code is required for registration".to_string(),
                     ));
                 }
-                
+
                 // Validate the invite code
                 let is_valid = crate::db::validate_invite_code(&pool, code).await?;
                 if !is_valid {
@@ -474,7 +474,7 @@ pub async fn register(
                         "Invalid or expired invite code".to_string(),
                     ));
                 }
-                
+
                 // Mark the invite code as used
                 crate::db::use_invite_code(&pool, code).await?;
             }
@@ -495,23 +495,22 @@ pub async fn register(
         ));
     }
 
-    // 安全性：使用安全的密码哈希（BLAKE3 + 100,000 次迭代）
     let password_handler = SecurePasswordHandler::new();
     let credentials = password_handler.create_password_credentials(&body.password)?;
 
-    // 序列化 ZKP registration 为 JSON 存储
+    // 序列化完整的 ZKP registration（包含 commitment 和 salt）
     let zkp_registration_json =
         serde_json::to_string(&credentials.zkp_registration).map_err(|e| {
             AppError::InternalServerError(format!("Failed to serialize ZKP registration: {}", e))
         })?;
 
-    // 创建用户
+    // 创建用户（zkp_registration 包含完整的 commitment + salt）
     let user = crate::db::create_user(
         &pool,
         username,
         email,
         &credentials.password_hash,
-        &zkp_registration_json,
+        Some(&zkp_registration_json),
         role, // Use the determined role (admin for first user, user for others)
     )
     .await?;
@@ -596,7 +595,9 @@ pub async fn refresh_token(
     let jwt_handler = JwtHandler::new(&jwt_config);
 
     // Verify the refresh token
-    let claims = jwt_handler.verify_refresh_token(&body.refresh_token).await?;
+    let claims = jwt_handler
+        .verify_refresh_token(&body.refresh_token)
+        .await?;
 
     // Find the user to ensure they still exist
     let user = crate::db::find_user_by_id(&pool, &claims.sub)

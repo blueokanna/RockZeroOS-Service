@@ -1,5 +1,3 @@
-//! Database operations bridge module
-
 use rockzero_common::AppError;
 use rockzero_common::models::{FileMetadata, Widget};
 use sqlx::{SqlitePool, Row};
@@ -11,7 +9,7 @@ pub struct User {
     pub username: String,
     pub email: String,
     pub password_hash: String,
-    pub zkp_commitment: String,
+    pub zkp_registration: Option<String>,
     pub role: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -27,7 +25,7 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<(), AppError> {
             username TEXT UNIQUE NOT NULL,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
-            zkp_commitment TEXT NOT NULL,
+            zkp_registration TEXT,
             role TEXT NOT NULL DEFAULT 'user',
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -90,6 +88,53 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<(), AppError> {
     .await
     .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
+    // Files table for file metadata
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS files (
+            id TEXT PRIMARY KEY NOT NULL,
+            user_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            original_filename TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            file_size INTEGER NOT NULL DEFAULT 0,
+            checksum TEXT NOT NULL,
+            is_public INTEGER NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    // Widgets table
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS widgets (
+            id TEXT PRIMARY KEY NOT NULL,
+            user_id TEXT NOT NULL,
+            widget_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            config_json TEXT NOT NULL,
+            position_x INTEGER NOT NULL DEFAULT 0,
+            position_y INTEGER NOT NULL DEFAULT 0,
+            width INTEGER NOT NULL DEFAULT 1,
+            height INTEGER NOT NULL DEFAULT 1,
+            is_visible INTEGER NOT NULL DEFAULT 1,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
     Ok(())
 }
 
@@ -99,7 +144,7 @@ pub async fn create_user(
     username: &str,
     email: &str,
     password_hash: &str,
-    zkp_commitment: &str,
+    zkp_registration: Option<&str>,
     role: &str,
 ) -> Result<User, AppError> {
     let id = uuid::Uuid::new_v4().to_string();
@@ -107,7 +152,7 @@ pub async fn create_user(
 
     sqlx::query(
         r#"
-        INSERT INTO users (id, username, email, password_hash, zkp_commitment, role, created_at, updated_at)
+        INSERT INTO users (id, username, email, password_hash, zkp_registration, role, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
@@ -115,7 +160,7 @@ pub async fn create_user(
     .bind(username)
     .bind(email)
     .bind(password_hash)
-    .bind(zkp_commitment)
+    .bind(zkp_registration)
     .bind(role)
     .bind(now)
     .bind(now)
@@ -134,7 +179,7 @@ pub async fn create_user(
         username: username.to_string(),
         email: email.to_string(),
         password_hash: password_hash.to_string(),
-        zkp_commitment: zkp_commitment.to_string(),
+        zkp_registration: zkp_registration.map(|s| s.to_string()),
         role: role.to_string(),
         created_at: now,
         updated_at: now,
@@ -145,7 +190,7 @@ pub async fn create_user(
 pub async fn find_user_by_id(pool: &SqlitePool, user_id: &str) -> Result<Option<User>, AppError> {
     let row = sqlx::query(
         r#"
-        SELECT id, username, email, password_hash, zkp_commitment, role, 
+        SELECT id, username, email, password_hash, zkp_registration, role, 
                created_at, updated_at
         FROM users WHERE id = ?
         "#,
@@ -162,7 +207,7 @@ pub async fn find_user_by_id(pool: &SqlitePool, user_id: &str) -> Result<Option<
                 username: r.try_get("username").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 email: r.try_get("email").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 password_hash: r.try_get("password_hash").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                zkp_commitment: r.try_get("zkp_commitment").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                zkp_registration: r.try_get("zkp_registration").ok(),
                 role: r.try_get("role").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 created_at: r.try_get("created_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 updated_at: r.try_get("updated_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
@@ -177,7 +222,7 @@ pub async fn find_user_by_id(pool: &SqlitePool, user_id: &str) -> Result<Option<
 pub async fn find_user_by_username(pool: &SqlitePool, username: &str) -> Result<Option<User>, AppError> {
     let row = sqlx::query(
         r#"
-        SELECT id, username, email, password_hash, zkp_commitment, role,
+        SELECT id, username, email, password_hash, zkp_registration, role,
                created_at, updated_at
         FROM users WHERE username = ?
         "#,
@@ -194,7 +239,7 @@ pub async fn find_user_by_username(pool: &SqlitePool, username: &str) -> Result<
                 username: r.try_get("username").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 email: r.try_get("email").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 password_hash: r.try_get("password_hash").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                zkp_commitment: r.try_get("zkp_commitment").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                zkp_registration: r.try_get("zkp_registration").ok(),
                 role: r.try_get("role").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 created_at: r.try_get("created_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 updated_at: r.try_get("updated_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
@@ -209,7 +254,7 @@ pub async fn find_user_by_username(pool: &SqlitePool, username: &str) -> Result<
 pub async fn find_user_by_email(pool: &SqlitePool, email: &str) -> Result<Option<User>, AppError> {
     let row = sqlx::query(
         r#"
-        SELECT id, username, email, password_hash, zkp_commitment, role,
+        SELECT id, username, email, password_hash, zkp_registration, role,
                created_at, updated_at
         FROM users WHERE email = ?
         "#,
@@ -226,7 +271,7 @@ pub async fn find_user_by_email(pool: &SqlitePool, email: &str) -> Result<Option
                 username: r.try_get("username").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 email: r.try_get("email").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 password_hash: r.try_get("password_hash").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                zkp_commitment: r.try_get("zkp_commitment").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                zkp_registration: r.try_get("zkp_registration").ok(),
                 role: r.try_get("role").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 created_at: r.try_get("created_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 updated_at: r.try_get("updated_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
@@ -315,13 +360,42 @@ pub async fn get_file_by_id(
 
 /// Find file by ID and verify user ownership
 pub async fn find_file_by_id(
-    _pool: &SqlitePool,
-    _file_id: &str,
-    _user_id: &str,
+    pool: &SqlitePool,
+    file_id: &str,
+    user_id: &str,
 ) -> Result<Option<FileMetadata>, AppError> {
-    // Placeholder - implement when database tables are created
-    // This should query the database for a file with matching id and user_id
-    Ok(None)
+    let row = sqlx::query(
+        r#"
+        SELECT id, user_id, filename, original_filename, file_path, mime_type, file_size, checksum, is_public, created_at, updated_at
+        FROM files 
+        WHERE id = ? AND user_id = ?
+        "#,
+    )
+    .bind(file_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    match row {
+        Some(r) => {
+            let file = FileMetadata {
+                id: r.try_get("id").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                user_id: r.try_get("user_id").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                filename: r.try_get("filename").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                original_filename: r.try_get("original_filename").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                file_path: r.try_get("file_path").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                mime_type: r.try_get("mime_type").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                file_size: r.try_get("file_size").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                checksum: r.try_get("checksum").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                is_public: r.try_get("is_public").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                created_at: r.try_get("created_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                updated_at: r.try_get("updated_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+            };
+            Ok(Some(file))
+        }
+        None => Ok(None),
+    }
 }
 
 pub async fn delete_file(_pool: &SqlitePool, _file_id: &str) -> Result<(), AppError> {
