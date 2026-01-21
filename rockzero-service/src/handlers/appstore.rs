@@ -267,7 +267,20 @@ async fn execute_wasm_module(
 pub async fn list_packages(_req: HttpRequest) -> Result<HttpResponse, AppError> {
     // Allow listing packages without FIDO2 - read-only operation
     // JWT authentication is handled by middleware if configured
-    let packages = load_packages()?;
+    
+    tracing::info!("📦 Listing app packages");
+    
+    let packages = match load_packages() {
+        Ok(pkgs) => {
+            tracing::info!("✅ Found {} packages", pkgs.len());
+            pkgs
+        }
+        Err(e) => {
+            tracing::warn!("⚠️ Failed to load packages: {:?}, returning empty list", e);
+            Vec::new()
+        }
+    };
+    
     Ok(HttpResponse::Ok().json(packages))
 }
 
@@ -439,28 +452,42 @@ pub async fn list_containers(_req: HttpRequest) -> Result<HttpResponse, AppError
     // Allow listing containers without FIDO2 - read-only operation
     // JWT authentication is handled by middleware if configured
 
+    tracing::info!("🐳 Listing Docker containers");
+
     #[cfg(target_os = "linux")]
     {
         let output = Command::new("docker")
             .args(&["ps", "-a", "--format", "{{json .}}"])
-            .output()
-            .map_err(|_| AppError::InternalError)?;
-
-        if !output.status.success() {
-            return Err(AppError::InternalError);
+            .output();
+        
+        match output {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let containers: Vec<DockerContainer> = stdout
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+                
+                tracing::info!("✅ Found {} containers", containers.len());
+                Ok(HttpResponse::Ok().json(containers))
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!("⚠️ Docker command failed: {}", stderr);
+                // Return empty list instead of error
+                Ok(HttpResponse::Ok().json(Vec::<DockerContainer>::new()))
+            }
+            Err(e) => {
+                tracing::warn!("⚠️ Docker not available: {}", e);
+                // Return empty list instead of error
+                Ok(HttpResponse::Ok().json(Vec::<DockerContainer>::new()))
+            }
         }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let containers: Vec<DockerContainer> = stdout
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
-
-        Ok(HttpResponse::Ok().json(containers))
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        tracing::info!("ℹ️ Docker not supported on this platform");
         Ok(HttpResponse::Ok().json(Vec::<DockerContainer>::new()))
     }
 }
@@ -469,28 +496,42 @@ pub async fn list_images(_req: HttpRequest) -> Result<HttpResponse, AppError> {
     // Allow listing images without FIDO2 - read-only operation
     // JWT authentication is handled by middleware if configured
 
+    tracing::info!("🐳 Listing Docker images");
+
     #[cfg(target_os = "linux")]
     {
         let output = Command::new("docker")
             .args(&["images", "--format", "{{json .}}"])
-            .output()
-            .map_err(|_| AppError::InternalError)?;
-
-        if !output.status.success() {
-            return Err(AppError::InternalError);
+            .output();
+        
+        match output {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let images: Vec<DockerImage> = stdout
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+                
+                tracing::info!("✅ Found {} images", images.len());
+                Ok(HttpResponse::Ok().json(images))
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!("⚠️ Docker command failed: {}", stderr);
+                // Return empty list instead of error
+                Ok(HttpResponse::Ok().json(Vec::<DockerImage>::new()))
+            }
+            Err(e) => {
+                tracing::warn!("⚠️ Docker not available: {}", e);
+                // Return empty list instead of error
+                Ok(HttpResponse::Ok().json(Vec::<DockerImage>::new()))
+            }
         }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let images: Vec<DockerImage> = stdout
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
-
-        Ok(HttpResponse::Ok().json(images))
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        tracing::info!("ℹ️ Docker not supported on this platform");
         Ok(HttpResponse::Ok().json(Vec::<DockerImage>::new()))
     }
 }

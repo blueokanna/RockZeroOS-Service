@@ -13,10 +13,9 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tracing::info;
-use walkdir::WalkDir;
 
 const BASE_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
-const MAX_FILE_SIZE: usize = 100 * 1024 * 1024 * 1024;
+const MAX_FILE_SIZE: usize = 1000 * 1024 * 1024 * 1024;
 const MAX_TEXT_PREVIEW_SIZE: usize = 1024 * 1024;
 const STREAM_CHUNK_SIZE: u64 = 128 * 1024;
 const MAX_RANGE_SIZE: u64 = 1024 * 1024;
@@ -347,8 +346,6 @@ pub async fn create_directory(
     })))
 }
 
-/// 上传进度跟踪 (reserved for future streaming upload progress feature)
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub struct UploadProgress {
     pub filename: String,
@@ -365,65 +362,65 @@ pub async fn upload_files(
     mut payload: Multipart,
     req: actix_web::HttpRequest,
 ) -> Result<impl Responder, AppError> {
-    crate::middleware::verify_fido2_or_passkey(&req).await?;
+    // 先记录请求信息
+    tracing::info!("📤 Upload request received");
+    tracing::info!("  - Authorization header: {:?}", req.headers().get("authorization"));
+    tracing::info!("  - Content-Type: {:?}", req.headers().get("content-type"));
+    
+    // 检查认证
+    if let Err(e) = crate::middleware::verify_fido2_or_passkey(&req).await {
+        tracing::error!("❌ Authentication failed: {:?}", e);
+        return Err(e);
+    }
+    
+    tracing::info!("✅ Authentication successful");
 
     let target_path = query.path.as_deref().unwrap_or("");
-    
-    // 验证路径不为空
-    if target_path.is_empty() {
-        return Err(AppError::BadRequest(
-            "Upload path cannot be empty. Please select a directory first.".to_string()
-        ));
-    }
-    
-    let decoded_target_path = urlencoding::decode(target_path)
-        .map(|s| s.into_owned())
-        .unwrap_or_else(|_| target_path.to_string());
+    tracing::info!("  - Target path: {:?}", target_path);
 
-    let full_path = sanitize_path(&decoded_target_path)?;
+    let decoded_target_path = if target_path.is_empty() {
+        // 如果路径为空，使用基础目录
+        tracing::info!("  - Using base directory (empty path)");
+        String::new()
+    } else {
+        urlencoding::decode(target_path)
+            .map(|s| s.into_owned())
+            .unwrap_or_else(|_| target_path.to_string())
+    };
 
+    let full_path = match sanitize_path(&decoded_target_path) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::error!("❌ Path sanitization failed: {:?}", e);
+            return Err(e);
+        }
+    };
+
+    tracing::info!("📂 Resolved upload path: {:?}", full_path);
+
+    // 确保目录存在，如果不存在则创建
     if !full_path.exists() {
-        return Err(AppError::NotFound(format!(
-            "Target directory does not exist: {}",
-            decoded_target_path
-        )));
+        tracing::info!("📁 Creating upload directory: {:?}", full_path);
+        std::fs::create_dir_all(&full_path).map_err(|e| {
+            tracing::error!("❌ Failed to create directory: {}", e);
+            AppError::InternalError
+        })?;
     }
-    
+
     if !full_path.is_dir() {
+        tracing::error!("❌ Target path is not a directory: {:?}", full_path);
         return Err(AppError::BadRequest(format!(
             "Target path is not a directory: {}",
-            decoded_target_path
+            full_path.display()
         )));
     }
 
-    // 检查目标路径是否在 eMMC 上，如果是则拒绝上传
+    // 获取规范化路径用于日志记录
     let canonical_path = full_path
         .canonicalize()
-        .map_err(|_| AppError::BadRequest("Cannot resolve target path".to_string()))?;
+        .unwrap_or_else(|_| full_path.clone());
 
-    #[cfg(target_os = "linux")]
-    {
-        let path_str = canonical_path.to_string_lossy();
-        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-            for line in mounts.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let device = parts[0];
-                    let mount_point = parts[1];
-
-                    if path_str.starts_with(mount_point) {
-                        if device.contains("mmcblk")
-                            && (mount_point == "/" || mount_point.starts_with("/boot"))
-                        {
-                            return Err(AppError::BadRequest(
-                                "Cannot upload to eMMC storage. Please select an external storage device.".to_string()
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    }
+    tracing::info!("✅ Upload target validated: {:?}", canonical_path);
 
     let mut uploaded_files = Vec::new();
     let start_time = std::time::Instant::now();
@@ -443,7 +440,7 @@ pub async fn upload_files(
                 AppError::BadRequest("Missing filename in upload".to_string())
             })?
             .to_string();
-        
+
         file_count += 1;
         tracing::info!("Processing file {}: {}", file_count, filename);
 
@@ -479,7 +476,7 @@ pub async fn upload_files(
                 fs::remove_file(&file_path).ok();
                 AppError::BadRequest(format!("Failed to read file data: {}", e))
             })?;
-            
+
             file_size += data.len();
 
             if file_size > MAX_FILE_SIZE {
@@ -521,6 +518,9 @@ pub async fn upload_files(
             AppError::InternalError
         })?;
 
+        // 显式关闭文件句柄
+        drop(file);
+
         let checksum = hasher.finalize().to_hex().to_string();
 
         // 计算最终速度
@@ -552,7 +552,7 @@ pub async fn upload_files(
     if uploaded_files.is_empty() {
         tracing::warn!("No files were uploaded");
         return Err(AppError::BadRequest(
-            "No files were uploaded. Please select files to upload.".to_string()
+            "No files were uploaded. Please select files to upload.".to_string(),
         ));
     }
 
@@ -757,63 +757,100 @@ pub async fn delete_files(body: web::Json<DeleteRequest>) -> Result<impl Respond
 pub async fn get_storage_info() -> Result<impl Responder, AppError> {
     let base_path = get_base_directory()?;
 
-    let mut total_size = 0u64;
-    for entry in WalkDir::new(&base_path)
-        .max_depth(5)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file() {
-            if let Ok(metadata) = entry.metadata() {
-                total_size += metadata.len();
-            }
-        }
-    }
+    tracing::info!("📊 Getting storage info for: {:?}", base_path);
 
-    // 尝试获取实际的磁盘空间信息
+    // 使用 statvfs 获取准确的磁盘空间信息
     #[cfg(target_os = "linux")]
     {
-        use std::process::Command;
-        if let Ok(output) = Command::new("df")
-            .args(&["-B1", base_path.to_str().unwrap_or("/")])
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(line) = stdout.lines().nth(1) {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 4 {
-                        let total_space = parts[1].parse::<u64>().unwrap_or(0);
-                        let used_space = parts[2].parse::<u64>().unwrap_or(0);
-                        let available_space = parts[3].parse::<u64>().unwrap_or(0);
-                        let usage_percentage = if total_space > 0 {
-                            (used_space as f64 / total_space as f64) * 100.0
-                        } else {
-                            0.0
-                        };
+        use std::mem::MaybeUninit;
 
-                        return Ok(HttpResponse::Ok().json(StorageInfo {
-                            total_space,
-                            used_space,
-                            available_space,
-                            usage_percentage,
-                        }));
-                    }
-                }
+        let path_cstr = match std::ffi::CString::new(base_path.to_string_lossy().as_bytes()) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("Failed to create CString: {}", e);
+                return Err(AppError::InternalError);
+            }
+        };
+
+        let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
+
+        unsafe {
+            if libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) == 0 {
+                let stat = stat.assume_init();
+                let block_size = stat.f_frsize as u64;
+                let total_blocks = stat.f_blocks as u64;
+                let free_blocks = stat.f_bfree as u64;
+                let available_blocks = stat.f_bavail as u64;
+
+                let total_space = total_blocks * block_size;
+                let available_space = available_blocks * block_size;
+                let used_space = total_space.saturating_sub(free_blocks * block_size);
+                let usage_percentage = if total_space > 0 {
+                    (used_space as f64 / total_space as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                tracing::info!(
+                    "✅ Storage info (statvfs): total={} ({:.2} GB), used={} ({:.2} GB), available={} ({:.2} GB), usage={:.2}%",
+                    total_space, total_space as f64 / (1024.0 * 1024.0 * 1024.0),
+                    used_space, used_space as f64 / (1024.0 * 1024.0 * 1024.0),
+                    available_space, available_space as f64 / (1024.0 * 1024.0 * 1024.0),
+                    usage_percentage
+                );
+
+                return Ok(HttpResponse::Ok().json(StorageInfo {
+                    total_space,
+                    used_space,
+                    available_space,
+                    usage_percentage,
+                }));
+            } else {
+                tracing::error!("statvfs failed: {}", std::io::Error::last_os_error());
             }
         }
     }
 
-    let available_space = 100 * 1024 * 1024 * 1024u64;
-    let total_space = available_space + total_size;
-    let usage_percentage = (total_size as f64 / total_space as f64) * 100.0;
+    // Windows 和其他平台使用 sysinfo
+    #[cfg(not(target_os = "linux"))]
+    {
+        use sysinfo::Disks;
+        let disks = Disks::new_with_refreshed_list();
 
-    Ok(HttpResponse::Ok().json(StorageInfo {
-        total_space,
-        used_space: total_size,
-        available_space,
-        usage_percentage,
-    }))
+        // 查找包含 base_path 的磁盘
+        for disk in disks.list() {
+            let mount_point = disk.mount_point();
+            if base_path.starts_with(mount_point) {
+                let total_space = disk.total_space();
+                let available_space = disk.available_space();
+                let used_space = total_space.saturating_sub(available_space);
+                let usage_percentage = if total_space > 0 {
+                    (used_space as f64 / total_space as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                tracing::info!(
+                    "✅ Storage info (sysinfo): total={} ({:.2} GB), used={} ({:.2} GB), available={} ({:.2} GB), usage={:.2}%",
+                    total_space, total_space as f64 / (1024.0 * 1024.0 * 1024.0),
+                    used_space, used_space as f64 / (1024.0 * 1024.0 * 1024.0),
+                    available_space, available_space as f64 / (1024.0 * 1024.0 * 1024.0),
+                    usage_percentage
+                );
+
+                return Ok(HttpResponse::Ok().json(StorageInfo {
+                    total_space,
+                    used_space,
+                    available_space,
+                    usage_percentage,
+                }));
+            }
+        }
+    }
+
+    // 最后的后备方案：返回错误而不是默认值
+    tracing::error!("⚠️ Could not get storage info for {:?}", base_path);
+    Err(AppError::InternalError)
 }
 
 /// 获取有效的基础目录

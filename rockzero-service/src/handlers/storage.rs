@@ -669,6 +669,7 @@ fn parse_linux_device(
     let (used, available) = if let Some(ref mp) = mount_point {
         get_mount_usage(mp)
     } else {
+        // 未挂载的设备，可用空间等于总大小
         (0, size)
     };
 
@@ -753,9 +754,20 @@ fn get_mount_usage(mount_point: &str) -> (u64, u64) {
 
             let total = total_blocks * block_size;
             let available = available_blocks * block_size;
-            let used = total - (free_blocks * block_size);
+            // 正确计算已使用空间：总空间 - 空闲空间
+            let used = total.saturating_sub(free_blocks * block_size);
+
+            tracing::debug!(
+                "Mount usage for {}: total={} ({:.2} GB), used={} ({:.2} GB), available={} ({:.2} GB)",
+                mount_point,
+                total, total as f64 / (1024.0 * 1024.0 * 1024.0),
+                used, used as f64 / (1024.0 * 1024.0 * 1024.0),
+                available, available as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
 
             return (used, available);
+        } else {
+            tracing::warn!("Failed to get mount usage for {}: {}", mount_point, std::io::Error::last_os_error());
         }
     }
 
