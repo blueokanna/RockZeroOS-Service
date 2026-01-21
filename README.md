@@ -11,7 +11,7 @@
 ### 🔐 安全特性
 
 - **SAE/WPA3 密钥协商** - 基于 Dragonfly 协议的安全密钥交换
-- **端到端加密** - AES-128-GCM 加密的 HLS 视频流
+- **端到端加密** - AES-256-GCM 加密的 HLS 视频流
 - **零知识证明** - Bulletproofs 支持，无需暴露密码即可验证
 - **FIDO2/WebAuthn** - 硬件密钥认证（YubiKey、TouchID 等）
 - **安全存储** - 加密数据库、文件加密/解密、安全擦除
@@ -20,7 +20,7 @@
 ### 🎬 媒体功能
 
 - **硬件加速转码** - 支持 NVIDIA (NVENC/NVDEC)、Intel (QSV)、AMD (VAAPI)、ARM/Amlogic A311D (V4L2 M2M)
-- **加密 HLS 流媒体** - 分片级别的 AES-128 加密保护
+- **加密 HLS 流媒体** - 分片级别的 AES-256-GCM 加密保护
 - **智能编码器选择** - 自动检测并使用最佳硬件加速
 - **多音轨/字幕支持** - 完整的媒体信息提取
 - **缩略图生成** - 视频、图片缩略图自动生成
@@ -590,7 +590,7 @@ Response: (M3U8 playlist)
 #EXTM3U
 #EXT-X-VERSION:3
 #EXT-X-TARGETDURATION:6
-#EXT-X-KEY:METHOD=AES-128,URI="/api/v1/secure-hls/{hls_session_id}/key"
+#EXT-X-KEY:METHOD=AES-256,URI="/api/v1/secure-hls/{hls_session_id}/key"
 #EXTINF:6.0,
 segment_0.ts
 #EXTINF:6.0,

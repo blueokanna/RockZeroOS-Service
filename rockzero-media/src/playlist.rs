@@ -44,7 +44,7 @@ impl PlaylistGenerator {
         playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
         if use_encryption {
             playlist.push_str(&format!(
-                "#EXT-X-KEY:METHOD=AES-128,URI=\"{}/api/v1/hls/{}/key\"\n",
+                "#EXT-X-KEY:METHOD=AES-256,URI=\"{}/api/v1/hls/{}/key\"\n",
                 self.base_url, self.session_id
             ));
         }
@@ -79,7 +79,7 @@ impl PlaylistGenerator {
         // 每个分片使用不同的密钥
         for i in 0..segment_count {
             playlist.push_str(&format!(
-                "#EXT-X-KEY:METHOD=AES-128,URI=\"{}/api/v1/hls/{}/key/{}\"\n",
+                "#EXT-X-KEY:METHOD=AES-256,URI=\"{}/api/v1/hls/{}/key/{}\"\n",
                 self.base_url, self.session_id, i
             ));
             playlist.push_str(&format!("#EXTINF:{:.3},\n", segment_duration));
@@ -110,7 +110,7 @@ impl PlaylistGenerator {
 
         // 加密密钥
         playlist.push_str(&format!(
-            "#EXT-X-KEY:METHOD=AES-128,URI=\"{}/api/v1/hls/{}/key\"\n\n",
+            "#EXT-X-KEY:METHOD=AES-256,URI=\"{}/api/v1/hls/{}/key\"\n\n",
             self.base_url, self.session_id
         ));
 
@@ -124,7 +124,6 @@ impl PlaylistGenerator {
             ));
         }
 
-        // 注意：实时流不添加 ENDLIST
         playlist
     }
 }
@@ -180,6 +179,6 @@ mod tests {
 
         assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:100"));
         assert!(playlist.contains("segment_100.ts"));
-        assert!(!playlist.contains("#EXT-X-ENDLIST")); // 实时流不应该有 ENDLIST
+        assert!(!playlist.contains("#EXT-X-ENDLIST"));
     }
 }

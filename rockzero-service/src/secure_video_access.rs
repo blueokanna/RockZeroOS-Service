@@ -1,3 +1,7 @@
+//! Secure video access module with ZKP-based authentication
+//! This module provides secure video token management for protected content.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};

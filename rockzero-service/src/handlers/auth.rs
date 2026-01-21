@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, TokenData, Validation};
 use serde::{Deserialize, Serialize};
@@ -13,6 +11,7 @@ use rockzero_crypto::{EnhancedPasswordProof, PasswordRegistration, ZkpContext};
 
 const HASH_ITERATIONS: u32 = 100_000;
 const SALT_LENGTH: usize = 32;
+#[allow(dead_code)]
 const NONCE_EXPIRY_SECONDS: i64 = 300;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -106,6 +105,8 @@ impl JwtHandler {
         Ok(token_data.claims)
     }
 
+    /// Verify refresh token (used for token refresh endpoint)
+    #[allow(dead_code)]
     pub async fn verify_refresh_token(&self, token: &str) -> Result<Claims, AppError> {
         let token_data = self.decode_token(token)?;
 
@@ -123,6 +124,8 @@ impl JwtHandler {
         Ok(token_data.claims)
     }
 
+    /// Revoke a token by its JTI (used for logout)
+    #[allow(dead_code)]
     pub async fn revoke_token(&self, jti: &str) {
         let mut revoked = self.revoked_tokens.write().await;
         revoked.insert(jti.to_string());
@@ -142,6 +145,7 @@ impl JwtHandler {
 
 pub struct SecurePasswordHandler {
     pub zkp_context: ZkpContext,
+    #[allow(dead_code)]
     used_nonces: Arc<RwLock<Vec<(String, i64)>>>,
 }
 
@@ -171,7 +175,8 @@ impl SecurePasswordHandler {
         verify_password(password, stored_hash)
     }
 
-    /// Verify an enhanced ZKP proof against stored registration
+    /// Verify an enhanced ZKP proof against stored registration (used in tests)
+    #[allow(dead_code)]
     pub async fn verify_enhanced_proof(
         &self,
         proof: &EnhancedPasswordProof,
@@ -203,23 +208,29 @@ impl SecurePasswordHandler {
         Ok(result)
     }
 
-    /// Generate an enhanced proof for authentication
+    /// Generate an enhanced proof for authentication (used in tests)
+    #[allow(dead_code)]
     pub fn generate_enhanced_proof(
         &self,
         password: &str,
         registration: &PasswordRegistration,
         context: &str,
     ) -> Result<EnhancedPasswordProof, AppError> {
-        self.zkp_context.generate_enhanced_proof(password, registration, context)
+        self.zkp_context
+            .generate_enhanced_proof(password, registration, context)
     }
 
+    /// Derive encryption key from password (used in tests)
+    #[allow(dead_code)]
     pub fn derive_encryption_key(&self, password: &str, context: &str) -> [u8; 32] {
         let password_bytes = password.as_bytes();
         let context_bytes = context.as_bytes();
-        
+
         blake3_hash(&[password_bytes, context_bytes])
     }
 
+    /// Calculate password entropy (used for strength validation)
+    #[allow(dead_code)]
     pub fn calculate_password_entropy(password: &str) -> u64 {
         ZkpContext::calculate_password_entropy(password)
     }
@@ -307,10 +318,14 @@ mod tests {
             .unwrap());
 
         // Test enhanced proof generation and verification
-        let proof = handler.generate_enhanced_proof(password, &credentials.zkp_registration, "login").unwrap();
-        
+        let proof = handler
+            .generate_enhanced_proof(password, &credentials.zkp_registration, "login")
+            .unwrap();
+
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(handler.verify_enhanced_proof(&proof, &credentials.zkp_registration, "login")).unwrap();
+        let result = rt
+            .block_on(handler.verify_enhanced_proof(&proof, &credentials.zkp_registration, "login"))
+            .unwrap();
         assert!(result);
     }
 
@@ -323,7 +338,8 @@ mod tests {
         let credentials = handler.create_password_credentials(password).unwrap();
 
         // Trying to generate a proof with wrong password should fail
-        let result = handler.generate_enhanced_proof(wrong_password, &credentials.zkp_registration, "login");
+        let result =
+            handler.generate_enhanced_proof(wrong_password, &credentials.zkp_registration, "login");
         assert!(result.is_err());
     }
 
@@ -390,13 +406,16 @@ pub async fn register(
     // 安全性：验证必填字段
     let username = body.username.trim();
     let email = body.email.trim();
-    
+
     if username.is_empty() || email.is_empty() || body.password.is_empty() {
         return Err(AppError::BadRequest("All fields are required".to_string()));
     }
 
     // 安全性：验证用户名格式（只允许字母、数字、下划线、连字符）
-    if !username.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+    if !username
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
         return Err(AppError::BadRequest(
             "Username can only contain letters, numbers, underscores and hyphens".to_string(),
         ));
@@ -418,21 +437,62 @@ pub async fn register(
     let has_uppercase = body.password.chars().any(|c| c.is_uppercase());
     let has_lowercase = body.password.chars().any(|c| c.is_lowercase());
     let has_digit = body.password.chars().any(|c| c.is_numeric());
-    
+
     if !has_uppercase || !has_lowercase || !has_digit {
         return Err(AppError::BadRequest(
             "Password must contain uppercase, lowercase and numbers".to_string(),
         ));
     }
 
+    // Check if this is the first user (will be super admin)
+    let user_count = crate::db::count_users(&pool).await?;
+    let is_first_user = user_count == 0;
+    
+    // Determine role: first user is admin, others are regular users
+    let role = if is_first_user { "admin" } else { "user" };
+    
+    // Non-first users MUST provide a valid invite code
+    if !is_first_user {
+        match &body.invite_code {
+            None => {
+                return Err(AppError::BadRequest(
+                    "Invite code is required for registration".to_string(),
+                ));
+            }
+            Some(code) => {
+                let code = code.trim();
+                if code.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "Invite code is required for registration".to_string(),
+                    ));
+                }
+                
+                // Validate the invite code
+                let is_valid = crate::db::validate_invite_code(&pool, code).await?;
+                if !is_valid {
+                    return Err(AppError::BadRequest(
+                        "Invalid or expired invite code".to_string(),
+                    ));
+                }
+                
+                // Mark the invite code as used
+                crate::db::use_invite_code(&pool, code).await?;
+            }
+        }
+    }
+
     // 安全性：检查用户名是否已存在（防止用户枚举攻击，使用统一的错误消息）
     if (crate::db::find_user_by_username(&pool, username).await?).is_some() {
-        return Err(AppError::BadRequest("Username or email already exists".to_string()));
+        return Err(AppError::BadRequest(
+            "Username or email already exists".to_string(),
+        ));
     }
 
     // 安全性：检查邮箱是否已存在
     if (crate::db::find_user_by_email(&pool, email).await?).is_some() {
-        return Err(AppError::BadRequest("Username or email already exists".to_string()));
+        return Err(AppError::BadRequest(
+            "Username or email already exists".to_string(),
+        ));
     }
 
     // 安全性：使用安全的密码哈希（BLAKE3 + 100,000 次迭代）
@@ -440,8 +500,10 @@ pub async fn register(
     let credentials = password_handler.create_password_credentials(&body.password)?;
 
     // 序列化 ZKP registration 为 JSON 存储
-    let zkp_registration_json = serde_json::to_string(&credentials.zkp_registration)
-        .map_err(|e| AppError::InternalServerError(format!("Failed to serialize ZKP registration: {}", e)))?;
+    let zkp_registration_json =
+        serde_json::to_string(&credentials.zkp_registration).map_err(|e| {
+            AppError::InternalServerError(format!("Failed to serialize ZKP registration: {}", e))
+        })?;
 
     // 创建用户
     let user = crate::db::create_user(
@@ -450,7 +512,7 @@ pub async fn register(
         email,
         &credentials.password_hash,
         &zkp_registration_json,
-        "user",
+        role, // Use the determined role (admin for first user, user for others)
     )
     .await?;
 
@@ -483,7 +545,7 @@ pub async fn login(
     }
 
     let username = body.username.trim();
-    
+
     // 安全性：查找用户（支持用户名或邮箱登录）
     let user = if username.contains('@') {
         crate::db::find_user_by_email(&pool, username).await?

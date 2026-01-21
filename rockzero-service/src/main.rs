@@ -147,6 +147,11 @@ async fn main() -> std::io::Result<()> {
     let _video_access_manager = secure_video_access::init_global_video_access_manager();
     info!("Video access manager initialized");
 
+    // 自动挂载所有磁盘
+    info!("Auto-mounting disks...");
+    handlers::disk_manager::auto_mount_all_disks();
+    info!("Disk auto-mount completed");
+
     HttpServer::new(move || {
         let pool = pool.clone();
         let secure_storage = secure_storage.clone();

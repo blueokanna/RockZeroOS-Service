@@ -347,7 +347,8 @@ pub async fn create_directory(
     })))
 }
 
-/// 上传进度跟踪
+/// 上传进度跟踪 (reserved for future streaming upload progress feature)
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub struct UploadProgress {
     pub filename: String,

@@ -237,6 +237,56 @@ pub async fn find_user_by_email(pool: &SqlitePool, email: &str) -> Result<Option
     }
 }
 
+/// Count total number of users in the system
+pub async fn count_users(pool: &SqlitePool) -> Result<i64, AppError> {
+    let row = sqlx::query("SELECT COUNT(*) as count FROM users")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+    
+    let count: i64 = row.try_get("count").unwrap_or(0);
+    Ok(count)
+}
+
+/// Validate an invite code
+pub async fn validate_invite_code(pool: &SqlitePool, code: &str) -> Result<bool, AppError> {
+    let row = sqlx::query(
+        r#"
+        SELECT code, max_uses, current_uses, expires_at
+        FROM invite_codes 
+        WHERE code = ? AND (expires_at IS NULL OR expires_at > datetime('now'))
+        "#,
+    )
+    .bind(code)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+    
+    match row {
+        Some(r) => {
+            let max_uses: i32 = r.try_get("max_uses").unwrap_or(1);
+            let current_uses: i32 = r.try_get("current_uses").unwrap_or(0);
+            Ok(current_uses < max_uses)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Use an invite code (increment usage count)
+pub async fn use_invite_code(pool: &SqlitePool, code: &str) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        UPDATE invite_codes SET current_uses = current_uses + 1
+        WHERE code = ?
+        "#,
+    )
+    .bind(code)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+    
+    Ok(())
+}
 
 
 pub async fn create_file_metadata(

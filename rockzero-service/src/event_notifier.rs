@@ -1,3 +1,7 @@
+//! Event notifier module for broadcasting system events
+//! This module is infrastructure code prepared for future real-time notification features.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};

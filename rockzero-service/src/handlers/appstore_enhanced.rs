@@ -37,7 +37,7 @@ impl AppPackageKind {
             AppPackageKind::Ipk => "ipk",
         }
     }
-    
+
     pub fn display_name(&self) -> &'static str {
         match self {
             AppPackageKind::Wasm => "WASM Application",
@@ -45,7 +45,7 @@ impl AppPackageKind {
             AppPackageKind::Ipk => "IPK Package (iStoreOS/OpenWRT)",
         }
     }
-    
+
     pub fn description(&self) -> &'static str {
         match self {
             AppPackageKind::Wasm => "Custom WASM-based online application with flexible rules",
@@ -127,15 +127,14 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
         .gzip(true)
         .brotli(true)
         .deflate(true)
-        .use_rustls_tls() // 使用 rustls
-        .danger_accept_invalid_certs(false) // 不接受无效证书
+        .use_rustls_tls()
+        .danger_accept_invalid_certs(false)
         .build()
         .map_err(|e| {
             error!("❌ Failed to create HTTP client: {}", e);
             AppError::InternalServerError(e.to_string())
         })?;
 
-    // 尝试多次请求，增加重试机制
     let mut last_error = String::new();
     for attempt in 1..=3 {
         info!(
@@ -165,7 +164,6 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
                         continue;
                     }
                 } else {
-                    // 先获取文本，然后解析
                     match response.text().await {
                         Ok(text) => {
                             info!("📦 Received {} bytes of data", text.len());
@@ -258,7 +256,6 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
         }
     }
 
-    // 所有重试都失败，返回错误信息而不是空列表
     error!(
         "❌ CasaOS store completely unavailable after 3 attempts: {}",
         last_error
@@ -270,28 +267,65 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
 }
 
 fn parse_casaos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<AppStoreItem> {
-    let id = app.get("id")?.as_str()?.to_string();
-    let name = app.get("name")?.as_str()?.to_string();
-    let title = app.get("title")?.as_str()?.to_string();
-    let description = app.get("description")?.as_str().unwrap_or("").to_string();
-    let version = app.get("version")?.as_str()?.to_string();
-    let icon = app
-        .get("icon")
+    // CasaOS API returns different field names, handle both old and new format
+    let id = app.get("id")
+        .or_else(|| app.get("name"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())?;
+    
+    let name = app.get("name")
+        .or_else(|| app.get("title"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())?;
+    
+    let title = app.get("title")
+        .or_else(|| app.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(&name)
+        .to_string();
+    
+    let description = app.get("description")
+        .or_else(|| app.get("tagline"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    
+    // Version can be in different places
+    let version = app.get("version")
+        .or_else(|| app.get("main").and_then(|m| m.get("version")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("latest")
+        .to_string();
+    
+    let icon = app.get("icon")
+        .or_else(|| app.get("image"))
+        .or_else(|| app.get("thumbnail"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let category = app
-        .get("category")
+    
+    let category = app.get("category")
+        .or_else(|| app.get("categories").and_then(|c| c.as_array()).and_then(|arr| arr.first()))
         .and_then(|v| v.as_str())
         .unwrap_or("Other")
         .to_string();
-    let author = app
-        .get("author")
+    
+    let author = app.get("author")
+        .or_else(|| app.get("developer"))
+        .or_else(|| app.get("maintainer"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let install_url = app.get("compose_url")?.as_str()?.to_string();
+    
+    // Install URL can be compose_url, url, or construct from name
+    let install_url = app.get("compose_url")
+        .or_else(|| app.get("url"))
+        .or_else(|| app.get("source"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("https://github.com/IceWhaleTech/CasaOS-AppStore/tree/main/Apps/{}", id));
 
     let architectures = app
         .get("arch")
+        .or_else(|| app.get("architectures"))
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()

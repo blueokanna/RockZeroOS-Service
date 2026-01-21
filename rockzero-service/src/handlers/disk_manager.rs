@@ -9,6 +9,128 @@ use std::process::Command;
 
 use rockzero_common::AppError;
 
+/// Auto-mount all configured disks on startup
+/// This function reads the fstab or auto-mount configuration and mounts any unmounted disks
+#[cfg(target_os = "linux")]
+pub fn auto_mount_all_disks() {
+    log::info!("Starting auto-mount for all disks...");
+    
+    // Read lsblk to find all block devices with filesystems
+    let output = Command::new("lsblk")
+        .args(["-J", "-o", "NAME,TYPE,MOUNTPOINT,FSTYPE,SIZE,UUID"])
+        .output();
+    
+    let Ok(output) = output else {
+        log::warn!("Failed to run lsblk for auto-mount");
+        return;
+    };
+    
+    if !output.status.success() {
+        log::warn!("lsblk failed: {}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    
+    let lsblk_json = String::from_utf8_lossy(&output.stdout);
+    let lsblk: serde_json::Value = match serde_json::from_str(&lsblk_json) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("Failed to parse lsblk output: {}", e);
+            return;
+        }
+    };
+    
+    let Some(blockdevices) = lsblk.get("blockdevices").and_then(|v| v.as_array()) else {
+        log::warn!("No block devices found");
+        return;
+    };
+    
+    let mount_base = std::env::var("MOUNT_BASE").unwrap_or_else(|_| "/mnt".to_string());
+    let mut mounted_count = 0;
+    
+    for device in blockdevices {
+        // Process each device and its children (partitions)
+        let children = device.get("children").and_then(|c| c.as_array());
+        
+        let devices_to_check: Vec<&serde_json::Value> = if let Some(children) = children {
+            children.iter().collect()
+        } else {
+            vec![device]
+        };
+        
+        for dev in devices_to_check {
+            let name = dev.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let dev_type = dev.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let mountpoint = dev.get("mountpoint").and_then(|m| m.as_str());
+            let fstype = dev.get("fstype").and_then(|f| f.as_str());
+            
+            // Skip if not a partition or disk, or if already mounted
+            if dev_type != "part" && dev_type != "disk" {
+                continue;
+            }
+            
+            // Skip if already mounted
+            if mountpoint.is_some() && !mountpoint.unwrap().is_empty() {
+                continue;
+            }
+            
+            // Skip if no filesystem
+            let Some(fstype) = fstype else {
+                continue;
+            };
+            if fstype.is_empty() {
+                continue;
+            }
+            
+            // Skip system partitions (boot, swap, etc.)
+            if fstype == "swap" || fstype == "vfat" && name.contains("boot") {
+                continue;
+            }
+            
+            let device_path = format!("/dev/{}", name);
+            let mount_point = format!("{}/{}", mount_base, name);
+            
+            // Create mount point
+            if let Err(e) = std::fs::create_dir_all(&mount_point) {
+                log::warn!("Failed to create mount point {}: {}", mount_point, e);
+                continue;
+            }
+            
+            // Mount the device
+            let mount_result = Command::new("mount")
+                .arg(&device_path)
+                .arg(&mount_point)
+                .output();
+            
+            match mount_result {
+                Ok(output) => {
+                    if output.status.success() {
+                        log::info!("Auto-mounted {} to {}", device_path, mount_point);
+                        mounted_count += 1;
+                        
+                        // Set permissions
+                        let _ = Command::new("chmod")
+                            .args(["755", &mount_point])
+                            .output();
+                    } else {
+                        let error = String::from_utf8_lossy(&output.stderr);
+                        log::debug!("Failed to mount {}: {}", device_path, error.trim());
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to execute mount for {}: {}", device_path, e);
+                }
+            }
+        }
+    }
+    
+    log::info!("Auto-mount completed: {} disks mounted", mounted_count);
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn auto_mount_all_disks() {
+    log::info!("Auto-mount not supported on this platform");
+}
+
 #[allow(dead_code)]
 pub const SUPPORTED_FILESYSTEMS: &[&str] = &[
     "ext4", "ext3", "ext2", "xfs", "btrfs", "f2fs", "fat32", "exfat", "ntfs",
@@ -135,6 +257,18 @@ pub async fn list_disks() -> Result<HttpResponse, AppError> {
     let mut disks = Vec::new();
 
     for disk in disks_info.list() {
+        let device_path = disk.name().to_string_lossy().to_string();
+        let mount_point = disk.mount_point().to_string_lossy().to_string();
+        
+        // 过滤掉 zram 和 log2ram 等虚拟设备
+        if device_path.contains("zram") || 
+           device_path.contains("log2ram") ||
+           mount_point.contains("log2ram") ||
+           device_path.contains("loop") ||
+           (device_path.contains("ram") && !device_path.contains("nvram")) {
+            continue;
+        }
+        
         let total_space = disk.total_space();
         let available_space = disk.available_space();
         let used_space = total_space.saturating_sub(available_space);
@@ -143,9 +277,6 @@ pub async fn list_disks() -> Result<HttpResponse, AppError> {
         } else {
             0.0
         };
-
-        let device_path = disk.name().to_string_lossy().to_string();
-        let mount_point = disk.mount_point().to_string_lossy().to_string();
         let is_removable = disk.is_removable();
         let disk_type = format!("{:?}", disk.kind());
         
@@ -200,6 +331,14 @@ pub async fn list_disks() -> Result<HttpResponse, AppError> {
     {
         if let Ok(unmounted) = get_unmounted_disks() {
             for disk in unmounted {
+                // 过滤掉 zram 和 log2ram 等虚拟设备
+                if disk.device_path.contains("zram") || 
+                   disk.device_path.contains("log2ram") ||
+                   disk.mount_point.contains("log2ram") ||
+                   disk.device_path.contains("loop") ||
+                   (disk.device_path.contains("ram") && !disk.device_path.contains("nvram")) {
+                    continue;
+                }
                 if !disks.iter().any(|d| d.device_path == disk.device_path) {
                     disks.push(disk);
                 }
@@ -848,7 +987,8 @@ pub async fn format_disk(
             )));
         }
 
-        // 检查设备是否已挂载 - 如果已挂载则拒绝格式化
+        // 检查设备是否已挂载 - 如果已挂载则自动卸载
+        let mut original_mount_point: Option<String> = None;
         let mount_check = Command::new("findmnt")
             .args(["-n", "-o", "TARGET", device])
             .output();
@@ -857,10 +997,52 @@ pub async fn format_disk(
             if output.status.success() {
                 let mount_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !mount_point.is_empty() {
-                    return Err(AppError::BadRequest(format!(
-                        "Device {} is currently mounted at '{}'. Please unmount it first before formatting.",
-                        device, mount_point
-                    )));
+                    log::info!("Device {} is mounted at '{}', auto-unmounting...", device, mount_point);
+                    original_mount_point = Some(mount_point.clone());
+                    
+                    // 先尝试使用 fuser 杀死占用进程
+                    let _ = Command::new("fuser")
+                        .args(["-km", &mount_point])
+                        .output();
+                    
+                    // 等待进程终止
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    
+                    // 尝试卸载
+                    let unmount_output = Command::new("umount")
+                        .arg("-f")  // Force unmount
+                        .arg(&mount_point)
+                        .output();
+                    
+                    if let Err(e) = unmount_output {
+                        return Err(AppError::BadRequest(format!(
+                            "Failed to unmount device {} from '{}': {}",
+                            device, mount_point, e
+                        )));
+                    }
+                    
+                    let unmount_result = unmount_output.unwrap();
+                    if !unmount_result.status.success() {
+                        // 尝试 lazy unmount
+                        let lazy_unmount = Command::new("umount")
+                            .arg("-l")  // Lazy unmount
+                            .arg(&mount_point)
+                            .output();
+                        
+                        if let Ok(lazy_result) = lazy_unmount {
+                            if !lazy_result.status.success() {
+                                let error = String::from_utf8_lossy(&lazy_result.stderr);
+                                return Err(AppError::BadRequest(format!(
+                                    "Failed to unmount device {} from '{}'. Please close all programs using the disk and try again. Error: {}",
+                                    device, mount_point, error
+                                )));
+                            }
+                        }
+                    }
+                    
+                    // 等待卸载完成
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    log::info!("Successfully unmounted {} from '{}'", device, mount_point);
                 }
             }
         }
@@ -973,11 +1155,44 @@ pub async fn format_disk(
             // 额外等待确保文件系统信息已更新
             std::thread::sleep(std::time::Duration::from_millis(1000));
 
+            // 如果之前有挂载点，自动重新挂载
+            let mut remounted = false;
+            if let Some(mount_point) = &original_mount_point {
+                log::info!("Re-mounting {} to '{}'...", device, mount_point);
+                
+                // 确保挂载点目录存在
+                let _ = std::fs::create_dir_all(mount_point);
+                
+                // 重新挂载
+                let remount_output = Command::new("mount")
+                    .arg(device)
+                    .arg(mount_point)
+                    .output();
+                
+                if let Ok(result) = remount_output {
+                    if result.status.success() {
+                        remounted = true;
+                        log::info!("Successfully re-mounted {} to '{}'", device, mount_point);
+                    } else {
+                        let error = String::from_utf8_lossy(&result.stderr);
+                        log::warn!("Failed to re-mount {} to '{}': {}", device, mount_point, error);
+                    }
+                }
+            }
+
+            let message = if remounted {
+                format!("Disk formatted successfully with {} filesystem and re-mounted", body.file_system)
+            } else {
+                format!("Disk formatted successfully with {} filesystem", body.file_system)
+            };
+
             return Ok(HttpResponse::Ok().json(serde_json::json!({
                 "success": true,
-                "message": format!("Disk formatted successfully with {} filesystem", body.file_system),
+                "message": message,
                 "device": device,
                 "file_system": body.file_system,
+                "remounted": remounted,
+                "mount_point": original_mount_point,
             })));
         } else {
             let error = String::from_utf8_lossy(&output.stderr);

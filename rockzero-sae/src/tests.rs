@@ -39,9 +39,9 @@ mod integration_tests {
         let client_kd = KeyDerivation::new(client_pmk);
         let server_kd = KeyDerivation::new(server_pmk);
 
-        // 派生 HLS 加密密钥
-        let client_hls_key = client_kd.derive_aes128_key(b"hls-encryption", None).unwrap();
-        let server_hls_key = server_kd.derive_aes128_key(b"hls-encryption", None).unwrap();
+        // 派生 HLS 加密密钥 (AES-256)
+        let client_hls_key = client_kd.derive_aes256_key(b"hls-encryption", None).unwrap();
+        let server_hls_key = server_kd.derive_aes256_key(b"hls-encryption", None).unwrap();
         
         assert_eq!(client_hls_key, server_hls_key);
 
