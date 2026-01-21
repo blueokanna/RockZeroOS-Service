@@ -204,6 +204,7 @@ async fn main() -> std::io::Result<()> {
                         web::scope("/auth")
                             .route("/register", web::post().to(handlers::auth::register))
                             .route("/login", web::post().to(handlers::auth::login))
+                            .route("/refresh", web::post().to(handlers::auth::refresh_token))
                             .route("/me", web::get().to(handlers::auth::me)),
                     )
                     .service(

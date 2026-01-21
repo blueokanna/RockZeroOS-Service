@@ -581,6 +581,34 @@ pub async fn login(
     }))
 }
 
+/// Refresh token request
+#[derive(Debug, Deserialize)]
+pub struct RefreshTokenRequest {
+    pub refresh_token: String,
+}
+
+/// Refresh access token using refresh token
+pub async fn refresh_token(
+    pool: web::Data<SqlitePool>,
+    body: web::Json<RefreshTokenRequest>,
+) -> Result<impl Responder, AppError> {
+    let jwt_config = AppConfig::from_env();
+    let jwt_handler = JwtHandler::new(&jwt_config);
+
+    // Verify the refresh token
+    let claims = jwt_handler.verify_refresh_token(&body.refresh_token).await?;
+
+    // Find the user to ensure they still exist
+    let user = crate::db::find_user_by_id(&pool, &claims.sub)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("User not found".to_string()))?;
+
+    // Generate new tokens
+    let tokens = jwt_handler.generate_tokens(&user.id, &user.email, &user.role)?;
+
+    Ok(HttpResponse::Ok().json(tokens))
+}
+
 /// Get current user info (requires authentication)
 pub async fn me(
     pool: web::Data<SqlitePool>,

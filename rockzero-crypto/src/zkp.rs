@@ -12,9 +12,9 @@ use rockzero_common::error::AppError;
 
 const PASSWORD_DOMAIN: &str = "RockZero-Password-ZKP-v1";
 const BLINDING_DOMAIN: &str = "RockZero-Blinding-Derive-v1";
-const MIN_PASSWORD_ENTROPY_BITS: u64 = 40;
-const NONCE_EXPIRY_SECONDS: u64 = 600; // 10 minutes
-const PBKDF_ITERATIONS: u32 = 100_000; // Production-grade iterations
+const MIN_PASSWORD_ENTROPY_BITS: u64 = 28;
+const NONCE_EXPIRY_SECONDS: u64 = 600;
+const PBKDF_ITERATIONS: u32 = 100_000;
 
 lazy_static::lazy_static! {
     static ref USED_NONCES: Mutex<HashMap<String, u64>> = Mutex::new(HashMap::new());
