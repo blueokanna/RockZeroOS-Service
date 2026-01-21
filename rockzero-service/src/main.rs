@@ -190,6 +190,8 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(Logger::default())
             .wrap(cors)
+            // 配置大文件上传限制 (100GB)
+            .app_data(web::PayloadConfig::default().limit(100 * 1024 * 1024 * 1024))
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(secure_storage.clone()))
             .app_data(web::Data::new(invite_manager.clone()))
@@ -253,6 +255,7 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(
                         web::scope("/invite")
+                            .wrap(middleware::JwtAuth)
                             .route("/create", web::post().to(invite::create_invite))
                             .route("/validate/{code}", web::get().to(invite::validate_invite))
                             .route("/remaining", web::post().to(invite::invite_remaining_time)),

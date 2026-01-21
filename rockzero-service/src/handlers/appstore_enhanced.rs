@@ -128,7 +128,8 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
         .brotli(true)
         .deflate(true)
         .use_rustls_tls()
-        .danger_accept_invalid_certs(false)
+        // Some deployments miss certain root CAs; allow invalid certs so store can load
+        .danger_accept_invalid_certs(true)
         .build()
         .map_err(|e| {
             error!("❌ Failed to create HTTP client: {}", e);
@@ -357,6 +358,7 @@ pub async fn list_istoreos_apps() -> Result<HttpResponse, AppError> {
 
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        .danger_accept_invalid_certs(true)
         .build()
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
