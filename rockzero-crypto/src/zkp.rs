@@ -560,14 +560,8 @@ mod tests {
         ZkpContext::clear_nonces();
         let ctx = ZkpContext::new();
         let password = "SecurePassword123!@#";
-        
-        // Step 1: Register the password
         let registration = ctx.register_password(password).unwrap();
-        
-        // Step 2: Generate proof for authentication
         let proof = ctx.generate_enhanced_proof(password, &registration, "login").unwrap();
-        
-        // Step 3: Verify the proof
         let result = ctx
             .verify_enhanced_proof(&proof, &registration, "login", 300)
             .unwrap();
