@@ -368,14 +368,32 @@ pub async fn upload_files(
     crate::middleware::verify_fido2_or_passkey(&req).await?;
 
     let target_path = query.path.as_deref().unwrap_or("");
+    
+    // 验证路径不为空
+    if target_path.is_empty() {
+        return Err(AppError::BadRequest(
+            "Upload path cannot be empty. Please select a directory first.".to_string()
+        ));
+    }
+    
     let decoded_target_path = urlencoding::decode(target_path)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| target_path.to_string());
 
     let full_path = sanitize_path(&decoded_target_path)?;
 
-    if !full_path.exists() || !full_path.is_dir() {
-        return Err(AppError::BadRequest("Invalid target directory".to_string()));
+    if !full_path.exists() {
+        return Err(AppError::NotFound(format!(
+            "Target directory does not exist: {}",
+            decoded_target_path
+        )));
+    }
+    
+    if !full_path.is_dir() {
+        return Err(AppError::BadRequest(format!(
+            "Target path is not a directory: {}",
+            decoded_target_path
+        )));
     }
 
     // 检查目标路径是否在 eMMC 上，如果是则拒绝上传
@@ -409,15 +427,25 @@ pub async fn upload_files(
 
     let mut uploaded_files = Vec::new();
     let start_time = std::time::Instant::now();
+    let mut file_count = 0;
 
     while let Some(item) = payload.next().await {
-        let mut field = item.map_err(|_| AppError::BadRequest("Invalid file data".to_string()))?;
+        let mut field = item.map_err(|e| {
+            tracing::error!("Failed to read multipart field: {}", e);
+            AppError::BadRequest(format!("Invalid file data: {}", e))
+        })?;
 
         let content_disposition = field.content_disposition();
         let filename = content_disposition
             .get_filename()
-            .ok_or_else(|| AppError::BadRequest("Missing filename".to_string()))?
+            .ok_or_else(|| {
+                tracing::error!("Missing filename in multipart field");
+                AppError::BadRequest("Missing filename in upload".to_string())
+            })?
             .to_string();
+        
+        file_count += 1;
+        tracing::info!("Processing file {}: {}", file_count, filename);
 
         // URL-decode filename to handle UTF-8 characters
         let decoded_filename = urlencoding::decode(&filename)
@@ -446,16 +474,30 @@ pub async fn upload_files(
         let file_start_time = std::time::Instant::now();
 
         while let Some(chunk) = field.next().await {
-            let data = chunk.map_err(|_| AppError::InternalError)?;
+            let data = chunk.map_err(|e| {
+                tracing::error!("Failed to read chunk for {}: {}", decoded_filename, e);
+                fs::remove_file(&file_path).ok();
+                AppError::BadRequest(format!("Failed to read file data: {}", e))
+            })?;
+            
             file_size += data.len();
 
             if file_size > MAX_FILE_SIZE {
+                tracing::error!("File {} exceeds size limit", decoded_filename);
                 fs::remove_file(&file_path).ok();
-                return Err(AppError::BadRequest("File size exceeds limit".to_string()));
+                return Err(AppError::BadRequest(format!(
+                    "File {} exceeds maximum size limit of {} GB",
+                    decoded_filename,
+                    MAX_FILE_SIZE / (1024 * 1024 * 1024)
+                )));
             }
 
             hasher.update(&data);
-            file.write_all(&data).map_err(|_| AppError::InternalError)?;
+            file.write_all(&data).map_err(|e| {
+                tracing::error!("Failed to write file {}: {}", decoded_filename, e);
+                fs::remove_file(&file_path).ok();
+                AppError::InternalError
+            })?;
 
             // 计算上传速度（每1MB报告一次）
             if file_size.is_multiple_of(1024 * 1024) {
@@ -473,7 +515,11 @@ pub async fn upload_files(
         }
 
         // 确保数据写入磁盘
-        file.sync_all().map_err(|_| AppError::InternalError)?;
+        file.sync_all().map_err(|e| {
+            tracing::error!("Failed to sync file {}: {}", decoded_filename, e);
+            fs::remove_file(&file_path).ok();
+            AppError::InternalError
+        })?;
 
         let checksum = hasher.finalize().to_hex().to_string();
 
@@ -485,12 +531,12 @@ pub async fn upload_files(
             0.0
         };
 
-        info!(
-            "File uploaded to {}: {} ({} bytes, {:.2} Mbps)",
-            canonical_path.display(),
+        tracing::info!(
+            "✅ File uploaded successfully: {} ({} bytes, {:.2} Mbps) to {}",
             decoded_filename,
             file_size,
-            speed_mbps
+            speed_mbps,
+            canonical_path.display()
         );
 
         uploaded_files.push(serde_json::json!({
@@ -501,6 +547,13 @@ pub async fn upload_files(
             "speed_mbps": format!("{:.2}", speed_mbps),
             "duration_seconds": format!("{:.2}", elapsed),
         }));
+    }
+
+    if uploaded_files.is_empty() {
+        tracing::warn!("No files were uploaded");
+        return Err(AppError::BadRequest(
+            "No files were uploaded. Please select files to upload.".to_string()
+        ));
     }
 
     let total_elapsed = start_time.elapsed().as_secs_f64();
@@ -514,6 +567,13 @@ pub async fn upload_files(
     } else {
         0.0
     };
+
+    tracing::info!(
+        "✅ Upload complete: {} files, {} bytes total, {:.2} Mbps average",
+        uploaded_files.len(),
+        total_size,
+        avg_speed_mbps
+    );
 
     Ok(HttpResponse::Created().json(serde_json::json!({
         "message": "Files uploaded successfully",

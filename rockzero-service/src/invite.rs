@@ -117,12 +117,6 @@ impl InviteCodeManager {
 
 // ============ Actix handlers ============
 
-#[derive(Debug, Serialize)]
-pub struct InviteCreateResponse {
-    pub invite: InviteCode,
-    pub remaining_seconds: i64,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct InviteCodePayload {
     pub code: String,
@@ -134,7 +128,12 @@ pub async fn create_invite(
 ) -> Result<impl Responder, AppError> {
     let invite = manager.create_invite_code(&claims.sub)?;
     let remaining = manager.get_remaining_seconds(&invite)?;
-    Ok(HttpResponse::Ok().json(InviteCreateResponse { invite, remaining_seconds: remaining }))
+    
+    // 返回前端期望的格式
+    Ok(HttpResponse::Ok().json(json!({
+        "code": invite.code,
+        "expires_in_seconds": remaining
+    })))
 }
 
 pub async fn validate_invite(
