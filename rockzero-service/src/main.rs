@@ -739,21 +739,25 @@ async fn main() -> std::io::Result<()> {
                             ),
                     )
                     // ============ 安全 HLS 流式传输 ============
-                    // SAE 握手和会话创建（需要 JWT 认证）
                     .service(
                         web::scope("/secure-hls")
-                            .wrap(middleware::JwtAuth)
-                            .route("/sae/init", web::post().to(handlers::secure_hls::init_sae_handshake))
-                            .route("/sae/complete", web::post().to(handlers::secure_hls::complete_sae_handshake))
-                            .route("/session/create", web::post().to(handlers::secure_hls::create_hls_session)),
-                    )
-                    // 安全 HLS 播放列表和分片（使用 session_id 授权）
-                    // 生产级安全：视频段必须使用 POST + ZKP 证明
-                    .service(
-                        web::scope("/secure-hls")
+                            // SAE 握手和会话创建（需要 JWT 认证）
+                            .service(
+                                web::scope("/sae")
+                                    .wrap(middleware::JwtAuth)
+                                    .route("/init", web::post().to(handlers::secure_hls::init_sae_handshake))
+                                    .route("/complete", web::post().to(handlers::secure_hls::complete_sae_handshake))
+                            )
+                            .service(
+                                web::scope("/session")
+                                    .wrap(middleware::JwtAuth)
+                                    .route("/create", web::post().to(handlers::secure_hls::create_hls_session))
+                            )
+                            // 安全 HLS 播放列表和分片（使用 session_id 授权）
+                            // 生产级安全：视频段必须使用 POST + ZKP 证明
                             .route("/{session_id}/playlist.m3u8", web::get().to(handlers::secure_hls::get_secure_playlist))
                             // 视频段只允许 POST 请求（必须包含 ZKP 证明）
-                            .route("/{session_id}/{segment}", web::post().to(handlers::secure_hls::get_secure_segment)),
+                            .route("/{session_id}/{segment}", web::post().to(handlers::secure_hls::get_secure_segment))
                     )
                     .service(
                         web::scope("/media")
