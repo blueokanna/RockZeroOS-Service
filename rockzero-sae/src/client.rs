@@ -116,7 +116,7 @@ impl SaeClient {
         Ok(SaeCommit {
             group_id: 19, // Curve25519
             scalar: scalar.to_bytes(),
-            element: element.compress().to_bytes(),
+            element: element.compress().to_bytes().to_vec(),
         })
     }
 
@@ -139,10 +139,29 @@ impl SaeClient {
 
         let peer_element = {
             use curve25519_dalek::edwards::CompressedEdwardsY;
-            let compressed = CompressedEdwardsY(peer_commit.element);
+            
+            // 支持 32 字节（x 坐标或 Curve25519 y 坐标）
+            let element_bytes = if peer_commit.element.len() == 32 {
+                // 32 字节：直接作为 Curve25519 的 y 坐标使用
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(&peer_commit.element);
+                bytes
+            } else if peer_commit.element.len() == 33 {
+                // 33 字节：secp256r1 压缩点，提取 y 坐标
+                let mut y_bytes = [0u8; 32];
+                y_bytes.copy_from_slice(&peer_commit.element[1..33]);
+                y_bytes
+            } else {
+                return Err(SaeError::InvalidCommit(format!(
+                    "Invalid element length: {} (expected 32 or 33)",
+                    peer_commit.element.len()
+                )));
+            };
+            
+            let compressed = CompressedEdwardsY(element_bytes);
             compressed
                 .decompress()
-                .ok_or_else(|| SaeError::InvalidCommit("Invalid peer element".to_string()))?
+                .ok_or_else(|| SaeError::InvalidCommit("Invalid peer element - decompression failed".to_string()))?
         };
 
         // 3. 验证对方的 scalar 和 element 不等于自己的

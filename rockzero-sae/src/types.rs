@@ -10,8 +10,8 @@ pub struct SaeCommit {
     /// Commit scalar (32 bytes)
     pub scalar: [u8; 32],
     
-    /// Commit element (32 bytes compressed point)
-    pub element: [u8; 32],
+    /// Commit element (33 bytes compressed point for secp256r1)
+    pub element: Vec<u8>,
 }
 
 /// SAE Confirm 消息（使用 Base64 编码进行 JSON 序列化）
@@ -108,15 +108,14 @@ impl<'de> Deserialize<'de> for SaeCommit {
                             let element_bytes = BASE64
                                 .decode(&element_str)
                                 .map_err(|e| de::Error::custom(format!("Invalid base64 for element: {}", e)))?;
-                            if element_bytes.len() != 32 {
+                            // 支持 32 字节（Curve25519）或 33 字节（secp256r1 压缩点）
+                            if element_bytes.len() != 32 && element_bytes.len() != 33 {
                                 return Err(de::Error::custom(format!(
-                                    "Element must be 32 bytes, got {}",
+                                    "Element must be 32 or 33 bytes, got {}",
                                     element_bytes.len()
                                 )));
                             }
-                            let mut arr = [0u8; 32];
-                            arr.copy_from_slice(&element_bytes);
-                            element = Some(arr);
+                            element = Some(element_bytes);
                         }
                     }
                 }
@@ -252,10 +251,9 @@ impl SaeCommit {
 
         let group_id = u16::from_le_bytes([bytes[0], bytes[1]]);
         let mut scalar = [0u8; 32];
-        let mut element = [0u8; 32];
         
         scalar.copy_from_slice(&bytes[2..34]);
-        element.copy_from_slice(&bytes[34..66]);
+        let element = bytes[34..].to_vec();
 
         Some(Self {
             group_id,
@@ -300,7 +298,7 @@ mod tests {
         let commit = SaeCommit {
             group_id: 19,
             scalar: [1u8; 32],
-            element: [2u8; 32],
+            element: vec![2u8; 32],
         };
 
         let bytes = commit.to_bytes();
