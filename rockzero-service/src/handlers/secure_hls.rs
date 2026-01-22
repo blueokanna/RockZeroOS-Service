@@ -24,11 +24,102 @@ fn convert_hls_error(err: rockzero_media::HlsError) -> AppError {
     }
 }
 
+/// 安全地处理文件路径
+/// 
+/// 验证路径是否在允许的目录中，防止路径遍历攻击
+fn sanitize_file_path(path: &str) -> Result<std::path::PathBuf, AppError> {
+    use std::path::PathBuf;
+
+    // URL 解码
+    let decoded_path = urlencoding::decode(path)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| path.to_string());
+
+    let path_buf = PathBuf::from(&decoded_path);
+
+    // 如果是绝对路径，直接验证
+    if path_buf.is_absolute() {
+        // 尝试规范化路径
+        let canonical = path_buf
+            .canonicalize()
+            .unwrap_or_else(|_| path_buf.clone());
+
+        // 验证路径是否在允许的目录中
+        const ALLOWED_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
+        let path_str = canonical.to_string_lossy();
+
+        for allowed_dir in ALLOWED_DIRS {
+            if path_str.starts_with(allowed_dir) {
+                return Ok(canonical);
+            }
+        }
+
+        // Windows 路径
+        #[cfg(target_os = "windows")]
+        {
+            // 允许所有盘符
+            if path_str.len() >= 2 && path_str.chars().nth(1) == Some(':') {
+                return Ok(canonical);
+            }
+        }
+
+        return Err(AppError::Forbidden(
+            "File path is not in allowed directories".to_string(),
+        ));
+    }
+
+    // 相对路径：相对于基础目录
+    let base_dir = get_base_directory()?;
+    let full_path = base_dir.join(&decoded_path);
+
+    let canonical = full_path
+        .canonicalize()
+        .unwrap_or_else(|_| full_path.clone());
+
+    Ok(canonical)
+}
+
+/// 获取基础目录
+fn get_base_directory() -> Result<std::path::PathBuf, AppError> {
+    use std::path::Path;
+
+    #[cfg(target_os = "windows")]
+    {
+        let fallback = Path::new("./storage");
+        std::fs::create_dir_all(fallback).ok();
+        Ok(fallback.to_path_buf())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        const BASE_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
+
+        for base_dir in BASE_DIRS {
+            let path = Path::new(base_dir);
+            if path.exists() && path.is_dir() {
+                if std::fs::read_dir(path).is_ok() {
+                    return Ok(path.to_path_buf());
+                }
+            }
+        }
+
+        let data_dir = Path::new("/data");
+        if std::fs::create_dir_all(data_dir).is_ok() {
+            return Ok(data_dir.to_path_buf());
+        }
+
+        let fallback = Path::new("./storage");
+        std::fs::create_dir_all(fallback).ok();
+        Ok(fallback.to_path_buf())
+    }
+}
+
 // ============ 数据结构 ============
 
 #[derive(Debug, Deserialize)]
 pub struct InitSaeRequest {
-    pub file_id: String,
+    pub file_id: Option<String>,  // 文件 ID（数据库中的）
+    pub file_path: Option<String>, // 文件路径（文件系统中的）
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,10 +147,33 @@ pub async fn init_sae_handshake(
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
 
-    // 验证文件访问权限
-    let _file = crate::db::find_file_by_id(&pool, &body.file_id, &user_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("File not found".to_string()))?;
+    // 验证文件访问权限（支持文件 ID 或文件路径）
+    let file_path = if let Some(ref file_id) = body.file_id {
+        // 通过文件 ID 查找
+        let file = crate::db::find_file_by_id(&pool, file_id, &user_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("File not found: {}", file_id)))?;
+        file.file_path
+    } else if let Some(ref path) = body.file_path {
+        // 直接使用文件路径（验证路径是否存在）
+        let sanitized_path = sanitize_file_path(path)?;
+        if !sanitized_path.exists() {
+            return Err(AppError::NotFound(format!("File not found: {}", path)));
+        }
+        if !sanitized_path.is_file() {
+            return Err(AppError::BadRequest(format!("Path is not a file: {}", path)));
+        }
+        sanitized_path.to_string_lossy().to_string()
+    } else {
+        return Err(AppError::BadRequest(
+            "Either file_id or file_path must be provided".to_string(),
+        ));
+    };
+
+    info!(
+        "Initializing SAE handshake for user {} - file: {}",
+        user_id, file_path
+    );
 
     // 从数据库获取用户的密码哈希（用于 SAE）
     let user = crate::db::find_user_by_id(&pool, &user_id)
@@ -76,9 +190,6 @@ pub async fn init_sae_handshake(
         .init_sae_handshake(user_id.clone(), password)
         .map_err(convert_hls_error)?;
 
-    // 获取 SAE 服务器的 commit（需要先处理客户端的 commit）
-    // 这里我们返回 temp_session_id，客户端需要发送 commit
-
     info!(
         "Initialized SAE handshake for user {} - temp session {}",
         user_id, temp_session_id
@@ -86,6 +197,7 @@ pub async fn init_sae_handshake(
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "temp_session_id": temp_session_id,
+        "file_path": file_path,
         "message": "SAE handshake initialized, send client commit next"
     })))
 }
@@ -147,7 +259,8 @@ pub async fn complete_sae_handshake(
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
     pub temp_session_id: String,
-    pub file_id: String,
+    pub file_id: Option<String>,      // 文件 ID（数据库中的）
+    pub file_path: Option<String>,    // 文件路径（文件系统中的）
     pub zkp_registration: Option<String>,
 }
 
@@ -159,10 +272,33 @@ pub async fn create_hls_session(
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
 
-    // 1. 获取文件信息并验证访问权限
-    let file = crate::db::find_file_by_id(&pool, &body.file_id, &user_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("File not found".to_string()))?;
+    // 1. 获取文件路径（支持文件 ID 或文件路径）
+    let file_path = if let Some(ref file_id) = body.file_id {
+        // 通过文件 ID 查找
+        let file = crate::db::find_file_by_id(&pool, file_id, &user_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("File not found: {}", file_id)))?;
+        file.file_path
+    } else if let Some(ref path) = body.file_path {
+        // 直接使用文件路径（验证路径是否存在）
+        let sanitized_path = sanitize_file_path(path)?;
+        if !sanitized_path.exists() {
+            return Err(AppError::NotFound(format!("File not found: {}", path)));
+        }
+        if !sanitized_path.is_file() {
+            return Err(AppError::BadRequest(format!("Path is not a file: {}", path)));
+        }
+        sanitized_path.to_string_lossy().to_string()
+    } else {
+        return Err(AppError::BadRequest(
+            "Either file_id or file_path must be provided".to_string(),
+        ));
+    };
+
+    info!(
+        "Creating HLS session for user {} - file: {}",
+        user_id, file_path
+    );
 
     // 2. 获取用户的 ZKP 注册数据
     let zkp_registration: Option<PasswordRegistration> =
@@ -173,7 +309,6 @@ pub async fn create_hls_session(
             })?)
         } else {
             // 从数据库获取用户的 ZKP 注册数据
-            // 这需要在用户注册/登录时存储
             match get_user_zkp_registration(&pool, &user_id).await {
                 Ok(Some(reg)) => Some(reg),
                 Ok(None) => {
@@ -196,7 +331,7 @@ pub async fn create_hls_session(
         .complete_sae_handshake_with_registration(
             &body.temp_session_id,
             user_id.clone(),
-            file.file_path.clone(),
+            file_path.clone(),
             zkp_registration.clone(),
         )
         .map_err(convert_hls_error)?;
@@ -210,7 +345,7 @@ pub async fn create_hls_session(
     let has_zkp = zkp_registration.is_some();
     info!(
         "Created HLS session {} for user {} - file {} (ZKP enabled: {})",
-        session_id, user_id, file.file_path, has_zkp
+        session_id, user_id, file_path, has_zkp
     );
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
