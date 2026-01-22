@@ -280,49 +280,100 @@ pub async fn get_secure_playlist(
 }
 
 /// 获取加密的 TS 段（需要 ZKP 证明）
+///
+/// **生产级安全实现**：
+/// - 仅支持 POST 请求 + JSON body
+/// - 必须提供有效的 ZKP 证明
+/// - 验证会话有效性
+/// - 验证 ZKP 证明的时间戳和 nonce
+/// - 使用 AES-256-GCM 加密视频段
+///
+/// # 安全流程
+/// 1. 验证 HTTP 方法（必须是 POST）
+/// 2. 验证会话存在且未过期
+/// 3. 解析并验证 ZKP 证明
+/// 4. 读取并加密视频段
+/// 5. 返回加密数据
 pub async fn get_secure_segment(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<(String, String)>,
-    body: web::Json<SecureSegmentRequest>,
+    req: actix_web::HttpRequest,
+    body: web::Bytes,
 ) -> Result<impl Responder, AppError> {
     let (session_id, segment_name) = path.into_inner();
 
-    // 1. 验证会话
+    // 1. 验证 HTTP 方法（生产环境必须是 POST）
+    if req.method() != actix_web::http::Method::POST {
+        warn!(
+            "Invalid HTTP method for segment request: {} (expected POST)",
+            req.method()
+        );
+        return Err(AppError::BadRequest(
+            "Segment requests must use POST method with ZKP proof".to_string(),
+        ));
+    }
+
+    // 2. 解析 JSON body
+    let segment_request: SecureSegmentRequest = serde_json::from_slice(&body).map_err(|e| {
+        warn!("Failed to parse segment request body: {}", e);
+        AppError::BadRequest(format!("Invalid JSON body: {}", e))
+    })?;
+
+    info!(
+        "Secure segment request: session={}, segment={}, zkp_proof_len={}",
+        session_id,
+        segment_name,
+        segment_request.zkp_proof.len()
+    );
+
+    // 3. 验证会话
     let manager = hls_manager.read().await;
     let session = manager
         .get_session(&session_id)
         .map_err(convert_hls_error)?;
 
-    // 2. 验证 ZKP 证明
-    if !verify_zkp_proof(&session, &body.zkp_proof)? {
+    // 4. 验证 ZKP 证明（生产环境必须验证）
+    if !verify_zkp_proof(&session, &segment_request.zkp_proof)? {
         warn!(
             "Invalid ZKP proof for session {} segment {}",
             session_id, segment_name
         );
-        return Err(AppError::Unauthorized("Invalid ZKP proof".to_string()));
+        return Err(AppError::Unauthorized(
+            "Invalid ZKP proof - authentication failed".to_string(),
+        ));
     }
 
-    // 3. 从 FFmpeg 转码输出读取实际的 TS 段
-    // 这会先尝试从缓存读取，如果不存在则触发实时转码
+    info!(
+        "✅ ZKP proof verified for session {} segment {}",
+        session_id, segment_name
+    );
+
+    // 5. 从 FFmpeg 转码输出读取实际的 TS 段
     let segment_data = read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?;
 
-    // 4. 使用会话密钥加密段
+    // 6. 使用会话密钥加密段
     let encrypted_segment = session
         .encrypt_segment(&segment_data)
         .map_err(convert_hls_error)?;
 
     info!(
-        "Serving encrypted segment {} for session {} (size: {} bytes)",
+        "Serving encrypted segment {} for session {} (original: {} bytes, encrypted: {} bytes)",
         segment_name,
         session_id,
+        segment_data.len(),
         encrypted_segment.len()
     );
 
+    // 7. 返回加密的视频段
     Ok(HttpResponse::Ok()
-        .content_type("application/octet-stream")
+        .content_type("video/mp2t")
         .insert_header(("X-Encrypted", "true"))
         .insert_header(("X-Encryption-Method", "AES-256-GCM"))
-        .insert_header(("Content-Length", encrypted_segment.len().to_string()))
+        .insert_header(("X-ZKP-Verified", "true"))
+        .insert_header(("Content-Length", encrypted_segment.len()))
+        .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
+        .insert_header(("Pragma", "no-cache"))
+        .insert_header(("Expires", "0"))
         .body(encrypted_segment))
 }
 

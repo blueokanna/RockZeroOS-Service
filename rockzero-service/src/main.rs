@@ -747,10 +747,12 @@ async fn main() -> std::io::Result<()> {
                             .route("/sae/complete", web::post().to(handlers::secure_hls::complete_sae_handshake))
                             .route("/session/create", web::post().to(handlers::secure_hls::create_hls_session)),
                     )
-                    // 安全 HLS 播放列表和分片（不需要 JWT，使用 session_id 授权）
+                    // 安全 HLS 播放列表和分片（使用 session_id 授权）
+                    // 生产级安全：视频段必须使用 POST + ZKP 证明
                     .service(
                         web::scope("/secure-hls")
                             .route("/{session_id}/playlist.m3u8", web::get().to(handlers::secure_hls::get_secure_playlist))
+                            // 视频段只允许 POST 请求（必须包含 ZKP 证明）
                             .route("/{session_id}/{segment}", web::post().to(handlers::secure_hls::get_secure_segment)),
                     )
                     .service(
