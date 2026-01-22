@@ -298,7 +298,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(encrypted.data.len() > 0);
+        assert!(!encrypted.data.is_empty());
         assert!(encrypted.zkp_proof.is_some());
 
         let decrypted = transport.decrypt_chunk(&encrypted).await.unwrap();

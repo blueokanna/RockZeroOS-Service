@@ -246,6 +246,38 @@ impl SaeServer {
     pub fn is_authenticated(&self) -> bool {
         self.state == SaeServerState::Accepted
     }
+
+    /// 获取服务器的 Confirm 消息
+    /// 
+    /// 只有在 process_client_commit 之后才能调用
+    pub fn get_server_confirm(&self) -> Result<SaeConfirm> {
+        if self.state != SaeServerState::Confirmed && self.state != SaeServerState::Accepted {
+            return Err(SaeError::InvalidState(format!(
+                "Cannot get server confirm in state {:?}",
+                self.state
+            )));
+        }
+
+        let kck = self.kck.ok_or_else(|| SaeError::InvalidState("KCK not derived yet".to_string()))?;
+        let scalar = self.scalar.ok_or_else(|| SaeError::InvalidState("Scalar not set".to_string()))?;
+        let peer_scalar = self.peer_scalar.ok_or_else(|| SaeError::InvalidState("Peer scalar not set".to_string()))?;
+        let element = self.element.ok_or_else(|| SaeError::InvalidState("Element not set".to_string()))?;
+        let peer_element = self.peer_element.ok_or_else(|| SaeError::InvalidState("Peer element not set".to_string()))?;
+
+        let confirm = compute_confirm(
+            &kck,
+            self.send_confirm,
+            &scalar,
+            &peer_scalar,
+            &element,
+            &peer_element,
+        )?;
+
+        Ok(SaeConfirm {
+            send_confirm: self.send_confirm,
+            confirm,
+        })
+    }
 }
 
 #[cfg(test)]

@@ -163,7 +163,7 @@ pub fn compute_pmk(
     // 3. 计算 K = local_rand * temp
     let shared_secret = local_rand * temp;
     
-    // 4. 将共享密钥点转换为字节（使用 x 坐标）
+    // 4. 将共享密钥点转换为字节（使用压缩格式）
     let k_bytes = shared_secret.compress().to_bytes();
     
     Ok(k_bytes)

@@ -132,21 +132,29 @@ impl SaeClient {
         self.peer_scalar = Some(peer_scalar);
         self.peer_element = Some(peer_element);
 
-        // 计算 PMK
+        // 计算共享密钥（使用 rand 而不是 scalar）
         let pwd_element = password_to_element(&self.password, &self.mac_self, &self.mac_peer)?;
-        let pmk = compute_pmk(
-            self.scalar.as_ref().unwrap(),
-            self.element.as_ref().unwrap(),
+        let shared_secret = compute_pmk(
+            self.rand.as_ref().unwrap(),
             &peer_scalar,
             &peer_element,
             &pwd_element,
+        )?;
+
+        // 派生 KCK 和 PMK
+        let (kck, pmk) = derive_kck_pmk(
+            &shared_secret,
+            self.scalar.as_ref().unwrap(),
+            &peer_scalar,
+            self.element.as_ref().unwrap(),
+            &peer_element,
         )?;
 
         self.pmk = Some(pmk);
 
         // 计算确认值
         let confirm = compute_confirm(
-            &pmk,
+            &kck,
             self.send_confirm,
             self.scalar.as_ref().unwrap(),
             &peer_scalar,
@@ -267,20 +275,28 @@ impl SaeServer {
         self.scalar = Some(scalar);
         self.element = Some(element);
 
-        // 计算 PMK
-        let pmk = compute_pmk(
-            &scalar,
-            &element,
+        // 计算共享密钥（使用 rand 而不是 scalar）
+        let shared_secret = compute_pmk(
+            &rand,
             &peer_scalar,
             &peer_element,
             &pwd_element,
+        )?;
+
+        // 派生 KCK 和 PMK
+        let (kck, pmk) = derive_kck_pmk(
+            &shared_secret,
+            &scalar,
+            &peer_scalar,
+            &element,
+            &peer_element,
         )?;
 
         self.pmk = Some(pmk);
 
         // 生成确认值
         let confirm = compute_confirm(
-            &pmk,
+            &kck,
             self.send_confirm,
             &scalar,
             &peer_scalar,

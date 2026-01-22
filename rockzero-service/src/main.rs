@@ -746,6 +746,8 @@ async fn main() -> std::io::Result<()> {
                                 web::scope("/sae")
                                     .wrap(middleware::JwtAuth)
                                     .route("/init", web::post().to(handlers::secure_hls::init_sae_handshake))
+                                    .route("/commit", web::post().to(handlers::secure_hls::send_client_commit))
+                                    .route("/confirm", web::post().to(handlers::secure_hls::send_client_confirm))
                                     .route("/complete", web::post().to(handlers::secure_hls::complete_sae_handshake))
                             )
                             .service(

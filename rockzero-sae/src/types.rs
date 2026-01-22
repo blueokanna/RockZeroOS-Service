@@ -35,7 +35,7 @@ impl Serialize for SaeCommit {
         
         let mut state = serializer.serialize_struct("SaeCommit", 3)?;
         state.serialize_field("group_id", &self.group_id)?;
-        state.serialize_field("scalar", &BASE64.encode(&self.scalar))?;
+        state.serialize_field("scalar", &BASE64.encode(self.scalar))?;
         state.serialize_field("element", &BASE64.encode(&self.element))?;
         state.end()
     }
@@ -146,7 +146,7 @@ impl Serialize for SaeConfirm {
         
         let mut state = serializer.serialize_struct("SaeConfirm", 2)?;
         state.serialize_field("send_confirm", &self.send_confirm)?;
-        state.serialize_field("confirm", &BASE64.encode(&self.confirm))?;
+        state.serialize_field("confirm", &BASE64.encode(self.confirm))?;
         state.end()
     }
 }

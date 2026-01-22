@@ -202,7 +202,98 @@ pub async fn init_sae_handshake(
     })))
 }
 
-/// 步骤 2: 完成 SAE 握手
+/// 步骤 2A: 发送客户端 Commit
+///
+/// 客户端发送 commit，服务器返回 server commit
+#[derive(Debug, Deserialize)]
+pub struct SendClientCommitRequest {
+    pub temp_session_id: String,
+    pub client_commit: SaeCommit,
+}
+
+pub async fn send_client_commit(
+    _pool: web::Data<SqlitePool>,
+    hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
+    body: web::Json<SendClientCommitRequest>,
+) -> Result<impl Responder, AppError> {
+    let user_id = claims.sub.clone();
+
+    // 获取 SAE 服务器实例并处理客户端 commit
+    let server_commit = {
+        let manager = hls_manager.read().await;
+        let mut servers = manager.sae_servers.lock().unwrap();
+        let sae_server = servers
+            .get_mut(&body.temp_session_id)
+            .ok_or_else(|| AppError::NotFound("SAE session not found".to_string()))?;
+
+        // 处理客户端的 commit 并生成服务器的 commit
+        let (server_commit, _server_confirm) = sae_server
+            .process_client_commit(&body.client_commit)
+            .map_err(|e| AppError::CryptoError(format!("SAE commit failed: {}", e)))?;
+
+        server_commit
+    };
+
+    info!(
+        "Processed client commit for user {} - temp session {}",
+        user_id, body.temp_session_id
+    );
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "server_commit": server_commit,
+        "message": "Server commit generated, send client confirm next"
+    })))
+}
+
+/// 步骤 2B: 发送客户端 Confirm
+///
+/// 客户端发送 confirm，服务器验证并返回 server confirm
+#[derive(Debug, Deserialize)]
+pub struct SendClientConfirmRequest {
+    pub temp_session_id: String,
+    pub client_confirm: SaeConfirm,
+}
+
+pub async fn send_client_confirm(
+    _pool: web::Data<SqlitePool>,
+    hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
+    body: web::Json<SendClientConfirmRequest>,
+) -> Result<impl Responder, AppError> {
+    let user_id = claims.sub.clone();
+
+    // 获取 SAE 服务器实例并验证客户端 confirm
+    let server_confirm = {
+        let manager = hls_manager.read().await;
+        let mut servers = manager.sae_servers.lock().unwrap();
+        let sae_server = servers
+            .get_mut(&body.temp_session_id)
+            .ok_or_else(|| AppError::NotFound("SAE session not found".to_string()))?;
+
+        // 验证客户端的 confirm
+        sae_server
+            .verify_client_confirm(&body.client_confirm)
+            .map_err(|e| AppError::CryptoError(format!("SAE confirm failed: {}", e)))?;
+
+        // 获取服务器的 confirm
+        sae_server
+            .get_server_confirm()
+            .map_err(|e| AppError::CryptoError(format!("Failed to get server confirm: {}", e)))?
+    };
+
+    info!(
+        "Verified client confirm for user {} - temp session {}",
+        user_id, body.temp_session_id
+    );
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "server_confirm": server_confirm,
+        "message": "SAE handshake completed, call create_session next"
+    })))
+}
+
+/// 步骤 2 (旧版): 完成 SAE 握手
 ///
 /// 客户端发送 commit 和 confirm，服务器验证并返回 server confirm
 pub async fn complete_sae_handshake(
