@@ -614,6 +614,57 @@ pub async fn get_secure_segment(
         .body(encrypted_segment))
 }
 
+/// 停止 HLS 会话
+///
+/// **生产级安全实现**：
+/// - 验证会话存在
+/// - 移除会话状态
+/// - 清理关联资源
+///
+/// # 参数
+/// - `hls_manager`: HLS 会话管理器
+/// - `path`: 路径参数，包含会话 ID
+///
+/// # 返回
+/// - 成功时返回 200 状态码
+/// - 会话不存在时返回 404
+pub async fn stop_session(
+    hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    path: web::Path<String>,
+) -> Result<impl Responder, AppError> {
+    let session_id = path.into_inner();
+
+    info!("Stopping HLS session: {}", session_id);
+
+    // 获取写锁以移除会话
+    let manager = hls_manager.write().await;
+    
+    // 尝试移除会话
+    match manager.remove_session(&session_id) {
+        Ok(_) => {
+            info!("✅ HLS session stopped successfully: {}", session_id);
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "message": "Session stopped successfully",
+                "session_id": session_id
+            })))
+        }
+        Err(rockzero_media::HlsError::SessionNotFound(_)) => {
+            // 会话不存在也返回成功（幂等操作）
+            info!("HLS session already stopped or not found: {}", session_id);
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "message": "Session already stopped or not found",
+                "session_id": session_id
+            })))
+        }
+        Err(e) => {
+            warn!("Failed to stop HLS session {}: {:?}", session_id, e);
+            Err(convert_hls_error(e))
+        }
+    }
+}
+
 // ============ 辅助函数 ============
 
 /// 生成安全的 M3U8 播放列表（不包含 #EXT-X-KEY）

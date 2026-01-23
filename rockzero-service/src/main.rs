@@ -758,6 +758,8 @@ async fn main() -> std::io::Result<()> {
                             // 安全 HLS 播放列表和分片（使用 session_id 授权）
                             // 生产级安全：视频段必须使用 POST + ZKP 证明
                             .route("/{session_id}/playlist.m3u8", web::get().to(handlers::secure_hls::get_secure_playlist))
+                            // 停止 HLS 会话（需要 JWT 认证）
+                            .route("/{session_id}/stop", web::post().to(handlers::secure_hls::stop_session))
                             // 视频段只允许 POST 请求（必须包含 ZKP 证明）
                             .route("/{session_id}/{segment}", web::post().to(handlers::secure_hls::get_secure_segment))
                     )
