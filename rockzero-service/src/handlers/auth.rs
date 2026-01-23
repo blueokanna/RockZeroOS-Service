@@ -286,6 +286,19 @@ fn derive_key_with_salt(password: &[u8], salt: &[u8]) -> Vec<u8> {
     result
 }
 
+/// 计算 SAE 共享密钥：SHA3-256(password)
+/// 
+/// 这个值与 Flutter 客户端的 _hashPassword 函数保持一致
+/// Flutter 端使用：hashlib.sha3_256.convert(utf8.encode(password)).toString()
+pub fn compute_sae_secret(password: &str) -> String {
+    use sha3::{Sha3_256, Digest};
+    
+    let mut hasher = Sha3_256::new();
+    hasher.update(password.as_bytes());
+    let result = hasher.finalize();
+    hex::encode(result)
+}
+
 fn generate_token_id() -> Result<String, AppError> {
     let mut bytes = [0u8; 16];
     getrandom::getrandom(&mut bytes)
@@ -498,6 +511,10 @@ pub async fn register(
     let password_handler = SecurePasswordHandler::new();
     let credentials = password_handler.create_password_credentials(&body.password)?;
 
+    // 计算 SAE 共享密钥：SHA-256(password)
+    // 这个值与 Flutter 客户端的 _hashPassword 函数保持一致
+    let sae_secret = compute_sae_secret(&body.password);
+
     // 序列化完整的 ZKP registration（包含 commitment 和 salt）
     let zkp_registration_json =
         serde_json::to_string(&credentials.zkp_registration).map_err(|e| {
@@ -510,6 +527,7 @@ pub async fn register(
         username,
         email,
         &credentials.password_hash,
+        Some(&sae_secret),
         Some(&zkp_registration_json),
         role, // Use the determined role (admin for first user, user for others)
     )

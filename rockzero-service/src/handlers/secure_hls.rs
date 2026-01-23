@@ -175,14 +175,25 @@ pub async fn init_sae_handshake(
         user_id, file_path
     );
 
-    // 从数据库获取用户的密码哈希（用于 SAE）
+    // 从数据库获取用户的 SAE 密钥（SHA-256 hash of password）
     let user = crate::db::find_user_by_id(&pool, &user_id)
         .await?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    // 使用用户密码哈希作为 SAE 的共享密钥
-    // 注意：这里使用密码哈希而不是明文密码
-    let password = user.password_hash.as_bytes().to_vec();
+    // 使用用户的 SAE 共享密钥（SHA-256 hash of password）
+    // 这与 Flutter 客户端的 _hashPassword 函数计算结果一致
+    let password = match &user.sae_secret {
+        Some(secret) => secret.as_bytes().to_vec(),
+        None => {
+            // 兼容旧用户：如果没有 sae_secret，使用 password_hash（会导致握手失败）
+            // 建议用户重新登录以更新 sae_secret
+            tracing::warn!(
+                "User {} does not have sae_secret, SAE handshake may fail. Please re-register.",
+                user_id
+            );
+            user.password_hash.as_bytes().to_vec()
+        }
+    };
 
     // 初始化 SAE 握手
     let manager = hls_manager.read().await;
@@ -710,22 +721,20 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
 
 /// 视频段缓存目录配置
 ///
-/// 在生产环境中，这应该从配置文件读取
+/// 与 StorageConfig 使用相同的环境变量配置，确保清理任务能正确清理缓存。
+/// 
+/// 优先级:
+/// 1. `HLS_CACHE_PATH` 环境变量（与 StorageConfig 一致）
+/// 2. `ROCKZERO_HLS_CACHE_DIR` 环境变量（兼容旧配置）
+/// 3. 默认 `./data/hls_cache`（与 StorageConfig 默认值一致）
 fn get_hls_cache_dir() -> std::path::PathBuf {
-    // 优先使用环境变量，否则使用默认路径
-    std::env::var("ROCKZERO_HLS_CACHE_DIR")
+    // 优先使用 HLS_CACHE_PATH（与 StorageConfig 一致）
+    std::env::var("HLS_CACHE_PATH")
+        .or_else(|_| std::env::var("ROCKZERO_HLS_CACHE_DIR"))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
-            // 默认使用 /var/cache/rockzero/hls（Linux）
-            // 或 temp 目录下的 rockzero-hls
-            #[cfg(target_os = "linux")]
-            {
-                std::path::PathBuf::from("/var/cache/rockzero/hls")
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                std::env::temp_dir().join("rockzero-hls")
-            }
+            // 默认使用 ./data/hls_cache（与 StorageConfig 默认值一致）
+            std::path::PathBuf::from("./data/hls_cache")
         })
 }
 

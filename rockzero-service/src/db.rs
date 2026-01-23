@@ -9,6 +9,9 @@ pub struct User {
     pub username: String,
     pub email: String,
     pub password_hash: String,
+    /// SHA-256 hash of the plaintext password, used for SAE handshake
+    /// This is stored separately from password_hash (which is bcrypt/argon2)
+    pub sae_secret: Option<String>,
     pub zkp_registration: Option<String>,
     pub role: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -25,6 +28,7 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<(), AppError> {
             username TEXT UNIQUE NOT NULL,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
+            sae_secret TEXT,
             zkp_registration TEXT,
             role TEXT NOT NULL DEFAULT 'user',
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -135,6 +139,12 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<(), AppError> {
     .await
     .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
+    // 数据库迁移：为旧表添加 sae_secret 列（如果不存在）
+    // SQLite 不支持 IF NOT EXISTS 语法用于 ADD COLUMN，所以我们需要先检查
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN sae_secret TEXT")
+        .execute(pool)
+        .await; // 忽略错误（列可能已存在）
+
     Ok(())
 }
 
@@ -144,6 +154,7 @@ pub async fn create_user(
     username: &str,
     email: &str,
     password_hash: &str,
+    sae_secret: Option<&str>,
     zkp_registration: Option<&str>,
     role: &str,
 ) -> Result<User, AppError> {
@@ -152,14 +163,15 @@ pub async fn create_user(
 
     sqlx::query(
         r#"
-        INSERT INTO users (id, username, email, password_hash, zkp_registration, role, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO users (id, username, email, password_hash, sae_secret, zkp_registration, role, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&id)
     .bind(username)
     .bind(email)
     .bind(password_hash)
+    .bind(sae_secret)
     .bind(zkp_registration)
     .bind(role)
     .bind(now)
@@ -179,6 +191,7 @@ pub async fn create_user(
         username: username.to_string(),
         email: email.to_string(),
         password_hash: password_hash.to_string(),
+        sae_secret: sae_secret.map(|s| s.to_string()),
         zkp_registration: zkp_registration.map(|s| s.to_string()),
         role: role.to_string(),
         created_at: now,
@@ -190,7 +203,7 @@ pub async fn create_user(
 pub async fn find_user_by_id(pool: &SqlitePool, user_id: &str) -> Result<Option<User>, AppError> {
     let row = sqlx::query(
         r#"
-        SELECT id, username, email, password_hash, zkp_registration, role, 
+        SELECT id, username, email, password_hash, sae_secret, zkp_registration, role, 
                created_at, updated_at
         FROM users WHERE id = ?
         "#,
@@ -207,6 +220,7 @@ pub async fn find_user_by_id(pool: &SqlitePool, user_id: &str) -> Result<Option<
                 username: r.try_get("username").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 email: r.try_get("email").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 password_hash: r.try_get("password_hash").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                sae_secret: r.try_get("sae_secret").ok(),
                 zkp_registration: r.try_get("zkp_registration").ok(),
                 role: r.try_get("role").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 created_at: r.try_get("created_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
@@ -222,7 +236,7 @@ pub async fn find_user_by_id(pool: &SqlitePool, user_id: &str) -> Result<Option<
 pub async fn find_user_by_username(pool: &SqlitePool, username: &str) -> Result<Option<User>, AppError> {
     let row = sqlx::query(
         r#"
-        SELECT id, username, email, password_hash, zkp_registration, role,
+        SELECT id, username, email, password_hash, sae_secret, zkp_registration, role,
                created_at, updated_at
         FROM users WHERE username = ?
         "#,
@@ -239,6 +253,7 @@ pub async fn find_user_by_username(pool: &SqlitePool, username: &str) -> Result<
                 username: r.try_get("username").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 email: r.try_get("email").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 password_hash: r.try_get("password_hash").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                sae_secret: r.try_get("sae_secret").ok(),
                 zkp_registration: r.try_get("zkp_registration").ok(),
                 role: r.try_get("role").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 created_at: r.try_get("created_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
@@ -254,7 +269,7 @@ pub async fn find_user_by_username(pool: &SqlitePool, username: &str) -> Result<
 pub async fn find_user_by_email(pool: &SqlitePool, email: &str) -> Result<Option<User>, AppError> {
     let row = sqlx::query(
         r#"
-        SELECT id, username, email, password_hash, zkp_registration, role,
+        SELECT id, username, email, password_hash, sae_secret, zkp_registration, role,
                created_at, updated_at
         FROM users WHERE email = ?
         "#,
@@ -271,6 +286,7 @@ pub async fn find_user_by_email(pool: &SqlitePool, email: &str) -> Result<Option
                 username: r.try_get("username").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 email: r.try_get("email").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 password_hash: r.try_get("password_hash").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                sae_secret: r.try_get("sae_secret").ok(),
                 zkp_registration: r.try_get("zkp_registration").ok(),
                 role: r.try_get("role").map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 created_at: r.try_get("created_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,

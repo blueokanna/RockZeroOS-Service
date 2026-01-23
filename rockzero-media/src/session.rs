@@ -265,6 +265,10 @@ impl HlsSessionManager {
         })
     }
 
+    /// 移除会话
+    /// 
+    /// 注意：此方法仅移除内存中的会话状态。
+    /// 要同时清理 HLS 缓存文件，请使用 `remove_session_with_cleanup`。
     pub fn remove_session(&self, session_id: &str) -> Result<()> {
         let mut sessions = self.sessions.lock().unwrap();
         sessions
@@ -273,9 +277,83 @@ impl HlsSessionManager {
         Ok(())
     }
 
+    /// 移除会话并清理关联的 HLS 缓存文件
+    /// 
+    /// # 参数
+    /// - `session_id`: 要移除的会话ID
+    /// - `hls_cache_dir`: HLS 缓存根目录路径
+    /// 
+    /// 该方法会：
+    /// 1. 移除内存中的会话状态
+    /// 2. 根据视频文件路径计算缓存目录
+    /// 3. 删除对应的缓存目录及其内容
+    pub fn remove_session_with_cleanup(
+        &self,
+        session_id: &str,
+        hls_cache_dir: &std::path::Path,
+    ) -> Result<Option<std::path::PathBuf>> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions
+            .remove(session_id)
+            .ok_or_else(|| HlsError::SessionNotFound(session_id.to_string()))?;
+        
+        // 计算视频文件对应的缓存目录
+        let video_hash = blake3::hash(session.file_path.as_bytes());
+        let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+        let cache_dir = hls_cache_dir.join(&video_id);
+        
+        // 异步删除缓存目录（返回路径供调用者处理）
+        if cache_dir.exists() {
+            return Ok(Some(cache_dir));
+        }
+        
+        Ok(None)
+    }
+
+    /// 清理过期会话
+    /// 
+    /// 注意：此方法仅清理内存中的过期会话。
+    /// 要同时清理 HLS 缓存文件，请使用 `cleanup_expired_sessions_with_cache`。
     pub fn cleanup_expired_sessions(&self) {
         let mut sessions = self.sessions.lock().unwrap();
         sessions.retain(|_, session| !session.is_expired());
+    }
+
+    /// 清理过期会话并返回需要清理的缓存目录列表
+    /// 
+    /// # 参数
+    /// - `hls_cache_dir`: HLS 缓存根目录路径
+    /// 
+    /// # 返回
+    /// 返回需要删除的缓存目录列表，调用者应异步删除这些目录
+    pub fn cleanup_expired_sessions_with_cache(
+        &self,
+        hls_cache_dir: &std::path::Path,
+    ) -> Vec<std::path::PathBuf> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut cache_dirs_to_remove = Vec::new();
+        
+        // 找出所有过期的会话
+        let expired_sessions: Vec<_> = sessions
+            .iter()
+            .filter(|(_, session)| session.is_expired())
+            .map(|(id, session)| (id.clone(), session.file_path.clone()))
+            .collect();
+        
+        // 计算需要清理的缓存目录
+        for (session_id, file_path) in expired_sessions {
+            let video_hash = blake3::hash(file_path.as_bytes());
+            let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+            let cache_dir = hls_cache_dir.join(&video_id);
+            
+            if cache_dir.exists() {
+                cache_dirs_to_remove.push(cache_dir);
+            }
+            
+            sessions.remove(&session_id);
+        }
+        
+        cache_dirs_to_remove
     }
 
     pub fn session_count(&self) -> usize {

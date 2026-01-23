@@ -254,21 +254,97 @@ impl StorageManager {
             stats.log_size = size;
         }
 
+        // 统计视频存储目录
+        if let Ok(size) = get_directory_size(&self.config.video_storage_path).await {
+            stats.video_storage_size = size;
+        }
+
+        // 统计数据库大小（查找 data 目录下的 .db 文件）
+        let data_dir = std::path::PathBuf::from("./data");
+        if let Ok(size) = get_db_files_size(&data_dir).await {
+            stats.database_size = size;
+        }
+
+        // 计算 RockZeroOS 总占用
+        stats.total_app_usage = stats.hls_cache_size
+            + stats.temp_storage_size
+            + stats.log_size
+            + stats.video_storage_size
+            + stats.database_size;
+
         if let Ok(available) = get_available_space(&self.config.external_storage_path).await {
             stats.available_space = available;
         }
 
         stats
     }
+
+    /// 获取 HLS 缓存路径（供外部使用）
+    pub fn get_hls_cache_path(&self) -> &std::path::Path {
+        &self.config.hls_cache_path
+    }
+
+    /// 立即清理指定的 HLS 会话缓存
+    pub async fn cleanup_session_cache(&self, video_hash: &str) -> std::io::Result<u64> {
+        let cache_dir = self.config.hls_cache_path.join(video_hash);
+        if !cache_dir.exists() {
+            return Ok(0);
+        }
+
+        let size_before = get_directory_size(&cache_dir).await.unwrap_or(0);
+        fs::remove_dir_all(&cache_dir).await?;
+        
+        info!("🗑️ Cleaned up session cache: {} ({} bytes)", video_hash, size_before);
+        Ok(size_before)
+    }
 }
 
 /// 存储统计信息
+/// 
+/// 提供 RockZeroOS 应用专用的存储使用详情
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct StorageStats {
+    /// HLS 转码缓存大小
     pub hls_cache_size: u64,
+    /// 临时文件大小
     pub temp_storage_size: u64,
+    /// 日志文件大小
     pub log_size: u64,
+    /// 视频存储大小
+    pub video_storage_size: u64,
+    /// 数据库文件大小
+    pub database_size: u64,
+    /// RockZeroOS 应用总占用
+    pub total_app_usage: u64,
+    /// 外部存储可用空间
     pub available_space: u64,
+}
+
+/// 获取数据库文件大小
+async fn get_db_files_size(path: &std::path::Path) -> std::io::Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let mut total_size = 0u64;
+    let mut entries = fs::read_dir(path).await?;
+
+    while let Some(entry) = entries.next_entry().await? {
+        let metadata = entry.metadata().await?;
+        let file_name = entry.file_name();
+        let file_name_str = file_name.to_string_lossy();
+        
+        if metadata.is_file() {
+            // 统计所有数据库相关文件
+            if file_name_str.ends_with(".db") 
+                || file_name_str.ends_with(".db-shm")
+                || file_name_str.ends_with(".db-wal") {
+                total_size += metadata.len();
+            }
+        }
+    }
+
+    Ok(total_size)
 }
 
 /// 获取可用空间
