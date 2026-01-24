@@ -52,17 +52,23 @@ pub struct BoundStrengthProof {
 }
 
 /// Enhanced password proof for authentication
+/// 
+/// This is the complete, production-grade proof structure that includes:
+/// - Schnorr proof of password knowledge
+/// - Bulletproofs range proof for password entropy verification
+/// - Replay attack protection (timestamp + nonce)
+/// - Context binding
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnhancedPasswordProof {
     /// Schnorr proof of password knowledge
     pub schnorr_proof: SchnorrProof,
-    /// Proof that password has sufficient entropy
+    /// Bulletproofs range proof that password has sufficient entropy
     pub strength_proof: BoundStrengthProof,
     /// Timestamp to prevent delayed replay
     pub timestamp: i64,
     /// Unique nonce to prevent replay attacks
     pub nonce: String,
-    /// Context binding (e.g., "login", "register")
+    /// Context binding (e.g., "login", "register", "hls_segment_access")
     pub context: String,
 }
 

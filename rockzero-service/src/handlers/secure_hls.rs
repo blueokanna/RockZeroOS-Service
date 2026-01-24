@@ -9,8 +9,6 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-// ============ 辅助函数：错误转换 ============
-
 fn convert_hls_error(err: rockzero_media::HlsError) -> AppError {
     match err {
         rockzero_media::HlsError::SessionNotFound(msg) => AppError::NotFound(msg),
@@ -24,9 +22,6 @@ fn convert_hls_error(err: rockzero_media::HlsError) -> AppError {
     }
 }
 
-/// 安全地处理文件路径
-/// 
-/// 验证路径是否在允许的目录中，防止路径遍历攻击
 fn sanitize_file_path(path: &str) -> Result<std::path::PathBuf, AppError> {
     use std::path::PathBuf;
 
@@ -40,9 +35,7 @@ fn sanitize_file_path(path: &str) -> Result<std::path::PathBuf, AppError> {
     // 如果是绝对路径，直接验证
     if path_buf.is_absolute() {
         // 尝试规范化路径
-        let canonical = path_buf
-            .canonicalize()
-            .unwrap_or_else(|_| path_buf.clone());
+        let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
 
         // 验证路径是否在允许的目录中
         const ALLOWED_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
@@ -79,7 +72,6 @@ fn sanitize_file_path(path: &str) -> Result<std::path::PathBuf, AppError> {
     Ok(canonical)
 }
 
-/// 获取基础目录
 fn get_base_directory() -> Result<std::path::PathBuf, AppError> {
     use std::path::Path;
 
@@ -114,11 +106,9 @@ fn get_base_directory() -> Result<std::path::PathBuf, AppError> {
     }
 }
 
-// ============ 数据结构 ============
-
 #[derive(Debug, Deserialize)]
 pub struct InitSaeRequest {
-    pub file_id: Option<String>,  // 文件 ID（数据库中的）
+    pub file_id: Option<String>,   // 文件 ID（数据库中的）
     pub file_path: Option<String>, // 文件路径（文件系统中的）
 }
 
@@ -134,11 +124,6 @@ pub struct SecureSegmentRequest {
     pub zkp_proof: String, // Base64 编码的 ZKP 证明
 }
 
-// ============ SAE 握手处理 ============
-
-/// 步骤 1: 初始化 SAE 握手
-///
-/// 客户端调用此接口开始 SAE 握手流程
 pub async fn init_sae_handshake(
     pool: web::Data<SqlitePool>,
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
@@ -161,7 +146,10 @@ pub async fn init_sae_handshake(
             return Err(AppError::NotFound(format!("File not found: {}", path)));
         }
         if !sanitized_path.is_file() {
-            return Err(AppError::BadRequest(format!("Path is not a file: {}", path)));
+            return Err(AppError::BadRequest(format!(
+                "Path is not a file: {}",
+                path
+            )));
         }
         sanitized_path.to_string_lossy().to_string()
     } else {
@@ -180,13 +168,9 @@ pub async fn init_sae_handshake(
         .await?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    // 使用用户的 SAE 共享密钥（SHA-256 hash of password）
-    // 这与 Flutter 客户端的 _hashPassword 函数计算结果一致
     let password = match &user.sae_secret {
         Some(secret) => secret.as_bytes().to_vec(),
         None => {
-            // 兼容旧用户：如果没有 sae_secret，使用 password_hash（会导致握手失败）
-            // 建议用户重新登录以更新 sae_secret
             tracing::warn!(
                 "User {} does not have sae_secret, SAE handshake may fail. Please re-register.",
                 user_id
@@ -195,7 +179,6 @@ pub async fn init_sae_handshake(
         }
     };
 
-    // 初始化 SAE 握手
     let manager = hls_manager.read().await;
     let temp_session_id = manager
         .init_sae_handshake(user_id.clone(), password)
@@ -213,9 +196,6 @@ pub async fn init_sae_handshake(
     })))
 }
 
-/// 步骤 2A: 发送客户端 Commit
-///
-/// 客户端发送 commit，服务器返回 server commit
 #[derive(Debug, Deserialize)]
 pub struct SendClientCommitRequest {
     pub temp_session_id: String,
@@ -230,7 +210,6 @@ pub async fn send_client_commit(
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
 
-    // 获取 SAE 服务器实例并处理客户端 commit
     let server_commit = {
         let manager = hls_manager.read().await;
         let mut servers = manager.sae_servers.lock().unwrap();
@@ -238,7 +217,6 @@ pub async fn send_client_commit(
             .get_mut(&body.temp_session_id)
             .ok_or_else(|| AppError::NotFound("SAE session not found".to_string()))?;
 
-        // 处理客户端的 commit 并生成服务器的 commit
         let (server_commit, _server_confirm) = sae_server
             .process_client_commit(&body.client_commit)
             .map_err(|e| AppError::CryptoError(format!("SAE commit failed: {}", e)))?;
@@ -257,9 +235,6 @@ pub async fn send_client_commit(
     })))
 }
 
-/// 步骤 2B: 发送客户端 Confirm
-///
-/// 客户端发送 confirm，服务器验证并返回 server confirm
 #[derive(Debug, Deserialize)]
 pub struct SendClientConfirmRequest {
     pub temp_session_id: String,
@@ -274,7 +249,6 @@ pub async fn send_client_confirm(
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
 
-    // 获取 SAE 服务器实例并验证客户端 confirm
     let server_confirm = {
         let manager = hls_manager.read().await;
         let mut servers = manager.sae_servers.lock().unwrap();
@@ -282,12 +256,10 @@ pub async fn send_client_confirm(
             .get_mut(&body.temp_session_id)
             .ok_or_else(|| AppError::NotFound("SAE session not found".to_string()))?;
 
-        // 验证客户端的 confirm
         sae_server
             .verify_client_confirm(&body.client_confirm)
             .map_err(|e| AppError::CryptoError(format!("SAE confirm failed: {}", e)))?;
 
-        // 获取服务器的 confirm
         sae_server
             .get_server_confirm()
             .map_err(|e| AppError::CryptoError(format!("Failed to get server confirm: {}", e)))?
@@ -304,9 +276,6 @@ pub async fn send_client_confirm(
     })))
 }
 
-/// 步骤 2 (旧版): 完成 SAE 握手
-///
-/// 客户端发送 commit 和 confirm，服务器验证并返回 server confirm
 pub async fn complete_sae_handshake(
     _pool: web::Data<SqlitePool>,
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
@@ -315,7 +284,6 @@ pub async fn complete_sae_handshake(
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
 
-    // 获取 SAE 服务器实例并处理握手
     let (server_commit, server_confirm) = {
         let manager = hls_manager.read().await;
         let mut servers = manager.sae_servers.lock().unwrap();
@@ -323,12 +291,10 @@ pub async fn complete_sae_handshake(
             .get_mut(&body.temp_session_id)
             .ok_or_else(|| AppError::NotFound("SAE session not found".to_string()))?;
 
-        // 处理客户端的 commit 并生成服务器的 commit 和 confirm
         let (server_commit, server_confirm) = sae_server
             .process_client_commit(&body.client_commit)
             .map_err(|e| AppError::CryptoError(format!("SAE commit failed: {}", e)))?;
 
-        // 验证客户端的 confirm
         sae_server
             .verify_client_confirm(&body.client_confirm)
             .map_err(|e| AppError::CryptoError(format!("SAE confirm failed: {}", e)))?;
@@ -348,21 +314,11 @@ pub async fn complete_sae_handshake(
     })))
 }
 
-/// 步骤 3: 创建 HLS 会话
-///
-/// SAE 握手完成后，创建实际的 HLS 会话
-///
-/// # 安全流程
-/// 1. 验证用户身份（通过 JWT claims）
-/// 2. 验证文件访问权限
-/// 3. 获取用户的 ZKP 注册数据（用于后续的 ZKP 验证）
-/// 4. 完成 SAE 握手并创建会话
-/// 5. 将 ZKP 注册数据关联到会话
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
     pub temp_session_id: String,
-    pub file_id: Option<String>,      // 文件 ID（数据库中的）
-    pub file_path: Option<String>,    // 文件路径（文件系统中的）
+    pub file_id: Option<String>,   // 文件 ID（数据库中的）
+    pub file_path: Option<String>, // 文件路径（文件系统中的）
     pub zkp_registration: Option<String>,
 }
 
@@ -374,7 +330,6 @@ pub async fn create_hls_session(
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
 
-    // 1. 获取文件路径（支持文件 ID 或文件路径）
     let file_path = if let Some(ref file_id) = body.file_id {
         // 通过文件 ID 查找
         let file = crate::db::find_file_by_id(&pool, file_id, &user_id)
@@ -388,7 +343,10 @@ pub async fn create_hls_session(
             return Err(AppError::NotFound(format!("File not found: {}", path)));
         }
         if !sanitized_path.is_file() {
-            return Err(AppError::BadRequest(format!("Path is not a file: {}", path)));
+            return Err(AppError::BadRequest(format!(
+                "Path is not a file: {}",
+                path
+            )));
         }
         sanitized_path.to_string_lossy().to_string()
     } else {
@@ -402,15 +360,12 @@ pub async fn create_hls_session(
         user_id, file_path
     );
 
-    // 2. 获取用户的 ZKP 注册数据
     let zkp_registration: Option<PasswordRegistration> =
         if let Some(ref reg_json) = body.zkp_registration {
-            // 从请求中解析
             Some(serde_json::from_str(reg_json).map_err(|e| {
                 AppError::BadRequest(format!("Invalid ZKP registration format: {}", e))
             })?)
         } else {
-            // 从数据库获取用户的 ZKP 注册数据
             match get_user_zkp_registration(&pool, &user_id).await {
                 Ok(Some(reg)) => Some(reg),
                 Ok(None) => {
@@ -427,7 +382,6 @@ pub async fn create_hls_session(
             }
         };
 
-    // 3. 完成 SAE 握手并创建会话（带 ZKP 注册数据）
     let manager = hls_manager.read().await;
     let session_id = manager
         .complete_sae_handshake_with_registration(
@@ -438,12 +392,10 @@ pub async fn create_hls_session(
         )
         .map_err(convert_hls_error)?;
 
-    // 4. 获取会话信息
     let session = manager
         .get_session(&session_id)
         .map_err(convert_hls_error)?;
 
-    // 5. 记录日志
     let has_zkp = zkp_registration.is_some();
     info!(
         "Created HLS session {} for user {} - file {} (ZKP enabled: {})",
@@ -459,21 +411,17 @@ pub async fn create_hls_session(
     })))
 }
 
-/// 从数据库获取用户的 ZKP 注册数据
-///
-/// 从数据库中的 zkp_registration 字段读取用户的 ZKP 注册数据
 async fn get_user_zkp_registration(
     pool: &SqlitePool,
     user_id: &str,
 ) -> Result<Option<PasswordRegistration>, AppError> {
-    // 查询用户的 ZKP 注册数据
     let user = crate::db::find_user_by_id(pool, user_id).await?;
-    
+
     match user {
         Some(u) => {
             if let Some(zkp_reg_json) = u.zkp_registration {
-                let registration: PasswordRegistration =
-                    serde_json::from_str(&zkp_reg_json).map_err(|e| {
+                let registration: PasswordRegistration = serde_json::from_str(&zkp_reg_json)
+                    .map_err(|e| {
                         AppError::InternalServerError(format!(
                             "Invalid ZKP registration data in database: {}",
                             e
@@ -539,7 +487,6 @@ pub async fn get_secure_segment(
 ) -> Result<impl Responder, AppError> {
     let (session_id, segment_name) = path.into_inner();
 
-    // 1. 验证 HTTP 方法（生产环境必须是 POST）
     if req.method() != actix_web::http::Method::POST {
         warn!(
             "Invalid HTTP method for segment request: {} (expected POST)",
@@ -638,7 +585,7 @@ pub async fn stop_session(
 
     // 获取写锁以移除会话
     let manager = hls_manager.write().await;
-    
+
     // 尝试移除会话
     match manager.remove_session(&session_id) {
         Ok(_) => {
@@ -692,43 +639,52 @@ fn generate_secure_m3u8(segment_count: usize, segment_duration: f32) -> String {
     playlist
 }
 
-/// 验证客户端的 ZKP 证明
+/// 验证客户端的 Bulletproofs ZKP 证明
 ///
-/// 这是生产级实现，使用会话中存储的 PasswordRegistration 进行验证。
+/// **生产级安全实现**：使用 Bulletproofs 零知识证明验证
 ///
-/// # 安全性说明
-/// - 使用存储在会话中的 PasswordRegistration（在用户注册/登录时创建）
-/// - ZKP 证明验证确保客户端知道正确的密码，而不需要传输密码本身
-/// - 包含时间戳和 nonce 防止重放攻击
-/// - 上下文绑定防止证明在不同场景中被重用
+/// ## 验证流程
+/// 1. 解码 Base64 编码的证明
+/// 2. 解析为 EnhancedPasswordProof 结构
+/// 3. 验证上下文绑定（必须是 "hls_segment_access"）
+/// 4. 验证时间戳（防止延迟重放，5分钟有效期）
+/// 5. 使用 ZkpContext 验证 Schnorr 证明和范围证明
+///
+/// ## 安全特性
+/// - Schnorr 证明：验证客户端知道密码，不泄露密码本身
+/// - Schnorr 证明：验证密码知识
+/// - Bulletproofs 范围证明：密码熵值 >= 28 bits（密码学证明）
+/// - 时间戳 + nonce：防止重放攻击
+/// - 上下文绑定：防止跨上下文攻击
+///
+/// ## 证明类型
+/// - EnhancedPasswordProof: Schnorr 证明 + Bulletproofs 范围证明（完整版）
+///
+/// ## 要求
+/// - 会话必须包含 PasswordRegistration（用户注册时生成）
+/// - 客户端必须使用相同的密码生成证明
 ///
 fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, AppError> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
-    // 1. 检查会话是否有 ZKP 注册数据
-    let registration = session.get_zkp_registration().ok_or_else(|| {
-        AppError::CryptoError(
-            "Session does not have ZKP registration data. \
-             Ensure the session was created with PasswordRegistration."
-                .to_string(),
-        )
-    })?;
-
-    // 2. 解码 Base64 编码的证明
+    // 1. 解码 Base64 编码的证明
     let proof_bytes = BASE64.decode(proof_base64).map_err(|e| {
         AppError::BadRequest(format!("Invalid Base64 encoding in ZKP proof: {}", e))
     })?;
 
-    // 3. 解析 ZKP 证明结构
+    // 2. 解析为 EnhancedPasswordProof（完整的 Bulletproofs 证明）
     let proof: EnhancedPasswordProof = serde_json::from_slice(&proof_bytes).map_err(|e| {
         AppError::BadRequest(format!(
-            "Invalid ZKP proof structure: {}. Expected EnhancedPasswordProof JSON.",
+            "Invalid EnhancedPasswordProof structure: {}. \
+             Ensure the client is using the full Bulletproofs implementation.",
             e
         ))
     })?;
 
-    // 4. 验证上下文 - 确保证明是为视频段访问生成的
     const EXPECTED_CONTEXT: &str = "hls_segment_access";
+    const MAX_AGE_SECONDS: i64 = 300; // 5分钟有效期
+
+    // 3. 验证上下文
     if proof.context != EXPECTED_CONTEXT {
         warn!(
             "ZKP proof context mismatch: expected '{}', got '{}'",
@@ -737,21 +693,54 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
         return Ok(false);
     }
 
-    // 5. 创建 ZKP 上下文并验证证明
+    // 4. 验证时间戳（防止延迟重放）
+    let now = chrono::Utc::now().timestamp();
+    if now - proof.timestamp > MAX_AGE_SECONDS {
+        warn!(
+            "ZKP proof expired: timestamp={}, now={}, age={}s",
+            proof.timestamp,
+            now,
+            now - proof.timestamp
+        );
+        return Ok(false);
+    }
+
+    if proof.timestamp > now + 60 {
+        warn!(
+            "ZKP proof timestamp in future: timestamp={}, now={}",
+            proof.timestamp, now
+        );
+        return Ok(false);
+    }
+
+    // 5. 检查会话是否有 ZKP 注册数据
+    let registration = session.get_zkp_registration().ok_or_else(|| {
+        AppError::CryptoError(
+            "Session does not have ZKP registration data. \
+             User must complete registration with ZKP enabled."
+                .to_string(),
+        )
+    })?;
+
+    // 6. 使用 ZkpContext 验证完整的 Bulletproofs 证明
     let zkp_context = ZkpContext::new();
 
-    // 6. 验证增强证明
-    // - 300秒有效期（5分钟，适合流媒体场景）
-    // - 使用存储的 registration 验证 commitment 匹配
-    // - 验证 Schnorr 证明（知识证明）
-    // - 验证范围证明（密码强度证明）
-    // - 检查 nonce 防止重放
-    // - 检查时间戳防止延迟重放
-    match zkp_context.verify_enhanced_proof(&proof, registration, EXPECTED_CONTEXT, 300) {
+    info!(
+        "Verifying EnhancedPasswordProof (Bulletproofs) for session {}",
+        session.session_id
+    );
+
+    match zkp_context.verify_enhanced_proof(&proof, registration, EXPECTED_CONTEXT, MAX_AGE_SECONDS)
+    {
         Ok(valid) => {
-            if !valid {
+            if valid {
+                info!(
+                    "✅ Bulletproofs ZKP proof verified for session {}",
+                    session.session_id
+                );
+            } else {
                 warn!(
-                    "ZKP proof verification failed for session {} (mathematical verification failed)",
+                    "❌ Bulletproofs ZKP proof verification failed for session {}",
                     session.session_id
                 );
             }
@@ -759,11 +748,11 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
         }
         Err(e) => {
             warn!(
-                "ZKP proof verification error for session {}: {}",
+                "Bulletproofs ZKP proof verification error for session {}: {}",
                 session.session_id, e
             );
             Err(AppError::CryptoError(format!(
-                "ZKP verification failed: {}",
+                "Bulletproofs ZKP verification failed: {}",
                 e
             )))
         }
@@ -773,7 +762,7 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
 /// 视频段缓存目录配置
 ///
 /// 与 StorageConfig 使用相同的环境变量配置，确保清理任务能正确清理缓存。
-/// 
+///
 /// 优先级:
 /// 1. `HLS_CACHE_PATH` 环境变量（与 StorageConfig 一致）
 /// 2. `ROCKZERO_HLS_CACHE_DIR` 环境变量（兼容旧配置）
@@ -1053,8 +1042,7 @@ enum HardwareAccel {
 async fn detect_hardware_acceleration() -> HardwareAccel {
     use tokio::fs;
 
-    if fs::metadata("/dev/dri/renderD128").await.is_ok()
-        && check_ffmpeg_encoder("h264_vaapi").await
+    if fs::metadata("/dev/dri/renderD128").await.is_ok() && check_ffmpeg_encoder("h264_vaapi").await
     {
         return HardwareAccel::Vaapi;
     }
@@ -1101,7 +1089,7 @@ mod tests {
         assert!(playlist.contains("#EXTM3U"));
         assert!(playlist.contains("segment_0.ts"));
         assert!(playlist.contains("segment_4.ts"));
-        assert!(!playlist.contains("#EXT-X-KEY")); // 不应该包含密钥 URL
+        assert!(!playlist.contains("#EXT-X-KEY"));
         assert!(playlist.contains("AES-256-GCM"));
     }
 
@@ -1122,9 +1110,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hardware_acceleration_detection() {
-        // 测试硬件加速检测（不依赖实际硬件）
         let hw_accel = detect_hardware_acceleration().await;
-        // 应该返回某种类型（即使是 None）
         assert!(matches!(
             hw_accel,
             HardwareAccel::Vaapi | HardwareAccel::V4l2 | HardwareAccel::None

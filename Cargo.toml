@@ -7,6 +7,7 @@ members = [
     "rockzero-media",
     "rockzero-sae",
     "rockzero-service",
+    "rockzero-zkp-ffi",
 ]
 
 [workspace.package]
