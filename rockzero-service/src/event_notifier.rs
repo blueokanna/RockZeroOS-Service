@@ -11,7 +11,7 @@ use tracing::{info, warn};
 use serde::{Serialize, Deserialize};
 use sha3::{Sha3_256, Digest};
 
-/// 系统事件类型
+/// System event type
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SystemEventType {
     FileSystemChange,
@@ -27,7 +27,7 @@ pub enum SystemEventType {
     SecurityAlert,
 }
 
-/// 系统事件（带安全验证）
+/// System event (with security verification)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemEvent {
     pub event_type: SystemEventType,
@@ -362,7 +362,7 @@ impl EventNotifier {
     }
 }
 
-/// 全局事件通知器 (使用 OnceLock 确保线程安全)
+/// Global event notifier (using OnceLock for thread safety)
 static GLOBAL_NOTIFIER: OnceLock<Arc<EventNotifier>> = OnceLock::new();
 
 pub fn init_global_notifier(debounce_ms: u64) -> Arc<EventNotifier> {

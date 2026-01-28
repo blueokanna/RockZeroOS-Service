@@ -1,6 +1,7 @@
 use actix_web::{web, HttpResponse};
 use rockzero_common::AppError;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
 
@@ -132,4 +133,101 @@ pub struct StorageStatsResponse {
     /// 兼容旧接口
     #[serde(rename = "total_used_mb")]
     pub total_used_mb: f64,
+}
+
+/// 准确的磁盘使用情况请求
+#[derive(Debug, Deserialize)]
+pub struct AccurateDiskUsageRequest {
+    /// 挂载点路径
+    pub mount_point: String,
+}
+
+/// 准确的磁盘使用情况响应
+#[derive(Debug, Serialize)]
+pub struct AccurateDiskUsageResponse {
+    /// 总空间（字节）
+    pub total_space: u64,
+    /// 可用空间（字节）
+    pub available_space: u64,
+    /// 已使用空间（文件系统级别）
+    pub used_space: u64,
+    /// 缓存占用空间
+    pub cache_size: u64,
+    /// 实际用户数据（排除缓存）
+    pub actual_user_data: u64,
+    /// 使用百分比（基于实际用户数据）
+    pub usage_percentage: f64,
+    
+    // 格式化值
+    pub total_space_gb: f64,
+    pub available_space_gb: f64,
+    pub used_space_gb: f64,
+    pub cache_size_mb: f64,
+    pub actual_user_data_gb: f64,
+}
+
+/// 获取准确的磁盘使用情况（排除缓存）
+pub async fn get_accurate_disk_usage(
+    storage_manager: web::Data<Arc<StorageManager>>,
+    body: web::Json<AccurateDiskUsageRequest>,
+) -> Result<HttpResponse, AppError> {
+    let mount_point = PathBuf::from(&body.mount_point);
+    
+    if !mount_point.exists() {
+        return Err(AppError::NotFound(format!(
+            "挂载点不存在: {}",
+            body.mount_point
+        )));
+    }
+    
+    let usage = storage_manager
+        .get_accurate_disk_usage(&mount_point)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("获取磁盘使用情况失败: {}", e)))?;
+    
+    info!(
+        "📊 准确磁盘使用情况 - 挂载点: {}, 总空间: {:.2} GB, 已用: {:.2} GB, 缓存: {:.2} MB, 实际用户数据: {:.2} GB",
+        body.mount_point,
+        usage.total_space as f64 / 1024.0 / 1024.0 / 1024.0,
+        usage.used_space as f64 / 1024.0 / 1024.0 / 1024.0,
+        usage.cache_size as f64 / 1024.0 / 1024.0,
+        usage.actual_user_data as f64 / 1024.0 / 1024.0 / 1024.0
+    );
+    
+    Ok(HttpResponse::Ok().json(AccurateDiskUsageResponse {
+        total_space: usage.total_space,
+        available_space: usage.available_space,
+        used_space: usage.used_space,
+        cache_size: usage.cache_size,
+        actual_user_data: usage.actual_user_data,
+        usage_percentage: usage.usage_percentage,
+        total_space_gb: usage.total_space as f64 / 1024.0 / 1024.0 / 1024.0,
+        available_space_gb: usage.available_space as f64 / 1024.0 / 1024.0 / 1024.0,
+        used_space_gb: usage.used_space as f64 / 1024.0 / 1024.0 / 1024.0,
+        cache_size_mb: usage.cache_size as f64 / 1024.0 / 1024.0,
+        actual_user_data_gb: usage.actual_user_data as f64 / 1024.0 / 1024.0 / 1024.0,
+    }))
+}
+
+/// 强制清理所有缓存（格式化后调用）
+pub async fn force_cleanup_all_cache(
+    storage_manager: web::Data<Arc<StorageManager>>,
+) -> Result<HttpResponse, AppError> {
+    info!("🗑️ 强制清理所有缓存...");
+    
+    let cleaned_bytes = storage_manager
+        .force_cleanup_all_cache()
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("缓存清理失败: {}", e)))?;
+    
+    let cleaned_mb = cleaned_bytes as f64 / 1024.0 / 1024.0;
+    
+    info!("✅ 缓存清理完成，释放 {:.2} MB", cleaned_mb);
+    
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "message": format!("缓存清理完成，释放 {:.2} MB", cleaned_mb),
+        "cleaned_bytes": cleaned_bytes,
+        "cleaned_mb": cleaned_mb
+    })))
 }

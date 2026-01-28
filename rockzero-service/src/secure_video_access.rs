@@ -42,7 +42,7 @@ pub enum VideoPermission {
 }
 
 impl VideoAccessToken {
-    /// 创建新的访问令牌
+    /// Create a new access token
     pub fn new(
         user_id: String,
         file_path: PathBuf,
@@ -54,7 +54,7 @@ impl VideoAccessToken {
         let created_at = Instant::now();
         let expires_at = created_at + Duration::from_secs(ttl_seconds);
         
-        // 使用简化的密钥派生（基于密码和上下文）
+        // Simplified key derivation (based on password and context)
         let mut hasher = Sha3_256::new();
         hasher.update(password.as_bytes());
         hasher.update(user_id.as_bytes());
@@ -63,7 +63,7 @@ impl VideoAccessToken {
         let key_hash = hasher.finalize();
         let sae_key = key_hash.to_vec();
         
-        // 使用 ZkpContext 注册密码并生成 Bulletproofs 证明
+        // Use ZkpContext to register password and generate Bulletproofs proof
         let zkp_ctx = ZkpContext::new();
         let registration = zkp_ctx.register_password(password)
             .map_err(|e| format!("Password registration failed: {}", e))?;
@@ -72,7 +72,7 @@ impl VideoAccessToken {
         let proof = serde_json::to_vec(&enhanced_proof)
             .map_err(|e| format!("Proof serialization failed: {}", e))?;
         
-        // 生成签名
+        // Generate signature
         let mut hasher = Sha3_256::new();
         hasher.update(token_id.as_bytes());
         hasher.update(user_id.as_bytes());
@@ -94,15 +94,15 @@ impl VideoAccessToken {
         })
     }
     
-    /// 验证令牌
+    /// Verify the token
     pub fn verify(&self, password: &str) -> bool {
-        // 检查是否过期
+        // Check if expired
         if Instant::now() > self.expires_at {
             warn!("Token expired: {}", self.token_id);
             return false;
         }
         
-        // 验证密钥（使用相同的派生方法）
+        // Verify key (using same derivation method)
         let mut hasher = Sha3_256::new();
         hasher.update(password.as_bytes());
         hasher.update(self.user_id.as_bytes());
@@ -116,13 +116,13 @@ impl VideoAccessToken {
             return false;
         }
         
-        // 生成新的证明来验证密码是否正确
+        // Generate new proof to verify password correctness
         let zkp_ctx = ZkpContext::new();
         
-        // 尝试用给定密码生成证明 - 如果密码正确，会成功
+        // Try to generate proof with given password - succeeds if password is correct
         match zkp_ctx.generate_enhanced_proof(password, &self.registration, "video_access") {
             Ok(_) => {
-                // 密码正确，可以生成有效的证明
+                // Password correct, can generate valid proof
             }
             Err(e) => {
                 warn!("Password verification failed: {}", e);
@@ -130,7 +130,7 @@ impl VideoAccessToken {
             }
         }
         
-        // 验证签名
+        // Verify signature
         let mut hasher = Sha3_256::new();
         hasher.update(self.token_id.as_bytes());
         hasher.update(self.user_id.as_bytes());
@@ -146,22 +146,22 @@ impl VideoAccessToken {
         true
     }
     
-    /// 检查是否有特定权限
+    /// Check if has specific permission
     pub fn has_permission(&self, permission: &VideoPermission) -> bool {
         self.permissions.contains(permission)
     }
     
-    /// 检查是否可以访问特定文件
+    /// Check if can access specific file
     pub fn can_access_file(&self, file_path: &Path) -> bool {
         self.file_path == file_path
     }
 }
 
-/// 视频访问管理器
+/// Video access manager
 pub struct VideoAccessManager {
-    /// 活跃的访问令牌
+    /// Active access tokens
     tokens: Arc<RwLock<HashMap<String, VideoAccessToken>>>,
-    /// 用户的文件访问权限
+    /// User file access permissions
     user_permissions: Arc<RwLock<HashMap<String, Vec<PathBuf>>>>,
 }
 
@@ -173,7 +173,7 @@ impl VideoAccessManager {
         }
     }
     
-    /// 创建访问令牌
+    /// Create access token
     pub async fn create_token(
         &self,
         user_id: String,
@@ -182,12 +182,12 @@ impl VideoAccessManager {
         permissions: Vec<VideoPermission>,
         ttl_seconds: u64,
     ) -> Result<String, String> {
-        // 检查用户是否有权限访问该文件
+        // Check if user has permission to access the file
         if !self.check_user_permission(&user_id, &file_path).await {
             return Err("User does not have permission to access this file".to_string());
         }
         
-        // 创建令牌
+        // Create token
         let token = VideoAccessToken::new(
             user_id.clone(),
             file_path.clone(),
@@ -198,7 +198,7 @@ impl VideoAccessManager {
         
         let token_id = token.token_id.clone();
         
-        // 存储令牌
+        // Store token
         let mut tokens = self.tokens.write().await;
         tokens.insert(token_id.clone(), token);
         
@@ -208,7 +208,7 @@ impl VideoAccessManager {
         Ok(token_id)
     }
     
-    /// 验证访问令牌
+    /// Verify access token
     pub async fn verify_token(
         &self,
         token_id: &str,

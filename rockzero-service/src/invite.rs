@@ -129,7 +129,7 @@ pub async fn create_invite(
     let invite = manager.create_invite_code(&claims.sub)?;
     let remaining = manager.get_remaining_seconds(&invite)?;
     
-    // 返回前端期望的格式
+    // Return format expected by frontend
     Ok(HttpResponse::Ok().json(json!({
         "code": invite.code,
         "expires_in_seconds": remaining

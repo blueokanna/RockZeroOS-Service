@@ -1,5 +1,4 @@
-use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, TokenData, Validation};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -7,7 +6,7 @@ use tokio::sync::RwLock;
 
 use rockzero_common::{AppConfig, AppError, TokenResponse};
 use rockzero_crypto::{blake3_hash, constant_time_compare};
-use rockzero_crypto::{EnhancedPasswordProof, PasswordRegistration, ZkpContext};
+use rockzero_crypto::{EnhancedPasswordProof, JwtEncoder, PasswordRegistration, ZkpContext};
 
 const HASH_ITERATIONS: u32 = 100_000;
 const SALT_LENGTH: usize = 32;
@@ -19,6 +18,7 @@ pub struct Claims {
     pub sub: String,
     pub email: String,
     pub role: String,
+    #[serde(default)]
     pub token_type: String,
     pub exp: i64,
     pub iat: i64,
@@ -27,8 +27,8 @@ pub struct Claims {
 }
 
 pub struct JwtHandler {
-    encoding_key: EncodingKey,
-    decoding_key: DecodingKey,
+    access_encoder: JwtEncoder,
+    refresh_encoder: JwtEncoder,
     access_expiration_hours: i64,
     refresh_expiration_days: i64,
     revoked_tokens: Arc<RwLock<HashSet<String>>>,
@@ -36,9 +36,12 @@ pub struct JwtHandler {
 
 impl JwtHandler {
     pub fn new(config: &AppConfig) -> Self {
+        let access_secret = format!("{}-access", config.jwt_secret);
+        let refresh_secret = format!("{}-refresh", config.jwt_secret);
+
         Self {
-            encoding_key: EncodingKey::from_secret(config.jwt_secret.as_bytes()),
-            decoding_key: DecodingKey::from_secret(config.jwt_secret.as_bytes()),
+            access_encoder: JwtEncoder::from_password(&access_secret),
+            refresh_encoder: JwtEncoder::from_password(&refresh_secret),
             access_expiration_hours: config.jwt_expiration_hours,
             refresh_expiration_days: config.refresh_token_expiration_days,
             revoked_tokens: Arc::new(RwLock::new(HashSet::new())),
@@ -51,8 +54,6 @@ impl JwtHandler {
         email: &str,
         role: &str,
     ) -> Result<TokenResponse, AppError> {
-        let now = Utc::now();
-
         let access_jti = generate_token_id()?;
         let refresh_jti = generate_token_id()?;
 
@@ -61,24 +62,24 @@ impl JwtHandler {
             email: email.to_string(),
             role: role.to_string(),
             token_type: "access".to_string(),
-            exp: (now + Duration::hours(self.access_expiration_hours)).timestamp(),
-            iat: now.timestamp(),
+            exp: Utc::now().timestamp() + self.access_expiration_hours * 3600,
+            iat: Utc::now().timestamp(),
             jti: Some(access_jti),
         };
 
-        let access_token = encode(&Header::default(), &access_claims, &self.encoding_key)?;
+        let access_token = self.access_encoder.encode(&access_claims)?;
 
         let refresh_claims = Claims {
             sub: user_id.to_string(),
             email: email.to_string(),
             role: role.to_string(),
             token_type: "refresh".to_string(),
-            exp: (now + Duration::days(self.refresh_expiration_days)).timestamp(),
-            iat: now.timestamp(),
+            exp: Utc::now().timestamp() + self.refresh_expiration_days * 86400,
+            iat: Utc::now().timestamp(),
             jti: Some(refresh_jti),
         };
 
-        let refresh_token = encode(&Header::default(), &refresh_claims, &self.encoding_key)?;
+        let refresh_token = self.refresh_encoder.encode(&refresh_claims)?;
 
         Ok(TokenResponse {
             access_token,
@@ -89,57 +90,62 @@ impl JwtHandler {
     }
 
     pub async fn verify_access_token(&self, token: &str) -> Result<Claims, AppError> {
-        let token_data = self.decode_token(token)?;
+        let claims: Claims = self.access_encoder.decode(token)?;
 
-        if token_data.claims.token_type != "access" {
+        if claims.token_type != "access" {
             return Err(AppError::InvalidToken);
         }
 
-        if let Some(jti) = &token_data.claims.jti {
+        if claims.exp < Utc::now().timestamp() {
+            return Err(AppError::Unauthorized("Token expired".to_string()));
+        }
+
+        if let Some(jti) = &claims.jti {
             let revoked = self.revoked_tokens.read().await;
             if revoked.contains(jti) {
                 return Err(AppError::InvalidToken);
             }
         }
 
-        Ok(token_data.claims)
+        Ok(claims)
     }
 
-    /// Verify refresh token (used for token refresh endpoint)
-    #[allow(dead_code)]
     pub async fn verify_refresh_token(&self, token: &str) -> Result<Claims, AppError> {
-        let token_data = self.decode_token(token)?;
+        let claims: Claims = self.refresh_encoder.decode(token)?;
 
-        if token_data.claims.token_type != "refresh" {
+        if claims.token_type != "refresh" {
             return Err(AppError::InvalidToken);
         }
 
-        if let Some(jti) = &token_data.claims.jti {
+        if claims.exp < Utc::now().timestamp() {
+            return Err(AppError::Unauthorized("Token expired".to_string()));
+        }
+
+        if let Some(jti) = &claims.jti {
             let revoked = self.revoked_tokens.read().await;
             if revoked.contains(jti) {
                 return Err(AppError::InvalidToken);
             }
         }
 
-        Ok(token_data.claims)
+        Ok(claims)
     }
 
-    /// Revoke a token by its JTI (used for logout)
     #[allow(dead_code)]
     pub async fn revoke_token(&self, jti: &str) {
         let mut revoked = self.revoked_tokens.write().await;
         revoked.insert(jti.to_string());
     }
 
-    fn decode_token(&self, token: &str) -> Result<TokenData<Claims>, AppError> {
-        let validation = Validation::default();
-        decode::<Claims>(token, &self.decoding_key, &validation).map_err(|e| e.into())
-    }
-
     pub fn extract_token_from_header(auth_header: &str) -> Result<&str, AppError> {
         auth_header.strip_prefix("Bearer ").ok_or_else(|| {
             AppError::Unauthorized("Invalid authorization header format".to_string())
         })
+    }
+
+    #[allow(dead_code)]
+    pub fn get_access_public_key(&self) -> String {
+        self.access_encoder.get_public_key_base64()
     }
 }
 
@@ -157,7 +163,6 @@ impl SecurePasswordHandler {
         }
     }
 
-    /// Register a new password and return credentials for storage
     pub fn create_password_credentials(
         &self,
         password: &str,
@@ -175,7 +180,6 @@ impl SecurePasswordHandler {
         verify_password(password, stored_hash)
     }
 
-    /// Verify an enhanced ZKP proof against stored registration (used in tests)
     #[allow(dead_code)]
     pub async fn verify_enhanced_proof(
         &self,
@@ -208,7 +212,6 @@ impl SecurePasswordHandler {
         Ok(result)
     }
 
-    /// Generate an enhanced proof for authentication (used in tests)
     #[allow(dead_code)]
     pub fn generate_enhanced_proof(
         &self,
@@ -220,16 +223,13 @@ impl SecurePasswordHandler {
             .generate_enhanced_proof(password, registration, context)
     }
 
-    /// Derive encryption key from password (used in tests)
     #[allow(dead_code)]
     pub fn derive_encryption_key(&self, password: &str, context: &str) -> [u8; 32] {
         let password_bytes = password.as_bytes();
         let context_bytes = context.as_bytes();
-
         blake3_hash(&[password_bytes, context_bytes])
     }
 
-    /// Calculate password entropy (used for strength validation)
     #[allow(dead_code)]
     pub fn calculate_password_entropy(password: &str) -> u64 {
         ZkpContext::calculate_password_entropy(password)
@@ -286,13 +286,9 @@ fn derive_key_with_salt(password: &[u8], salt: &[u8]) -> Vec<u8> {
     result
 }
 
-/// 计算 SAE 共享密钥：SHA3-256(password)
-/// 
-/// 这个值与 Flutter 客户端的 _hashPassword 函数保持一致
-/// Flutter 端使用：hashlib.sha3_256.convert(utf8.encode(password)).toString()
 pub fn compute_sae_secret(password: &str) -> String {
-    use sha3::{Sha3_256, Digest};
-    
+    use sha3::{Digest, Sha3_256};
+
     let mut hasher = Sha3_256::new();
     hasher.update(password.as_bytes());
     let result = hasher.finalize();
@@ -330,7 +326,6 @@ mod tests {
             .verify_password(password, &credentials.password_hash)
             .unwrap());
 
-        // Test enhanced proof generation and verification
         let proof = handler
             .generate_enhanced_proof(password, &credentials.zkp_registration, "login")
             .unwrap();
@@ -350,7 +345,6 @@ mod tests {
 
         let credentials = handler.create_password_credentials(password).unwrap();
 
-        // Trying to generate a proof with wrong password should fail
         let result =
             handler.generate_enhanced_proof(wrong_password, &credentials.zkp_registration, "login");
         assert!(result.is_err());
@@ -368,9 +362,37 @@ mod tests {
         assert_eq!(key1, key3);
         assert_ne!(key1, key2);
     }
+
+    #[test]
+    fn test_jwt_eddsa() {
+        use base64::Engine;
+        
+        let config = AppConfig {
+            jwt_secret: "test-secret".to_string(),
+            jwt_expiration_hours: 24,
+            refresh_token_expiration_days: 7,
+            ..Default::default()
+        };
+
+        let handler = JwtHandler::new(&config);
+        let tokens = handler
+            .generate_tokens("user123", "test@example.com", "user")
+            .unwrap();
+
+        assert!(!tokens.access_token.is_empty());
+        assert!(!tokens.refresh_token.is_empty());
+
+        let parts: Vec<&str> = tokens.access_token.split('.').collect();
+        assert_eq!(parts.len(), 3);
+
+        let header_json =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&header_json).unwrap();
+        assert_eq!(header["alg"], "EdDSA");
+        assert_eq!(header["typ"], "JWT");
+    }
 }
 
-// HTTP Request/Response structures
 use actix_web::{web, HttpResponse, Responder};
 use sqlx::SqlitePool;
 
@@ -406,17 +428,14 @@ pub struct UserInfo {
     pub role: String,
 }
 
-/// Register a new user
 pub async fn register(
     pool: web::Data<SqlitePool>,
     body: web::Json<RegisterRequest>,
 ) -> Result<impl Responder, AppError> {
-    // 安全性：验证输入长度，防止过长输入导致的 DoS 攻击
     if body.username.len() > 50 || body.email.len() > 100 || body.password.len() > 128 {
         return Err(AppError::BadRequest("Input fields too long".to_string()));
     }
 
-    // 安全性：验证必填字段
     let username = body.username.trim();
     let email = body.email.trim();
 
@@ -424,7 +443,6 @@ pub async fn register(
         return Err(AppError::BadRequest("All fields are required".to_string()));
     }
 
-    // 安全性：验证用户名格式（只允许字母、数字、下划线、连字符）
     if !username
         .chars()
         .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
@@ -434,19 +452,16 @@ pub async fn register(
         ));
     }
 
-    // 安全性：验证邮箱格式
     if !email.contains('@') || !email.contains('.') || email.len() < 5 {
         return Err(AppError::BadRequest("Invalid email format".to_string()));
     }
 
-    // 安全性：强密码策略
     if body.password.len() < 8 {
         return Err(AppError::BadRequest(
             "Password must be at least 8 characters".to_string(),
         ));
     }
 
-    // 安全性：检查密码复杂度
     let has_uppercase = body.password.chars().any(|c| c.is_uppercase());
     let has_lowercase = body.password.chars().any(|c| c.is_lowercase());
     let has_digit = body.password.chars().any(|c| c.is_numeric());
@@ -457,14 +472,10 @@ pub async fn register(
         ));
     }
 
-    // Check if this is the first user (will be super admin)
     let user_count = crate::db::count_users(&pool).await?;
     let is_first_user = user_count == 0;
-
-    // Determine role: first user is admin, others are regular users
     let role = if is_first_user { "admin" } else { "user" };
 
-    // Non-first users MUST provide a valid invite code
     if !is_first_user {
         match &body.invite_code {
             None => {
@@ -480,7 +491,6 @@ pub async fn register(
                     ));
                 }
 
-                // Validate the invite code
                 let is_valid = crate::db::validate_invite_code(&pool, code).await?;
                 if !is_valid {
                     return Err(AppError::BadRequest(
@@ -488,20 +498,17 @@ pub async fn register(
                     ));
                 }
 
-                // Mark the invite code as used
                 crate::db::use_invite_code(&pool, code).await?;
             }
         }
     }
 
-    // 安全性：检查用户名是否已存在（防止用户枚举攻击，使用统一的错误消息）
     if (crate::db::find_user_by_username(&pool, username).await?).is_some() {
         return Err(AppError::BadRequest(
             "Username or email already exists".to_string(),
         ));
     }
 
-    // 安全性：检查邮箱是否已存在
     if (crate::db::find_user_by_email(&pool, email).await?).is_some() {
         return Err(AppError::BadRequest(
             "Username or email already exists".to_string(),
@@ -511,17 +518,13 @@ pub async fn register(
     let password_handler = SecurePasswordHandler::new();
     let credentials = password_handler.create_password_credentials(&body.password)?;
 
-    // 计算 SAE 共享密钥：SHA-256(password)
-    // 这个值与 Flutter 客户端的 _hashPassword 函数保持一致
     let sae_secret = compute_sae_secret(&body.password);
 
-    // 序列化完整的 ZKP registration（包含 commitment 和 salt）
     let zkp_registration_json =
         serde_json::to_string(&credentials.zkp_registration).map_err(|e| {
             AppError::InternalServerError(format!("Failed to serialize ZKP registration: {}", e))
         })?;
 
-    // 创建用户（zkp_registration 包含完整的 commitment + salt）
     let user = crate::db::create_user(
         &pool,
         username,
@@ -529,11 +532,10 @@ pub async fn register(
         &credentials.password_hash,
         Some(&sae_secret),
         Some(&zkp_registration_json),
-        role, // Use the determined role (admin for first user, user for others)
+        role,
     )
     .await?;
 
-    // 安全性：生成 JWT tokens（使用短期 access token 和长期 refresh token）
     let jwt_config = AppConfig::from_env();
     let jwt_handler = JwtHandler::new(&jwt_config);
     let tokens = jwt_handler.generate_tokens(&user.id, &user.email, &user.role)?;
@@ -551,36 +553,29 @@ pub async fn register(
     }))
 }
 
-/// Login with username and password
 pub async fn login(
     pool: web::Data<SqlitePool>,
     body: web::Json<LoginRequest>,
 ) -> Result<impl Responder, AppError> {
-    // 安全性：验证输入长度，防止过长输入
     if body.username.len() > 100 || body.password.len() > 128 {
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     }
 
     let username = body.username.trim();
 
-    // 安全性：查找用户（支持用户名或邮箱登录）
     let user = if username.contains('@') {
         crate::db::find_user_by_email(&pool, username).await?
     } else {
         crate::db::find_user_by_username(&pool, username).await?
     };
 
-    // 安全性：使用统一的错误消息，防止用户枚举攻击
     let user = user.ok_or_else(|| AppError::Unauthorized("Invalid credentials".to_string()))?;
 
-    // 安全性：验证密码（使用常量时间比较，防止时序攻击）
     let password_handler = SecurePasswordHandler::new();
     if !password_handler.verify_password(&body.password, &user.password_hash)? {
-        // 安全性：即使密码错误，也要执行相同的时间消耗，防止时序攻击
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     }
 
-    // 安全性：生成 JWT tokens
     let jwt_config = AppConfig::from_env();
     let jwt_handler = JwtHandler::new(&jwt_config);
     let tokens = jwt_handler.generate_tokens(&user.id, &user.email, &user.role)?;
@@ -598,13 +593,11 @@ pub async fn login(
     }))
 }
 
-/// Refresh token request
 #[derive(Debug, Deserialize)]
 pub struct RefreshTokenRequest {
     pub refresh_token: String,
 }
 
-/// Refresh access token using refresh token
 pub async fn refresh_token(
     pool: web::Data<SqlitePool>,
     body: web::Json<RefreshTokenRequest>,
@@ -612,23 +605,19 @@ pub async fn refresh_token(
     let jwt_config = AppConfig::from_env();
     let jwt_handler = JwtHandler::new(&jwt_config);
 
-    // Verify the refresh token
     let claims = jwt_handler
         .verify_refresh_token(&body.refresh_token)
         .await?;
 
-    // Find the user to ensure they still exist
     let user = crate::db::find_user_by_id(&pool, &claims.sub)
         .await?
         .ok_or_else(|| AppError::Unauthorized("User not found".to_string()))?;
 
-    // Generate new tokens
     let tokens = jwt_handler.generate_tokens(&user.id, &user.email, &user.role)?;
 
     Ok(HttpResponse::Ok().json(tokens))
 }
 
-/// Get current user info (requires authentication)
 pub async fn me(
     pool: web::Data<SqlitePool>,
     claims: web::ReqData<Claims>,

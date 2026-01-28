@@ -1,4 +1,4 @@
-//! SAE 协议实现
+//! SAE protocol implementation
 
 use curve25519_dalek::{edwards::{CompressedEdwardsY, EdwardsPoint}, scalar::Scalar};
 use serde::{Deserialize, Serialize};

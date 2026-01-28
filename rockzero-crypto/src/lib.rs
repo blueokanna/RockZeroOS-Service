@@ -1,13 +1,24 @@
 pub mod aes;
+pub mod bulletproofs_ffi;
 pub mod crypto;
+pub mod ed25519;
 pub mod hash;
+pub mod jwt;
 pub mod signature;
 pub mod tls;
 pub mod utils;
 pub mod zkp;
 
 pub use aes::{decrypt_aes256_gcm, encrypt_aes256_gcm};
+pub use bulletproofs_ffi::{
+    BulletproofsContext, BulletproofsRangeProof, BulletproofsVerifyResult, VideoStreamProof,
+};
+pub use ed25519::{Ed25519Context, Ed25519KeyPair, Ed25519Signature, SignedMessage};
 pub use hash::{blake3_hash, blake3_hash_single, sha3_256_hash, sha3_256_hash_multi};
+pub use jwt::{
+    derive_signing_key_from_password, signing_key_from_pem, signing_key_to_pem, JwtClaims,
+    JwtEncoder, JwtHeader, JwtVerifier, TokenManager, TokenPair,
+};
 pub use signature::{generate_keypair, sign, verify};
 pub use tls::{load_rustls_config, TlsConfig};
 pub use utils::{
@@ -15,7 +26,8 @@ pub use utils::{
     secure_random_hex, secure_zero, secure_zero_key,
 };
 pub use zkp::{
-    EnhancedPasswordProof, SchnorrProof, BoundStrengthProof, PasswordRegistration, ZkpContext,
+    BoundStrengthProof, EnhancedPasswordProof, PasswordRegistration, RangeProofData, SchnorrProof,
+    ZkpContext,
 };
 
 pub use rockzero_sae::{SaeClient, SaeCommit, SaeConfirm, SaeServer};

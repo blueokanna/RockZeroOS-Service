@@ -41,7 +41,9 @@ crc32fast = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
+lazy_static = { workspace = true }
 rand = { workspace = true }
+sha2 = { workspace = true }
 sha3 = { workspace = true }
 
 # Database

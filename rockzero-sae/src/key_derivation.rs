@@ -1,4 +1,4 @@
-//! 密钥派生 - 从 PMK 派生应用密钥（使用 SHA3-256）
+//! Key derivation - Derive application keys from PMK (using SHA3-256)
 
 use hkdf::Hkdf;
 use sha3::Sha3_256;

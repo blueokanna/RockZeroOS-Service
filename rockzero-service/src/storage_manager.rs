@@ -5,26 +5,26 @@ use tokio::time::{interval, Duration};
 use tracing::{info, warn, error};
 use serde::{Deserialize, Serialize};
 
-/// 存储空间配置
+/// Storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
-    /// 外部存储路径
+    /// External storage path
     pub external_storage_path: PathBuf,
-    /// 视频存储路径
+    /// Video storage path
     pub video_storage_path: PathBuf,
-    /// 临时文件路径
+    /// Temporary file path
     pub temp_storage_path: PathBuf,
-    /// HLS 缓存路径
+    /// HLS cache path
     pub hls_cache_path: PathBuf,
-    /// 日志路径
+    /// Log path
     pub log_path: PathBuf,
-    /// 最小可用空间（字节）
+    /// Minimum free space (bytes)
     pub min_free_space: u64,
-    /// HLS 缓存保留天数
+    /// HLS cache retention days
     pub hls_cache_retention_days: u64,
-    /// 临时文件保留天数
+    /// Temporary file retention days
     pub temp_file_retention_days: u64,
-    /// 日志文件保留天数
+    /// Log file retention days
     pub log_retention_days: u64,
 }
 
@@ -45,7 +45,7 @@ impl Default for StorageConfig {
 }
 
 impl StorageConfig {
-    /// 从环境变量加载配置
+    /// Load configuration from environment variables
     pub fn from_env() -> Self {
         Self {
             external_storage_path: std::env::var("EXTERNAL_STORAGE_PATH")
@@ -82,7 +82,7 @@ impl StorageConfig {
         }
     }
 
-    /// 初始化所有存储目录
+    /// Initialize all storage directories
     pub async fn init_directories(&self) -> std::io::Result<()> {
         let dirs = [
             &self.external_storage_path,
@@ -104,7 +104,9 @@ impl StorageConfig {
     }
 }
 
-/// 存储空间管理器
+/// Storage Manager
+/// 
+/// Provides accurate storage space calculation, excluding system cache and temporary files
 pub struct StorageManager {
     config: StorageConfig,
 }
@@ -114,11 +116,91 @@ impl StorageManager {
         Self { config }
     }
 
-    /// 启动后台清理任务
+    /// Get accurate disk usage (excluding cache)
+    /// 
+    /// This method calculates actual user data usage, excluding:
+    /// - HLS transcoding cache
+    /// - Temporary files
+    /// - System logs
+    pub async fn get_accurate_disk_usage(&self, mount_point: &std::path::Path) -> std::io::Result<AccurateDiskUsage> {
+        // Get filesystem-level statistics
+        let (total, available, used) = get_filesystem_stats(mount_point).await?;
+        
+        // Calculate RockZeroOS app cache space usage
+        let cache_size = self.get_total_cache_size().await;
+        
+        // Actual user data = used space - cache space
+        let actual_user_data = used.saturating_sub(cache_size);
+        
+        Ok(AccurateDiskUsage {
+            total_space: total,
+            available_space: available,
+            used_space: used,
+            cache_size,
+            actual_user_data,
+            usage_percentage: if total > 0 {
+                (actual_user_data as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            },
+        })
+    }
+
+    /// Get total size of all caches
+    async fn get_total_cache_size(&self) -> u64 {
+        let mut total = 0u64;
+        
+        // HLS cache
+        if let Ok(size) = get_directory_size(&self.config.hls_cache_path).await {
+            total += size;
+        }
+        
+        // Temporary files
+        if let Ok(size) = get_directory_size(&self.config.temp_storage_path).await {
+            total += size;
+        }
+        
+        // Log files
+        if let Ok(size) = get_directory_size(&self.config.log_path).await {
+            total += size;
+        }
+        
+        total
+    }
+
+    /// Force cleanup all caches (for use after formatting)
+    pub async fn force_cleanup_all_cache(&self) -> std::io::Result<u64> {
+        let mut total_cleaned = 0u64;
+        
+        // Clean HLS cache
+        if self.config.hls_cache_path.exists() {
+            if let Ok(size) = get_directory_size(&self.config.hls_cache_path).await {
+                total_cleaned += size;
+            }
+            fs::remove_dir_all(&self.config.hls_cache_path).await.ok();
+            fs::create_dir_all(&self.config.hls_cache_path).await.ok();
+            info!("🗑️ Cleaned HLS cache directory");
+        }
+        
+        // Clean temporary files
+        if self.config.temp_storage_path.exists() {
+            if let Ok(size) = get_directory_size(&self.config.temp_storage_path).await {
+                total_cleaned += size;
+            }
+            fs::remove_dir_all(&self.config.temp_storage_path).await.ok();
+            fs::create_dir_all(&self.config.temp_storage_path).await.ok();
+            info!("🗑️ Cleaned temp storage directory");
+        }
+        
+        info!("✅ Force cleanup completed: {} bytes freed", total_cleaned);
+        Ok(total_cleaned)
+    }
+
+    /// Start background cleanup tasks
     pub fn start_cleanup_tasks(self: std::sync::Arc<Self>) {
         let manager = self.clone();
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(3600)); // 每小时运行一次
+            let mut interval = interval(Duration::from_secs(3600)); // Run every hour
             loop {
                 interval.tick().await;
                 info!("🧹 Starting scheduled cleanup tasks...");
@@ -130,25 +212,25 @@ impl StorageManager {
         });
     }
 
-    /// 运行所有清理任务
+    /// Run all cleanup tasks
     pub async fn run_cleanup(&self) -> std::io::Result<()> {
-        // 1. 检查存储空间
+        // 1. Check storage space
         self.check_storage_space().await?;
 
-        // 2. 清理 HLS 缓存
+        // 2. Clean HLS cache
         self.cleanup_hls_cache().await?;
 
-        // 3. 清理临时文件
+        // 3. Clean temporary files
         self.cleanup_temp_files().await?;
 
-        // 4. 清理旧日志
+        // 4. Clean old logs
         self.cleanup_old_logs().await?;
 
         info!("✅ Cleanup tasks completed");
         Ok(())
     }
 
-    /// 检查存储空间
+    /// Check storage space
     pub async fn check_storage_space(&self) -> std::io::Result<()> {
         let paths = [
             ("External Storage", &self.config.external_storage_path),
@@ -186,7 +268,7 @@ impl StorageManager {
         Ok(())
     }
 
-    /// 清理 HLS 缓存
+    /// Clean HLS cache
     pub async fn cleanup_hls_cache(&self) -> std::io::Result<()> {
         let path = &self.config.hls_cache_path;
         if !path.exists() {
@@ -203,7 +285,7 @@ impl StorageManager {
         Ok(())
     }
 
-    /// 清理临时文件
+    /// Clean temporary files
     pub async fn cleanup_temp_files(&self) -> std::io::Result<()> {
         let path = &self.config.temp_storage_path;
         if !path.exists() {
@@ -220,7 +302,7 @@ impl StorageManager {
         Ok(())
     }
 
-    /// 清理旧日志
+    /// Clean old logs
     pub async fn cleanup_old_logs(&self) -> std::io::Result<()> {
         let path = &self.config.log_path;
         if !path.exists() {
@@ -237,11 +319,11 @@ impl StorageManager {
         Ok(())
     }
 
-    /// 获取存储统计信息
+    /// Get storage statistics
     pub async fn get_storage_stats(&self) -> StorageStats {
         let mut stats = StorageStats::default();
 
-        // 统计各个目录的使用情况
+        // Calculate usage for each directory
         if let Ok(size) = get_directory_size(&self.config.hls_cache_path).await {
             stats.hls_cache_size = size;
         }
@@ -254,18 +336,18 @@ impl StorageManager {
             stats.log_size = size;
         }
 
-        // 统计视频存储目录
+        // Calculate video storage directory
         if let Ok(size) = get_directory_size(&self.config.video_storage_path).await {
             stats.video_storage_size = size;
         }
 
-        // 统计数据库大小（查找 data 目录下的 .db 文件）
+        // Calculate database size (find .db files in data directory)
         let data_dir = std::path::PathBuf::from("./data");
         if let Ok(size) = get_db_files_size(&data_dir).await {
             stats.database_size = size;
         }
 
-        // 计算 RockZeroOS 总占用
+        // Calculate total RockZeroOS usage
         stats.total_app_usage = stats.hls_cache_size
             + stats.temp_storage_size
             + stats.log_size
@@ -279,12 +361,12 @@ impl StorageManager {
         stats
     }
 
-    /// 获取 HLS 缓存路径（供外部使用）
+    /// Get HLS cache path (for external use)
     pub fn get_hls_cache_path(&self) -> &std::path::Path {
         &self.config.hls_cache_path
     }
 
-    /// 立即清理指定的 HLS 会话缓存
+    /// Immediately clean up specified HLS session cache
     pub async fn cleanup_session_cache(&self, video_hash: &str) -> std::io::Result<u64> {
         let cache_dir = self.config.hls_cache_path.join(video_hash);
         if !cache_dir.exists() {
@@ -299,28 +381,96 @@ impl StorageManager {
     }
 }
 
-/// 存储统计信息
-/// 
-/// 提供 RockZeroOS 应用专用的存储使用详情
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct StorageStats {
-    /// HLS 转码缓存大小
     pub hls_cache_size: u64,
-    /// 临时文件大小
     pub temp_storage_size: u64,
-    /// 日志文件大小
     pub log_size: u64,
-    /// 视频存储大小
     pub video_storage_size: u64,
-    /// 数据库文件大小
     pub database_size: u64,
-    /// RockZeroOS 应用总占用
     pub total_app_usage: u64,
-    /// 外部存储可用空间
     pub available_space: u64,
 }
 
-/// 获取数据库文件大小
+/// Accurate disk usage
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct AccurateDiskUsage {
+    /// Total space
+    pub total_space: u64,
+    /// Available space
+    pub available_space: u64,
+    /// Used space (filesystem level)
+    pub used_space: u64,
+    /// Cache occupied space
+    pub cache_size: u64,
+    /// Actual user data (excluding cache)
+    pub actual_user_data: u64,
+    /// Usage percentage (based on actual user data)
+    pub usage_percentage: f64,
+}
+
+/// Get filesystem level statistics
+async fn get_filesystem_stats(path: &Path) -> std::io::Result<(u64, u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::mem::MaybeUninit;
+        let path_cstr = std::ffi::CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        
+        let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
+        
+        unsafe {
+            if libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) == 0 {
+                let stat = stat.assume_init();
+                let block_size = stat.f_frsize as u64;
+                let total = stat.f_blocks as u64 * block_size;
+                let available = stat.f_bavail as u64 * block_size;
+                let free = stat.f_bfree as u64 * block_size;
+                let used = total - free;
+                return Ok((total, available, used));
+            }
+        }
+        
+        Err(std::io::Error::last_os_error())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use winapi::um::fileapi::GetDiskFreeSpaceExW;
+        
+        let wide_path: Vec<u16> = path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        
+        let mut free_bytes: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut total_free_bytes: u64 = 0;
+        
+        unsafe {
+            if GetDiskFreeSpaceExW(
+                wide_path.as_ptr(),
+                &mut free_bytes as *mut u64 as *mut _,
+                &mut total_bytes as *mut u64 as *mut _,
+                &mut total_free_bytes as *mut u64 as *mut _,
+            ) != 0 {
+                let used = total_bytes - total_free_bytes;
+                return Ok((total_bytes, free_bytes, used));
+            }
+        }
+        
+        Err(std::io::Error::last_os_error())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Ok((0, 0, 0))
+    }
+}
+
+/// Get database files size
 async fn get_db_files_size(path: &std::path::Path) -> std::io::Result<u64> {
     if !path.exists() {
         return Ok(0);
@@ -335,7 +485,7 @@ async fn get_db_files_size(path: &std::path::Path) -> std::io::Result<u64> {
         let file_name_str = file_name.to_string_lossy();
         
         if metadata.is_file() {
-            // 统计所有数据库相关文件
+            // Count all database related files
             if file_name_str.ends_with(".db") 
                 || file_name_str.ends_with(".db-shm")
                 || file_name_str.ends_with(".db-wal") {
@@ -347,7 +497,7 @@ async fn get_db_files_size(path: &std::path::Path) -> std::io::Result<u64> {
     Ok(total_size)
 }
 
-/// 获取可用空间
+/// Get available space
 async fn get_available_space(path: &Path) -> std::io::Result<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -400,7 +550,7 @@ async fn get_available_space(path: &Path) -> std::io::Result<u64> {
     }
 }
 
-/// 获取目录大小
+/// Get directory size
 fn get_directory_size(path: &Path) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<u64>> + Send + '_>> {
     Box::pin(async move {
         if !path.exists() {
@@ -424,7 +574,7 @@ fn get_directory_size(path: &Path) -> std::pin::Pin<Box<dyn std::future::Future<
     })
 }
 
-/// 清理旧文件
+/// Clean up old files
 async fn cleanup_old_files(path: &Path, retention_secs: u64) -> std::io::Result<usize> {
     if !path.exists() {
         return Ok(0);
@@ -480,7 +630,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_directory_size() {
-        // 创建一个受控的临时目录用于测试
+        // Create a controlled temp directory for testing
         let temp_dir = std::env::temp_dir().join(format!(
             "rockzero_test_dir_{}",
             std::time::SystemTime::now()
@@ -490,15 +640,15 @@ mod tests {
         ));
         fs::create_dir_all(&temp_dir).await.expect("Failed to create test directory");
         
-        // 创建一些测试文件
+        // Create some test files
         let test_file = temp_dir.join("test_file.txt");
         fs::write(&test_file, "Hello, World!").await.expect("Failed to write test file");
         
         let size = get_directory_size(&temp_dir).await;
         assert!(size.is_ok());
-        assert!(size.unwrap() >= 13); // "Hello, World!" 有 13 字节
+        assert!(size.unwrap() >= 13); // "Hello, World!" is 13 bytes
         
-        // 清理
+        // Cleanup
         fs::remove_dir_all(&temp_dir).await.ok();
     }
 }

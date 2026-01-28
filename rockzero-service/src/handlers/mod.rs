@@ -8,6 +8,7 @@ pub mod streaming;
 pub mod webdav;
 pub mod secure_hls;
 pub mod storage_management;
+pub mod zkp_auth;
 
 // 占位符模块 - 待实现
 pub mod system;

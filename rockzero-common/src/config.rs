@@ -15,6 +15,24 @@ pub struct AppConfig {
     pub tls_key_path: Option<String>,
 }
 
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            host: "0.0.0.0".to_string(),
+            port: 8080,
+            database_url: "sqlite:./rockzero.db?mode=rwc".to_string(),
+            jwt_secret: "default-dev-secret-change-in-production".to_string(),
+            jwt_expiration_hours: 24,
+            refresh_token_expiration_days: 30,
+            encryption_key: "default-dev-key-change-in-production-32b".to_string(),
+            data_dir: "./data".to_string(),
+            tls_enabled: false,
+            tls_cert_path: None,
+            tls_key_path: None,
+        }
+    }
+}
+
 impl AppConfig {
     pub fn from_env() -> Self {
         let args: Vec<String> = env::args().collect();

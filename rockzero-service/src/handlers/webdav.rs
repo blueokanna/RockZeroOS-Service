@@ -27,7 +27,7 @@ pub struct LockRequest {
     pub timeout: Option<u64>,
 }
 
-/// WebDAV OPTIONS - 返回支持的方法
+/// WebDAV OPTIONS - Return supported methods
 pub async fn webdav_options() -> HttpResponse {
     HttpResponse::Ok()
         .insert_header(("DAV", "1, 2"))
@@ -36,7 +36,7 @@ pub async fn webdav_options() -> HttpResponse {
         .finish()
 }
 
-/// WebDAV PROPFIND - 获取资源属性
+/// WebDAV PROPFIND - Get resource properties
 pub async fn webdav_propfind(
     req: HttpRequest,
     path: web::Path<String>,
@@ -74,7 +74,7 @@ pub async fn webdav_propfind(
         return Err(AppError::NotFound("Resource not found".to_string()));
     }
 
-    // 生成 WebDAV XML 响应
+    // Generate WebDAV XML response
     let xml = generate_multistatus_xml(&responses);
 
     Ok(HttpResponse::MultiStatus()
@@ -83,7 +83,7 @@ pub async fn webdav_propfind(
 }
 
 
-/// WebDAV GET - 下载文件
+/// WebDAV GET - Download file
 pub async fn webdav_get(path: web::Path<String>) -> Result<actix_files::NamedFile, AppError> {
     let requested_path = path.into_inner();
     let full_path = get_webdav_path(&requested_path)?;
@@ -99,7 +99,7 @@ pub async fn webdav_get(path: web::Path<String>) -> Result<actix_files::NamedFil
     actix_files::NamedFile::open(&full_path).map_err(|_| AppError::InternalError)
 }
 
-/// WebDAV HEAD - 获取文件元信息
+/// WebDAV HEAD - Get file metadata
 pub async fn webdav_head(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let requested_path = path.into_inner();
     let full_path = get_webdav_path(&requested_path)?;
@@ -119,7 +119,7 @@ pub async fn webdav_head(path: web::Path<String>) -> Result<HttpResponse, AppErr
         .finish())
 }
 
-/// WebDAV PUT - 上传/更新文件
+/// WebDAV PUT - Upload/update file
 pub async fn webdav_put(
     path: web::Path<String>,
     body: web::Bytes,
@@ -127,7 +127,7 @@ pub async fn webdav_put(
     let requested_path = path.into_inner();
     let full_path = get_webdav_path(&requested_path)?;
 
-    // 确保父目录存在
+    // Ensure parent directory exists
     if let Some(parent) = full_path.parent() {
         fs::create_dir_all(parent).map_err(|_| AppError::InternalError)?;
     }
@@ -146,7 +146,7 @@ pub async fn webdav_put(
     }
 }
 
-/// WebDAV DELETE - 删除文件或目录
+/// WebDAV DELETE - Delete file or directory
 pub async fn webdav_delete(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let requested_path = path.into_inner();
     let full_path = get_webdav_path(&requested_path)?;
@@ -166,7 +166,7 @@ pub async fn webdav_delete(path: web::Path<String>) -> Result<HttpResponse, AppE
     Ok(HttpResponse::NoContent().finish())
 }
 
-/// WebDAV MKCOL - 创建目录
+/// WebDAV MKCOL - Create directory
 pub async fn webdav_mkcol(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let requested_path = path.into_inner();
     let full_path = get_webdav_path(&requested_path)?;
@@ -175,7 +175,7 @@ pub async fn webdav_mkcol(path: web::Path<String>) -> Result<HttpResponse, AppEr
         return Err(AppError::Conflict("Resource already exists".to_string()));
     }
 
-    // 检查父目录是否存在
+    // Check if parent directory exists
     if let Some(parent) = full_path.parent() {
         if !parent.exists() {
             return Err(AppError::Conflict("Parent directory does not exist".to_string()));
@@ -189,7 +189,7 @@ pub async fn webdav_mkcol(path: web::Path<String>) -> Result<HttpResponse, AppEr
     Ok(HttpResponse::Created().finish())
 }
 
-/// WebDAV COPY - 复制文件或目录
+/// WebDAV COPY - Copy file or directory
 pub async fn webdav_copy(
     req: HttpRequest,
     path: web::Path<String>,
@@ -241,7 +241,7 @@ pub async fn webdav_copy(
 }
 
 
-/// WebDAV MOVE - 移动文件或目录
+/// WebDAV MOVE - Move file or directory
 pub async fn webdav_move(
     req: HttpRequest,
     path: web::Path<String>,
@@ -297,7 +297,7 @@ pub async fn webdav_move(
     }
 }
 
-/// WebDAV LOCK - 锁定资源 (简化实现)
+/// WebDAV LOCK - Lock resource (simplified implementation)
 pub async fn webdav_lock(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let requested_path = path.into_inner();
     let lock_token = format!("opaquelocktoken:{}", uuid::Uuid::new_v4());
@@ -327,14 +327,14 @@ pub async fn webdav_lock(path: web::Path<String>) -> Result<HttpResponse, AppErr
         .body(xml))
 }
 
-/// WebDAV UNLOCK - 解锁资源
+/// WebDAV UNLOCK - Unlock resource
 pub async fn webdav_unlock(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let requested_path = path.into_inner();
     info!("WebDAV UNLOCK: {}", requested_path);
     Ok(HttpResponse::NoContent().finish())
 }
 
-/// WebDAV PROPPATCH - 修改属性 (简化实现)
+/// WebDAV PROPPATCH - Modify properties (simplified implementation)
 pub async fn webdav_proppatch(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let requested_path = path.into_inner();
     info!("WebDAV PROPPATCH: {}", requested_path);
@@ -353,8 +353,6 @@ pub async fn webdav_proppatch(path: web::Path<String>) -> Result<HttpResponse, A
         .body(xml))
 }
 
-// 辅助函数
-
 fn get_webdav_path(path: &str) -> Result<PathBuf, AppError> {
     let base = Path::new(WEBDAV_BASE);
     fs::create_dir_all(base).ok();
@@ -366,7 +364,7 @@ fn get_webdav_path(path: &str) -> Result<PathBuf, AppError> {
         base.join(clean_path)
     };
 
-    // 防止路径遍历攻击
+    // Prevent path traversal attacks
     let canonical = full_path
         .canonicalize()
         .unwrap_or_else(|_| full_path.clone());
@@ -466,7 +464,6 @@ fn generate_multistatus_xml(responses: &[PropfindResponse]) -> String {
 }
 
 fn extract_path_from_uri(uri: &str) -> String {
-    // 从完整 URI 中提取路径部分
     if let Some(pos) = uri.find("/webdav/") {
         uri[pos + 8..].to_string()
     } else if let Some(pos) = uri.find("/webdav") {

@@ -1,10 +1,10 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
-/// SAE Commit 消息（使用 Base64 编码进行 JSON 序列化）
+/// SAE Commit message (using Base64 encoding for JSON serialization)
 #[derive(Debug, Clone)]
 pub struct SaeCommit {
-    /// 椭圆曲线组 ID (19 = Curve25519)
+    /// Elliptic curve group ID (19 = Curve25519)
     pub group_id: u16,
     
     /// Commit scalar (32 bytes)
@@ -14,17 +14,17 @@ pub struct SaeCommit {
     pub element: Vec<u8>,
 }
 
-/// SAE Confirm 消息（使用 Base64 编码进行 JSON 序列化）
+/// SAE Confirm message (using Base64 encoding for JSON serialization)
 #[derive(Debug, Clone)]
 pub struct SaeConfirm {
-    /// Send-Confirm 计数器
+    /// Send-Confirm counter
     pub send_confirm: u16,
     
-    /// Confirm 值 (32 bytes HMAC)
+    /// Confirm value (32 bytes HMAC)
     pub confirm: [u8; 32],
 }
 
-// ============ 自定义序列化/反序列化（使用 Base64） ============
+// ============ Custom Serialization/Deserialization (using Base64) ============
 
 impl Serialize for SaeCommit {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -108,7 +108,7 @@ impl<'de> Deserialize<'de> for SaeCommit {
                             let element_bytes = BASE64
                                 .decode(&element_str)
                                 .map_err(|e| de::Error::custom(format!("Invalid base64 for element: {}", e)))?;
-                            // 支持 32 字节（Curve25519）或 33 字节（secp256r1 压缩点）
+                            // Support 32 bytes (Curve25519) or 33 bytes (secp256r1 compressed point)
                             if element_bytes.len() != 32 && element_bytes.len() != 33 {
                                 return Err(de::Error::custom(format!(
                                     "Element must be 32 or 33 bytes, got {}",
@@ -226,7 +226,7 @@ impl<'de> Deserialize<'de> for SaeConfirm {
     }
 }
 
-/// SAE 握手完整消息
+/// SAE handshake complete message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaeHandshake {
     pub commit: SaeCommit,
@@ -234,7 +234,7 @@ pub struct SaeHandshake {
 }
 
 impl SaeCommit {
-    /// 序列化为字节
+    /// Serialize to bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&self.group_id.to_le_bytes());
@@ -243,7 +243,7 @@ impl SaeCommit {
         bytes
     }
 
-    /// 从字节反序列化
+    /// Deserialize from bytes
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 66 {
             return None;
@@ -264,7 +264,7 @@ impl SaeCommit {
 }
 
 impl SaeConfirm {
-    /// 序列化为字节
+    /// Serialize to bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&self.send_confirm.to_le_bytes());
@@ -272,7 +272,7 @@ impl SaeConfirm {
         bytes
     }
 
-    /// 从字节反序列化
+    /// Deserialize from bytes
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 34 {
             return None;

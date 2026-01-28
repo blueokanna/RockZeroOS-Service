@@ -122,35 +122,35 @@ async fn main() -> std::io::Result<()> {
     let secure_storage = Arc::new(SecureStorageManager::new(PathBuf::from(&secure_base)));
     info!("Secure Storage: ZKP + WPA3-SAE + CRC32 enabled");
 
-    // 初始化安全HLS管理器
+    // Initialize secure HLS manager
     let secure_hls_manager = Arc::new(RwLock::new(rockzero_media::HlsSessionManager::new()));
     info!("Secure HLS streaming: WPA3-SAE + ZKP + AES-256-GCM enabled");
 
-    // 初始化存储管理器
+    // Initialize storage manager
     let storage_config = StorageConfig::from_env();
     storage_config.init_directories().await?;
     let storage_manager = Arc::new(StorageManager::new(storage_config));
     info!("Storage Manager initialized");
 
-    // 启动后台清理任务
+    // Start background cleanup tasks
     storage_manager.clone().start_cleanup_tasks();
     info!("Storage cleanup tasks started");
 
     let invite_manager = Arc::new(InviteCodeManager::new());
 
-    // 初始化 AppConfig
+    // Initialize AppConfig
     let app_config = Arc::new(AppConfig::from_env());
     info!("App configuration loaded");
 
-    // 初始化事件通知器（200ms去抖动）
+    // Initialize event notifier (200ms debounce)
     let _event_notifier = event_notifier::init_global_notifier(200);
     info!("Event notifier initialized");
 
-    // 初始化视频访问管理器
+    // Initialize video access manager
     let _video_access_manager = secure_video_access::init_global_video_access_manager();
     info!("Video access manager initialized");
 
-    // 自动挂载所有磁盘
+    // Auto-mount all disks
     info!("Auto-mounting disks...");
     handlers::disk_manager::auto_mount_all_disks();
     info!("Disk auto-mount completed");
@@ -201,6 +201,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(secure_hls_manager_data))
             .app_data(web::Data::new(storage_manager_data))
             .app_data(web::Data::from(app_config_data))
+            .app_data(web::Data::new(std::sync::Arc::new(handlers::zkp_auth::ZkpAuthManager::new())))
             .route("/health", web::get().to(handlers::health::health_check))
             .service(
                 web::scope("/api/v1")
@@ -209,7 +210,23 @@ async fn main() -> std::io::Result<()> {
                             .route("/register", web::post().to(handlers::auth::register))
                             .route("/login", web::post().to(handlers::auth::login))
                             .route("/refresh", web::post().to(handlers::auth::refresh_token))
-                            .route("/me", web::get().to(handlers::auth::me)),
+                            .route("/me", web::get().to(handlers::auth::me))
+                            // ZKP zero-knowledge proof authentication
+                            .route("/zkp/login", web::post().to(handlers::zkp_auth::zkp_login))
+                            .route("/zkp/registration", web::post().to(handlers::zkp_auth::get_zkp_registration)),
+                    )
+                    .service(
+                        web::scope("/zkp")
+                            .wrap(middleware::JwtAuth)
+                            .route("/search/token", web::post().to(handlers::zkp_auth::create_search_token))
+                            .route("/search/execute", web::post().to(handlers::zkp_auth::execute_encrypted_search))
+                            .route("/share/proof", web::post().to(handlers::zkp_auth::create_share_proof))
+                            .route("/share/verify", web::post().to(handlers::zkp_auth::verify_share_proof))
+                            .route("/range-proof/create", web::post().to(handlers::zkp_auth::create_range_proof))
+                            .route("/range-proof/verify", web::post().to(handlers::zkp_auth::verify_range_proof))
+                            .route("/video/proof", web::post().to(handlers::zkp_auth::create_video_stream_proof))
+                            .route("/video/verify", web::post().to(handlers::zkp_auth::verify_video_stream_proof))
+                            .route("/proof/generate", web::post().to(handlers::zkp_auth::generate_zkp_proof)),
                     )
                     .service(
                         web::scope("/system")
@@ -284,6 +301,14 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/check",
                                 web::get().to(handlers::storage_management::check_storage_space),
+                            )
+                            .route(
+                                "/accurate-usage",
+                                web::post().to(handlers::storage_management::get_accurate_disk_usage),
+                            )
+                            .route(
+                                "/force-cleanup",
+                                web::post().to(handlers::storage_management::force_cleanup_all_cache),
                             ),
                     )
                     .service(
@@ -399,7 +424,7 @@ async fn main() -> std::io::Result<()> {
                                 "/packages/{id}/run",
                                 web::post().to(handlers::appstore::run_wasm_package),
                             )
-                            // CasaOS 和 iStoreOS 支持
+                            // CasaOS and iStoreOS support
                             .route(
                                 "/casaos",
                                 web::get().to(handlers::appstore_enhanced::list_casaos_apps),
@@ -412,7 +437,7 @@ async fn main() -> std::io::Result<()> {
                                 "/ipk/install",
                                 web::post().to(handlers::appstore_enhanced::install_ipk_package),
                             )
-                            // Docker 容器管理
+                            // Docker container management
                             .route(
                                 "/containers",
                                 web::get().to(handlers::appstore::list_containers),
@@ -462,7 +487,7 @@ async fn main() -> std::io::Result<()> {
                                 "/{id}/partitions",
                                 web::get().to(handlers::disk_manager::list_partitions),
                             )
-                            // 添加不带ID的路由，用于直接传递device参数
+                            // Add routes without ID for direct device parameter passing
                             .route("/mount", web::post().to(handlers::disk_manager::mount_disk))
                             .route(
                                 "/unmount",
@@ -472,7 +497,7 @@ async fn main() -> std::io::Result<()> {
                                 "/format",
                                 web::post().to(handlers::disk_manager::format_disk),
                             )
-                            // 保留带ID的路由以兼容旧代码
+                            // Keep routes with ID for backward compatibility
                             .route(
                                 "/{id}/mount",
                                 web::post().to(handlers::disk_manager::mount_disk),
@@ -523,7 +548,7 @@ async fn main() -> std::io::Result<()> {
                                 web::get().to(handlers::disk_manager::get_disk_temperature),
                             ),
                     )
-                    // 专业级存储管理 API
+                    // Professional storage management API
                     .service(
                         web::scope("/storage")
                             .route(
@@ -558,7 +583,7 @@ async fn main() -> std::io::Result<()> {
                             )
                             .route("/auto-mount", web::post().to(handlers::storage::auto_mount)),
                     )
-                    // 视频硬件加速 API
+                    // Video hardware acceleration API
                     .service(
                         web::scope("/video-hardware")
                             .route(
@@ -739,10 +764,10 @@ async fn main() -> std::io::Result<()> {
                                 web::post().to(handlers::secure_storage::derive_specific_key),
                             ),
                     )
-                    // ============ 安全 HLS 流式传输 ============
+                    // ============ Secure HLS Streaming ============
                     .service(
                         web::scope("/secure-hls")
-                            // SAE 握手和会话创建（需要 JWT 认证）
+                            // SAE handshake and session creation (requires JWT auth)
                             .service(
                                 web::scope("/sae")
                                     .wrap(middleware::JwtAuth)
@@ -756,12 +781,12 @@ async fn main() -> std::io::Result<()> {
                                     .wrap(middleware::JwtAuth)
                                     .route("/create", web::post().to(handlers::secure_hls::create_hls_session))
                             )
-                            // 安全 HLS 播放列表和分片（使用 session_id 授权）
-                            // 生产级安全：视频段必须使用 POST + ZKP 证明
+                            // Secure HLS playlist and segments (authorized by session_id)
+                            // Production-grade security: video segments must use POST + ZKP proof
                             .route("/{session_id}/playlist.m3u8", web::get().to(handlers::secure_hls::get_secure_playlist))
-                            // 停止 HLS 会话（需要 JWT 认证）
+                            // Stop HLS session (requires JWT auth)
                             .route("/{session_id}/stop", web::post().to(handlers::secure_hls::stop_session))
-                            // 视频段只允许 POST 请求（必须包含 ZKP 证明）
+                            // Video segments only allow POST requests (must include ZKP proof)
                             .route("/{session_id}/{segment}", web::post().to(handlers::secure_hls::get_secure_segment))
                     )
                     .service(

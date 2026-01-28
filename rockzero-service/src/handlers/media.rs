@@ -7,27 +7,27 @@ use std::process::Command;
 use tracing::info;
 
 // ============================================================
-// 媒体处理模块
+// Media Processing Module
 //
-// 注意：视频流播放请使用安全HLS（secure_hls.rs）
+// Note: For video streaming, use Secure HLS (secure_hls.rs)
 //
-// 安全HLS提供：
-// - WPA3-SAE 握手（密钥交换）
-// - ZKP 零知识证明（身份验证）
-// - AES-256-GCM 加密（数据保护）
-// - 防重放攻击（时间戳 + Nonce）
-// - 硬件加速支持（VAAPI, V4L2, NVENC等）
+// Secure HLS provides:
+// - WPA3-SAE handshake (key exchange)
+// - ZKP zero-knowledge proof (authentication)
+// - AES-256-GCM encryption (data protection)
+// - Replay attack protection (timestamp + nonce)
+// - Hardware acceleration support (VAAPI, V4L2, NVENC, etc.)
 //
-// 本模块提供：
-// - 基础媒体信息查询
-// - 编解码器能力检测
-// - 媒体元数据管理
+// This module provides:
+// - Basic media information queries
+// - Codec capability detection
+// - Media metadata management
 // ============================================================
 
-/// 查找 FFmpeg 可执行文件路径
+/// Find FFmpeg executable path
 ///
-/// 优先级：
-/// 1. 全局设置的路径（通过 ffmpeg_manager）
+/// Priority:
+/// 1. Global settings path (via ffmpeg_manager)
 /// 2. 常见系统路径（/usr/bin, /usr/local/bin等）
 /// 3. Windows特定路径（C:\ffmpeg\bin等）
 fn find_ffmpeg() -> Option<String> {
