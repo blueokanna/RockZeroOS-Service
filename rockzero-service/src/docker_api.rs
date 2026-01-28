@@ -201,7 +201,7 @@ impl DockerClient {
 
     /// Create a new Docker client with custom socket path
     #[allow(dead_code)]
-    pub fn with_socket(_socket_path: &str) -> Result<Self, DockerError> {
+    pub fn with_socket(socket_path: &str) -> Result<Self, DockerError> {
         #[cfg(target_os = "linux")]
         {
             // Check if socket exists
@@ -221,6 +221,7 @@ impl DockerClient {
 
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = socket_path; // Suppress unused warning
             Err(DockerError::ConnectionFailed(
                 "Docker API only supported on Linux".to_string(),
             ))
