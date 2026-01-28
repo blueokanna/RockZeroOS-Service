@@ -84,6 +84,10 @@ walkdir = { workspace = true }
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 
+# Docker API (Unix socket)
+hyper = { workspace = true }
+serde_yaml = { workspace = true }
+
 # FIDO2/WebAuthn (optional)
 webauthn-rs = { workspace = true, optional = true }
 webauthn-rs-proto = { workspace = true, optional = true }
@@ -91,6 +95,7 @@ webauthn-rs-proto = { workspace = true, optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
 nix = { workspace = true }
+hyperlocal = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { workspace = true }

@@ -99,6 +99,11 @@ crc32fast = "1.3"
 tempfile = "3.8"
 tokio-test = "0.4"
 
+# Docker API (Unix socket)
+hyper = { version = "0.14", features = ["client", "http1"] }
+hyperlocal = "0.8"
+serde_yaml = "0.9"
+
 # 配置构建输出目录到外部存储（HDD）
 # 使用环境变量 CARGO_TARGET_DIR 或在 .cargo/config.toml 中配置
 

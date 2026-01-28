@@ -1,5 +1,6 @@
 mod crypto;
 mod db;
+mod docker_api;
 mod event_notifier;
 mod ffmpeg_manager;
 mod fido;
