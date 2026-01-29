@@ -18,8 +18,15 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 const DEFAULT_APPSTORE_ROOT: &str = "./data/appstore";
-const CASAOS_STORE_URL: &str = "https://casaos.icewhale.org/store/apps";
 const ISTOREOS_STORE_URL: &str = "https://fw.koolcenter.com/iStoreOS/apps";
+
+const CASAOS_STORE_URLS: &[&str] = &[
+    "https://play.cuse.eu.org/Cpe204-Appstore-play-arm.zip",
+    "https://play.cuse.eu.org/Cp0204-AppStore-Play.zip",
+    "https://casaos.app/store/apps.json",
+    "https://raw.githubusercontent.com/bigbeartechworld/big-bear-casaos/master/Apps/big-bear-casaos-apps.json",
+    "https://raw.githubusercontent.com/WisdomSky/CasaOS-Coolstore/main/apps.json",
+];
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
@@ -113,11 +120,9 @@ pub struct AppStoreItem {
     pub installed: bool,
 }
 
-/// 获取 CasaOS 应用商店列表（无需认证）
 pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
-    info!("🔍 Fetching CasaOS app store...");
+    info!("Fetching CasaOS app store...");
 
-    // 使用原生 TLS 和更宽松的配置
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -128,29 +133,18 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
         .brotli(true)
         .deflate(true)
         .use_rustls_tls()
-        // Some deployments miss certain root CAs; allow invalid certs so store can load
         .danger_accept_invalid_certs(true)
         .build()
         .map_err(|e| {
-            error!("❌ Failed to create HTTP client: {}", e);
+            error!("Failed to create HTTP client: {}", e);
             AppError::InternalServerError(e.to_string())
         })?;
 
-    // 尝试多个 CasaOS 商店 URL
-    let store_urls = [
-        CASAOS_STORE_URL,
-        "https://casaos-appstore.github.io/casaos-appstore/apps.json",
-        "https://raw.githubusercontent.com/IceWhaleTech/CasaOS-AppStore/main/Apps/apps.json",
-    ];
-
     let mut last_error = String::new();
     
-    for store_url in &store_urls {
+    for store_url in CASAOS_STORE_URLS {
         for attempt in 1..=2 {
-            info!(
-                "🔄 Attempt {} to fetch CasaOS store from {}",
-                attempt, store_url
-            );
+            info!("Attempt {} to fetch CasaOS store from {}", attempt, store_url);
 
             match client
                 .get(*store_url)
@@ -163,10 +157,10 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
             {
                 Ok(response) => {
                     let status = response.status();
-                    info!("📡 Response status: {}", status);
+                    info!("Response status: {}", status);
 
                     if !status.is_success() {
-                        error!("❌ CasaOS store returned error: {}", status);
+                        error!("CasaOS store returned error: {}", status);
                         last_error = format!("CasaOS store returned status: {}", status);
                         if attempt < 2 {
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -175,7 +169,7 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
                     } else {
                         match response.text().await {
                             Ok(text) => {
-                                info!("📦 Received {} bytes of data", text.len());
+                                info!("Received {} bytes of data", text.len());
 
                                 match serde_json::from_str::<Value>(&text) {
                                     Ok(apps_json) => {
@@ -186,38 +180,49 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
                                             .collect();
 
                                         let mut apps = Vec::new();
+                                        
                                         if let Some(app_list) = apps_json.as_array() {
-                                            info!(
-                                                "📋 Processing {} apps from CasaOS store",
-                                                app_list.len()
-                                            );
+                                            info!("Processing {} apps from CasaOS store", app_list.len());
                                             for app in app_list {
-                                                if let Some(item) =
-                                                    parse_casaos_app(app, &installed_ids)
-                                                {
+                                                if let Some(item) = parse_casaos_app(app, &installed_ids) {
                                                     apps.push(item);
                                                 }
                                             }
-                                        } else if let Some(data) =
-                                            apps_json.get("data").and_then(|d| d.as_array())
-                                        {
-                                            info!(
-                                                "📋 Processing {} apps from CasaOS store (nested data)",
-                                                data.len()
-                                            );
+                                        } else if let Some(data) = apps_json.get("data").and_then(|d| d.as_array()) {
+                                            info!("Processing {} apps from CasaOS store (nested data)", data.len());
                                             for app in data {
-                                                if let Some(item) =
-                                                    parse_casaos_app(app, &installed_ids)
-                                                {
+                                                if let Some(item) = parse_casaos_app(app, &installed_ids) {
                                                     apps.push(item);
+                                                }
+                                            }
+                                        } else if let Some(data) = apps_json.get("apps").and_then(|d| d.as_array()) {
+                                            info!("Processing {} apps from CasaOS store (apps field)", data.len());
+                                            for app in data {
+                                                if let Some(item) = parse_casaos_app(app, &installed_ids) {
+                                                    apps.push(item);
+                                                }
+                                            }
+                                        } else if apps_json.is_object() {
+                                            info!("Processing apps from CasaOS store (object format)");
+                                            for (key, app) in apps_json.as_object().unwrap() {
+                                                if app.is_object() {
+                                                    let mut app_with_id = app.clone();
+                                                    if app_with_id.get("id").is_none() {
+                                                        if let Some(obj) = app_with_id.as_object_mut() {
+                                                            obj.insert("id".to_string(), Value::String(key.clone()));
+                                                        }
+                                                    }
+                                                    if let Some(item) = parse_casaos_app(&app_with_id, &installed_ids) {
+                                                        apps.push(item);
+                                                    }
                                                 }
                                             }
                                         } else {
-                                            warn!("⚠️ Unexpected JSON structure from CasaOS store");
+                                            warn!("Unexpected JSON structure from CasaOS store");
                                         }
 
                                         let total = apps.len();
-                                        info!("✅ Successfully parsed {} CasaOS apps", total);
+                                        info!("Successfully parsed {} CasaOS apps", total);
 
                                         return Ok(HttpResponse::Ok().json(AppStoreList {
                                             apps,
@@ -226,20 +231,20 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
                                         }));
                                     }
                                     Err(e) => {
-                                        error!("❌ Failed to parse JSON: {}", e);
+                                        error!("Failed to parse JSON: {}", e);
                                         last_error = format!("Invalid JSON from CasaOS store: {}", e);
                                     }
                                 }
                             }
                             Err(e) => {
-                                error!("❌ Failed to read response text: {}", e);
+                                error!("Failed to read response text: {}", e);
                                 last_error = format!("Failed to read response: {}", e);
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    error!("❌ Network error (attempt {}): {}", attempt, e);
+                    error!("Network error (attempt {}): {}", attempt, e);
                     last_error = format!("Network error: {}", e);
                     if attempt < 2 {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -250,11 +255,7 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
         }
     }
 
-    // 如果所有尝试都失败，返回空列表而不是错误（让 UI 可以显示）
-    warn!(
-        "⚠️ CasaOS store unavailable, returning empty list. Last error: {}",
-        last_error
-    );
+    warn!("CasaOS store unavailable, returning empty list. Last error: {}", last_error);
     Ok(HttpResponse::Ok().json(AppStoreList {
         apps: Vec::new(),
         total: 0,
@@ -263,14 +264,15 @@ pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
 }
 
 fn parse_casaos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<AppStoreItem> {
-    // CasaOS API returns different field names, handle both old and new format
     let id = app.get("id")
         .or_else(|| app.get("name"))
+        .or_else(|| app.get("title"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())?;
     
     let name = app.get("name")
         .or_else(|| app.get("title"))
+        .or_else(|| app.get("id"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())?;
     
@@ -282,20 +284,26 @@ fn parse_casaos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<Ap
     
     let description = app.get("description")
         .or_else(|| app.get("tagline"))
+        .or_else(|| app.get("short_description"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
     
-    // Version can be in different places
     let version = app.get("version")
         .or_else(|| app.get("main").and_then(|m| m.get("version")))
         .and_then(|v| v.as_str())
+        .or_else(|| {
+            app.get("image")
+                .and_then(|i| i.as_str())
+                .and_then(|s| s.split(':').last())
+        })
         .unwrap_or("latest")
         .to_string();
     
     let icon = app.get("icon")
         .or_else(|| app.get("image"))
         .or_else(|| app.get("thumbnail"))
+        .or_else(|| app.get("logo"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     
@@ -311,17 +319,18 @@ fn parse_casaos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<Ap
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     
-    // Install URL can be compose_url, url, or construct from name
     let install_url = app.get("compose_url")
         .or_else(|| app.get("url"))
         .or_else(|| app.get("source"))
+        .or_else(|| app.get("docker_image"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("https://github.com/IceWhaleTech/CasaOS-AppStore/tree/main/Apps/{}", id));
+        .unwrap_or_else(|| format!("docker://{}", id));
 
     let architectures = app
         .get("arch")
         .or_else(|| app.get("architectures"))
+        .or_else(|| app.get("supported_architectures"))
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -347,67 +356,90 @@ fn parse_casaos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<Ap
     })
 }
 
-/// 获取 iStoreOS 应用商店列表（无需认证）
 pub async fn list_istoreos_apps() -> Result<HttpResponse, AppError> {
-    info!("🔍 Fetching iStoreOS app store...");
+    info!("Fetching iStoreOS app store...");
 
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .danger_accept_invalid_certs(true)
         .build()
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
-    let response = client
-        .get(ISTOREOS_STORE_URL)
-        .send()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("Failed to fetch iStoreOS store: {}", e)))?;
+    match client.get(ISTOREOS_STORE_URL).send().await {
+        Ok(response) => {
+            if !response.status().is_success() {
+                warn!("iStoreOS store returned error: {}", response.status());
+                return Ok(HttpResponse::Ok().json(AppStoreList {
+                    apps: Vec::new(),
+                    total: 0,
+                    source: "istoreos".to_string(),
+                }));
+            }
 
-    if !response.status().is_success() {
-        return Err(AppError::BadRequest(
-            "iStoreOS store unavailable".to_string(),
-        ));
-    }
+            match response.json::<Value>().await {
+                Ok(apps_json) => {
+                    let installed_packages = load_packages()?;
+                    let installed_ids: HashMap<String, bool> = installed_packages
+                        .iter()
+                        .map(|p| (p.id.clone(), true))
+                        .collect();
 
-    let apps_json: Value = response.json().await.map_err(|e| {
-        AppError::BadRequest(format!("Invalid response from iStoreOS store: {}", e))
-    })?;
+                    let mut apps = Vec::new();
+                    if let Some(app_list) = apps_json.as_array() {
+                        for app in app_list {
+                            if let Some(item) = parse_istoreos_app(app, &installed_ids) {
+                                apps.push(item);
+                            }
+                        }
+                    }
 
-    let installed_packages = load_packages()?;
-    let installed_ids: HashMap<String, bool> = installed_packages
-        .iter()
-        .map(|p| (p.id.clone(), true))
-        .collect();
+                    let total = apps.len();
+                    info!("Found {} iStoreOS apps", total);
 
-    let mut apps = Vec::new();
-    if let Some(app_list) = apps_json.as_array() {
-        for app in app_list {
-            if let Some(item) = parse_istoreos_app(app, &installed_ids) {
-                apps.push(item);
+                    Ok(HttpResponse::Ok().json(AppStoreList {
+                        apps,
+                        total,
+                        source: "istoreos".to_string(),
+                    }))
+                }
+                Err(e) => {
+                    warn!("Failed to parse iStoreOS response: {}", e);
+                    Ok(HttpResponse::Ok().json(AppStoreList {
+                        apps: Vec::new(),
+                        total: 0,
+                        source: "istoreos".to_string(),
+                    }))
+                }
             }
         }
+        Err(e) => {
+            warn!("Failed to fetch iStoreOS store: {}", e);
+            Ok(HttpResponse::Ok().json(AppStoreList {
+                apps: Vec::new(),
+                total: 0,
+                source: "istoreos".to_string(),
+            }))
+        }
     }
-
-    let total = apps.len();
-    info!("✅ Found {} iStoreOS apps", total);
-
-    Ok(HttpResponse::Ok().json(AppStoreList {
-        apps,
-        total,
-        source: "istoreos".to_string(),
-    }))
 }
 
 fn parse_istoreos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<AppStoreItem> {
-    let name = app.get("name")?.as_str()?.to_string();
+    let name = app.get("name").and_then(|v| v.as_str())?.to_string();
     let id = format!("istoreos_{}", name);
     let title = app
         .get("title")
         .and_then(|v| v.as_str())
         .unwrap_or(&name)
         .to_string();
-    let description = app.get("summary")?.as_str()?.to_string();
-    let version = app.get("version")?.as_str()?.to_string();
+    let description = app.get("summary")
+        .or_else(|| app.get("description"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let version = app.get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("latest")
+        .to_string();
     let icon = app
         .get("icon")
         .and_then(|v| v.as_str())
@@ -421,7 +453,10 @@ fn parse_istoreos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<
         .get("maintainer")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let install_url = app.get("download_url")?.as_str()?.to_string();
+    let install_url = app.get("download_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     let architectures = app
         .get("platforms")
@@ -450,14 +485,13 @@ fn parse_istoreos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<
     })
 }
 
-/// 安装 IPK 包
 pub async fn install_ipk_package(
     body: web::Json<PackageInstallRequest>,
     req: HttpRequest,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
 
-    info!("📦 Installing IPK package from {}", body.url);
+    info!("Installing IPK package from {}", body.url);
 
     let client = Client::builder()
         .build()
@@ -502,8 +536,7 @@ pub async fn install_ipk_package(
 
     #[cfg(target_os = "linux")]
     {
-        // 使用 opkg 安装
-        info!("🔧 Installing IPK with opkg...");
+        info!("Installing IPK with opkg...");
         let output = Command::new("opkg")
             .args(["install", target.to_str().unwrap()])
             .output()
@@ -511,7 +544,7 @@ pub async fn install_ipk_package(
 
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
-            error!("❌ IPK installation failed: {}", err);
+            error!("IPK installation failed: {}", err);
             return Err(AppError::BadRequest(format!(
                 "IPK installation failed: {}",
                 err
@@ -521,7 +554,7 @@ pub async fn install_ipk_package(
 
     #[cfg(not(target_os = "linux"))]
     {
-        warn!("⚠️ IPK installation is only supported on Linux");
+        warn!("IPK installation is only supported on Linux");
     }
 
     let mut packages = load_packages()?;
@@ -542,7 +575,7 @@ pub async fn install_ipk_package(
     packages.push(record.clone());
     save_packages(&packages)?;
 
-    info!("✅ IPK package installed successfully");
+    info!("IPK package installed successfully");
     Ok(HttpResponse::Created().json(record))
 }
 

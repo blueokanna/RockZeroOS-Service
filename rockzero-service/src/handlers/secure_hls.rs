@@ -128,7 +128,7 @@ fn verify_secure_request(
     Ok(())
 }
 
-/// 计算请求签名
+/// Compute request signature
 fn compute_request_signature(
     session_id: &str,
     timestamp: i64,
@@ -151,7 +151,7 @@ fn compute_request_signature(
     hex::encode(result.into_bytes())
 }
 
-/// 常量时间比较（防止时序攻击）
+/// Constant time comparison (prevent timing attacks)
 fn constant_time_compare(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
@@ -478,7 +478,7 @@ pub async fn create_hls_session(
     })))
 }
 
-/// 获取安全的 M3U8 播放列表
+/// Get secure M3U8 playlist
 pub async fn get_secure_playlist(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<String>,
@@ -502,25 +502,18 @@ pub async fn get_secure_playlist(
         .body(playlist))
 }
 
-/// 安全段请求参数（查询字符串）
+/// Secure segment request query parameters
 #[derive(Debug, Deserialize)]
 pub struct SecureSegmentQuery {
-    /// 请求时间戳（Unix 毫秒）
+    /// Request timestamp (Unix milliseconds)
     pub ts: Option<i64>,
-    /// 唯一请求 Nonce
+    /// Unique request nonce
     pub nonce: Option<String>,
-    /// 请求签名
+    /// Request signature
     pub sig: Option<String>,
 }
 
-/// 获取加密的 TS 段（带防重放保护）
-///
-/// **安全实现**：
-/// - 验证会话有效性（通过 SAE 握手建立）
-/// - 验证请求签名（防止请求伪造）
-/// - 验证时间戳（防止延迟重放）
-/// - 验证 Nonce（防止即时重放）
-/// - 使用 AES-256-GCM 加密视频段
+/// Get encrypted TS segment with replay protection
 pub async fn get_secure_segment(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<(String, String)>,
@@ -545,20 +538,18 @@ pub async fn get_secure_segment(
         };
         
         verify_secure_request(&params, &session_id, &segment_name, &session.pmk)?;
-        info!("✅ Secure request verified for segment {}", segment_name);
+        info!("Secure request verified for segment {}", segment_name);
     } else {
-        // 如果没有提供安全参数，检查是否来自本地代理
         let peer_addr = req.peer_addr();
         let is_local = peer_addr.map(|addr| addr.ip().is_loopback()).unwrap_or(false);
         
         if !is_local {
-            warn!("⚠️ Non-local request without security params for segment {}", segment_name);
-            // 在生产环境中，可以选择拒绝没有安全参数的非本地请求
+            warn!("Non-local request without security params for segment {}", segment_name);
             // return Err(AppError::Unauthorized("Security parameters required".to_string()));
         }
     }
 
-    info!("✅ Session verified for segment {} (user: {})", segment_name, session.user_id);
+    info!("Session verified for segment {} (user: {})", segment_name, session.user_id);
 
     // 3. 从 FFmpeg 转码输出读取实际的 TS 段
     let segment_data = read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?;
@@ -583,7 +574,7 @@ pub async fn get_secure_segment(
         .body(encrypted_segment))
 }
 
-/// 停止 HLS 会话
+/// Stop HLS session
 pub async fn stop_session(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<String>,
@@ -596,7 +587,7 @@ pub async fn stop_session(
 
     match manager.remove_session(&session_id) {
         Ok(_) => {
-            info!("✅ HLS session stopped successfully: {}", session_id);
+            info!("HLS session stopped successfully: {}", session_id);
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "success": true,
                 "message": "Session stopped successfully",
@@ -618,18 +609,28 @@ pub async fn stop_session(
     }
 }
 
-/// 生成安全的 M3U8 播放列表
+/// Generate secure M3U8 playlist with proper seeking support
+/// 
+/// Key features for accurate seeking:
+/// - EXT-X-PLAYLIST-TYPE:VOD for full seeking support
+/// - Accurate segment durations
+/// - No encryption key (handled by our custom AES-256-GCM)
 fn generate_secure_m3u8(segment_count: usize, segment_duration: f32) -> String {
     let mut playlist = String::from("#EXTM3U\n");
-    playlist.push_str("#EXT-X-VERSION:3\n");
+    playlist.push_str("#EXT-X-VERSION:6\n");
+    // VOD type allows full seeking
+    playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
     playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", segment_duration.ceil() as u32));
     playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
-    playlist.push_str("# Encrypted with AES-256-GCM\n");
+    // Independent segments for better seeking
+    playlist.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+    playlist.push_str("# Encrypted with AES-256-GCM (custom implementation)\n");
     playlist.push_str("# Key derived from SAE handshake\n");
     playlist.push_str("# Replay protection enabled\n\n");
 
     for i in 0..segment_count {
-        playlist.push_str(&format!("#EXTINF:{:.3},\n", segment_duration));
+        // Each segment starts with a keyframe for accurate seeking
+        playlist.push_str(&format!("#EXTINF:{:.6},\n", segment_duration));
         playlist.push_str(&format!("segment_{}.ts\n", i));
     }
 
@@ -637,7 +638,6 @@ fn generate_secure_m3u8(segment_count: usize, segment_duration: f32) -> String {
     playlist
 }
 
-/// 视频段缓存目录配置
 fn get_hls_cache_dir() -> std::path::PathBuf {
     std::env::var("HLS_CACHE_PATH")
         .or_else(|_| std::env::var("ROCKZERO_HLS_CACHE_DIR"))
@@ -645,211 +645,465 @@ fn get_hls_cache_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from("./data/hls_cache"))
 }
 
-/// 从 FFmpeg 转码输出读取视频段
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HardwareAccel {
+    AmlogicV4l2,
+    Vaapi,
+    V4l2Generic,
+    None,
+}
+
+struct VideoInfo {
+    duration: f64,
+    has_video: bool,
+    has_audio: bool,
+    video_codec: String,
+    width: u32,
+    height: u32,
+}
+
+async fn probe_video_info(video_path: &std::path::Path) -> Result<VideoInfo, AppError> {
+    use tokio::process::Command;
+    
+    let ffprobe_path = std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string());
+    
+    let output = Command::new(&ffprobe_path)
+        .args([
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+            video_path.to_str().unwrap_or(""),
+        ])
+        .output()
+        .await
+        .map_err(|e| AppError::IoError(format!("Failed to probe video: {}", e)))?;
+    
+    if !output.status.success() {
+        return Err(AppError::InternalServerError("FFprobe failed".to_string()));
+    }
+    
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&json_str)
+        .map_err(|e| AppError::InternalServerError(format!("Failed to parse ffprobe: {}", e)))?;
+    
+    let duration = json["format"]["duration"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    
+    let streams = json["streams"].as_array();
+    let mut has_video = false;
+    let mut has_audio = false;
+    let mut video_codec = String::new();
+    let mut width = 0u32;
+    let mut height = 0u32;
+    
+    if let Some(streams) = streams {
+        for stream in streams {
+            let codec_type = stream["codec_type"].as_str().unwrap_or("");
+            if codec_type == "video" {
+                has_video = true;
+                video_codec = stream["codec_name"].as_str().unwrap_or("").to_string();
+                width = stream["width"].as_u64().unwrap_or(0) as u32;
+                height = stream["height"].as_u64().unwrap_or(0) as u32;
+            } else if codec_type == "audio" {
+                has_audio = true;
+            }
+        }
+    }
+    
+    Ok(VideoInfo { duration, has_video, has_audio, video_codec, width, height })
+}
+
+async fn detect_hardware_acceleration() -> HardwareAccel {
+    use tokio::fs;
+    
+    if is_amlogic_device().await {
+        if check_ffmpeg_encoder("h264_v4l2m2m").await {
+            return HardwareAccel::AmlogicV4l2;
+        }
+    }
+    
+    if fs::metadata("/dev/dri/renderD128").await.is_ok() {
+        if check_ffmpeg_encoder("h264_vaapi").await {
+            return HardwareAccel::Vaapi;
+        }
+    }
+    
+    if fs::metadata("/dev/video10").await.is_ok() || fs::metadata("/dev/video11").await.is_ok() {
+        if check_ffmpeg_encoder("h264_v4l2m2m").await {
+            return HardwareAccel::V4l2Generic;
+        }
+    }
+    
+    HardwareAccel::None
+}
+
+async fn is_amlogic_device() -> bool {
+    if let Ok(content) = tokio::fs::read_to_string("/proc/cpuinfo").await {
+        if content.contains("Amlogic") || content.contains("A311D") || 
+           content.contains("S905") || content.contains("S922") {
+            return true;
+        }
+    }
+    if let Ok(content) = tokio::fs::read_to_string("/sys/firmware/devicetree/base/compatible").await {
+        if content.contains("amlogic") || content.contains("meson") {
+            return true;
+        }
+    }
+    false
+}
+
+async fn check_ffmpeg_encoder(encoder: &str) -> bool {
+    use tokio::process::Command;
+    
+    let ffmpeg_path = std::env::var("FFMPEG_PATH")
+        .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
+        .unwrap_or_else(|_| "ffmpeg".to_string());
+    
+    if let Ok(output) = Command::new(&ffmpeg_path).args(["-encoders"]).output().await {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return stdout.contains(encoder);
+    }
+    false
+}
+
 async fn read_video_segment_from_ffmpeg(
     file_path: &str,
     segment_name: &str,
 ) -> Result<Vec<u8>, AppError> {
     use std::path::PathBuf;
-
-    // 1. 验证段名称格式（防止路径遍历攻击）
+    
     if !segment_name.starts_with("segment_") || !segment_name.ends_with(".ts") {
-        return Err(AppError::BadRequest(format!(
-            "Invalid segment name format: '{}'. Expected 'segment_N.ts'",
-            segment_name
-        )));
+        return Err(AppError::BadRequest(format!("Invalid segment name: '{}'", segment_name)));
     }
-
-    // 2. 解析段索引
+    
     let segment_index: usize = segment_name
         .trim_start_matches("segment_")
         .trim_end_matches(".ts")
         .parse()
-        .map_err(|_| AppError::BadRequest(format!("Invalid segment index in name: '{}'", segment_name)))?;
-
-    // 3. 验证段索引范围
-    const MAX_SEGMENT_INDEX: usize = 100_000;
-    if segment_index > MAX_SEGMENT_INDEX {
-        return Err(AppError::BadRequest(format!(
-            "Segment index {} exceeds maximum allowed ({})",
-            segment_index, MAX_SEGMENT_INDEX
-        )));
+        .map_err(|_| AppError::BadRequest(format!("Invalid segment index: '{}'", segment_name)))?;
+    
+    if segment_index > 100_000 {
+        return Err(AppError::BadRequest("Segment index too large".to_string()));
     }
-
-    // 4. 计算视频文件的唯一标识符
+    
     let video_hash = blake3::hash(file_path.as_bytes());
     let video_id = hex::encode(&video_hash.as_bytes()[..8]);
-
-    // 5. 构建缓存目录路径
     let cache_dir = get_hls_cache_dir().join(&video_id);
     let cached_segment_path = cache_dir.join(segment_name);
-
-    // 6. 尝试从缓存读取
+    
     if cached_segment_path.exists() {
         info!("Cache hit for segment {} of video {}", segment_name, video_id);
-        return tokio::fs::read(&cached_segment_path).await.map_err(|e| {
-            AppError::IoError(format!("Failed to read cached segment {}: {}", segment_name, e))
-        });
+        return tokio::fs::read(&cached_segment_path).await
+            .map_err(|e| AppError::IoError(format!("Failed to read cached segment: {}", e)));
     }
-
-    // 7. 缓存不存在，检查原始视频文件
+    
     let original_video = PathBuf::from(file_path);
     if !original_video.exists() {
-        return Err(AppError::NotFound(format!("Original video file not found: {}", file_path)));
+        return Err(AppError::NotFound(format!("Video not found: {}", file_path)));
     }
-
-    // 8. 触发实时转码
-    info!("Cache miss for segment {} of video {}, triggering FFmpeg transcode", segment_name, video_id);
-
+    
+    info!("Cache miss for segment {} of video {}, transcoding", segment_name, video_id);
+    
     if !cache_dir.exists() {
-        tokio::fs::create_dir_all(&cache_dir)
-            .await
-            .map_err(|e| AppError::IoError(format!("Failed to create cache directory: {}", e)))?;
+        tokio::fs::create_dir_all(&cache_dir).await
+            .map_err(|e| AppError::IoError(format!("Failed to create cache dir: {}", e)))?;
     }
-
-    let segment_data = transcode_segment_async(&original_video, &cache_dir, segment_index).await?;
-
-    // 异步缓存
+    
+    let segment_data = transcode_segment_with_seek(&original_video, &cache_dir, segment_index).await?;
+    
     let cache_path_clone = cached_segment_path.clone();
     let data_clone = segment_data.clone();
     tokio::spawn(async move {
-        if let Err(e) = tokio::fs::write(&cache_path_clone, &data_clone).await {
-            warn!("Failed to cache segment: {}", e);
-        }
+        let _ = tokio::fs::write(&cache_path_clone, &data_clone).await;
     });
-
+    
     Ok(segment_data)
 }
 
-/// 硬件加速类型
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum HardwareAccel {
-    Vaapi,
-    V4l2,
-    None,
-}
-
-/// 使用 FFmpeg 异步转码单个视频段
-async fn transcode_segment_async(
+async fn transcode_segment_with_seek(
     video_path: &std::path::Path,
     output_dir: &std::path::Path,
     segment_index: usize,
 ) -> Result<Vec<u8>, AppError> {
     use tokio::process::Command;
-
+    
     const SEGMENT_DURATION: f64 = 10.0;
     let start_time = segment_index as f64 * SEGMENT_DURATION;
     let output_path = output_dir.join(format!("segment_{}.ts", segment_index));
-
+    
     let ffmpeg_path = std::env::var("FFMPEG_PATH")
         .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
         .unwrap_or_else(|_| "ffmpeg".to_string());
-
+    
     let hw_accel = detect_hardware_acceleration().await;
-
-    let mut args = vec![
-        "-y".to_string(),
-        "-ss".to_string(),
-        format!("{:.3}", start_time),
-        "-i".to_string(),
-        video_path.to_str().unwrap_or("").to_string(),
-        "-t".to_string(),
-        format!("{:.3}", SEGMENT_DURATION),
-    ];
-
-    match hw_accel {
-        HardwareAccel::Vaapi => {
-            info!("Using VAAPI hardware acceleration for segment {}", segment_index);
-            args.extend(vec![
-                "-hwaccel".to_string(), "vaapi".to_string(),
-                "-hwaccel_device".to_string(), "/dev/dri/renderD128".to_string(),
-                "-hwaccel_output_format".to_string(), "vaapi".to_string(),
-                "-c:v".to_string(), "h264_vaapi".to_string(),
-                "-qp".to_string(), "23".to_string(),
-            ]);
-        }
-        HardwareAccel::V4l2 => {
-            info!("Using V4L2 hardware acceleration for segment {}", segment_index);
-            args.extend(vec![
-                "-c:v".to_string(), "h264_v4l2m2m".to_string(),
-                "-b:v".to_string(), "2M".to_string(),
-            ]);
-        }
-        HardwareAccel::None => {
-            info!("Using software encoding (libx264) for segment {}", segment_index);
-            args.extend(vec![
-                "-c:v".to_string(), "libx264".to_string(),
-                "-preset".to_string(), "veryfast".to_string(),
-                "-tune".to_string(), "zerolatency".to_string(),
-                "-profile:v".to_string(), "main".to_string(),
-                "-level".to_string(), "4.0".to_string(),
-                "-crf".to_string(), "23".to_string(),
-            ]);
-        }
-    }
-
-    args.extend(vec![
-        "-c:a".to_string(), "aac".to_string(),
-        "-b:a".to_string(), "128k".to_string(),
-        "-ac".to_string(), "2".to_string(),
-        "-ar".to_string(), "44100".to_string(),
-        "-f".to_string(), "mpegts".to_string(),
-        "-movflags".to_string(), "+faststart".to_string(),
-        output_path.to_str().unwrap_or("").to_string(),
-    ]);
-
+    let video_path_str = video_path.to_str().unwrap_or("");
+    let output_path_str = output_path.to_str().unwrap_or("");
+    
+    let video_info = probe_video_info(video_path).await.ok();
+    
+    // Determine if transcoding is needed
+    let needs_transcode = video_info.as_ref()
+        .map(|info| {
+            // Transcode if not H.264 or resolution too high
+            info.video_codec != "h264" || info.width > 1920 ||
+            // Also transcode if seeking to non-zero position (ensures keyframe at start)
+            segment_index > 0
+        })
+        .unwrap_or(true);
+    
+    info!(
+        "Transcoding segment {} at {:.2}s with {:?} (needs_transcode: {})",
+        segment_index, start_time, hw_accel, needs_transcode
+    );
+    
+    let args = build_ffmpeg_args(
+        hw_accel, video_path_str, output_path_str,
+        start_time, SEGMENT_DURATION, needs_transcode, &video_info,
+    );
+    
+    info!("FFmpeg command: {} {}", ffmpeg_path, args.join(" "));
+    
     let output = Command::new(&ffmpeg_path)
         .args(&args)
         .output()
         .await
-        .map_err(|e| AppError::IoError(format!("Failed to execute FFmpeg: {}", e)))?;
-
+        .map_err(|e| AppError::IoError(format!("FFmpeg execution failed: {}", e)))?;
+    
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!("FFmpeg failed with {:?}: {}", hw_accel, stderr);
+        
+        // Retry with software encoding if hardware failed
+        if hw_accel != HardwareAccel::None {
+            info!("Retrying segment {} with software encoding", segment_index);
+            let fallback_args = build_ffmpeg_args(
+                HardwareAccel::None, video_path_str, output_path_str,
+                start_time, SEGMENT_DURATION, true, &video_info,
+            );
+            
+            let fallback_output = Command::new(&ffmpeg_path)
+                .args(&fallback_args)
+                .output()
+                .await
+                .map_err(|e| AppError::IoError(format!("FFmpeg fallback failed: {}", e)))?;
+            
+            if !fallback_output.status.success() {
+                let fallback_stderr = String::from_utf8_lossy(&fallback_output.stderr);
+                return Err(AppError::InternalServerError(format!(
+                    "Transcode failed for segment {}: {}", segment_index, fallback_stderr
+                )));
+            }
+        } else {
+            return Err(AppError::InternalServerError(format!(
+                "Transcode failed for segment {}: {}", segment_index, stderr
+            )));
+        }
+    }
+    
+    // Verify output file exists and has content
+    let segment_data = tokio::fs::read(&output_path).await
+        .map_err(|e| AppError::IoError(format!("Failed to read transcoded segment: {}", e)))?;
+    
+    if segment_data.is_empty() {
         return Err(AppError::InternalServerError(format!(
-            "FFmpeg transcode failed for segment {}: {}",
-            segment_index, stderr
+            "Transcoded segment {} is empty", segment_index
         )));
     }
-
-    tokio::fs::read(&output_path)
-        .await
-        .map_err(|e| AppError::IoError(format!("Failed to read transcoded segment: {}", e)))
+    
+    info!(
+        "✅ Segment {} transcoded successfully: {} bytes",
+        segment_index, segment_data.len()
+    );
+    
+    Ok(segment_data)
 }
 
-/// 检测可用的硬件加速
-async fn detect_hardware_acceleration() -> HardwareAccel {
-    use tokio::fs;
-
-    if fs::metadata("/dev/dri/renderD128").await.is_ok() && check_ffmpeg_encoder("h264_vaapi").await {
-        return HardwareAccel::Vaapi;
+/// Build FFmpeg arguments optimized for Amlogic A311D and other hardware
+/// 
+/// Key optimizations for A311D:
+/// - Use h264_v4l2m2m encoder with proper buffer settings
+/// - Force keyframe at segment boundaries for accurate seeking
+/// - Proper audio sync with video timestamps
+fn build_ffmpeg_args(
+    hw_accel: HardwareAccel,
+    input_path: &str,
+    output_path: &str,
+    start_time: f64,
+    duration: f64,
+    needs_transcode: bool,
+    video_info: &Option<VideoInfo>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    
+    // Basic options
+    args.extend(["-y", "-hide_banner", "-loglevel", "warning"].iter().map(|s| s.to_string()));
+    
+    // CRITICAL: Use accurate seek for proper random access
+    // -ss before -i for fast seek, but we need accurate timestamps
+    args.push("-ss".to_string());
+    args.push(format!("{:.3}", start_time));
+    
+    // Hardware acceleration input options for Amlogic A311D
+    match hw_accel {
+        HardwareAccel::AmlogicV4l2 => {
+            // A311D specific: Use V4L2 M2M for both decode and encode
+            // Check if decoder is available
+            if std::path::Path::new("/dev/video10").exists() {
+                args.extend([
+                    "-hwaccel", "v4l2m2m",
+                    "-c:v", "h264_v4l2m2m",
+                ].iter().map(|s| s.to_string()));
+            }
+        }
+        HardwareAccel::Vaapi => {
+            args.extend([
+                "-hwaccel", "vaapi",
+                "-hwaccel_device", "/dev/dri/renderD128",
+                "-hwaccel_output_format", "vaapi",
+            ].iter().map(|s| s.to_string()));
+        }
+        HardwareAccel::V4l2Generic => {
+            // Generic V4L2 hardware acceleration
+            if std::path::Path::new("/dev/video10").exists() {
+                args.extend(["-hwaccel", "v4l2m2m"].iter().map(|s| s.to_string()));
+            }
+        }
+        HardwareAccel::None => {}
     }
-
-    if (fs::metadata("/dev/video10").await.is_ok() || fs::metadata("/dev/video11").await.is_ok())
-        && check_ffmpeg_encoder("h264_v4l2m2m").await
-    {
-        return HardwareAccel::V4l2;
+    
+    args.push("-i".to_string());
+    args.push(input_path.to_string());
+    
+    // Duration
+    args.push("-t".to_string());
+    args.push(format!("{:.3}", duration));
+    
+    // CRITICAL: Force accurate seeking with copyts disabled for segment boundaries
+    // This ensures each segment starts with a keyframe
+    args.extend([
+        "-force_key_frames", "expr:gte(t,0)",
+    ].iter().map(|s| s.to_string()));
+    
+    if needs_transcode {
+        match hw_accel {
+            HardwareAccel::AmlogicV4l2 => {
+                // Amlogic A311D optimized encoding settings
+                // The A311D has a dedicated VPU that supports H.264 encoding
+                args.extend([
+                    "-c:v", "h264_v4l2m2m",
+                    // Bitrate control for smooth playback
+                    "-b:v", "4M",
+                    "-maxrate", "6M",
+                    "-bufsize", "8M",
+                    // GOP settings for seeking
+                    "-g", "30",
+                    "-keyint_min", "30",
+                    // Profile for compatibility
+                    "-profile:v", "high",
+                    "-level", "4.1",
+                    // V4L2 specific options
+                    "-num_output_buffers", "32",
+                    "-num_capture_buffers", "16",
+                ].iter().map(|s| s.to_string()));
+            }
+            HardwareAccel::Vaapi => {
+                args.extend([
+                    "-vf", "format=nv12|vaapi,hwupload",
+                    "-c:v", "h264_vaapi",
+                    "-qp", "23",
+                    "-g", "30",
+                    "-keyint_min", "30",
+                ].iter().map(|s| s.to_string()));
+            }
+            HardwareAccel::V4l2Generic => {
+                args.extend([
+                    "-c:v", "h264_v4l2m2m",
+                    "-b:v", "3M",
+                    "-maxrate", "4M",
+                    "-bufsize", "6M",
+                    "-g", "30",
+                    "-keyint_min", "30",
+                ].iter().map(|s| s.to_string()));
+            }
+            HardwareAccel::None => {
+                args.extend([
+                    "-c:v", "libx264",
+                    "-preset", "fast",
+                    "-tune", "zerolatency",
+                    "-profile:v", "high",
+                    "-level", "4.1",
+                    "-crf", "22",
+                    // CRITICAL: GOP settings for accurate seeking
+                    "-g", "30",
+                    "-keyint_min", "30",
+                    "-sc_threshold", "0",
+                    // B-frames for better compression but limit for latency
+                    "-bf", "2",
+                    "-refs", "3",
+                ].iter().map(|s| s.to_string()));
+            }
+        }
+        
+        // Resolution scaling
+        let target_height = video_info.as_ref()
+            .map(|info| {
+                if info.height > 1080 { 1080 } 
+                else if info.height > 720 { 720 } 
+                else { info.height }
+            })
+            .unwrap_or(720);
+        
+        if video_info.as_ref().map(|i| i.height > target_height).unwrap_or(false) {
+            match hw_accel {
+                HardwareAccel::Vaapi => {
+                    // VAAPI scaling is done in the filter chain above
+                }
+                _ => {
+                    args.push("-vf".to_string());
+                    args.push(format!("scale=-2:{}", target_height));
+                }
+            }
+        }
+    } else {
+        // Copy video stream without re-encoding
+        args.extend(["-c:v", "copy"].iter().map(|s| s.to_string()));
     }
-
-    HardwareAccel::None
-}
-
-/// 检查 FFmpeg 是否支持指定的编码器
-async fn check_ffmpeg_encoder(encoder: &str) -> bool {
-    use tokio::process::Command;
-
-    let ffmpeg_path = std::env::var("FFMPEG_PATH")
-        .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
-        .unwrap_or_else(|_| "ffmpeg".to_string());
-
-    let output = Command::new(&ffmpeg_path).args(["-encoders"]).output().await;
-
-    if let Ok(output) = output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return stdout.contains(encoder);
+    
+    // CRITICAL: Audio encoding for proper sync during seeking
+    // Always re-encode audio to ensure proper timestamps
+    if video_info.as_ref().map(|i| i.has_audio).unwrap_or(true) {
+        args.extend([
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-ac", "2",
+            "-ar", "48000",
+            // Audio sync options - CRITICAL for seek functionality
+            "-async", "1",
+            "-af", "aresample=async=1:first_pts=0",
+        ].iter().map(|s| s.to_string()));
+    } else {
+        args.push("-an".to_string());
     }
-
-    false
+    
+    // MPEGTS output options optimized for HLS streaming
+    args.extend([
+        "-f", "mpegts",
+        // CRITICAL: Timestamp handling for accurate seeking
+        "-mpegts_copyts", "0",
+        "-output_ts_offset", "0",
+        "-avoid_negative_ts", "make_zero",
+        "-start_at_zero",
+        // Buffer settings
+        "-max_muxing_queue_size", "2048",
+        "-muxdelay", "0",
+        "-muxpreload", "0",
+    ].iter().map(|s| s.to_string()));
+    
+    args.push(output_path.to_string());
+    args
 }
 
 #[cfg(test)]

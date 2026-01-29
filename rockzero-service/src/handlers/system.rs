@@ -18,7 +18,6 @@ pub struct SystemInfo {
     pub uptime: u64,
 }
 
-/// CPU 核心使用率信息
 #[derive(Debug, Serialize)]
 pub struct CpuCoreUsage {
     pub core_id: usize,
@@ -29,13 +28,9 @@ pub struct CpuCoreUsage {
 /// CPU 核心架构信息 (用于 ARM big.LITTLE 等异构架构)
 #[derive(Debug, Serialize)]
 pub struct CpuCoreArchInfo {
-    /// 核心架构名称 (如 Cortex-A55, Cortex-A76)
     pub core_name: String,
-    /// CPU Part ID
     pub part_id: String,
-    /// 该类型核心的数量
     pub count: usize,
-    /// CPU 实现者 (如 ARM, Qualcomm)
     pub implementer: Option<String>,
 }
 

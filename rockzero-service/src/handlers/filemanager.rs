@@ -385,6 +385,17 @@ pub async fn upload_files(
 
     tracing::info!("📂 Resolved upload path: {:?}", full_path);
 
+    // 🔒 验证目标路径是否在外部存储上（非eMMC）
+    #[cfg(target_os = "linux")]
+    {
+        let path_str = full_path.to_string_lossy();
+        if let Err(e) = crate::handlers::storage::validate_external_storage_path(&path_str) {
+            tracing::error!("❌ External storage validation failed: {:?}", e);
+            return Err(e);
+        }
+        tracing::info!("✅ External storage validation passed");
+    }
+
     if !full_path.exists() {
         tracing::info!("📁 Creating upload directory: {:?}", full_path);
         std::fs::create_dir_all(&full_path).map_err(|e| {

@@ -205,6 +205,13 @@ async fn main() -> std::io::Result<()> {
             .route("/health", web::get().to(handlers::health::health_check))
             .service(
                 web::scope("/api/v1")
+                    // 静态资源路由（Logo等）
+                    .service(
+                        web::scope("/assets")
+                            .route("/logo", web::get().to(handlers::health::serve_logo))
+                            .route("/readme", web::get().to(handlers::health::serve_readme))
+                            .route("/about", web::get().to(handlers::health::get_about))
+                    )
                     .service(
                         web::scope("/auth")
                             .route("/register", web::post().to(handlers::auth::register))
@@ -255,6 +262,14 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/devices",
                                 web::get().to(handlers::storage::list_storage_devices),
+                            )
+                            .route(
+                                "/stats",
+                                web::get().to(handlers::storage::get_external_storage_stats),
+                            )
+                            .route(
+                                "/config",
+                                web::get().to(handlers::storage::get_external_storage_config),
                             )
                             .route(
                                 "/device/{id}",
@@ -554,6 +569,14 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/devices",
                                 web::get().to(handlers::storage::list_storage_devices),
+                            )
+                            .route(
+                                "/stats",
+                                web::get().to(handlers::storage::get_external_storage_stats),
+                            )
+                            .route(
+                                "/config",
+                                web::get().to(handlers::storage::get_external_storage_config),
                             )
                             .route(
                                 "/devices/{id}",
