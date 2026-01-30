@@ -840,6 +840,9 @@ async fn transcode_segment_with_seek(
     let start_time = segment_index as f64 * SEGMENT_DURATION;
     let output_path = output_dir.join(format!("segment_{}.ts", segment_index));
 
+    // Remove any existing output file first
+    let _ = tokio::fs::remove_file(&output_path).await;
+
     // Check if we're beyond video duration
     let video_info = probe_video_info(video_path).await.ok();
     if let Some(ref info) = video_info {
@@ -859,16 +862,12 @@ async fn transcode_segment_with_seek(
     let video_path_str = video_path.to_str().unwrap_or("");
     let output_path_str = output_path.to_str().unwrap_or("");
 
-    let needs_transcode = video_info.as_ref()
-        .map(|info| {
-            info.video_codec != "h264" || info.width > 1920 ||
-            segment_index > 0
-        })
-        .unwrap_or(true);
+    // Always transcode for HLS compatibility
+    let needs_transcode = true;
 
     info!(
-        "Transcoding segment {} at {:.2}s with {:?} (needs_transcode: {})",
-        segment_index, start_time, hw_accel, needs_transcode
+        "Transcoding segment {} at {:.2}s with {:?}",
+        segment_index, start_time, hw_accel
     );
 
     let args = build_ffmpeg_args(
@@ -884,16 +883,24 @@ async fn transcode_segment_with_seek(
         .await
         .map_err(|e| AppError::IoError(format!("FFmpeg execution failed: {}", e)))?;
 
-    if !output.status.success() {
+    let mut transcode_success = output.status.success();
+
+    if !transcode_success {
         let stderr = String::from_utf8_lossy(&output.stderr);
         warn!("FFmpeg failed with {:?}: {}", hw_accel, stderr);
 
         if hw_accel != HardwareAccel::None {
             info!("Retrying segment {} with software encoding", segment_index);
+            
+            // Remove any partial output
+            let _ = tokio::fs::remove_file(&output_path).await;
+            
             let fallback_args = build_ffmpeg_args(
                 HardwareAccel::None, video_path_str, output_path_str,
                 start_time, SEGMENT_DURATION, true, &video_info,
             );
+
+            info!("FFmpeg fallback command: {} {}", ffmpeg_path, fallback_args.join(" "));
 
             let fallback_output = Command::new(&ffmpeg_path)
                 .args(&fallback_args)
@@ -901,7 +908,10 @@ async fn transcode_segment_with_seek(
                 .await
                 .map_err(|e| AppError::IoError(format!("FFmpeg fallback failed: {}", e)))?;
 
-            if !fallback_output.status.success() {
+            if fallback_output.status.success() {
+                transcode_success = true;
+                info!("Fallback transcoding succeeded for segment {}", segment_index);
+            } else {
                 let fallback_stderr = String::from_utf8_lossy(&fallback_output.stderr);
                 return Err(AppError::InternalServerError(format!(
                     "Transcode failed for segment {}: {}", segment_index, fallback_stderr
@@ -914,6 +924,16 @@ async fn transcode_segment_with_seek(
         }
     }
 
+    if !transcode_success {
+        return Err(AppError::InternalServerError(format!(
+            "Transcode failed for segment {}", segment_index
+        )));
+    }
+
+    // Wait a bit for file system to sync
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Read the transcoded segment
     let segment_data = tokio::fs::read(&output_path).await
         .map_err(|e| AppError::IoError(format!("Failed to read transcoded segment: {}", e)))?;
 
@@ -921,6 +941,10 @@ async fn transcode_segment_with_seek(
         return Err(AppError::InternalServerError(format!(
             "Transcoded segment {} is empty", segment_index
         )));
+    }
+
+    if segment_data.len() < 1000 {
+        warn!("Segment {} is suspiciously small: {} bytes", segment_index, segment_data.len());
     }
 
     info!(
