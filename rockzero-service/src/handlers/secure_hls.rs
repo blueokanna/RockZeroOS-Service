@@ -454,11 +454,20 @@ pub async fn get_secure_playlist(
     let session_id = path.into_inner();
 
     let manager = hls_manager.read().await;
-    let _session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+    let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
 
-    let playlist = generate_secure_m3u8(100, 10.0);
+    // Get actual video duration
+    let video_path = std::path::Path::new(&session.file_path);
+    let video_info = probe_video_info(video_path).await.ok();
+    
+    let duration = video_info.as_ref().map(|i| i.duration).unwrap_or(600.0);
+    let segment_duration = 10.0f64;
+    let segment_count = ((duration / segment_duration).ceil() as usize).max(1);
 
-    info!("Serving secure playlist for session {}", session_id);
+    let playlist = generate_secure_m3u8(segment_count, segment_duration as f32, duration);
+
+    info!("Serving secure playlist for session {} (duration: {:.1}s, segments: {})", 
+          session_id, duration, segment_count);
 
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
@@ -512,6 +521,13 @@ pub async fn get_secure_segment(
     info!("Session verified for segment {} (user: {})", segment_name, session.user_id);
 
     let segment_data = read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?;
+
+    // Validate segment data before encryption
+    if segment_data.len() < 1024 {
+        return Err(AppError::InternalServerError(format!(
+            "Invalid segment data: only {} bytes (expected at least 1KB)", segment_data.len()
+        )));
+    }
 
     let encrypted_segment = session.encrypt_segment(&segment_data).map_err(convert_hls_error)?;
 
@@ -589,7 +605,7 @@ pub async fn prebuffer_segment(
         .finish())
 }
 
-fn generate_secure_m3u8(segment_count: usize, segment_duration: f32) -> String {
+fn generate_secure_m3u8(segment_count: usize, segment_duration: f32, total_duration: f64) -> String {
     let mut playlist = String::from("#EXTM3U\n");
     playlist.push_str("#EXT-X-VERSION:6\n");
     playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
@@ -601,7 +617,16 @@ fn generate_secure_m3u8(segment_count: usize, segment_duration: f32) -> String {
     playlist.push_str("# Replay protection enabled\n\n");
 
     for i in 0..segment_count {
-        playlist.push_str(&format!("#EXTINF:{:.6},\n", segment_duration));
+        // Calculate actual duration for this segment
+        let segment_start = i as f64 * segment_duration as f64;
+        let remaining = total_duration - segment_start;
+        let actual_duration = if remaining < segment_duration as f64 {
+            remaining.max(0.1)
+        } else {
+            segment_duration as f64
+        };
+        
+        playlist.push_str(&format!("#EXTINF:{:.6},\n", actual_duration));
         playlist.push_str(&format!("segment_{}.ts\n", i));
     }
 
@@ -766,9 +791,18 @@ async fn read_video_segment_from_ffmpeg(
     let cached_segment_path = cache_dir.join(segment_name);
 
     if cached_segment_path.exists() {
-        info!("Cache hit for segment {} of video {}", segment_name, video_id);
-        return tokio::fs::read(&cached_segment_path).await
-            .map_err(|e| AppError::IoError(format!("Failed to read cached segment: {}", e)));
+        // Validate cached segment - must be at least 1KB for a valid TS segment
+        if let Ok(metadata) = tokio::fs::metadata(&cached_segment_path).await {
+            if metadata.len() >= 1024 {
+                info!("Cache hit for segment {} of video {} ({} bytes)", segment_name, video_id, metadata.len());
+                return tokio::fs::read(&cached_segment_path).await
+                    .map_err(|e| AppError::IoError(format!("Failed to read cached segment: {}", e)));
+            } else {
+                // Invalid cached segment, delete and re-transcode
+                warn!("Invalid cached segment {} ({} bytes), removing and re-transcoding", segment_name, metadata.len());
+                let _ = tokio::fs::remove_file(&cached_segment_path).await;
+            }
+        }
     }
 
     let original_video = PathBuf::from(file_path);
@@ -785,11 +819,12 @@ async fn read_video_segment_from_ffmpeg(
 
     let segment_data = transcode_segment_with_seek(&original_video, &cache_dir, segment_index).await?;
 
-    let cache_path_clone = cached_segment_path.clone();
-    let data_clone = segment_data.clone();
-    tokio::spawn(async move {
-        let _ = tokio::fs::write(&cache_path_clone, &data_clone).await;
-    });
+    // Write to cache synchronously to avoid race conditions
+    if let Err(e) = tokio::fs::write(&cached_segment_path, &segment_data).await {
+        warn!("Failed to cache segment {}: {}", segment_name, e);
+    } else {
+        info!("Cached segment {} ({} bytes)", segment_name, segment_data.len());
+    }
 
     Ok(segment_data)
 }
@@ -805,6 +840,17 @@ async fn transcode_segment_with_seek(
     let start_time = segment_index as f64 * SEGMENT_DURATION;
     let output_path = output_dir.join(format!("segment_{}.ts", segment_index));
 
+    // Check if we're beyond video duration
+    let video_info = probe_video_info(video_path).await.ok();
+    if let Some(ref info) = video_info {
+        if start_time >= info.duration {
+            return Err(AppError::BadRequest(format!(
+                "Segment {} starts at {:.1}s but video is only {:.1}s long",
+                segment_index, start_time, info.duration
+            )));
+        }
+    }
+
     let ffmpeg_path = std::env::var("FFMPEG_PATH")
         .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
         .unwrap_or_else(|_| "ffmpeg".to_string());
@@ -812,8 +858,6 @@ async fn transcode_segment_with_seek(
     let hw_accel = detect_hardware_acceleration().await;
     let video_path_str = video_path.to_str().unwrap_or("");
     let output_path_str = output_path.to_str().unwrap_or("");
-
-    let video_info = probe_video_info(video_path).await.ok();
 
     let needs_transcode = video_info.as_ref()
         .map(|info| {
@@ -1043,7 +1087,7 @@ mod tests {
 
     #[test]
     fn test_secure_playlist_generation() {
-        let playlist = generate_secure_m3u8(5, 10.0);
+        let playlist = generate_secure_m3u8(5, 10.0, 50.0);
         assert!(playlist.contains("#EXTM3U"));
         assert!(playlist.contains("segment_0.ts"));
         assert!(playlist.contains("segment_4.ts"));
