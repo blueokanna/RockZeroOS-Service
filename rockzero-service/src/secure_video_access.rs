@@ -8,7 +8,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
-use sha3::{Sha3_256, Digest};
 use tracing::{info, warn};
 
 use rockzero_crypto::{ZkpContext, PasswordRegistration};
@@ -54,14 +53,14 @@ impl VideoAccessToken {
         let created_at = Instant::now();
         let expires_at = created_at + Duration::from_secs(ttl_seconds);
         
-        // Simplified key derivation (based on password and context)
-        let mut hasher = Sha3_256::new();
+        // Simplified key derivation (based on password and context) using Blake3
+        let mut hasher = blake3::Hasher::new();
         hasher.update(password.as_bytes());
         hasher.update(user_id.as_bytes());
         hasher.update(file_path.to_string_lossy().as_bytes());
         hasher.update(token_id.as_bytes());
         let key_hash = hasher.finalize();
-        let sae_key = key_hash.to_vec();
+        let sae_key = key_hash.as_bytes().to_vec();
         
         // Use ZkpContext to register password and generate Bulletproofs proof
         let zkp_ctx = ZkpContext::new();
@@ -72,13 +71,13 @@ impl VideoAccessToken {
         let proof = serde_json::to_vec(&enhanced_proof)
             .map_err(|e| format!("Proof serialization failed: {}", e))?;
         
-        // Generate signature
-        let mut hasher = Sha3_256::new();
+        // Generate signature using Blake3
+        let mut hasher = blake3::Hasher::new();
         hasher.update(token_id.as_bytes());
         hasher.update(user_id.as_bytes());
         hasher.update(file_path.to_string_lossy().as_bytes());
         hasher.update(&sae_key);
-        let signature = hex::encode(hasher.finalize());
+        let signature = hex::encode(hasher.finalize().as_bytes());
         
         Ok(Self {
             token_id,
@@ -102,14 +101,14 @@ impl VideoAccessToken {
             return false;
         }
         
-        // Verify key (using same derivation method)
-        let mut hasher = Sha3_256::new();
+        // Verify key (using same derivation method with Blake3)
+        let mut hasher = blake3::Hasher::new();
         hasher.update(password.as_bytes());
         hasher.update(self.user_id.as_bytes());
         hasher.update(self.file_path.to_string_lossy().as_bytes());
         hasher.update(self.token_id.as_bytes());
         let key_hash = hasher.finalize();
-        let expected_key = key_hash.to_vec();
+        let expected_key = key_hash.as_bytes().to_vec();
         
         if expected_key != self.sae_key {
             warn!("Key mismatch for token: {}", self.token_id);
@@ -130,13 +129,13 @@ impl VideoAccessToken {
             }
         }
         
-        // Verify signature
-        let mut hasher = Sha3_256::new();
+        // Verify signature using Blake3
+        let mut hasher = blake3::Hasher::new();
         hasher.update(self.token_id.as_bytes());
         hasher.update(self.user_id.as_bytes());
         hasher.update(self.file_path.to_string_lossy().as_bytes());
         hasher.update(&self.sae_key);
-        let computed_signature = hex::encode(hasher.finalize());
+        let computed_signature = hex::encode(hasher.finalize().as_bytes());
         
         if computed_signature != self.signature {
             warn!("Signature mismatch for token: {}", self.token_id);

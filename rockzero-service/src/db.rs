@@ -9,8 +9,6 @@ pub struct User {
     pub username: String,
     pub email: String,
     pub password_hash: String,
-    /// SHA-256 hash of the plaintext password, used for SAE handshake
-    /// This is stored separately from password_hash (which is bcrypt/argon2)
     pub sae_secret: Option<String>,
     pub zkp_registration: Option<String>,
     pub role: String,

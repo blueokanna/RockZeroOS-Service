@@ -471,15 +471,23 @@ pub struct SecureDatabase {
 
 impl SecureDatabase {
     pub fn new(db_path: &Path, master_password: &str) -> Result<Self, AppError> {
-        use hkdf::Hkdf;
-        use sha3::Sha3_256;
-
+        // Use Blake3-based HKDF for key derivation
         let db_identifier = db_path.to_string_lossy().to_string();
-        let hkdf = Hkdf::<Sha3_256>::new(Some(db_identifier.as_bytes()), master_password.as_bytes());
-
-        let mut key = [0u8; 32];
-        hkdf.expand(b"rockzero-secure-database-v1", &mut key)
-            .map_err(|e| AppError::CryptoError(format!("Key derivation failed: {}", e)))?;
+        
+        // Extract: PRK = Blake3(salt || IKM)
+        let salt_hash = blake3::hash(db_identifier.as_bytes());
+        let mut extract_input = Vec::with_capacity(32 + master_password.len());
+        extract_input.extend_from_slice(salt_hash.as_bytes());
+        extract_input.extend_from_slice(master_password.as_bytes());
+        let prk = blake3::hash(&extract_input);
+        
+        // Expand: key = Blake3(PRK || info || 0x01)
+        let info = b"rockzero-secure-database-v1";
+        let mut expand_input = Vec::with_capacity(32 + info.len() + 1);
+        expand_input.extend_from_slice(prk.as_bytes());
+        expand_input.extend_from_slice(info);
+        expand_input.push(1);
+        let key = *blake3::hash(&expand_input).as_bytes();
 
         let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|_| AppError::CryptoError("Failed to create cipher".to_string()))?;

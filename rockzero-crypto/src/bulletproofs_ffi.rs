@@ -198,17 +198,11 @@ impl BulletproofsContext {
     }
 
     fn sign_with_hmac(&self, key: &[u8; 32], message: &[u8]) -> Result<String, AppError> {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-
-        type HmacSha256 = Hmac<Sha256>;
-
-        let mut mac = HmacSha256::new_from_slice(key)
-            .map_err(|_| AppError::CryptoError("Invalid HMAC key".to_string()))?;
-        mac.update(message);
-        let result = mac.finalize();
-
-        Ok(BASE64.encode(result.into_bytes()))
+        let mut input = Vec::with_capacity(32 + message.len());
+        input.extend_from_slice(key);
+        input.extend_from_slice(message);
+        let hash = blake3::hash(&input);
+        Ok(BASE64.encode(hash.as_bytes()))
     }
 }
 

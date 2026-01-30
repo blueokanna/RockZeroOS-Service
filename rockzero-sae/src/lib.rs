@@ -61,7 +61,7 @@
 //!
 //! After successful SAE handshake, both parties obtain the same PMK (Pairwise Master Key):
 //! - AES-256-GCM encryption (HLS video streams)
-//! - HMAC-SHA3-256 message authentication
+//! - Blake3 keyed hash for message authentication
 //! - Further key derivation (KDF)
 //!
 //! ## References

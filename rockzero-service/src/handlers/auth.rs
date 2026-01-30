@@ -287,12 +287,9 @@ fn derive_key_with_salt(password: &[u8], salt: &[u8]) -> Vec<u8> {
 }
 
 pub fn compute_sae_secret(password: &str) -> String {
-    use sha3::{Digest, Sha3_256};
-
-    let mut hasher = Sha3_256::new();
-    hasher.update(password.as_bytes());
-    let result = hasher.finalize();
-    hex::encode(result)
+    // Use Blake3 for SAE secret computation
+    let hash = blake3::hash(password.as_bytes());
+    hex::encode(hash.as_bytes())
 }
 
 fn generate_token_id() -> Result<String, AppError> {

@@ -15,6 +15,7 @@ rockzero-sae = { path = "../rockzero-sae" }
 # Cryptography
 aes-gcm = { workspace = true }
 base64 = { workspace = true }
+blake3 = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 hkdf = { workspace = true }

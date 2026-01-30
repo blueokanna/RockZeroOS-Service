@@ -9,7 +9,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, RwLock, Mutex};
 use tracing::{info, warn};
 use serde::{Serialize, Deserialize};
-use sha3::{Sha3_256, Digest};
 
 /// System event type
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -75,17 +74,17 @@ impl SystemEvent {
     }
     
     fn compute_hash(&self) -> String {
-        let mut hasher = Sha3_256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(format!("{:?}", self.event_type).as_bytes());
         if let Some(ref path) = self.path {
             hasher.update(path.as_bytes());
         }
-        hasher.update(self.unix_timestamp.to_le_bytes());
-        hasher.update(self.version_token.to_le_bytes());
+        hasher.update(&self.unix_timestamp.to_le_bytes());
+        hasher.update(&self.version_token.to_le_bytes());
         if let Some(ref user_id) = self.user_id {
             hasher.update(user_id.as_bytes());
         }
-        hex::encode(hasher.finalize())
+        hex::encode(hasher.finalize().as_bytes())
     }
     
     pub fn verify(&self) -> bool {
