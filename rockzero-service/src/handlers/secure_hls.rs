@@ -609,6 +609,34 @@ pub async fn stop_session(
     }
 }
 
+/// Prebuffer segment - triggers transcoding without returning encrypted data
+/// Used by clients to warm up the cache before playback
+pub async fn prebuffer_segment(
+    hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    path: web::Path<(String, String)>,
+) -> Result<impl Responder, AppError> {
+    let (session_id, segment_name) = path.into_inner();
+
+    info!("Prebuffer request: session={}, segment={}", session_id, segment_name);
+
+    // Verify session exists
+    let manager = hls_manager.read().await;
+    let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+
+    // Trigger transcoding (this will cache the result)
+    let segment_data = read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?;
+
+    info!(
+        "Prebuffered segment {} for session {} ({} bytes)",
+        segment_name, session_id, segment_data.len()
+    );
+
+    Ok(HttpResponse::Ok()
+        .insert_header(("X-Prebuffered", "true"))
+        .insert_header(("X-Segment-Size", segment_data.len()))
+        .finish())
+}
+
 /// Generate secure M3U8 playlist with proper seeking support
 /// 
 /// Key features for accurate seeking:
@@ -992,19 +1020,17 @@ fn build_ffmpeg_args(
             HardwareAccel::AmlogicV4l2 => {
                 // Amlogic A311D optimized encoding settings
                 // The A311D has a dedicated VPU that supports H.264 encoding
+                // NOTE: h264_v4l2m2m does NOT support -profile:v option
                 args.extend([
                     "-c:v", "h264_v4l2m2m",
                     // Bitrate control for smooth playback
                     "-b:v", "4M",
                     "-maxrate", "6M",
                     "-bufsize", "8M",
-                    // GOP settings for seeking
+                    // GOP settings for seeking - shorter for faster random access
                     "-g", "30",
-                    "-keyint_min", "30",
-                    // Profile for compatibility
-                    "-profile:v", "high",
-                    "-level", "4.1",
-                    // V4L2 specific options
+                    "-keyint_min", "15",
+                    // V4L2 specific options - increased buffers for smoother playback
                     "-num_output_buffers", "32",
                     "-num_capture_buffers", "16",
                 ].iter().map(|s| s.to_string()));

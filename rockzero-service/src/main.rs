@@ -809,6 +809,8 @@ async fn main() -> std::io::Result<()> {
                             .route("/{session_id}/playlist.m3u8", web::get().to(handlers::secure_hls::get_secure_playlist))
                             // Stop HLS session (requires JWT auth)
                             .route("/{session_id}/stop", web::post().to(handlers::secure_hls::stop_session))
+                            // Prebuffer segment (HEAD request to trigger transcoding without returning data)
+                            .route("/{session_id}/{segment}", web::head().to(handlers::secure_hls::prebuffer_segment))
                             // Video segments only allow POST requests (must include ZKP proof)
                             .route("/{session_id}/{segment}", web::post().to(handlers::secure_hls::get_secure_segment))
                     )
