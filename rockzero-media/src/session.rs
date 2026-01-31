@@ -38,7 +38,8 @@ impl HkdfBlake3 {
     fn new_with_session_salt(session_id: &str, ikm: &[u8]) -> Self {
         // Derive salt from session_id: blake3("hls-session-salt:" + session_id)
         let salt_input = format!("hls-session-salt:{}", session_id);
-        let salt = *blake3::hash(salt_input.as_bytes()).as_bytes();
+        let salt_input_bytes = salt_input.as_bytes();
+        let salt = *blake3::hash(salt_input_bytes).as_bytes();
 
         // PRK = blake3(salt + ikm)
         let mut input = Vec::with_capacity(32 + ikm.len());
@@ -125,7 +126,6 @@ impl HlsSession {
         let expires_at = created_at + Duration::hours(3);
 
         // Use session-derived salt for HKDF
-        // Salt = blake3("hls-session-salt:" + session_id)
         let hk = HkdfBlake3::new_with_session_salt(&session_id, &pmk);
 
         let mut encryption_key = [0u8; 32];
@@ -239,9 +239,12 @@ impl HlsSessionManager {
         }
 
         let pmk = sae_server.get_pmk()?;
+        
         let session =
             HlsSession::new_with_registration(user_id, file_path, pmk, 1000, zkp_registration)?;
         let session_id = session.session_id.clone();
+
+        tracing::info!("Created HLS session: {}", session_id);
 
         let mut sessions = self.sessions.lock().unwrap();
         sessions.insert(session_id.clone(), session);
@@ -381,11 +384,6 @@ mod tests {
         // Same input should produce same output
         assert_eq!(key1, key2);
 
-        // Print the key for verification with Dart implementation
-        println!("Session ID: {}", session_id);
-        println!("PMK: {}", hex::encode(&pmk));
-        println!("Derived key for 'hls-master-key': {}", hex::encode(&key1));
-
         // Test with different session_id
         let hk2 = HkdfBlake3::new_with_session_salt("different-session", &pmk);
         let mut key3 = [0u8; 32];
@@ -393,7 +391,6 @@ mod tests {
 
         // Different session_id should produce different key
         assert_ne!(key1, key3);
-        println!("Derived key for different session: {}", hex::encode(&key3));
     }
 
     #[test]
@@ -411,9 +408,6 @@ mod tests {
 
         // Same input should produce same output
         assert_eq!(key1, key2);
-
-        println!("Legacy PMK: {}", hex::encode(&pmk));
-        println!("Legacy derived key: {}", hex::encode(&key1));
     }
 
     #[test]
@@ -429,11 +423,6 @@ mod tests {
 
         assert!(!session.is_expired());
         assert_eq!(session.segment_keys.len(), 10);
-
-        println!(
-            "Session encryption key: {}",
-            hex::encode(&session.encryption_key)
-        );
     }
 
     #[test]

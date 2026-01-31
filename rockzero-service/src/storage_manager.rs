@@ -1,30 +1,20 @@
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::time::{interval, Duration};
-use tracing::{info, warn, error};
-use serde::{Deserialize, Serialize};
+use tracing::{error, info, warn};
 
-/// Storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
-    /// External storage path
     pub external_storage_path: PathBuf,
-    /// Video storage path
     pub video_storage_path: PathBuf,
-    /// Temporary file path
     pub temp_storage_path: PathBuf,
-    /// HLS cache path
     pub hls_cache_path: PathBuf,
-    /// Log path
     pub log_path: PathBuf,
-    /// Minimum free space (bytes)
     pub min_free_space: u64,
-    /// HLS cache retention days
     pub hls_cache_retention_days: u64,
-    /// Temporary file retention days
     pub temp_file_retention_days: u64,
-    /// Log file retention days
     pub log_retention_days: u64,
 }
 
@@ -45,7 +35,6 @@ impl Default for StorageConfig {
 }
 
 impl StorageConfig {
-    /// Load configuration from environment variables
     pub fn from_env() -> Self {
         Self {
             external_storage_path: std::env::var("EXTERNAL_STORAGE_PATH")
@@ -82,7 +71,6 @@ impl StorageConfig {
         }
     }
 
-    /// Initialize all storage directories
     pub async fn init_directories(&self) -> std::io::Result<()> {
         let dirs = [
             &self.external_storage_path,
@@ -104,9 +92,6 @@ impl StorageConfig {
     }
 }
 
-/// Storage Manager
-/// 
-/// Provides accurate storage space calculation, excluding system cache and temporary files
 pub struct StorageManager {
     config: StorageConfig,
 }
@@ -116,22 +101,14 @@ impl StorageManager {
         Self { config }
     }
 
-    /// Get accurate disk usage (excluding cache)
-    /// 
-    /// This method calculates actual user data usage, excluding:
-    /// - HLS transcoding cache
-    /// - Temporary files
-    /// - System logs
-    pub async fn get_accurate_disk_usage(&self, mount_point: &std::path::Path) -> std::io::Result<AccurateDiskUsage> {
-        // Get filesystem-level statistics
+    pub async fn get_accurate_disk_usage(
+        &self,
+        mount_point: &std::path::Path,
+    ) -> std::io::Result<AccurateDiskUsage> {
         let (total, available, used) = get_filesystem_stats(mount_point).await?;
-        
-        // Calculate RockZeroOS app cache space usage
         let cache_size = self.get_total_cache_size().await;
-        
-        // Actual user data = used space - cache space
         let actual_user_data = used.saturating_sub(cache_size);
-        
+
         Ok(AccurateDiskUsage {
             total_space: total,
             available_space: available,
@@ -149,29 +126,29 @@ impl StorageManager {
     /// Get total size of all caches
     async fn get_total_cache_size(&self) -> u64 {
         let mut total = 0u64;
-        
+
         // HLS cache
         if let Ok(size) = get_directory_size(&self.config.hls_cache_path).await {
             total += size;
         }
-        
+
         // Temporary files
         if let Ok(size) = get_directory_size(&self.config.temp_storage_path).await {
             total += size;
         }
-        
+
         // Log files
         if let Ok(size) = get_directory_size(&self.config.log_path).await {
             total += size;
         }
-        
+
         total
     }
 
     /// Force cleanup all caches (for use after formatting)
     pub async fn force_cleanup_all_cache(&self) -> std::io::Result<u64> {
         let mut total_cleaned = 0u64;
-        
+
         // Clean HLS cache
         if self.config.hls_cache_path.exists() {
             if let Ok(size) = get_directory_size(&self.config.hls_cache_path).await {
@@ -181,17 +158,21 @@ impl StorageManager {
             fs::create_dir_all(&self.config.hls_cache_path).await.ok();
             info!("🗑️ Cleaned HLS cache directory");
         }
-        
+
         // Clean temporary files
         if self.config.temp_storage_path.exists() {
             if let Ok(size) = get_directory_size(&self.config.temp_storage_path).await {
                 total_cleaned += size;
             }
-            fs::remove_dir_all(&self.config.temp_storage_path).await.ok();
-            fs::create_dir_all(&self.config.temp_storage_path).await.ok();
+            fs::remove_dir_all(&self.config.temp_storage_path)
+                .await
+                .ok();
+            fs::create_dir_all(&self.config.temp_storage_path)
+                .await
+                .ok();
             info!("🗑️ Cleaned temp storage directory");
         }
-        
+
         info!("✅ Force cleanup completed: {} bytes freed", total_cleaned);
         Ok(total_cleaned)
     }
@@ -204,7 +185,7 @@ impl StorageManager {
             loop {
                 interval.tick().await;
                 info!("🧹 Starting scheduled cleanup tasks...");
-                
+
                 if let Err(e) = manager.run_cleanup().await {
                     error!("Cleanup task failed: {}", e);
                 }
@@ -247,7 +228,7 @@ impl StorageManager {
             match get_available_space(path).await {
                 Ok(available) => {
                     let available_gb = available as f64 / 1024.0 / 1024.0 / 1024.0;
-                    
+
                     if available < self.config.min_free_space {
                         warn!(
                             "⚠️ Low disk space on {}: {:.2} GB available (minimum: {:.2} GB)",
@@ -277,7 +258,7 @@ impl StorageManager {
 
         let retention_secs = self.config.hls_cache_retention_days * 24 * 3600;
         let deleted = cleanup_old_files(path, retention_secs).await?;
-        
+
         if deleted > 0 {
             info!("🗑️ Cleaned up {} old HLS cache files", deleted);
         }
@@ -294,7 +275,7 @@ impl StorageManager {
 
         let retention_secs = self.config.temp_file_retention_days * 24 * 3600;
         let deleted = cleanup_old_files(path, retention_secs).await?;
-        
+
         if deleted > 0 {
             info!("🗑️ Cleaned up {} temporary files", deleted);
         }
@@ -311,7 +292,7 @@ impl StorageManager {
 
         let retention_secs = self.config.log_retention_days * 24 * 3600;
         let deleted = cleanup_old_files(path, retention_secs).await?;
-        
+
         if deleted > 0 {
             info!("🗑️ Cleaned up {} old log files", deleted);
         }
@@ -375,12 +356,14 @@ impl StorageManager {
 
         let size_before = get_directory_size(&cache_dir).await.unwrap_or(0);
         fs::remove_dir_all(&cache_dir).await?;
-        
-        info!("🗑️ Cleaned up session cache: {} ({} bytes)", video_hash, size_before);
+
+        info!(
+            "🗑️ Cleaned up session cache: {} ({} bytes)",
+            video_hash, size_before
+        );
         Ok(size_before)
     }
 }
-
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct StorageStats {
@@ -417,9 +400,9 @@ async fn get_filesystem_stats(path: &Path) -> std::io::Result<(u64, u64, u64)> {
         use std::mem::MaybeUninit;
         let path_cstr = std::ffi::CString::new(path.to_string_lossy().as_bytes())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        
+
         let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
-        
+
         unsafe {
             if libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) == 0 {
                 let stat = stat.assume_init();
@@ -431,7 +414,7 @@ async fn get_filesystem_stats(path: &Path) -> std::io::Result<(u64, u64, u64)> {
                 return Ok((total, available, used));
             }
         }
-        
+
         Err(std::io::Error::last_os_error())
     }
 
@@ -439,28 +422,30 @@ async fn get_filesystem_stats(path: &Path) -> std::io::Result<(u64, u64, u64)> {
     {
         use std::os::windows::ffi::OsStrExt;
         use winapi::um::fileapi::GetDiskFreeSpaceExW;
-        
-        let wide_path: Vec<u16> = path.as_os_str()
+
+        let wide_path: Vec<u16> = path
+            .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        
+
         let mut free_bytes: u64 = 0;
         let mut total_bytes: u64 = 0;
         let mut total_free_bytes: u64 = 0;
-        
+
         unsafe {
             if GetDiskFreeSpaceExW(
                 wide_path.as_ptr(),
                 &mut free_bytes as *mut u64 as *mut _,
                 &mut total_bytes as *mut u64 as *mut _,
                 &mut total_free_bytes as *mut u64 as *mut _,
-            ) != 0 {
+            ) != 0
+            {
                 let used = total_bytes - total_free_bytes;
                 return Ok((total_bytes, free_bytes, used));
             }
         }
-        
+
         Err(std::io::Error::last_os_error())
     }
 
@@ -483,12 +468,13 @@ async fn get_db_files_size(path: &std::path::Path) -> std::io::Result<u64> {
         let metadata = entry.metadata().await?;
         let file_name = entry.file_name();
         let file_name_str = file_name.to_string_lossy();
-        
+
         if metadata.is_file() {
             // Count all database related files
-            if file_name_str.ends_with(".db") 
+            if file_name_str.ends_with(".db")
                 || file_name_str.ends_with(".db-shm")
-                || file_name_str.ends_with(".db-wal") {
+                || file_name_str.ends_with(".db-wal")
+            {
                 total_size += metadata.len();
             }
         }
@@ -504,9 +490,9 @@ async fn get_available_space(path: &Path) -> std::io::Result<u64> {
         use std::mem::MaybeUninit;
         let path_cstr = std::ffi::CString::new(path.to_string_lossy().as_bytes())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        
+
         let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
-        
+
         unsafe {
             if libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) == 0 {
                 let stat = stat.assume_init();
@@ -514,7 +500,7 @@ async fn get_available_space(path: &Path) -> std::io::Result<u64> {
                 return Ok(available);
             }
         }
-        
+
         Err(std::io::Error::last_os_error())
     }
 
@@ -522,25 +508,27 @@ async fn get_available_space(path: &Path) -> std::io::Result<u64> {
     {
         use std::os::windows::ffi::OsStrExt;
         use winapi::um::fileapi::GetDiskFreeSpaceExW;
-        
-        let wide_path: Vec<u16> = path.as_os_str()
+
+        let wide_path: Vec<u16> = path
+            .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        
+
         let mut free_bytes: u64 = 0;
-        
+
         unsafe {
             if GetDiskFreeSpaceExW(
                 wide_path.as_ptr(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 &mut free_bytes as *mut u64 as *mut _,
-            ) != 0 {
+            ) != 0
+            {
                 return Ok(free_bytes);
             }
         }
-        
+
         Err(std::io::Error::last_os_error())
     }
 
@@ -551,7 +539,9 @@ async fn get_available_space(path: &Path) -> std::io::Result<u64> {
 }
 
 /// Get directory size
-fn get_directory_size(path: &Path) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<u64>> + Send + '_>> {
+fn get_directory_size(
+    path: &Path,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<u64>> + Send + '_>> {
     Box::pin(async move {
         if !path.exists() {
             return Ok(0);
@@ -562,7 +552,7 @@ fn get_directory_size(path: &Path) -> std::pin::Pin<Box<dyn std::future::Future<
 
         while let Some(entry) = entries.next_entry().await? {
             let metadata = entry.metadata().await?;
-            
+
             if metadata.is_file() {
                 total_size += metadata.len();
             } else if metadata.is_dir() {
@@ -584,17 +574,17 @@ async fn cleanup_old_files(path: &Path, retention_secs: u64) -> std::io::Result<
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    
+
     let mut deleted_count = 0;
     let mut entries = fs::read_dir(path).await?;
 
     while let Some(entry) = entries.next_entry().await? {
         let metadata = entry.metadata().await?;
-        
+
         if let Ok(modified) = metadata.modified() {
             if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
                 let file_age = now.saturating_sub(duration.as_secs());
-                
+
                 if file_age > retention_secs {
                     if metadata.is_file() {
                         if let Err(e) = fs::remove_file(entry.path()).await {
@@ -638,16 +628,20 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        fs::create_dir_all(&temp_dir).await.expect("Failed to create test directory");
-        
+        fs::create_dir_all(&temp_dir)
+            .await
+            .expect("Failed to create test directory");
+
         // Create some test files
         let test_file = temp_dir.join("test_file.txt");
-        fs::write(&test_file, "Hello, World!").await.expect("Failed to write test file");
-        
+        fs::write(&test_file, "Hello, World!")
+            .await
+            .expect("Failed to write test file");
+
         let size = get_directory_size(&temp_dir).await;
         assert!(size.is_ok());
         assert!(size.unwrap() >= 13); // "Hello, World!" is 13 bytes
-        
+
         // Cleanup
         fs::remove_dir_all(&temp_dir).await.ok();
     }

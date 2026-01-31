@@ -20,10 +20,13 @@ use uuid::Uuid;
 const DEFAULT_APPSTORE_ROOT: &str = "./data/appstore";
 const ISTOREOS_STORE_URL: &str = "https://fw.koolcenter.com/iStoreOS/apps";
 
+// CasaOS App Store URLs - 使用多个镜像源
 const CASAOS_STORE_URLS: &[&str] = &[
-    "https://play.cuse.eu.org/Cpe204-Appstore-play-arm.zip",
-    "https://play.cuse.eu.org/Cp0204-AppStore-Play.zip",
-    "https://casaos.app/store/apps.json",
+    // 优先使用 Cp0204 的 AppStore-Play 镜像
+    "https://play.cuse.eu.org/Cp0204-AppStore-Play/apps.json",
+    "https://cdn.jsdelivr.net/gh/Cp0204/CasaOS-AppStore-Play@main/Apps/apps.json",
+    // 备用源
+    "https://raw.githubusercontent.com/Cp0204/CasaOS-AppStore-Play/main/Apps/apps.json",
     "https://raw.githubusercontent.com/bigbeartechworld/big-bear-casaos/master/Apps/big-bear-casaos-apps.json",
     "https://raw.githubusercontent.com/WisdomSky/CasaOS-Coolstore/main/apps.json",
 ];

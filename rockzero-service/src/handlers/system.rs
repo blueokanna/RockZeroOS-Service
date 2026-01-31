@@ -280,15 +280,45 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                     continue;
                 }
 
-                let used_space = if partition.mount_point.is_some() {
-                    partition.size
-                        - get_available_space(&partition.device_path).unwrap_or(partition.size)
+                let (used_space, available_space, actual_total) = if partition.mount_point.is_some() {
+                    // 对于已挂载的分区，使用 sysinfo 获取准确的空间信息
+                    let disks_info = Disks::new_with_refreshed_list();
+                    let mut found = false;
+                    let mut total = partition.size;
+                    let mut avail = partition.size;
+                    let mut used = 0u64;
+                    
+                    for disk in disks_info.list() {
+                        let disk_mount = disk.mount_point().to_string_lossy().to_string();
+                        let disk_name = disk.name().to_string_lossy().to_string();
+                        
+                        // 匹配挂载点或设备名
+                        if disk_mount == mount_point || 
+                           disk_name == partition.device_path ||
+                           disk_name.ends_with(&partition.name) {
+                            total = disk.total_space();
+                            avail = disk.available_space();
+                            used = total.saturating_sub(avail);
+                            found = true;
+                            break;
+                        }
+                    }
+                    
+                    if !found {
+                        // 回退到使用 get_available_space
+                        if let Some(avail_space) = get_available_space(&partition.device_path) {
+                            avail = avail_space;
+                            used = partition.size.saturating_sub(avail_space);
+                        }
+                    }
+                    
+                    (used, avail, total)
                 } else {
-                    0
+                    (0, partition.size, partition.size)
                 };
 
-                let usage_percentage = if partition.size > 0 {
-                    (used_space as f64 / partition.size as f64) * 100.0
+                let usage_percentage = if actual_total > 0 {
+                    (used_space as f64 / actual_total as f64) * 100.0
                 } else {
                     0.0
                 };
@@ -297,8 +327,8 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                     name: partition.name.clone(),
                     mount_point,
                     file_system,
-                    total_space: partition.size,
-                    available_space: partition.size - used_space,
+                    total_space: actual_total,
+                    available_space,
                     used_space,
                     usage_percentage,
                     is_removable: block_dev.is_removable,

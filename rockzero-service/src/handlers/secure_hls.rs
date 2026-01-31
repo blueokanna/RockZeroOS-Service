@@ -274,7 +274,9 @@ pub async fn init_sae_handshake(
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
     let password = match &user.sae_secret {
-        Some(secret) => secret.as_bytes().to_vec(),
+        Some(secret) => {
+            secret.as_bytes().to_vec()
+        }
         None => {
             warn!(
                 "User {} does not have sae_secret, using password_hash",
@@ -572,14 +574,6 @@ pub async fn get_secure_segment(
         "Session verified for segment {} (user: {})",
         segment_name, session.user_id
     );
-    info!(
-        "Session PMK first 8 bytes: {}",
-        hex::encode(&session.pmk[..8])
-    );
-    info!(
-        "Session encryption key first 8 bytes: {}",
-        hex::encode(&session.encryption_key[..8])
-    );
 
     let segment_data = read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?;
 
@@ -601,10 +595,6 @@ pub async fn get_secure_segment(
         session_id,
         segment_data.len(),
         encrypted_segment.len()
-    );
-    info!(
-        "Encrypted segment first 12 bytes (nonce): {}",
-        hex::encode(&encrypted_segment[..12])
     );
 
     Ok(HttpResponse::Ok()
