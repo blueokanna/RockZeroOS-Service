@@ -2070,36 +2070,59 @@ pub fn validate_external_storage_path(path: &str) -> Result<(), AppError> {
     use std::path::Path;
 
     let path = Path::new(path);
-    
+
     // 获取路径的挂载点
     let mount_point = get_mount_point_for_path(path)?;
-    
+
     // 检查挂载点对应的设备
     let device = get_device_for_mount_point(&mount_point)?;
-    
+
     // 检查设备是否是内部eMMC
     let device_name = device.trim_start_matches("/dev/");
     let base_name = device_name.split('p').next().unwrap_or(device_name);
-    
+
     if is_internal_emmc(base_name, &device) {
-        error!("❌ Storage to internal eMMC is not allowed: {} -> {}", path.display(), device);
+        error!(
+            "❌ Storage to internal eMMC is not allowed: {} -> {}",
+            path.display(),
+            device
+        );
         return Err(AppError::Forbidden(
             "存储到内部eMMC存储是不允许的。请使用外部存储设备（USB/SATA）。\nStorage to internal eMMC is not allowed. Please use external storage (USB/SATA).".to_string()
         ));
     }
-    
+
     // 检查是否是系统分区
-    let excluded_mounts = ["/", "/boot", "/boot/efi", "/home", "/var", "/tmp", "/usr", "/opt", "/root"];
+    let excluded_mounts = [
+        "/",
+        "/boot",
+        "/boot/efi",
+        "/home",
+        "/var",
+        "/tmp",
+        "/usr",
+        "/opt",
+        "/root",
+    ];
     for excluded in excluded_mounts {
         if mount_point == excluded {
-            error!("❌ Storage to system partition is not allowed: {} -> {}", path.display(), mount_point);
+            error!(
+                "❌ Storage to system partition is not allowed: {} -> {}",
+                path.display(),
+                mount_point
+            );
             return Err(AppError::Forbidden(
                 format!("存储到系统分区 {} 是不允许的。请使用外部存储设备。\nStorage to system partition {} is not allowed. Please use external storage.", mount_point, mount_point)
             ));
         }
     }
-    
-    info!("✅ Path {} is on external storage: {} ({})", path.display(), mount_point, device);
+
+    info!(
+        "✅ Path {} is on external storage: {} ({})",
+        path.display(),
+        mount_point,
+        device
+    );
     Ok(())
 }
 
@@ -2114,7 +2137,7 @@ pub fn validate_external_storage_path(_path: &str) -> Result<(), AppError> {
 #[cfg(target_os = "linux")]
 fn get_mount_point_for_path(path: &std::path::Path) -> Result<String, AppError> {
     use std::io::BufRead;
-    
+
     // 获取绝对路径
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
@@ -2123,17 +2146,17 @@ fn get_mount_point_for_path(path: &std::path::Path) -> Result<String, AppError> 
             .map_err(|_| AppError::InternalError)?
             .join(path)
     };
-    
+
     let abs_path_str = abs_path.to_string_lossy();
-    
+
     // 读取 /proc/mounts 获取所有挂载点
     let mounts_file = std::fs::File::open("/proc/mounts")
         .map_err(|e| AppError::IoError(format!("Failed to read /proc/mounts: {}", e)))?;
-    
+
     let reader = std::io::BufReader::new(mounts_file);
     let mut best_match: Option<String> = None;
     let mut best_match_len = 0;
-    
+
     for line in reader.lines() {
         if let Ok(line) = line {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -2147,7 +2170,7 @@ fn get_mount_point_for_path(path: &std::path::Path) -> Result<String, AppError> 
             }
         }
     }
-    
+
     best_match.ok_or_else(|| AppError::NotFound("Could not find mount point for path".to_string()))
 }
 
@@ -2155,12 +2178,12 @@ fn get_mount_point_for_path(path: &std::path::Path) -> Result<String, AppError> 
 #[cfg(target_os = "linux")]
 fn get_device_for_mount_point(mount_point: &str) -> Result<String, AppError> {
     use std::io::BufRead;
-    
+
     let mounts_file = std::fs::File::open("/proc/mounts")
         .map_err(|e| AppError::IoError(format!("Failed to read /proc/mounts: {}", e)))?;
-    
+
     let reader = std::io::BufReader::new(mounts_file);
-    
+
     for line in reader.lines() {
         if let Ok(line) = line {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -2169,8 +2192,11 @@ fn get_device_for_mount_point(mount_point: &str) -> Result<String, AppError> {
             }
         }
     }
-    
-    Err(AppError::NotFound(format!("Could not find device for mount point: {}", mount_point)))
+
+    Err(AppError::NotFound(format!(
+        "Could not find device for mount point: {}",
+        mount_point
+    )))
 }
 
 /// 获取默认的外部存储路径
@@ -2178,7 +2204,7 @@ fn get_device_for_mount_point(mount_point: &str) -> Result<String, AppError> {
 #[cfg(target_os = "linux")]
 pub fn get_default_external_storage_path() -> Result<String, AppError> {
     let devices = get_linux_devices()?;
-    
+
     // 查找第一个已挂载的外部存储设备
     for device in &devices {
         if device.is_mounted {
@@ -2191,7 +2217,7 @@ pub fn get_default_external_storage_path() -> Result<String, AppError> {
             }
         }
     }
-    
+
     // 如果没有找到已挂载的外部存储，尝试查找常见的外部存储挂载点
     let common_external_paths = [
         "/mnt/sda1",
@@ -2201,7 +2227,7 @@ pub fn get_default_external_storage_path() -> Result<String, AppError> {
         "/media/storage",
         "/data",
     ];
-    
+
     for path in common_external_paths {
         if std::path::Path::new(path).exists() {
             if validate_external_storage_path(path).is_ok() {
@@ -2210,7 +2236,7 @@ pub fn get_default_external_storage_path() -> Result<String, AppError> {
             }
         }
     }
-    
+
     Err(AppError::NotFound(
         "没有找到可用的外部存储设备。请连接USB或SATA存储设备。\nNo external storage device found. Please connect a USB or SATA storage device.".to_string()
     ))
@@ -2229,11 +2255,11 @@ pub fn get_default_external_storage_path() -> Result<String, AppError> {
 pub fn get_docker_data_path() -> Result<String, AppError> {
     let base_path = get_default_external_storage_path()?;
     let docker_path = format!("{}/docker", base_path);
-    
+
     // 创建Docker数据目录
     std::fs::create_dir_all(&docker_path)
         .map_err(|e| AppError::IoError(format!("Failed to create Docker data directory: {}", e)))?;
-    
+
     info!("🐳 Docker data path: {}", docker_path);
     Ok(docker_path)
 }
@@ -2250,11 +2276,11 @@ pub fn get_docker_data_path() -> Result<String, AppError> {
 pub fn get_app_data_path() -> Result<String, AppError> {
     let base_path = get_default_external_storage_path()?;
     let app_data_path = format!("{}/app_data", base_path);
-    
+
     // 创建应用数据目录
     std::fs::create_dir_all(&app_data_path)
         .map_err(|e| AppError::IoError(format!("Failed to create app data directory: {}", e)))?;
-    
+
     info!("📦 App data path: {}", app_data_path);
     Ok(app_data_path)
 }
@@ -2272,7 +2298,7 @@ pub async fn get_external_storage_config() -> Result<HttpResponse, AppError> {
         let default_path = get_default_external_storage_path().ok();
         let docker_path = get_docker_data_path().ok();
         let app_data_path = get_app_data_path().ok();
-        
+
         return Ok(HttpResponse::Ok().json(serde_json::json!({
             "external_storage_available": default_path.is_some(),
             "default_storage_path": default_path,
@@ -2286,7 +2312,7 @@ pub async fn get_external_storage_config() -> Result<HttpResponse, AppError> {
             }
         })));
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         Ok(HttpResponse::Ok().json(serde_json::json!({

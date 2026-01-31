@@ -22,11 +22,35 @@ pub struct HlsSession {
     pub zkp_registration: Option<PasswordRegistration>,
 }
 
+/// HKDF-Blake3 key derivation
+/// 
+/// This implementation uses Blake3 for both extract and expand phases.
+/// Salt is derived from session_id for per-session uniqueness.
 struct HkdfBlake3 {
     prk: [u8; 32],
 }
 
 impl HkdfBlake3 {
+    /// Create HKDF instance with salt derived from session_id
+    /// 
+    /// Salt derivation: salt = blake3("hls-session-salt:" + session_id)
+    /// PRK derivation: prk = blake3(salt + ikm)
+    fn new_with_session_salt(session_id: &str, ikm: &[u8]) -> Self {
+        // Derive salt from session_id: blake3("hls-session-salt:" + session_id)
+        let salt_input = format!("hls-session-salt:{}", session_id);
+        let salt = *blake3::hash(salt_input.as_bytes()).as_bytes();
+
+        // PRK = blake3(salt + ikm)
+        let mut input = Vec::with_capacity(32 + ikm.len());
+        input.extend_from_slice(&salt);
+        input.extend_from_slice(ikm);
+        let prk = *blake3::hash(&input).as_bytes();
+
+        Self { prk }
+    }
+
+    /// Legacy constructor for backward compatibility (uses zero salt or provided salt)
+    #[allow(dead_code)]
     fn new(salt: Option<&[u8]>, ikm: &[u8]) -> Self {
         let salt_key: [u8; 32] = match salt {
             Some(s) if s.len() == 32 => {
@@ -34,9 +58,7 @@ impl HkdfBlake3 {
                 key.copy_from_slice(s);
                 key
             }
-            Some(s) => {
-                *blake3::hash(s).as_bytes()
-            }
+            Some(s) => *blake3::hash(s).as_bytes(),
             None => [0u8; 32],
         };
 
@@ -48,6 +70,9 @@ impl HkdfBlake3 {
         Self { prk }
     }
 
+    /// Expand PRK to derive output key material
+    /// 
+    /// T(i) = blake3(PRK + T(i-1) + info + counter)
     fn expand(&self, info: &[u8], okm: &mut [u8]) -> std::result::Result<(), &'static str> {
         if okm.is_empty() {
             return Ok(());
@@ -99,7 +124,9 @@ impl HlsSession {
         let created_at = Utc::now();
         let expires_at = created_at + Duration::hours(3);
 
-        let hk = HkdfBlake3::new(None, &pmk);
+        // Use session-derived salt for HKDF
+        // Salt = blake3("hls-session-salt:" + session_id)
+        let hk = HkdfBlake3::new_with_session_salt(&session_id, &pmk);
 
         let mut encryption_key = [0u8; 32];
         hk.expand(b"hls-master-key", &mut encryption_key)
@@ -212,13 +239,8 @@ impl HlsSessionManager {
         }
 
         let pmk = sae_server.get_pmk()?;
-        let session = HlsSession::new_with_registration(
-            user_id, 
-            file_path, 
-            pmk, 
-            1000,
-            zkp_registration,
-        )?;
+        let session =
+            HlsSession::new_with_registration(user_id, file_path, pmk, 1000, zkp_registration)?;
         let session_id = session.session_id.clone();
 
         let mut sessions = self.sessions.lock().unwrap();
@@ -343,6 +365,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_hkdf_blake3_with_session_salt() {
+        // Test that HKDF-Blake3 with session salt produces consistent results
+        let pmk = [0x42u8; 32];
+        let session_id = "test-session-123";
+
+        let hk = HkdfBlake3::new_with_session_salt(session_id, &pmk);
+
+        let mut key1 = [0u8; 32];
+        hk.expand(b"hls-master-key", &mut key1).unwrap();
+
+        let mut key2 = [0u8; 32];
+        hk.expand(b"hls-master-key", &mut key2).unwrap();
+
+        // Same input should produce same output
+        assert_eq!(key1, key2);
+
+        // Print the key for verification with Dart implementation
+        println!("Session ID: {}", session_id);
+        println!("PMK: {}", hex::encode(&pmk));
+        println!("Derived key for 'hls-master-key': {}", hex::encode(&key1));
+
+        // Test with different session_id
+        let hk2 = HkdfBlake3::new_with_session_salt("different-session", &pmk);
+        let mut key3 = [0u8; 32];
+        hk2.expand(b"hls-master-key", &mut key3).unwrap();
+
+        // Different session_id should produce different key
+        assert_ne!(key1, key3);
+        println!("Derived key for different session: {}", hex::encode(&key3));
+    }
+
+    #[test]
+    fn test_hkdf_blake3_legacy() {
+        // Test legacy HKDF-Blake3 with zero salt
+        let pmk = [0x42u8; 32];
+
+        let hk = HkdfBlake3::new(None, &pmk);
+
+        let mut key1 = [0u8; 32];
+        hk.expand(b"hls-master-key", &mut key1).unwrap();
+
+        let mut key2 = [0u8; 32];
+        hk.expand(b"hls-master-key", &mut key2).unwrap();
+
+        // Same input should produce same output
+        assert_eq!(key1, key2);
+
+        println!("Legacy PMK: {}", hex::encode(&pmk));
+        println!("Legacy derived key: {}", hex::encode(&key1));
+    }
+
+    #[test]
     fn test_session_creation() {
         let pmk = [0x42u8; 32];
         let session = HlsSession::new(
@@ -355,6 +429,11 @@ mod tests {
 
         assert!(!session.is_expired());
         assert_eq!(session.segment_keys.len(), 10);
+
+        println!(
+            "Session encryption key: {}",
+            hex::encode(&session.encryption_key)
+        );
     }
 
     #[test]
@@ -366,7 +445,8 @@ mod tests {
         let client_device_id = [0x01; 32];
         let server_device_id = [0x02; 32];
 
-        let mut client = rockzero_sae::SaeClient::new(password.clone(), client_device_id, server_device_id);
+        let mut client =
+            rockzero_sae::SaeClient::new(password.clone(), client_device_id, server_device_id);
         let mut server = rockzero_sae::SaeServer::new(password, server_device_id, client_device_id);
 
         let client_commit = client.generate_commit().unwrap();
@@ -397,7 +477,8 @@ mod tests {
         assert_eq!(fetched.user_id, user_id);
         assert_eq!(fetched.file_path, file_path);
 
-        let mut expired = HlsSession::new("expired_user".into(), "/tmp/old.mp4".into(), pmk, 1).unwrap();
+        let mut expired =
+            HlsSession::new("expired_user".into(), "/tmp/old.mp4".into(), pmk, 1).unwrap();
         expired.expires_at = Utc::now() - Duration::hours(1);
         {
             let mut sessions = manager.sessions.lock().unwrap();

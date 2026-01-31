@@ -165,7 +165,9 @@ impl BulletproofsContext {
         }
 
         if proof.timestamp > now + 60 {
-            return Err(AppError::CryptoError("Proof timestamp in future".to_string()));
+            return Err(AppError::CryptoError(
+                "Proof timestamp in future".to_string(),
+            ));
         }
 
         let range_result = self.verify_range_proof(&proof.range_proof)?;

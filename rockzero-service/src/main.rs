@@ -201,7 +201,9 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(secure_hls_manager_data))
             .app_data(web::Data::new(storage_manager_data))
             .app_data(web::Data::from(app_config_data))
-            .app_data(web::Data::new(std::sync::Arc::new(handlers::zkp_auth::ZkpAuthManager::new())))
+            .app_data(web::Data::new(std::sync::Arc::new(
+                handlers::zkp_auth::ZkpAuthManager::new(),
+            )))
             .route("/health", web::get().to(handlers::health::health_check))
             .service(
                 web::scope("/api/v1")
@@ -210,7 +212,7 @@ async fn main() -> std::io::Result<()> {
                         web::scope("/assets")
                             .route("/logo", web::get().to(handlers::health::serve_logo))
                             .route("/readme", web::get().to(handlers::health::serve_readme))
-                            .route("/about", web::get().to(handlers::health::get_about))
+                            .route("/about", web::get().to(handlers::health::get_about)),
                     )
                     .service(
                         web::scope("/auth")
@@ -220,20 +222,50 @@ async fn main() -> std::io::Result<()> {
                             .route("/me", web::get().to(handlers::auth::me))
                             // ZKP zero-knowledge proof authentication
                             .route("/zkp/login", web::post().to(handlers::zkp_auth::zkp_login))
-                            .route("/zkp/registration", web::post().to(handlers::zkp_auth::get_zkp_registration)),
+                            .route(
+                                "/zkp/registration",
+                                web::post().to(handlers::zkp_auth::get_zkp_registration),
+                            ),
                     )
                     .service(
                         web::scope("/zkp")
                             .wrap(middleware::JwtAuth)
-                            .route("/search/token", web::post().to(handlers::zkp_auth::create_search_token))
-                            .route("/search/execute", web::post().to(handlers::zkp_auth::execute_encrypted_search))
-                            .route("/share/proof", web::post().to(handlers::zkp_auth::create_share_proof))
-                            .route("/share/verify", web::post().to(handlers::zkp_auth::verify_share_proof))
-                            .route("/range-proof/create", web::post().to(handlers::zkp_auth::create_range_proof))
-                            .route("/range-proof/verify", web::post().to(handlers::zkp_auth::verify_range_proof))
-                            .route("/video/proof", web::post().to(handlers::zkp_auth::create_video_stream_proof))
-                            .route("/video/verify", web::post().to(handlers::zkp_auth::verify_video_stream_proof))
-                            .route("/proof/generate", web::post().to(handlers::zkp_auth::generate_zkp_proof)),
+                            .route(
+                                "/search/token",
+                                web::post().to(handlers::zkp_auth::create_search_token),
+                            )
+                            .route(
+                                "/search/execute",
+                                web::post().to(handlers::zkp_auth::execute_encrypted_search),
+                            )
+                            .route(
+                                "/share/proof",
+                                web::post().to(handlers::zkp_auth::create_share_proof),
+                            )
+                            .route(
+                                "/share/verify",
+                                web::post().to(handlers::zkp_auth::verify_share_proof),
+                            )
+                            .route(
+                                "/range-proof/create",
+                                web::post().to(handlers::zkp_auth::create_range_proof),
+                            )
+                            .route(
+                                "/range-proof/verify",
+                                web::post().to(handlers::zkp_auth::verify_range_proof),
+                            )
+                            .route(
+                                "/video/proof",
+                                web::post().to(handlers::zkp_auth::create_video_stream_proof),
+                            )
+                            .route(
+                                "/video/verify",
+                                web::post().to(handlers::zkp_auth::verify_video_stream_proof),
+                            )
+                            .route(
+                                "/proof/generate",
+                                web::post().to(handlers::zkp_auth::generate_zkp_proof),
+                            ),
                     )
                     .service(
                         web::scope("/system")
@@ -319,11 +351,13 @@ async fn main() -> std::io::Result<()> {
                             )
                             .route(
                                 "/accurate-usage",
-                                web::post().to(handlers::storage_management::get_accurate_disk_usage),
+                                web::post()
+                                    .to(handlers::storage_management::get_accurate_disk_usage),
                             )
                             .route(
                                 "/force-cleanup",
-                                web::post().to(handlers::storage_management::force_cleanup_all_cache),
+                                web::post()
+                                    .to(handlers::storage_management::force_cleanup_all_cache),
                             ),
                     )
                     .service(
@@ -794,25 +828,49 @@ async fn main() -> std::io::Result<()> {
                             .service(
                                 web::scope("/sae")
                                     .wrap(middleware::JwtAuth)
-                                    .route("/init", web::post().to(handlers::secure_hls::init_sae_handshake))
-                                    .route("/commit", web::post().to(handlers::secure_hls::send_client_commit))
-                                    .route("/confirm", web::post().to(handlers::secure_hls::send_client_confirm))
-                                    .route("/complete", web::post().to(handlers::secure_hls::complete_sae_handshake))
+                                    .route(
+                                        "/init",
+                                        web::post().to(handlers::secure_hls::init_sae_handshake),
+                                    )
+                                    .route(
+                                        "/commit",
+                                        web::post().to(handlers::secure_hls::send_client_commit),
+                                    )
+                                    .route(
+                                        "/confirm",
+                                        web::post().to(handlers::secure_hls::send_client_confirm),
+                                    )
+                                    .route(
+                                        "/complete",
+                                        web::post()
+                                            .to(handlers::secure_hls::complete_sae_handshake),
+                                    ),
                             )
-                            .service(
-                                web::scope("/session")
-                                    .wrap(middleware::JwtAuth)
-                                    .route("/create", web::post().to(handlers::secure_hls::create_hls_session))
-                            )
+                            .service(web::scope("/session").wrap(middleware::JwtAuth).route(
+                                "/create",
+                                web::post().to(handlers::secure_hls::create_hls_session),
+                            ))
                             // Secure HLS playlist and segments (authorized by session_id)
                             // Production-grade security: video segments must use POST + ZKP proof
-                            .route("/{session_id}/playlist.m3u8", web::get().to(handlers::secure_hls::get_secure_playlist))
+                            .route(
+                                "/{session_id}/playlist.m3u8",
+                                web::get().to(handlers::secure_hls::get_secure_playlist),
+                            )
                             // Stop HLS session (requires JWT auth)
-                            .route("/{session_id}/stop", web::post().to(handlers::secure_hls::stop_session))
+                            .route(
+                                "/{session_id}/stop",
+                                web::post().to(handlers::secure_hls::stop_session),
+                            )
                             // Prebuffer segment (HEAD request to trigger transcoding without returning data)
-                            .route("/{session_id}/{segment}", web::head().to(handlers::secure_hls::prebuffer_segment))
+                            .route(
+                                "/{session_id}/{segment}",
+                                web::head().to(handlers::secure_hls::prebuffer_segment),
+                            )
                             // Video segments only allow POST requests (must include ZKP proof)
-                            .route("/{session_id}/{segment}", web::post().to(handlers::secure_hls::get_secure_segment))
+                            .route(
+                                "/{session_id}/{segment}",
+                                web::post().to(handlers::secure_hls::get_secure_segment),
+                            ),
                     )
                     .service(
                         web::scope("/media")

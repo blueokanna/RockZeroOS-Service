@@ -11,9 +11,9 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 lazy_static::lazy_static! {
-    static ref USED_NONCES: std::sync::Mutex<HashMap<String, i64>> = 
+    static ref USED_NONCES: std::sync::Mutex<HashMap<String, i64>> =
         std::sync::Mutex::new(HashMap::new());
-    static ref REQUEST_SIGNATURES: std::sync::Mutex<HashMap<String, i64>> = 
+    static ref REQUEST_SIGNATURES: std::sync::Mutex<HashMap<String, i64>> =
         std::sync::Mutex::new(HashMap::new());
 }
 
@@ -58,7 +58,8 @@ fn verify_secure_request(
     }
 
     {
-        let mut nonces = USED_NONCES.lock()
+        let mut nonces = USED_NONCES
+            .lock()
             .map_err(|_| AppError::InternalServerError("Failed to lock nonce store".to_string()))?;
 
         let expiry_threshold = now - NONCE_EXPIRY_SECONDS * 1000;
@@ -66,7 +67,7 @@ fn verify_secure_request(
 
         if nonces.contains_key(&params.nonce) {
             return Err(AppError::Unauthorized(
-                "Nonce already used (replay attack detected)".to_string()
+                "Nonce already used (replay attack detected)".to_string(),
             ));
         }
 
@@ -83,20 +84,21 @@ fn verify_secure_request(
 
     if !constant_time_compare(&params.signature, &expected_signature) {
         return Err(AppError::Unauthorized(
-            "Invalid request signature".to_string()
+            "Invalid request signature".to_string(),
         ));
     }
 
     {
-        let mut signatures = REQUEST_SIGNATURES.lock()
-            .map_err(|_| AppError::InternalServerError("Failed to lock signature store".to_string()))?;
+        let mut signatures = REQUEST_SIGNATURES.lock().map_err(|_| {
+            AppError::InternalServerError("Failed to lock signature store".to_string())
+        })?;
 
         let expiry_threshold = now - REQUEST_SIGNATURE_EXPIRY_SECONDS * 1000;
         signatures.retain(|_, &mut ts| ts > expiry_threshold);
 
         if signatures.contains_key(&params.signature) {
             return Err(AppError::Unauthorized(
-                "Request signature already used".to_string()
+                "Request signature already used".to_string(),
             ));
         }
 
@@ -170,7 +172,9 @@ fn sanitize_file_path(path: &str) -> Result<std::path::PathBuf, AppError> {
 
     let base_dir = get_base_directory()?;
     let full_path = base_dir.join(&decoded_path);
-    let canonical = full_path.canonicalize().unwrap_or_else(|_| full_path.clone());
+    let canonical = full_path
+        .canonicalize()
+        .unwrap_or_else(|_| full_path.clone());
 
     Ok(canonical)
 }
@@ -248,7 +252,10 @@ pub async fn init_sae_handshake(
             return Err(AppError::NotFound(format!("File not found: {}", path)));
         }
         if !sanitized_path.is_file() {
-            return Err(AppError::BadRequest(format!("Path is not a file: {}", path)));
+            return Err(AppError::BadRequest(format!(
+                "Path is not a file: {}",
+                path
+            )));
         }
         sanitized_path.to_string_lossy().to_string()
     } else {
@@ -257,7 +264,10 @@ pub async fn init_sae_handshake(
         ));
     };
 
-    info!("Initializing SAE handshake for user {} - file: {}", user_id, file_path);
+    info!(
+        "Initializing SAE handshake for user {} - file: {}",
+        user_id, file_path
+    );
 
     let user = crate::db::find_user_by_id(&pool, &user_id)
         .await?
@@ -266,7 +276,10 @@ pub async fn init_sae_handshake(
     let password = match &user.sae_secret {
         Some(secret) => secret.as_bytes().to_vec(),
         None => {
-            warn!("User {} does not have sae_secret, using password_hash", user_id);
+            warn!(
+                "User {} does not have sae_secret, using password_hash",
+                user_id
+            );
             user.password_hash.as_bytes().to_vec()
         }
     };
@@ -276,7 +289,10 @@ pub async fn init_sae_handshake(
         .init_sae_handshake(user_id.clone(), password)
         .map_err(convert_hls_error)?;
 
-    info!("Initialized SAE handshake for user {} - temp session {}", user_id, temp_session_id);
+    info!(
+        "Initialized SAE handshake for user {} - temp session {}",
+        user_id, temp_session_id
+    );
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "temp_session_id": temp_session_id,
@@ -313,7 +329,10 @@ pub async fn send_client_commit(
         server_commit
     };
 
-    info!("Processed client commit for user {} - temp session {}", user_id, body.temp_session_id);
+    info!(
+        "Processed client commit for user {} - temp session {}",
+        user_id, body.temp_session_id
+    );
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "server_commit": server_commit,
@@ -351,7 +370,10 @@ pub async fn send_client_confirm(
             .map_err(|e| AppError::CryptoError(format!("Failed to get server confirm: {}", e)))?
     };
 
-    info!("Verified client confirm for user {} - temp session {}", user_id, body.temp_session_id);
+    info!(
+        "Verified client confirm for user {} - temp session {}",
+        user_id, body.temp_session_id
+    );
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "server_confirm": server_confirm,
@@ -385,7 +407,10 @@ pub async fn complete_sae_handshake(
         (server_commit, server_confirm)
     };
 
-    info!("Completed SAE handshake for user {} - temp session {}", user_id, body.temp_session_id);
+    info!(
+        "Completed SAE handshake for user {} - temp session {}",
+        user_id, body.temp_session_id
+    );
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "server_commit": server_commit,
@@ -413,7 +438,10 @@ pub async fn create_hls_session(
             return Err(AppError::NotFound(format!("File not found: {}", path)));
         }
         if !sanitized_path.is_file() {
-            return Err(AppError::BadRequest(format!("Path is not a file: {}", path)));
+            return Err(AppError::BadRequest(format!(
+                "Path is not a file: {}",
+                path
+            )));
         }
         sanitized_path.to_string_lossy().to_string()
     } else {
@@ -422,16 +450,24 @@ pub async fn create_hls_session(
         ));
     };
 
-    info!("Creating HLS session for user {} - file: {}", user_id, file_path);
+    info!(
+        "Creating HLS session for user {} - file: {}",
+        user_id, file_path
+    );
 
     let manager = hls_manager.read().await;
     let session_id = manager
         .complete_sae_handshake(&body.temp_session_id, user_id.clone(), file_path.clone())
         .map_err(convert_hls_error)?;
 
-    let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+    let session = manager
+        .get_session(&session_id)
+        .map_err(convert_hls_error)?;
 
-    info!("Created HLS session {} for user {} - file {}", session_id, user_id, file_path);
+    info!(
+        "Created HLS session {} for user {} - file {}",
+        session_id, user_id, file_path
+    );
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "session_id": session_id,
@@ -454,20 +490,24 @@ pub async fn get_secure_playlist(
     let session_id = path.into_inner();
 
     let manager = hls_manager.read().await;
-    let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+    let session = manager
+        .get_session(&session_id)
+        .map_err(convert_hls_error)?;
 
     // Get actual video duration
     let video_path = std::path::Path::new(&session.file_path);
     let video_info = probe_video_info(video_path).await.ok();
-    
+
     let duration = video_info.as_ref().map(|i| i.duration).unwrap_or(600.0);
     let segment_duration = 10.0f64;
     let segment_count = ((duration / segment_duration).ceil() as usize).max(1);
 
     let playlist = generate_secure_m3u8(segment_count, segment_duration as f32, duration);
 
-    info!("Serving secure playlist for session {} (duration: {:.1}s, segments: {})", 
-          session_id, duration, segment_count);
+    info!(
+        "Serving secure playlist for session {} (duration: {:.1}s, segments: {})",
+        session_id, duration, segment_count
+    );
 
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
@@ -495,10 +535,15 @@ pub async fn get_secure_segment(
 ) -> Result<impl Responder, AppError> {
     let (session_id, segment_name) = path.into_inner();
 
-    info!("Secure segment request: session={}, segment={}", session_id, segment_name);
+    info!(
+        "Secure segment request: session={}, segment={}",
+        session_id, segment_name
+    );
 
     let manager = hls_manager.read().await;
-    let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+    let session = manager
+        .get_session(&session_id)
+        .map_err(convert_hls_error)?;
 
     if let (Some(ts), Some(nonce), Some(sig)) = (&query.ts, &query.nonce, &query.sig) {
         let params = SecureRequestParams {
@@ -511,29 +556,55 @@ pub async fn get_secure_segment(
         info!("Secure request verified for segment {}", segment_name);
     } else {
         let peer_addr = req.peer_addr();
-        let is_local = peer_addr.map(|addr| addr.ip().is_loopback()).unwrap_or(false);
+        let is_local = peer_addr
+            .map(|addr| addr.ip().is_loopback())
+            .unwrap_or(false);
 
         if !is_local {
-            warn!("Non-local request without security params for segment {}", segment_name);
+            warn!(
+                "Non-local request without security params for segment {}",
+                segment_name
+            );
         }
     }
 
-    info!("Session verified for segment {} (user: {})", segment_name, session.user_id);
+    info!(
+        "Session verified for segment {} (user: {})",
+        segment_name, session.user_id
+    );
+    info!(
+        "Session PMK first 8 bytes: {}",
+        hex::encode(&session.pmk[..8])
+    );
+    info!(
+        "Session encryption key first 8 bytes: {}",
+        hex::encode(&session.encryption_key[..8])
+    );
 
     let segment_data = read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?;
 
     // Validate segment data before encryption
     if segment_data.len() < 1024 {
         return Err(AppError::InternalServerError(format!(
-            "Invalid segment data: only {} bytes (expected at least 1KB)", segment_data.len()
+            "Invalid segment data: only {} bytes (expected at least 1KB)",
+            segment_data.len()
         )));
     }
 
-    let encrypted_segment = session.encrypt_segment(&segment_data).map_err(convert_hls_error)?;
+    let encrypted_segment = session
+        .encrypt_segment(&segment_data)
+        .map_err(convert_hls_error)?;
 
     info!(
         "Serving encrypted segment {} for session {} (original: {} bytes, encrypted: {} bytes)",
-        segment_name, session_id, segment_data.len(), encrypted_segment.len()
+        segment_name,
+        session_id,
+        segment_data.len(),
+        encrypted_segment.len()
+    );
+    info!(
+        "Encrypted segment first 12 bytes (nonce): {}",
+        hex::encode(&encrypted_segment[..12])
     );
 
     Ok(HttpResponse::Ok()
@@ -587,16 +658,23 @@ pub async fn prebuffer_segment(
 ) -> Result<impl Responder, AppError> {
     let (session_id, segment_name) = path.into_inner();
 
-    info!("Prebuffer request: session={}, segment={}", session_id, segment_name);
+    info!(
+        "Prebuffer request: session={}, segment={}",
+        session_id, segment_name
+    );
 
     let manager = hls_manager.read().await;
-    let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+    let session = manager
+        .get_session(&session_id)
+        .map_err(convert_hls_error)?;
 
     let segment_data = read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?;
 
     info!(
         "Prebuffered segment {} for session {} ({} bytes)",
-        segment_name, session_id, segment_data.len()
+        segment_name,
+        session_id,
+        segment_data.len()
     );
 
     Ok(HttpResponse::Ok()
@@ -605,11 +683,18 @@ pub async fn prebuffer_segment(
         .finish())
 }
 
-fn generate_secure_m3u8(segment_count: usize, segment_duration: f32, total_duration: f64) -> String {
+fn generate_secure_m3u8(
+    segment_count: usize,
+    segment_duration: f32,
+    total_duration: f64,
+) -> String {
     let mut playlist = String::from("#EXTM3U\n");
     playlist.push_str("#EXT-X-VERSION:6\n");
     playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
-    playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", segment_duration.ceil() as u32));
+    playlist.push_str(&format!(
+        "#EXT-X-TARGETDURATION:{}\n",
+        segment_duration.ceil() as u32
+    ));
     playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
     playlist.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
     playlist.push_str("# Encrypted with AES-256-GCM (custom implementation)\n");
@@ -625,7 +710,7 @@ fn generate_secure_m3u8(segment_count: usize, segment_duration: f32, total_durat
         } else {
             segment_duration as f64
         };
-        
+
         playlist.push_str(&format!("#EXTINF:{:.6},\n", actual_duration));
         playlist.push_str(&format!("segment_{}.ts\n", i));
     }
@@ -665,8 +750,10 @@ async fn probe_video_info(video_path: &std::path::Path) -> Result<VideoInfo, App
 
     let output = Command::new(&ffprobe_path)
         .args([
-            "-v", "quiet",
-            "-print_format", "json",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
             "-show_format",
             "-show_streams",
             video_path.to_str().unwrap_or(""),
@@ -709,7 +796,14 @@ async fn probe_video_info(video_path: &std::path::Path) -> Result<VideoInfo, App
         }
     }
 
-    Ok(VideoInfo { duration, has_video, has_audio, video_codec, width, height })
+    Ok(VideoInfo {
+        duration,
+        has_video,
+        has_audio,
+        video_codec,
+        width,
+        height,
+    })
 }
 
 async fn detect_hardware_acceleration() -> HardwareAccel {
@@ -738,12 +832,16 @@ async fn detect_hardware_acceleration() -> HardwareAccel {
 
 async fn is_amlogic_device() -> bool {
     if let Ok(content) = tokio::fs::read_to_string("/proc/cpuinfo").await {
-        if content.contains("Amlogic") || content.contains("A311D") || 
-           content.contains("S905") || content.contains("S922") {
+        if content.contains("Amlogic")
+            || content.contains("A311D")
+            || content.contains("S905")
+            || content.contains("S922")
+        {
             return true;
         }
     }
-    if let Ok(content) = tokio::fs::read_to_string("/sys/firmware/devicetree/base/compatible").await {
+    if let Ok(content) = tokio::fs::read_to_string("/sys/firmware/devicetree/base/compatible").await
+    {
         if content.contains("amlogic") || content.contains("meson") {
             return true;
         }
@@ -758,7 +856,11 @@ async fn check_ffmpeg_encoder(encoder: &str) -> bool {
         .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
         .unwrap_or_else(|_| "ffmpeg".to_string());
 
-    if let Ok(output) = Command::new(&ffmpeg_path).args(["-encoders"]).output().await {
+    if let Ok(output) = Command::new(&ffmpeg_path)
+        .args(["-encoders"])
+        .output()
+        .await
+    {
         let stdout = String::from_utf8_lossy(&output.stdout);
         return stdout.contains(encoder);
     }
@@ -772,7 +874,10 @@ async fn read_video_segment_from_ffmpeg(
     use std::path::PathBuf;
 
     if !segment_name.starts_with("segment_") || !segment_name.ends_with(".ts") {
-        return Err(AppError::BadRequest(format!("Invalid segment name: '{}'", segment_name)));
+        return Err(AppError::BadRequest(format!(
+            "Invalid segment name: '{}'",
+            segment_name
+        )));
     }
 
     let segment_index: usize = segment_name
@@ -794,12 +899,22 @@ async fn read_video_segment_from_ffmpeg(
         // Validate cached segment - must be at least 1KB for a valid TS segment
         if let Ok(metadata) = tokio::fs::metadata(&cached_segment_path).await {
             if metadata.len() >= 1024 {
-                info!("Cache hit for segment {} of video {} ({} bytes)", segment_name, video_id, metadata.len());
-                return tokio::fs::read(&cached_segment_path).await
-                    .map_err(|e| AppError::IoError(format!("Failed to read cached segment: {}", e)));
+                info!(
+                    "Cache hit for segment {} of video {} ({} bytes)",
+                    segment_name,
+                    video_id,
+                    metadata.len()
+                );
+                return tokio::fs::read(&cached_segment_path).await.map_err(|e| {
+                    AppError::IoError(format!("Failed to read cached segment: {}", e))
+                });
             } else {
                 // Invalid cached segment, delete and re-transcode
-                warn!("Invalid cached segment {} ({} bytes), removing and re-transcoding", segment_name, metadata.len());
+                warn!(
+                    "Invalid cached segment {} ({} bytes), removing and re-transcoding",
+                    segment_name,
+                    metadata.len()
+                );
                 let _ = tokio::fs::remove_file(&cached_segment_path).await;
             }
         }
@@ -807,23 +922,35 @@ async fn read_video_segment_from_ffmpeg(
 
     let original_video = PathBuf::from(file_path);
     if !original_video.exists() {
-        return Err(AppError::NotFound(format!("Video not found: {}", file_path)));
+        return Err(AppError::NotFound(format!(
+            "Video not found: {}",
+            file_path
+        )));
     }
 
-    info!("Cache miss for segment {} of video {}, transcoding", segment_name, video_id);
+    info!(
+        "Cache miss for segment {} of video {}, transcoding",
+        segment_name, video_id
+    );
 
     if !cache_dir.exists() {
-        tokio::fs::create_dir_all(&cache_dir).await
+        tokio::fs::create_dir_all(&cache_dir)
+            .await
             .map_err(|e| AppError::IoError(format!("Failed to create cache dir: {}", e)))?;
     }
 
-    let segment_data = transcode_segment_with_seek(&original_video, &cache_dir, segment_index).await?;
+    let segment_data =
+        transcode_segment_with_seek(&original_video, &cache_dir, segment_index).await?;
 
     // Write to cache synchronously to avoid race conditions
     if let Err(e) = tokio::fs::write(&cached_segment_path, &segment_data).await {
         warn!("Failed to cache segment {}: {}", segment_name, e);
     } else {
-        info!("Cached segment {} ({} bytes)", segment_name, segment_data.len());
+        info!(
+            "Cached segment {} ({} bytes)",
+            segment_name,
+            segment_data.len()
+        );
     }
 
     Ok(segment_data)
@@ -871,8 +998,13 @@ async fn transcode_segment_with_seek(
     );
 
     let args = build_ffmpeg_args(
-        hw_accel, video_path_str, output_path_str,
-        start_time, SEGMENT_DURATION, needs_transcode, &video_info,
+        hw_accel,
+        video_path_str,
+        output_path_str,
+        start_time,
+        SEGMENT_DURATION,
+        needs_transcode,
+        &video_info,
     );
 
     info!("FFmpeg command: {} {}", ffmpeg_path, args.join(" "));
@@ -891,16 +1023,25 @@ async fn transcode_segment_with_seek(
 
         if hw_accel != HardwareAccel::None {
             info!("Retrying segment {} with software encoding", segment_index);
-            
+
             // Remove any partial output
             let _ = tokio::fs::remove_file(&output_path).await;
-            
+
             let fallback_args = build_ffmpeg_args(
-                HardwareAccel::None, video_path_str, output_path_str,
-                start_time, SEGMENT_DURATION, true, &video_info,
+                HardwareAccel::None,
+                video_path_str,
+                output_path_str,
+                start_time,
+                SEGMENT_DURATION,
+                true,
+                &video_info,
             );
 
-            info!("FFmpeg fallback command: {} {}", ffmpeg_path, fallback_args.join(" "));
+            info!(
+                "FFmpeg fallback command: {} {}",
+                ffmpeg_path,
+                fallback_args.join(" ")
+            );
 
             let fallback_output = Command::new(&ffmpeg_path)
                 .args(&fallback_args)
@@ -910,23 +1051,29 @@ async fn transcode_segment_with_seek(
 
             if fallback_output.status.success() {
                 transcode_success = true;
-                info!("Fallback transcoding succeeded for segment {}", segment_index);
+                info!(
+                    "Fallback transcoding succeeded for segment {}",
+                    segment_index
+                );
             } else {
                 let fallback_stderr = String::from_utf8_lossy(&fallback_output.stderr);
                 return Err(AppError::InternalServerError(format!(
-                    "Transcode failed for segment {}: {}", segment_index, fallback_stderr
+                    "Transcode failed for segment {}: {}",
+                    segment_index, fallback_stderr
                 )));
             }
         } else {
             return Err(AppError::InternalServerError(format!(
-                "Transcode failed for segment {}: {}", segment_index, stderr
+                "Transcode failed for segment {}: {}",
+                segment_index, stderr
             )));
         }
     }
 
     if !transcode_success {
         return Err(AppError::InternalServerError(format!(
-            "Transcode failed for segment {}", segment_index
+            "Transcode failed for segment {}",
+            segment_index
         )));
     }
 
@@ -934,22 +1081,29 @@ async fn transcode_segment_with_seek(
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Read the transcoded segment
-    let segment_data = tokio::fs::read(&output_path).await
+    let segment_data = tokio::fs::read(&output_path)
+        .await
         .map_err(|e| AppError::IoError(format!("Failed to read transcoded segment: {}", e)))?;
 
     if segment_data.is_empty() {
         return Err(AppError::InternalServerError(format!(
-            "Transcoded segment {} is empty", segment_index
+            "Transcoded segment {} is empty",
+            segment_index
         )));
     }
 
     if segment_data.len() < 1000 {
-        warn!("Segment {} is suspiciously small: {} bytes", segment_index, segment_data.len());
+        warn!(
+            "Segment {} is suspiciously small: {} bytes",
+            segment_index,
+            segment_data.len()
+        );
     }
 
     info!(
         "✅ Segment {} transcoded successfully: {} bytes",
-        segment_index, segment_data.len()
+        segment_index,
+        segment_data.len()
     );
 
     Ok(segment_data)
@@ -966,7 +1120,11 @@ fn build_ffmpeg_args(
 ) -> Vec<String> {
     let mut args = Vec::new();
 
-    args.extend(["-y", "-hide_banner", "-loglevel", "warning"].iter().map(|s| s.to_string()));
+    args.extend(
+        ["-y", "-hide_banner", "-loglevel", "warning"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
 
     args.push("-ss".to_string());
     args.push(format!("{:.3}", start_time));
@@ -974,18 +1132,26 @@ fn build_ffmpeg_args(
     match hw_accel {
         HardwareAccel::AmlogicV4l2 => {
             if std::path::Path::new("/dev/video10").exists() {
-                args.extend([
-                    "-hwaccel", "v4l2m2m",
-                    "-c:v", "h264_v4l2m2m",
-                ].iter().map(|s| s.to_string()));
+                args.extend(
+                    ["-hwaccel", "v4l2m2m", "-c:v", "h264_v4l2m2m"]
+                        .iter()
+                        .map(|s| s.to_string()),
+                );
             }
         }
         HardwareAccel::Vaapi => {
-            args.extend([
-                "-hwaccel", "vaapi",
-                "-hwaccel_device", "/dev/dri/renderD128",
-                "-hwaccel_output_format", "vaapi",
-            ].iter().map(|s| s.to_string()));
+            args.extend(
+                [
+                    "-hwaccel",
+                    "vaapi",
+                    "-hwaccel_device",
+                    "/dev/dri/renderD128",
+                    "-hwaccel_output_format",
+                    "vaapi",
+                ]
+                .iter()
+                .map(|s| s.to_string()),
+            );
         }
         HardwareAccel::V4l2Generic => {
             if std::path::Path::new("/dev/video10").exists() {
@@ -1001,72 +1167,128 @@ fn build_ffmpeg_args(
     args.push("-t".to_string());
     args.push(format!("{:.3}", duration));
 
-    args.extend([
-        "-force_key_frames", "expr:gte(t,0)",
-    ].iter().map(|s| s.to_string()));
+    args.extend(
+        ["-force_key_frames", "expr:gte(t,0)"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
 
     if needs_transcode {
         match hw_accel {
             HardwareAccel::AmlogicV4l2 => {
-                args.extend([
-                    "-c:v", "h264_v4l2m2m",
-                    "-b:v", "4M",
-                    "-maxrate", "6M",
-                    "-bufsize", "8M",
-                    "-g", "30",
-                    "-keyint_min", "15",
-                    "-num_output_buffers", "32",
-                    "-num_capture_buffers", "16",
-                ].iter().map(|s| s.to_string()));
+                args.extend(
+                    [
+                        "-c:v",
+                        "h264_v4l2m2m",
+                        "-b:v",
+                        "4M",
+                        "-maxrate",
+                        "6M",
+                        "-bufsize",
+                        "8M",
+                        "-g",
+                        "30",
+                        "-keyint_min",
+                        "15",
+                        "-num_output_buffers",
+                        "32",
+                        "-num_capture_buffers",
+                        "16",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string()),
+                );
             }
             HardwareAccel::Vaapi => {
-                args.extend([
-                    "-vf", "format=nv12|vaapi,hwupload",
-                    "-c:v", "h264_vaapi",
-                    "-qp", "23",
-                    "-g", "30",
-                    "-keyint_min", "30",
-                ].iter().map(|s| s.to_string()));
+                args.extend(
+                    [
+                        "-vf",
+                        "format=nv12|vaapi,hwupload",
+                        "-c:v",
+                        "h264_vaapi",
+                        "-qp",
+                        "23",
+                        "-g",
+                        "30",
+                        "-keyint_min",
+                        "30",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string()),
+                );
             }
             HardwareAccel::V4l2Generic => {
-                args.extend([
-                    "-c:v", "h264_v4l2m2m",
-                    "-b:v", "3M",
-                    "-maxrate", "4M",
-                    "-bufsize", "6M",
-                    "-g", "30",
-                    "-keyint_min", "30",
-                ].iter().map(|s| s.to_string()));
+                args.extend(
+                    [
+                        "-c:v",
+                        "h264_v4l2m2m",
+                        "-b:v",
+                        "3M",
+                        "-maxrate",
+                        "4M",
+                        "-bufsize",
+                        "6M",
+                        "-g",
+                        "30",
+                        "-keyint_min",
+                        "30",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string()),
+                );
             }
             HardwareAccel::None => {
-                args.extend([
-                    "-c:v", "libx264",
-                    "-preset", "fast",
-                    "-tune", "zerolatency",
-                    "-profile:v", "high",
-                    "-level", "4.1",
-                    "-crf", "22",
-                    "-g", "30",
-                    "-keyint_min", "30",
-                    "-sc_threshold", "0",
-                    "-bf", "2",
-                    "-refs", "3",
-                ].iter().map(|s| s.to_string()));
+                args.extend(
+                    [
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "fast",
+                        "-tune",
+                        "zerolatency",
+                        "-profile:v",
+                        "high",
+                        "-level",
+                        "4.1",
+                        "-crf",
+                        "22",
+                        "-g",
+                        "30",
+                        "-keyint_min",
+                        "30",
+                        "-sc_threshold",
+                        "0",
+                        "-bf",
+                        "2",
+                        "-refs",
+                        "3",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string()),
+                );
             }
         }
 
-        let target_height = video_info.as_ref()
+        let target_height = video_info
+            .as_ref()
             .map(|info| {
-                if info.height > 1080 { 1080 } 
-                else if info.height > 720 { 720 } 
-                else { info.height }
+                if info.height > 1080 {
+                    1080
+                } else if info.height > 720 {
+                    720
+                } else {
+                    info.height
+                }
             })
             .unwrap_or(720);
 
-        if video_info.as_ref().map(|i| i.height > target_height).unwrap_or(false) {
+        if video_info
+            .as_ref()
+            .map(|i| i.height > target_height)
+            .unwrap_or(false)
+        {
             match hw_accel {
-                HardwareAccel::Vaapi => {
-                }
+                HardwareAccel::Vaapi => {}
                 _ => {
                     args.push("-vf".to_string());
                     args.push(format!("scale=-2:{}", target_height));
@@ -1078,28 +1300,49 @@ fn build_ffmpeg_args(
     }
 
     if video_info.as_ref().map(|i| i.has_audio).unwrap_or(true) {
-        args.extend([
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-ac", "2",
-            "-ar", "48000",
-            "-async", "1",
-            "-af", "aresample=async=1:first_pts=0",
-        ].iter().map(|s| s.to_string()));
+        args.extend(
+            [
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-ac",
+                "2",
+                "-ar",
+                "48000",
+                "-async",
+                "1",
+                "-af",
+                "aresample=async=1:first_pts=0",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
     } else {
         args.push("-an".to_string());
     }
 
-    args.extend([
-        "-f", "mpegts",
-        "-mpegts_copyts", "0",
-        "-output_ts_offset", "0",
-        "-avoid_negative_ts", "make_zero",
-        "-start_at_zero",
-        "-max_muxing_queue_size", "2048",
-        "-muxdelay", "0",
-        "-muxpreload", "0",
-    ].iter().map(|s| s.to_string()));
+    args.extend(
+        [
+            "-f",
+            "mpegts",
+            "-mpegts_copyts",
+            "0",
+            "-output_ts_offset",
+            "0",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-start_at_zero",
+            "-max_muxing_queue_size",
+            "2048",
+            "-muxdelay",
+            "0",
+            "-muxpreload",
+            "0",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
 
     args.push(output_path.to_string());
     args
@@ -1122,7 +1365,8 @@ mod tests {
     #[test]
     fn test_request_signature() {
         let pmk = [0x42u8; 32];
-        let sig = compute_request_signature("session123", 1234567890, "nonce123", "segment_0.ts", &pmk);
+        let sig =
+            compute_request_signature("session123", 1234567890, "nonce123", "segment_0.ts", &pmk);
         assert!(!sig.is_empty());
         assert_eq!(sig.len(), 64);
     }

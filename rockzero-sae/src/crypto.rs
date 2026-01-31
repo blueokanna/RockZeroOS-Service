@@ -1,3 +1,4 @@
+use crate::error::{Result, SaeError};
 use curve25519_dalek::{
     edwards::{CompressedEdwardsY, EdwardsPoint},
     scalar::Scalar,
@@ -5,11 +6,14 @@ use curve25519_dalek::{
 };
 use rand::rngs::OsRng;
 use rand::RngCore;
-use crate::error::{Result, SaeError};
 
 const SAE_MAX_PWE_LOOP: u32 = 40;
 
-pub fn password_to_element(password: &[u8], device_id1: &[u8], device_id2: &[u8]) -> Result<EdwardsPoint> {
+pub fn password_to_element(
+    password: &[u8],
+    device_id1: &[u8],
+    device_id2: &[u8],
+) -> Result<EdwardsPoint> {
     let (id1, id2) = if device_id1 < device_id2 {
         (device_id1, device_id2)
     } else {
@@ -46,7 +50,9 @@ pub fn password_to_element(password: &[u8], device_id1: &[u8], device_id2: &[u8]
         }
     }
 
-    Err(SaeError::CryptoError("Failed to derive PWE after maximum iterations".to_string()))
+    Err(SaeError::CryptoError(
+        "Failed to derive PWE after maximum iterations".to_string(),
+    ))
 }
 
 fn try_seed_to_point(seed: &[u8]) -> Option<EdwardsPoint> {
@@ -167,7 +173,8 @@ fn hkdf_blake3_expand(prk: &[u8; 32], info: &[u8], length: usize) -> Result<Vec<
         let copy_len = std::cmp::min(32, length - output.len());
         output.extend_from_slice(&t[..copy_len]);
 
-        counter = counter.checked_add(1)
+        counter = counter
+            .checked_add(1)
             .ok_or_else(|| SaeError::CryptoError("HKDF counter overflow".to_string()))?;
     }
 
@@ -218,11 +225,7 @@ pub fn verify_confirm(
     }
 }
 
-pub fn compute_pmkid(
-    pmk: &[u8; 32],
-    device_id1: &[u8],
-    device_id2: &[u8],
-) -> Result<[u8; 16]> {
+pub fn compute_pmkid(pmk: &[u8; 32], device_id1: &[u8], device_id2: &[u8]) -> Result<[u8; 16]> {
     let mut data = Vec::with_capacity(8 + device_id1.len() + device_id2.len());
     data.extend_from_slice(b"PMK Name");
     data.extend_from_slice(device_id1);
@@ -264,26 +267,20 @@ mod tests {
         let client_rand = generate_random_scalar();
         let client_mask = generate_random_mask();
         let client_scalar = compute_commit_scalar(&client_rand, &client_mask);
-        let client_element = compute_commit_element(&client_rand, &client_mask, &pwd_element).unwrap();
+        let client_element =
+            compute_commit_element(&client_rand, &client_mask, &pwd_element).unwrap();
 
         let server_rand = generate_random_scalar();
         let server_mask = generate_random_mask();
         let server_scalar = compute_commit_scalar(&server_rand, &server_mask);
-        let server_element = compute_commit_element(&server_rand, &server_mask, &pwd_element).unwrap();
+        let server_element =
+            compute_commit_element(&server_rand, &server_mask, &pwd_element).unwrap();
 
-        let client_pmk = compute_pmk(
-            &client_rand,
-            &server_scalar,
-            &server_element,
-            &pwd_element,
-        ).unwrap();
+        let client_pmk =
+            compute_pmk(&client_rand, &server_scalar, &server_element, &pwd_element).unwrap();
 
-        let server_pmk = compute_pmk(
-            &server_rand,
-            &client_scalar,
-            &client_element,
-            &pwd_element,
-        ).unwrap();
+        let server_pmk =
+            compute_pmk(&server_rand, &client_scalar, &client_element, &pwd_element).unwrap();
 
         assert_eq!(client_pmk, server_pmk);
     }
@@ -299,19 +296,17 @@ mod tests {
         let client_rand = generate_random_scalar();
         let client_mask = generate_random_mask();
         let client_scalar = compute_commit_scalar(&client_rand, &client_mask);
-        let client_element = compute_commit_element(&client_rand, &client_mask, &pwd_element).unwrap();
+        let client_element =
+            compute_commit_element(&client_rand, &client_mask, &pwd_element).unwrap();
 
         let server_rand = generate_random_scalar();
         let server_mask = generate_random_mask();
         let server_scalar = compute_commit_scalar(&server_rand, &server_mask);
-        let server_element = compute_commit_element(&server_rand, &server_mask, &pwd_element).unwrap();
+        let server_element =
+            compute_commit_element(&server_rand, &server_mask, &pwd_element).unwrap();
 
-        let shared_secret = compute_pmk(
-            &client_rand,
-            &server_scalar,
-            &server_element,
-            &pwd_element,
-        ).unwrap();
+        let shared_secret =
+            compute_pmk(&client_rand, &server_scalar, &server_element, &pwd_element).unwrap();
 
         let (kck, _pmk) = derive_kck_pmk(
             &shared_secret,
@@ -319,7 +314,8 @@ mod tests {
             &server_scalar,
             &client_element,
             &server_element,
-        ).unwrap();
+        )
+        .unwrap();
 
         let send_confirm = 1u16;
         let client_confirm = compute_confirm(
@@ -329,7 +325,8 @@ mod tests {
             &server_scalar,
             &client_element,
             &server_element,
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = verify_confirm(
             &kck,

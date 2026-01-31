@@ -5,8 +5,8 @@ use sysinfo::{Disks, Networks, System};
 #[cfg(target_os = "linux")]
 use std::fs;
 
-use rockzero_common::AppError;
 use crate::hardware;
+use rockzero_common::AppError;
 
 #[derive(Debug, Serialize)]
 pub struct SystemInfo {
@@ -25,7 +25,6 @@ pub struct CpuCoreUsage {
     pub frequency: u64,
 }
 
-/// CPU 核心架构信息 (用于 ARM big.LITTLE 等异构架构)
 #[derive(Debug, Serialize)]
 pub struct CpuCoreArchInfo {
     pub core_name: String,
@@ -154,7 +153,8 @@ pub async fn get_cpu_info() -> Result<impl Responder, AppError> {
 
     // 获取 CPU 核心架构信息 (ARM big.LITTLE 等)
     let hw_caps = hardware::detect_hardware();
-    let core_types: Vec<CpuCoreArchInfo> = hw_caps.cpu_core_types
+    let core_types: Vec<CpuCoreArchInfo> = hw_caps
+        .cpu_core_types
         .into_iter()
         .map(|ct| CpuCoreArchInfo {
             core_name: ct.core_name,
@@ -209,17 +209,19 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
     // 首先添加所有块设备
     for block_dev in block_devices {
         // 跳过虚拟设备
-        if block_dev.name.starts_with("loop") 
-            || block_dev.name.starts_with("ram") 
+        if block_dev.name.starts_with("loop")
+            || block_dev.name.starts_with("ram")
             || block_dev.name.starts_with("zram")
-            || block_dev.name.starts_with("dm-") {
+            || block_dev.name.starts_with("dm-")
+        {
             continue;
         }
 
         // 跳过 eMMC boot 分区 (mmcblk*boot0, mmcblk*boot1)
-        if block_dev.name.contains("boot0") 
+        if block_dev.name.contains("boot0")
             || block_dev.name.contains("boot1")
-            || block_dev.name.contains("rpmb") {
+            || block_dev.name.contains("rpmb")
+        {
             continue;
         }
 
@@ -232,20 +234,30 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                 }
                 seen_devices.insert(device_key.clone());
 
-                let mount_point = partition.mount_point.clone().unwrap_or_else(|| "Not mounted".to_string());
-                let file_system = partition.file_system.clone().unwrap_or_else(|| "Unknown".to_string());
-                
+                let mount_point = partition
+                    .mount_point
+                    .clone()
+                    .unwrap_or_else(|| "Not mounted".to_string());
+                let file_system = partition
+                    .file_system
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string());
+
                 // 跳过 VFAT/FAT 格式的磁盘（通常是 /boot 分区）
                 let fs_upper = file_system.to_uppercase();
-                if fs_upper == "VFAT" || fs_upper == "FAT32" || fs_upper == "FAT16" || fs_upper == "FAT" {
+                if fs_upper == "VFAT"
+                    || fs_upper == "FAT32"
+                    || fs_upper == "FAT16"
+                    || fs_upper == "FAT"
+                {
                     continue;
                 }
-                
+
                 // 跳过 /boot 分区
                 if mount_point == "/boot" || mount_point.starts_with("/boot/") {
                     continue;
                 }
-                
+
                 // 跳过系统虚拟文件系统
                 if mount_point.starts_with("/sys")
                     || mount_point.starts_with("/proc")
@@ -255,23 +267,26 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                     || file_system == "squashfs"
                     || file_system == "tmpfs"
                     || file_system == "devtmpfs"
-                    || file_system == "overlay" {
+                    || file_system == "overlay"
+                {
                     continue;
                 }
 
                 // 跳过 eMMC boot 分区
-                if partition.name.contains("boot0") 
+                if partition.name.contains("boot0")
                     || partition.name.contains("boot1")
-                    || partition.name.contains("rpmb") {
+                    || partition.name.contains("rpmb")
+                {
                     continue;
                 }
 
                 let used_space = if partition.mount_point.is_some() {
-                    partition.size - get_available_space(&partition.device_path).unwrap_or(partition.size)
+                    partition.size
+                        - get_available_space(&partition.device_path).unwrap_or(partition.size)
                 } else {
                     0
                 };
-                
+
                 let usage_percentage = if partition.size > 0 {
                     (used_space as f64 / partition.size as f64) * 100.0
                 } else {
@@ -335,7 +350,7 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
 #[cfg(target_os = "linux")]
 fn get_available_space(device_path: &str) -> Option<u64> {
     use std::fs;
-    
+
     // 从 /proc/mounts 查找挂载点
     if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
         for line in mounts.lines() {
@@ -377,9 +392,9 @@ pub async fn get_block_devices() -> Result<impl Responder, AppError> {
 
 pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
     use tracing::debug;
-    
+
     debug!("Starting hardware info collection");
-    
+
     let mut sys = System::new_all();
     sys.refresh_all();
 
@@ -406,7 +421,7 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
     if cpus.is_empty() {
         return Err(AppError::InternalError);
     }
-    
+
     let cpu = cpus.first().unwrap();
     let total_usage: f32 = cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32;
 
@@ -423,7 +438,8 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
 
     // 获取 CPU 核心架构信息 (ARM big.LITTLE 等)
     let hw_caps = hardware::detect_hardware();
-    let core_types: Vec<CpuCoreArchInfo> = hw_caps.cpu_core_types
+    let core_types: Vec<CpuCoreArchInfo> = hw_caps
+        .cpu_core_types
         .into_iter()
         .map(|ct| CpuCoreArchInfo {
             core_name: ct.core_name,
