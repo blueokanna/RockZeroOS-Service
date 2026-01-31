@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 use rockzero_common::{AppConfig, AppError, TokenResponse};
 use rockzero_crypto::{blake3_hash, constant_time_compare};
@@ -571,6 +572,16 @@ pub async fn login(
     let password_handler = SecurePasswordHandler::new();
     if !password_handler.verify_password(&body.password, &user.password_hash)? {
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
+    }
+
+    // Update sae_secret if not set or different from current password hash
+    let sae_secret = compute_sae_secret(&body.password);
+    if user.sae_secret.as_ref() != Some(&sae_secret) {
+        if let Err(e) = crate::db::update_user_sae_secret(&pool, &user.id, &sae_secret).await {
+            warn!("Failed to update sae_secret for user {}: {}", user.id, e);
+        } else {
+            info!("Updated sae_secret for user {}", user.id);
+        }
     }
 
     let jwt_config = AppConfig::from_env();

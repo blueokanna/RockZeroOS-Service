@@ -448,3 +448,24 @@ pub async fn delete_widget(
     // Placeholder - implement when database tables are created
     Ok(true)
 }
+
+/// Update user's SAE secret
+pub async fn update_user_sae_secret(
+    pool: &SqlitePool,
+    user_id: &str,
+    sae_secret: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        UPDATE users SET sae_secret = ?, updated_at = datetime('now')
+        WHERE id = ?
+        "#,
+    )
+    .bind(sae_secret)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    Ok(())
+}
