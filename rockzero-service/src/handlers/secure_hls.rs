@@ -727,10 +727,11 @@ fn get_hls_cache_dir() -> std::path::PathBuf {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HardwareAccel {
-    AmlogicV4l2,
-    Vaapi,
-    V4l2Generic,
-    None,
+    AmlogicV4l2,    // Amlogic A311D/S905/S922 等芯片
+    Vaapi,          // Intel/AMD GPU
+    V4l2Generic,    // 通用 V4L2
+    RockchipRga,    // Rockchip RK3588 等
+    None,           // 软件编码
 }
 
 struct VideoInfo {
@@ -744,25 +745,31 @@ struct VideoInfo {
 
 async fn probe_video_info(video_path: &std::path::Path) -> Result<VideoInfo, AppError> {
     use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
 
-    let ffprobe_path = std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string());
+    let ffprobe_path = std::env::var("FFPROBE_PATH")
+        .or_else(|_| rockzero_media::get_global_ffprobe_path().ok_or(""))
+        .unwrap_or_else(|_| "ffprobe".to_string());
 
-    let output = Command::new(&ffprobe_path)
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            video_path.to_str().unwrap_or(""),
-        ])
-        .output()
-        .await
-        .map_err(|e| AppError::IoError(format!("Failed to probe video: {}", e)))?;
+    let output = timeout(
+        Duration::from_secs(30),
+        Command::new(&ffprobe_path)
+            .args([
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                "-show_streams",
+                video_path.to_str().unwrap_or(""),
+            ])
+            .output()
+    )
+    .await
+    .map_err(|_| AppError::InternalServerError("FFprobe timeout".to_string()))?
+    .map_err(|e| AppError::IoError(format!("Failed to probe video: {}", e)))?;
 
     if !output.status.success() {
-        return Err(AppError::InternalServerError("FFprobe failed".to_string()));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::InternalServerError(format!("FFprobe failed: {}", stderr)));
     }
 
     let json_str = String::from_utf8_lossy(&output.stdout);
@@ -805,65 +812,167 @@ async fn probe_video_info(video_path: &std::path::Path) -> Result<VideoInfo, App
     })
 }
 
+/// 检测硬件加速能力
+/// 针对 Amlogic A311D 等芯片进行优化
 async fn detect_hardware_acceleration() -> HardwareAccel {
     use tokio::fs;
 
+    // 1. 首先检测是否是 Amlogic 设备（A311D, S905, S922 等）
     if is_amlogic_device().await {
-        if check_ffmpeg_encoder("h264_v4l2m2m").await {
-            return HardwareAccel::AmlogicV4l2;
+        info!("Detected Amlogic device, checking V4L2 M2M support...");
+        
+        // 检查 V4L2 M2M 设备
+        let v4l2_devices = ["/dev/video10", "/dev/video11", "/dev/video12"];
+        let mut has_v4l2_device = false;
+        
+        for device in &v4l2_devices {
+            if fs::metadata(device).await.is_ok() {
+                info!("Found V4L2 device: {}", device);
+                has_v4l2_device = true;
+                break;
+            }
+        }
+        
+        if has_v4l2_device {
+            // 检查 FFmpeg 是否支持 h264_v4l2m2m 编码器
+            if check_ffmpeg_encoder("h264_v4l2m2m").await {
+                info!("Amlogic V4L2 M2M hardware acceleration available");
+                return HardwareAccel::AmlogicV4l2;
+            } else {
+                warn!("h264_v4l2m2m encoder not available in FFmpeg");
+            }
         }
     }
 
+    // 2. 检测 VAAPI (Intel/AMD GPU)
     if fs::metadata("/dev/dri/renderD128").await.is_ok() {
         if check_ffmpeg_encoder("h264_vaapi").await {
+            info!("VAAPI hardware acceleration available");
             return HardwareAccel::Vaapi;
         }
     }
 
+    // 3. 检测 Rockchip RGA
+    if fs::metadata("/dev/rga").await.is_ok() || fs::metadata("/dev/mpp_service").await.is_ok() {
+        if check_ffmpeg_encoder("h264_rkmpp").await {
+            info!("Rockchip RGA hardware acceleration available");
+            return HardwareAccel::RockchipRga;
+        }
+    }
+
+    // 4. 通用 V4L2 检测
     if fs::metadata("/dev/video10").await.is_ok() || fs::metadata("/dev/video11").await.is_ok() {
         if check_ffmpeg_encoder("h264_v4l2m2m").await {
+            info!("Generic V4L2 M2M hardware acceleration available");
             return HardwareAccel::V4l2Generic;
         }
     }
 
+    info!("No hardware acceleration available, using software encoding");
     HardwareAccel::None
 }
 
+/// 检测是否是 Amlogic 设备
 async fn is_amlogic_device() -> bool {
+    // 检查 /proc/cpuinfo
     if let Ok(content) = tokio::fs::read_to_string("/proc/cpuinfo").await {
-        if content.contains("Amlogic")
-            || content.contains("A311D")
-            || content.contains("S905")
-            || content.contains("S922")
+        let content_lower = content.to_lowercase();
+        if content_lower.contains("amlogic")
+            || content_lower.contains("a311d")
+            || content_lower.contains("s905")
+            || content_lower.contains("s922")
+            || content_lower.contains("meson")
         {
+            info!("Amlogic device detected via /proc/cpuinfo");
             return true;
         }
     }
-    if let Ok(content) = tokio::fs::read_to_string("/sys/firmware/devicetree/base/compatible").await
-    {
-        if content.contains("amlogic") || content.contains("meson") {
+    
+    // 检查设备树
+    if let Ok(content) = tokio::fs::read_to_string("/sys/firmware/devicetree/base/compatible").await {
+        let content_lower = content.to_lowercase();
+        if content_lower.contains("amlogic") || content_lower.contains("meson") {
+            info!("Amlogic device detected via device tree");
             return true;
         }
     }
+    
+    // 检查 /sys/class/amhdmitx 目录（Amlogic 特有）
+    if tokio::fs::metadata("/sys/class/amhdmitx").await.is_ok() {
+        info!("Amlogic device detected via /sys/class/amhdmitx");
+        return true;
+    }
+    
+    // 检查 /dev/amvideo 设备（Amlogic 视频设备）
+    if tokio::fs::metadata("/dev/amvideo").await.is_ok() {
+        info!("Amlogic device detected via /dev/amvideo");
+        return true;
+    }
+    
     false
 }
 
+/// 检查 FFmpeg 是否支持指定的编码器
 async fn check_ffmpeg_encoder(encoder: &str) -> bool {
     use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
 
     let ffmpeg_path = std::env::var("FFMPEG_PATH")
         .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
         .unwrap_or_else(|_| "ffmpeg".to_string());
 
-    if let Ok(output) = Command::new(&ffmpeg_path)
-        .args(["-encoders"])
-        .output()
-        .await
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return stdout.contains(encoder);
+    let result = timeout(
+        Duration::from_secs(10),
+        Command::new(&ffmpeg_path)
+            .args(["-encoders"])
+            .output()
+    ).await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let has_encoder = stdout.contains(encoder);
+            if has_encoder {
+                info!("FFmpeg encoder '{}' is available", encoder);
+            } else {
+                warn!("FFmpeg encoder '{}' is NOT available", encoder);
+            }
+            has_encoder
+        }
+        Ok(Err(e)) => {
+            warn!("Failed to check FFmpeg encoder: {}", e);
+            false
+        }
+        Err(_) => {
+            warn!("Timeout checking FFmpeg encoder");
+            false
+        }
     }
-    false
+}
+
+/// 检查 FFmpeg 是否支持指定的解码器
+async fn check_ffmpeg_decoder(decoder: &str) -> bool {
+    use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
+
+    let ffmpeg_path = std::env::var("FFMPEG_PATH")
+        .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
+        .unwrap_or_else(|_| "ffmpeg".to_string());
+
+    let result = timeout(
+        Duration::from_secs(10),
+        Command::new(&ffmpeg_path)
+            .args(["-decoders"])
+            .output()
+    ).await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.contains(decoder)
+        }
+        _ => false,
+    }
 }
 
 async fn read_video_segment_from_ffmpeg(
@@ -961,8 +1070,11 @@ async fn transcode_segment_with_seek(
     segment_index: usize,
 ) -> Result<Vec<u8>, AppError> {
     use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
 
     const SEGMENT_DURATION: f64 = 10.0;
+    const TRANSCODE_TIMEOUT_SECS: u64 = 120;
+    
     let start_time = segment_index as f64 * SEGMENT_DURATION;
     let output_path = output_dir.join(format!("segment_{}.ts", segment_index));
 
@@ -983,6 +1095,19 @@ async fn transcode_segment_with_seek(
     let ffmpeg_path = std::env::var("FFMPEG_PATH")
         .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
         .unwrap_or_else(|_| "ffmpeg".to_string());
+
+    // 检查 FFmpeg 是否存在
+    let ffmpeg_exists = std::path::Path::new(&ffmpeg_path).exists() 
+        || which::which(&ffmpeg_path).is_ok();
+    
+    if !ffmpeg_exists {
+        warn!("FFmpeg not found at path: {}", ffmpeg_path);
+        // 尝试使用系统默认的 ffmpeg
+        let system_ffmpeg = which::which("ffmpeg")
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "ffmpeg".to_string());
+        info!("Trying system FFmpeg: {}", system_ffmpeg);
+    }
 
     let hw_accel = detect_hardware_acceleration().await;
     let video_path_str = video_path.to_str().unwrap_or("");
@@ -1008,17 +1133,39 @@ async fn transcode_segment_with_seek(
 
     info!("FFmpeg command: {} {}", ffmpeg_path, args.join(" "));
 
-    let output = Command::new(&ffmpeg_path)
-        .args(&args)
-        .output()
-        .await
-        .map_err(|e| AppError::IoError(format!("FFmpeg execution failed: {}", e)))?;
+    // 使用超时执行 FFmpeg
+    let output_result = timeout(
+        Duration::from_secs(TRANSCODE_TIMEOUT_SECS),
+        Command::new(&ffmpeg_path)
+            .args(&args)
+            .output()
+    ).await;
+
+    let output = match output_result {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            return Err(AppError::IoError(format!(
+                "FFmpeg execution failed for segment {}: {}. FFmpeg path: {}",
+                segment_index, e, ffmpeg_path
+            )));
+        }
+        Err(_) => {
+            return Err(AppError::InternalServerError(format!(
+                "FFmpeg timeout for segment {} (exceeded {}s)",
+                segment_index, TRANSCODE_TIMEOUT_SECS
+            )));
+        }
+    };
 
     let mut transcode_success = output.status.success();
 
     if !transcode_success {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("FFmpeg failed with {:?}: {}", hw_accel, stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        warn!(
+            "FFmpeg failed with {:?} for segment {}: stderr={}, stdout={}",
+            hw_accel, segment_index, stderr, stdout
+        );
 
         if hw_accel != HardwareAccel::None {
             info!("Retrying segment {} with software encoding", segment_index);
@@ -1042,24 +1189,41 @@ async fn transcode_segment_with_seek(
                 fallback_args.join(" ")
             );
 
-            let fallback_output = Command::new(&ffmpeg_path)
-                .args(&fallback_args)
-                .output()
-                .await
-                .map_err(|e| AppError::IoError(format!("FFmpeg fallback failed: {}", e)))?;
+            let fallback_result = timeout(
+                Duration::from_secs(TRANSCODE_TIMEOUT_SECS),
+                Command::new(&ffmpeg_path)
+                    .args(&fallback_args)
+                    .output()
+            ).await;
 
-            if fallback_output.status.success() {
-                transcode_success = true;
-                info!(
-                    "Fallback transcoding succeeded for segment {}",
-                    segment_index
-                );
-            } else {
-                let fallback_stderr = String::from_utf8_lossy(&fallback_output.stderr);
-                return Err(AppError::InternalServerError(format!(
-                    "Transcode failed for segment {}: {}",
-                    segment_index, fallback_stderr
-                )));
+            match fallback_result {
+                Ok(Ok(fallback_output)) => {
+                    if fallback_output.status.success() {
+                        transcode_success = true;
+                        info!(
+                            "Fallback transcoding succeeded for segment {}",
+                            segment_index
+                        );
+                    } else {
+                        let fallback_stderr = String::from_utf8_lossy(&fallback_output.stderr);
+                        return Err(AppError::InternalServerError(format!(
+                            "Transcode failed for segment {}: {}",
+                            segment_index, fallback_stderr
+                        )));
+                    }
+                }
+                Ok(Err(e)) => {
+                    return Err(AppError::IoError(format!(
+                        "FFmpeg fallback execution failed for segment {}: {}",
+                        segment_index, e
+                    )));
+                }
+                Err(_) => {
+                    return Err(AppError::InternalServerError(format!(
+                        "FFmpeg fallback timeout for segment {} (exceeded {}s)",
+                        segment_index, TRANSCODE_TIMEOUT_SECS
+                    )));
+                }
             }
         } else {
             return Err(AppError::InternalServerError(format!(
@@ -1076,8 +1240,14 @@ async fn transcode_segment_with_seek(
         )));
     }
 
-    // Wait a bit for file system to sync
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    if !output_path.exists() {
+        return Err(AppError::InternalServerError(format!(
+            "Transcoded segment {} file not found at {:?}",
+            segment_index, output_path
+        )));
+    }
 
     // Read the transcoded segment
     let segment_data = tokio::fs::read(&output_path)
@@ -1108,6 +1278,8 @@ async fn transcode_segment_with_seek(
     Ok(segment_data)
 }
 
+/// 构建 FFmpeg 命令行参数
+/// 针对 Amlogic A311D 等芯片进行优化
 fn build_ffmpeg_args(
     hw_accel: HardwareAccel,
     input_path: &str,
@@ -1119,155 +1291,159 @@ fn build_ffmpeg_args(
 ) -> Vec<String> {
     let mut args = Vec::new();
 
-    args.extend(
-        ["-y", "-hide_banner", "-loglevel", "warning"]
-            .iter()
-            .map(|s| s.to_string()),
-    );
+    // 基本参数
+    args.extend([
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "warning".to_string(),
+    ]);
 
+    // 输入前的 seek（更快）
     args.push("-ss".to_string());
     args.push(format!("{:.3}", start_time));
 
+    // 根据硬件加速类型添加解码参数
     match hw_accel {
         HardwareAccel::AmlogicV4l2 => {
-            if std::path::Path::new("/dev/video10").exists() {
-                args.extend(
-                    ["-hwaccel", "v4l2m2m", "-c:v", "h264_v4l2m2m"]
-                        .iter()
-                        .map(|s| s.to_string()),
-                );
-            }
+            // Amlogic A311D V4L2 M2M 硬件解码
+            // 注意：不要在输入前添加 -hwaccel，让 FFmpeg 自动选择
+            // V4L2 M2M 主要用于编码，解码通常使用软件解码器
         }
         HardwareAccel::Vaapi => {
-            args.extend(
-                [
-                    "-hwaccel",
-                    "vaapi",
-                    "-hwaccel_device",
-                    "/dev/dri/renderD128",
-                    "-hwaccel_output_format",
-                    "vaapi",
-                ]
-                .iter()
-                .map(|s| s.to_string()),
-            );
+            args.extend([
+                "-hwaccel".to_string(),
+                "vaapi".to_string(),
+                "-hwaccel_device".to_string(),
+                "/dev/dri/renderD128".to_string(),
+                "-hwaccel_output_format".to_string(),
+                "vaapi".to_string(),
+            ]);
         }
-        HardwareAccel::V4l2Generic => {
-            if std::path::Path::new("/dev/video10").exists() {
-                args.extend(["-hwaccel", "v4l2m2m"].iter().map(|s| s.to_string()));
-            }
+        HardwareAccel::RockchipRga => {
+            // Rockchip MPP 硬件解码
+            args.extend([
+                "-hwaccel".to_string(),
+                "rkmpp".to_string(),
+            ]);
         }
-        HardwareAccel::None => {}
+        HardwareAccel::V4l2Generic | HardwareAccel::None => {
+            // 不添加硬件解码参数
+        }
     }
 
+    // 输入文件
     args.push("-i".to_string());
     args.push(input_path.to_string());
 
+    // 持续时间
     args.push("-t".to_string());
     args.push(format!("{:.3}", duration));
 
-    args.extend(
-        ["-force_key_frames", "expr:gte(t,0)"]
-            .iter()
-            .map(|s| s.to_string()),
-    );
+    // 强制关键帧
+    args.extend([
+        "-force_key_frames".to_string(),
+        "expr:gte(t,0)".to_string(),
+    ]);
 
     if needs_transcode {
+        // 视频编码参数
         match hw_accel {
             HardwareAccel::AmlogicV4l2 => {
-                args.extend(
-                    [
-                        "-c:v",
-                        "h264_v4l2m2m",
-                        "-b:v",
-                        "4M",
-                        "-maxrate",
-                        "6M",
-                        "-bufsize",
-                        "8M",
-                        "-g",
-                        "30",
-                        "-keyint_min",
-                        "15",
-                        "-num_output_buffers",
-                        "32",
-                        "-num_capture_buffers",
-                        "16",
-                    ]
-                    .iter()
-                    .map(|s| s.to_string()),
-                );
+                // Amlogic A311D V4L2 M2M 硬件编码
+                // 使用 h264_v4l2m2m 编码器
+                args.extend([
+                    "-c:v".to_string(),
+                    "h264_v4l2m2m".to_string(),
+                    // 比特率控制
+                    "-b:v".to_string(),
+                    "4M".to_string(),
+                    "-maxrate".to_string(),
+                    "6M".to_string(),
+                    "-bufsize".to_string(),
+                    "8M".to_string(),
+                    // GOP 设置
+                    "-g".to_string(),
+                    "30".to_string(),
+                    "-keyint_min".to_string(),
+                    "30".to_string(),
+                    // V4L2 M2M 特定参数
+                    "-num_output_buffers".to_string(),
+                    "32".to_string(),
+                    "-num_capture_buffers".to_string(),
+                    "16".to_string(),
+                ]);
             }
             HardwareAccel::Vaapi => {
-                args.extend(
-                    [
-                        "-vf",
-                        "format=nv12|vaapi,hwupload",
-                        "-c:v",
-                        "h264_vaapi",
-                        "-qp",
-                        "23",
-                        "-g",
-                        "30",
-                        "-keyint_min",
-                        "30",
-                    ]
-                    .iter()
-                    .map(|s| s.to_string()),
-                );
+                args.extend([
+                    "-vf".to_string(),
+                    "format=nv12|vaapi,hwupload".to_string(),
+                    "-c:v".to_string(),
+                    "h264_vaapi".to_string(),
+                    "-qp".to_string(),
+                    "23".to_string(),
+                    "-g".to_string(),
+                    "30".to_string(),
+                    "-keyint_min".to_string(),
+                    "30".to_string(),
+                ]);
+            }
+            HardwareAccel::RockchipRga => {
+                args.extend([
+                    "-c:v".to_string(),
+                    "h264_rkmpp".to_string(),
+                    "-b:v".to_string(),
+                    "4M".to_string(),
+                    "-g".to_string(),
+                    "30".to_string(),
+                ]);
             }
             HardwareAccel::V4l2Generic => {
-                args.extend(
-                    [
-                        "-c:v",
-                        "h264_v4l2m2m",
-                        "-b:v",
-                        "3M",
-                        "-maxrate",
-                        "4M",
-                        "-bufsize",
-                        "6M",
-                        "-g",
-                        "30",
-                        "-keyint_min",
-                        "30",
-                    ]
-                    .iter()
-                    .map(|s| s.to_string()),
-                );
+                args.extend([
+                    "-c:v".to_string(),
+                    "h264_v4l2m2m".to_string(),
+                    "-b:v".to_string(),
+                    "3M".to_string(),
+                    "-maxrate".to_string(),
+                    "4M".to_string(),
+                    "-bufsize".to_string(),
+                    "6M".to_string(),
+                    "-g".to_string(),
+                    "30".to_string(),
+                    "-keyint_min".to_string(),
+                    "30".to_string(),
+                ]);
             }
             HardwareAccel::None => {
-                args.extend(
-                    [
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "fast",
-                        "-tune",
-                        "zerolatency",
-                        "-profile:v",
-                        "high",
-                        "-level",
-                        "4.1",
-                        "-crf",
-                        "22",
-                        "-g",
-                        "30",
-                        "-keyint_min",
-                        "30",
-                        "-sc_threshold",
-                        "0",
-                        "-bf",
-                        "2",
-                        "-refs",
-                        "3",
-                    ]
-                    .iter()
-                    .map(|s| s.to_string()),
-                );
+                // 软件编码 (libx264)
+                args.extend([
+                    "-c:v".to_string(),
+                    "libx264".to_string(),
+                    "-preset".to_string(),
+                    "fast".to_string(),
+                    "-tune".to_string(),
+                    "zerolatency".to_string(),
+                    "-profile:v".to_string(),
+                    "high".to_string(),
+                    "-level".to_string(),
+                    "4.1".to_string(),
+                    "-crf".to_string(),
+                    "22".to_string(),
+                    "-g".to_string(),
+                    "30".to_string(),
+                    "-keyint_min".to_string(),
+                    "30".to_string(),
+                    "-sc_threshold".to_string(),
+                    "0".to_string(),
+                    "-bf".to_string(),
+                    "2".to_string(),
+                    "-refs".to_string(),
+                    "3".to_string(),
+                ]);
             }
         }
 
+        // 视频缩放（如果需要）
         let target_height = video_info
             .as_ref()
             .map(|info| {
@@ -1281,13 +1457,19 @@ fn build_ffmpeg_args(
             })
             .unwrap_or(720);
 
-        if video_info
-            .as_ref()
-            .map(|i| i.height > target_height)
-            .unwrap_or(false)
-        {
+        if video_info.as_ref().map(|i| i.height > target_height).unwrap_or(false) {
             match hw_accel {
-                HardwareAccel::Vaapi => {}
+                HardwareAccel::Vaapi => {
+                    // VAAPI 使用硬件缩放
+                }
+                HardwareAccel::AmlogicV4l2 | HardwareAccel::V4l2Generic => {
+                    // V4L2 M2M 不支持缩放滤镜，需要在编码前使用软件缩放
+                    // 但这会影响性能，所以只在必要时使用
+                    if target_height < 720 {
+                        args.push("-vf".to_string());
+                        args.push(format!("scale=-2:{}", target_height));
+                    }
+                }
                 _ => {
                     args.push("-vf".to_string());
                     args.push(format!("scale=-2:{}", target_height));
@@ -1295,55 +1477,51 @@ fn build_ffmpeg_args(
             }
         }
     } else {
-        args.extend(["-c:v", "copy"].iter().map(|s| s.to_string()));
+        // 直接复制视频流
+        args.extend(["-c:v".to_string(), "copy".to_string()]);
     }
 
+    // 音频编码参数
     if video_info.as_ref().map(|i| i.has_audio).unwrap_or(true) {
-        args.extend(
-            [
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-ac",
-                "2",
-                "-ar",
-                "48000",
-                "-async",
-                "1",
-                "-af",
-                "aresample=async=1:first_pts=0",
-            ]
-            .iter()
-            .map(|s| s.to_string()),
-        );
+        args.extend([
+            "-c:a".to_string(),
+            "aac".to_string(),
+            "-b:a".to_string(),
+            "192k".to_string(),
+            "-ac".to_string(),
+            "2".to_string(),
+            "-ar".to_string(),
+            "48000".to_string(),
+            "-async".to_string(),
+            "1".to_string(),
+            "-af".to_string(),
+            "aresample=async=1:first_pts=0".to_string(),
+        ]);
     } else {
         args.push("-an".to_string());
     }
 
-    args.extend(
-        [
-            "-f",
-            "mpegts",
-            "-mpegts_copyts",
-            "0",
-            "-output_ts_offset",
-            "0",
-            "-avoid_negative_ts",
-            "make_zero",
-            "-start_at_zero",
-            "-max_muxing_queue_size",
-            "2048",
-            "-muxdelay",
-            "0",
-            "-muxpreload",
-            "0",
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
+    args.extend([
+        "-f".to_string(),
+        "mpegts".to_string(),
+        "-mpegts_copyts".to_string(),
+        "0".to_string(),
+        "-output_ts_offset".to_string(),
+        "0".to_string(),
+        "-avoid_negative_ts".to_string(),
+        "make_zero".to_string(),
+        "-start_at_zero".to_string(),
+        "-max_muxing_queue_size".to_string(),
+        "2048".to_string(),
+        "-muxdelay".to_string(),
+        "0".to_string(),
+        "-muxpreload".to_string(),
+        "0".to_string(),
+    ]);
 
+    // 输出文件
     args.push(output_path.to_string());
+
     args
 }
 

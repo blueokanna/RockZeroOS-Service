@@ -8,7 +8,7 @@ static GLOBAL_FFMPEG_PATH: Mutex<Option<String>> = Mutex::new(None);
 static GLOBAL_FFPROBE_PATH: Mutex<Option<String>> = Mutex::new(None);
 
 #[cfg(target_os = "windows")]
-const LOCAL_ASSETS_PATH: &str = r"D:\RustProject\RockZeroOS-Service\assets";
+const LOCAL_ASSETS_PATH: &str = r".\assets";
 
 #[cfg(not(target_os = "windows"))]
 const LOCAL_ASSETS_PATH: &str = "./assets";
