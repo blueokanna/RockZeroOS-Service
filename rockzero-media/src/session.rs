@@ -41,11 +41,17 @@ impl HkdfBlake3 {
         let salt_input_bytes = salt_input.as_bytes();
         let salt = *blake3::hash(salt_input_bytes).as_bytes();
 
+        tracing::debug!("[HkdfBlake3] Session ID: {}", session_id);
+        tracing::debug!("[HkdfBlake3] Salt (first 8 bytes): {}", hex::encode(&salt[..8]));
+        tracing::debug!("[HkdfBlake3] IKM (first 8 bytes): {}", hex::encode(&ikm[..8.min(ikm.len())]));
+
         // PRK = blake3(salt + ikm)
         let mut input = Vec::with_capacity(32 + ikm.len());
         input.extend_from_slice(&salt);
         input.extend_from_slice(ikm);
         let prk = *blake3::hash(&input).as_bytes();
+
+        tracing::debug!("[HkdfBlake3] PRK (first 8 bytes): {}", hex::encode(&prk[..8]));
 
         Self { prk }
     }
@@ -125,12 +131,17 @@ impl HlsSession {
         let created_at = Utc::now();
         let expires_at = created_at + Duration::hours(3);
 
+        tracing::info!("[HlsSession] Creating session: {}", session_id);
+        tracing::info!("[HlsSession] PMK (first 8 bytes): {}", hex::encode(&pmk[..8]));
+
         // Use session-derived salt for HKDF
         let hk = HkdfBlake3::new_with_session_salt(&session_id, &pmk);
 
         let mut encryption_key = [0u8; 32];
         hk.expand(b"hls-master-key", &mut encryption_key)
             .map_err(|e| HlsError::EncryptionError(format!("HKDF expand failed: {}", e)))?;
+
+        tracing::info!("[HlsSession] Encryption key (first 8 bytes): {}", hex::encode(&encryption_key[..8]));
 
         let mut segment_keys = Vec::with_capacity(max_segments);
         for i in 0..max_segments {

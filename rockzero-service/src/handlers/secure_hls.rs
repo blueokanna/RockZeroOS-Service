@@ -275,6 +275,9 @@ pub async fn init_sae_handshake(
 
     let password = match &user.sae_secret {
         Some(secret) => {
+            info!("[SAE Init] Using sae_secret for user {}", user_id);
+            info!("[SAE Init] sae_secret length: {} chars", secret.len());
+            info!("[SAE Init] sae_secret (first 16 chars): {}...", &secret[..16.min(secret.len())]);
             secret.as_bytes().to_vec()
         }
         None => {
@@ -282,9 +285,13 @@ pub async fn init_sae_handshake(
                 "User {} does not have sae_secret, using password_hash",
                 user_id
             );
+            info!("[SAE Init] password_hash length: {} chars", user.password_hash.len());
             user.password_hash.as_bytes().to_vec()
         }
     };
+    
+    info!("[SAE Init] Password bytes length: {}", password.len());
+    info!("[SAE Init] Password bytes (first 16): {}", hex::encode(&password[..16.min(password.len())]));
 
     let manager = hls_manager.read().await;
     let temp_session_id = manager
