@@ -1,359 +1,334 @@
-# RockZero
-
-一个安全、跨平台的个人云服务系统，专为 ARM 开发板和 x86 设备设计。
-
-## 这是什么？
-
-RockZero 是一个类似于群晖 NAS 的开源替代方案，让你可以在自己的硬件上搭建私有云。它包含：
-
-- **后端服务** (Rust) - 提供文件管理、用户认证、媒体处理等 API
-- **移动/桌面客户端** (Flutter) - 跨平台的图形界面应用
-
-你可以用它来：
-- 📁 管理和浏览你的文件
-- 🎬 在线播放视频和音乐（支持硬件加速转码）
-- 🔐 安全地存储敏感数据
-- 📱 通过手机随时访问你的文件
-- 🏠 搭建家庭媒体中心
-
-## 支持的硬件
-
-### ARM 开发板（推荐）
-| 设备 | 芯片 | 视频能力 |
-|------|------|----------|
-| Orange Pi 5 Plus | RK3588 | 8K 硬件编解码 |
-| Radxa Rock 5B | RK3588 | 8K 硬件编解码 |
-| Khadas VIM3 | A311D | 4K 硬件编解码 |
-| Raspberry Pi 4/5 | BCM2711/2712 | 1080p 硬件解码 |
-
-### x86 设备
-- Intel NUC
-- 普通 PC / 服务器
-- 虚拟机 (VMware, VirtualBox, Proxmox)
-
-## 快速开始
-
-### 方式一：Docker 部署（推荐新手）
-
-这是最简单的方式，不需要安装任何开发工具。
-
-```bash
-# 1. 下载项目
-git clone https://github.com/Blueokanna/RockZeroOS-Service.git
-cd RockZeroOS-Service
-
-# 2. 创建配置文件
-cp .env.example .env
-
-# 3. 编辑配置（重要！）
-# Windows 用户用记事本打开，Linux/Mac 用 nano 或 vim
-# 必须修改 JWT_SECRET 和 ENCRYPTION_KEY 为随机字符串
-
-# 4. 启动服务
-docker-compose up -d
-
-# 5. 查看日志确认启动成功
-docker-compose logs -f
-```
-
-服务启动后，访问 `http://你的IP:8080` 即可。
-
-### 方式二：源码编译
-
-适合想要自定义或开发的用户。
-
-**前置要求：**
-- Rust 1.70+（[安装指南](https://rustup.rs/)）
-- SQLite3
-- FFmpeg（可选，用于媒体处理）
-
-```bash
-# 1. 安装 Rust（如果没有）
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source ~/.cargo/env
-
-# 2. 下载项目
-git clone https://github.com/Blueokanna/RockZeroOS-Service.git
-cd RockZeroOS-Service
-
-# 3. 安装系统依赖
-# Ubuntu/Debian:
-sudo apt update
-sudo apt install -y build-essential pkg-config libssl-dev sqlite3
-
-# Arch Linux:
-sudo pacman -S base-devel openssl sqlite
-
-# macOS:
-brew install openssl sqlite
-
-# 4. 创建配置文件
-cp .env.example .env
-# 编辑 .env 文件，修改 JWT_SECRET 和 ENCRYPTION_KEY
-
-# 5. 编译并运行
-cargo build --release
-./target/release/rockzero-service
-```
-
-## 配置说明
-
-编辑 `.env` 文件来配置服务：
-
-```bash
-# 服务器地址和端口
-HOST=0.0.0.0          # 监听所有网卡，改成 127.0.0.1 只允许本机访问
-PORT=8080             # 服务端口
-
-# 数据库（默认使用 SQLite，无需额外配置）
-DATABASE_URL=sqlite://rockzero.db
-
-# 安全配置（必须修改！）
-JWT_SECRET=这里填一个至少32位的随机字符串
-ENCRYPTION_KEY=这里也填一个32位的随机字符串
-
-# JWT 令牌有效期
-JWT_EXPIRATION_HOURS=24           # 访问令牌24小时过期
-REFRESH_TOKEN_EXPIRATION_DAYS=30  # 刷新令牌30天过期
-
-# HTTPS 配置（生产环境建议开启）
-TLS_ENABLED=false
-TLS_CERT_PATH=./certs/cert.pem
-TLS_KEY_PATH=./certs/key.pem
-
-# 日志级别：error, warn, info, debug, trace
-RUST_LOG=info
-```
-
-**生成随机密钥的方法：**
-```bash
-# Linux/macOS
-openssl rand -hex 32
-
-# 或者用 Python
-python3 -c "import secrets; print(secrets.token_hex(32))"
-```
-
-## API 使用指南
-
-### 基础概念
-
-RockZero 使用 JWT (JSON Web Token) 进行身份验证。流程是：
-1. 注册账号
-2. 登录获取 token
-3. 后续请求在 Header 中带上 token
-
-### 常用 API 示例
-
-#### 1. 检查服务状态
-```bash
-curl http://localhost:8080/health
-```
-返回 `{"status":"ok"}` 表示服务正常。
-
-#### 2. 注册新用户
-```bash
-curl -X POST http://localhost:8080/api/v1/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{
-    "username": "myname",
-    "email": "me@example.com",
-    "password": "MySecurePassword123!"
-  }'
-```
-
-> 注意：第一个注册的用户自动成为管理员，后续用户需要邀请码。
-
-#### 3. 登录
-```bash
-curl -X POST http://localhost:8080/api/v1/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "me@example.com",
-    "password": "MySecurePassword123!"
-  }'
-```
-
-成功后返回：
-```json
-{
-  "access_token": "eyJhbGciOiJIUzI1NiIs...",
-  "refresh_token": "eyJhbGciOiJIUzI1NiIs...",
-  "user": {
-    "id": "xxx",
-    "username": "myname",
-    "email": "me@example.com",
-    "role": "admin"
-  }
-}
-```
-
-#### 4. 使用 Token 访问 API
-
-把登录返回的 `access_token` 放到请求头中：
-
-```bash
-# 保存 token 到变量（方便后续使用）
-TOKEN="eyJhbGciOiJIUzI1NiIs..."
-
-# 获取系统硬件信息
-curl -H "Authorization: Bearer $TOKEN" \
-  http://localhost:8080/api/v1/system/hardware
-
-# 列出文件目录
-curl -H "Authorization: Bearer $TOKEN" \
-  http://localhost:8080/api/v1/files/list?path=/
-
-# 获取磁盘信息
-curl -H "Authorization: Bearer $TOKEN" \
-  http://localhost:8080/api/v1/disk/info
-```
-
-### 完整 API 列表
-
-| 模块 | 端点 | 方法 | 说明 |
-|------|------|------|------|
-| **认证** | `/api/v1/auth/register` | POST | 注册新用户 |
-| | `/api/v1/auth/login` | POST | 用户登录 |
-| | `/api/v1/auth/refresh` | POST | 刷新 token |
-| | `/api/v1/auth/logout` | POST | 退出登录 |
-| **文件** | `/api/v1/files/list` | GET | 列出目录内容 |
-| | `/api/v1/files/upload` | POST | 上传文件 |
-| | `/api/v1/files/download/{path}` | GET | 下载文件 |
-| | `/api/v1/files/delete` | DELETE | 删除文件 |
-| | `/api/v1/files/mkdir` | POST | 创建文件夹 |
-| | `/api/v1/files/rename` | POST | 重命名文件 |
-| **系统** | `/api/v1/system/hardware` | GET | 硬件信息 |
-| | `/api/v1/system/status` | GET | 系统状态 |
-| **磁盘** | `/api/v1/disk/info` | GET | 磁盘列表 |
-| | `/api/v1/disk/usage` | GET | 磁盘使用情况 |
-| **媒体** | `/api/v1/media/codecs` | GET | 支持的编解码器 |
-| | `/api/v1/media/stream/{path}` | GET | 流媒体播放 |
-| **应用商店** | `/api/v1/appstore/list` | GET | 可用应用列表 |
-| | `/api/v1/appstore/install` | POST | 安装应用 |
-| | `/api/v1/docker/containers` | GET | 容器列表 |
-
-## Flutter 客户端
-
-项目包含一个 Flutter 编写的跨平台客户端，位于 `RockZeroOS-UI` 目录。
-
-### 编译客户端
-
-```bash
-cd RockZeroOS-UI
-
-# 安装依赖
-flutter pub get
-
-# 运行开发版本
-flutter run
-
-# 编译 Android APK
-flutter build apk --release
-
-# 编译 iOS（需要 macOS）
-flutter build ios --release
-
-# 编译 Windows 桌面版
-flutter build windows --release
-
-# 编译 Linux 桌面版
-flutter build linux --release
-
-# 编译 macOS 桌面版
-flutter build macos --release
-```
-
-### 客户端功能
-
-- 🏠 仪表盘 - 实时显示 CPU、内存、网络状态
-- 📁 文件管理 - 浏览、上传、下载、删除文件
-- 🎬 媒体播放 - 内置图片查看器和视频播放器
-- 🛒 应用商店 - 一键安装 Docker 应用
-- ⚙️ 设置 - 主题切换、安全设置、FIDO2 密钥管理
-
-## 安全特性
-
-RockZero 注重安全性，内置多种保护机制：
-
-- **端到端加密** - 使用 AES-256-GCM 加密敏感数据
-- **零知识证明** - 基于 Bulletproofs 的隐私保护
-- **FIDO2/Passkey** - 支持硬件安全密钥和生物识别
-- **JWT 认证** - 无状态的身份验证机制
-- **邀请码系统** - 防止未授权注册
-
-## 常见问题
-
-### Q: 启动时报错 "address already in use"
-端口被占用了，修改 `.env` 中的 `PORT` 为其他端口，如 8081。
-
-### Q: 如何开启 HTTPS？
-1. 准备 SSL 证书（可以用 Let's Encrypt 免费申请）
-2. 修改 `.env`：
-   ```
-   TLS_ENABLED=true
-   TLS_CERT_PATH=/path/to/cert.pem
-   TLS_KEY_PATH=/path/to/key.pem
-   ```
-
-### Q: 忘记密码怎么办？
-目前需要直接操作数据库重置，后续版本会添加密码重置功能。
-
-### Q: 如何备份数据？
-备份 `rockzero.db` 文件和你的文件存储目录即可。
-
-### Q: ARM 设备上视频转码很慢？
-确保 FFmpeg 正确配置了硬件加速。RK3588 设备需要安装 `librockchip-mpp`。
-
-## 项目结构
-
-```
-RockZeroOS-Service/
-├── src/                    # Rust 后端源码
-│   ├── main.rs            # 程序入口
-│   ├── auth.rs            # 认证逻辑
-│   ├── crypto.rs          # 加密模块
-│   ├── handlers/          # API 处理器
-│   │   ├── auth.rs        # 认证 API
-│   │   ├── files.rs       # 文件 API
-│   │   ├── media.rs       # 媒体 API
-│   │   └── ...
-│   └── ...
-├── RockZeroOS-UI/          # Flutter 客户端
-│   ├── lib/
-│   │   ├── main.dart      # 应用入口
-│   │   ├── core/          # 核心模块
-│   │   └── features/      # 功能模块
-│   └── ...
-├── scripts/                # 部署脚本
-├── docker-compose.yml      # Docker 配置
-├── Cargo.toml             # Rust 依赖配置
-└── .env.example           # 配置模板
-```
-
-## 贡献指南
-
-欢迎提交 Issue 和 Pull Request！
-
-1. Fork 本仓库
-2. 创建你的功能分支 (`git checkout -b feature/amazing-feature`)
-3. 提交更改 (`git commit -m 'Add some amazing feature'`)
-4. 推送到分支 (`git push origin feature/amazing-feature`)
-5. 创建 Pull Request
-
-## 开源协议
-
-本项目采用 AGPL-3.0 license 协议开源，详见 [LICENSE](LICENSE) 文件。
-
-## 致谢
-
-- [Actix Web](https://actix.rs/) - 高性能 Rust Web 框架
-- [Flutter](https://flutter.dev/) - 跨平台 UI 框架
-- [FFmpeg](https://ffmpeg.org/) - 多媒体处理
-- [CasaOS AppStore Play](https://github.com/Cp0204/CasaOS-AppStore-Play) - 应用商店数据
+<p align="center">
+  <img src="RockZeroOS-UI/assets/images/RockZero.png" alt="RockZeroOS Logo" width="200"/>
+</p>
+
+<h1 align="center">RockZeroOS</h1>
+
+<p align="center">
+  <strong>Secure Private Cloud NAS Operating System</strong>
+</p>
+
+<p align="center">
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.75%2B-orange.svg" alt="Rust"></a>
+  <a href="https://flutter.dev/"><img src="https://img.shields.io/badge/flutter-3.19%2B-blue.svg" alt="Flutter"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License"></a>
+  <img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Build Status">
+</p>
 
 ---
 
-Made with ❤️ by [Blueokanna](https://github.com/Blueokanna)
+## Overview
 
-如有问题，欢迎提 [Issue](https://github.com/Blueokanna/RockZeroOS-Service/issues) 或加入讨论！
+RockZeroOS is a high-performance, secure cross-platform private cloud NAS operating system built with Rust. It features military-grade encryption including WPA3-SAE key exchange, EdDSA (Ed25519) JWT authentication, Bulletproofs zero-knowledge proofs, hardware-accelerated video transcoding, and professional storage management.
+
+## Security Architecture
+
+```mermaid
+flowchart TB
+    subgraph Client["Flutter Client"]
+        A[User Login] --> B[EdDSA JWT Auth]
+        B --> C[SAE Handshake]
+        C --> D[Bulletproofs ZKP]
+    end
+    
+    subgraph Server["Rust Backend"]
+        E[JWT Verification] --> F[SAE Key Exchange]
+        F --> G[PMK Derivation]
+        G --> H[AES-256-GCM Encryption]
+    end
+    
+    B --> E
+    C --> F
+    D --> H
+    
+    style Client fill:#e1f5fe
+    style Server fill:#fff3e0
+```
+
+| Feature | Technology | Description |
+|---------|------------|-------------|
+| JWT Authentication | EdDSA (Ed25519) | Private key derived from BLAKE3 hash of password |
+| Key Exchange | WPA3-SAE (Dragonfly) | Secure key negotiation based on Curve25519 |
+| Zero-Knowledge Proof | Bulletproofs RangeProof | Prove password knowledge without revealing it |
+| Video Encryption | AES-256-GCM | Each HLS segment independently encrypted |
+| Replay Protection | Timestamp + Nonce + HMAC | Multi-layer protection mechanism |
+| Hardware Auth | FIDO2/WebAuthn | Support for YubiKey, TouchID, FaceID |
+| Secure Storage | Reed-Solomon + CRC32 | Data integrity verification and error correction |
+
+## Secure HLS Video Streaming
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    
+    C->>S: 1. JWT Authentication (EdDSA)
+    S-->>C: Access Token
+    
+    C->>S: 2. SAE Init
+    S-->>C: Temp Session ID
+    
+    C->>S: 3. SAE Commit (Curve25519)
+    S-->>C: Server Commit
+    
+    C->>S: 4. SAE Confirm
+    S-->>C: Server Confirm + PMK
+    
+    C->>S: 5. Create HLS Session
+    S-->>C: Session ID + Encryption Key
+    
+    loop Each Video Segment
+        C->>S: 6. Request Segment + Bulletproofs ZKP
+        S-->>C: AES-256-GCM Encrypted Segment
+        C->>C: 7. Local Proxy Decrypt
+    end
+```
+
+## Storage Management
+
+- **Smart Formatting** - Auto-select optimal filesystem based on usage
+  - System boot: ext4
+  - Media library: XFS (large file optimization)
+  - Database: ext4 (journal optimization)
+  - Backup: Btrfs (snapshot support)
+  - Cross-platform: exFAT/NTFS
+- **Auto Mount** - Smart mount point generation with UUID/Label recognition
+- **Partition Management** - GPT/MBR partition table creation
+- **Disk Health** - SMART data monitoring, temperature detection
+- **Secure Erase** - Multi-pass overwrite for data destruction
+
+## Hardware Accelerated Transcoding
+
+| Platform | Acceleration | Encoder | Decoder |
+|----------|--------------|---------|---------|
+| NVIDIA | NVENC/NVDEC | h264_nvenc, hevc_nvenc | h264_cuvid, hevc_cuvid |
+| Intel | QSV/VAAPI | h264_qsv, hevc_qsv | h264_qsv, hevc_qsv |
+| AMD | VAAPI | h264_vaapi, hevc_vaapi | - |
+| ARM | V4L2 M2M | h264_v4l2m2m | h264_v4l2m2m |
+| Amlogic | V4L2 M2M | h264_v4l2m2m | h264_v4l2m2m |
+
+## Project Structure
+
+```mermaid
+graph LR
+    subgraph Backend["Rust Backend"]
+        A[rockzero-common] --> B[rockzero-crypto]
+        B --> C[rockzero-sae]
+        B --> D[rockzero-media]
+        B --> E[rockzero-db]
+        C --> F[rockzero-service]
+        D --> F
+        E --> F
+    end
+    
+    subgraph Frontend["Flutter Frontend"]
+        G[RockZeroOS-UI]
+    end
+    
+    F <--> G
+    
+    style Backend fill:#ffebee
+    style Frontend fill:#e8f5e9
+```
+
+```
+RockZeroOS-Service/
+├── rockzero-common/          # Common library (error handling, config, types)
+├── rockzero-crypto/          # Cryptography library
+│   ├── jwt.rs                # EdDSA JWT (Ed25519 + BLAKE3)
+│   ├── ed25519.rs            # Ed25519 signatures
+│   ├── bulletproofs_ffi.rs   # Bulletproofs RangeProof
+│   ├── zkp.rs                # ZKP authentication
+│   ├── aes.rs                # AES-256-GCM encryption
+│   └── hash.rs               # BLAKE3, SHA3-256
+├── rockzero-sae/             # WPA3-SAE key exchange
+│   ├── client.rs             # SAE client
+│   ├── server.rs             # SAE server
+│   └── crypto.rs             # Curve25519 cryptography
+├── rockzero-media/           # Media processing
+│   ├── session.rs            # HLS session management
+│   ├── encryptor.rs          # AES-256-GCM video encryption
+│   └── bulletproof_auth.rs   # Video segment ZKP auth
+├── rockzero-db/              # Database (SQLite + Reed-Solomon)
+├── rockzero-service/         # Main service
+│   └── handlers/
+│       ├── auth.rs           # EdDSA JWT authentication
+│       ├── zkp_auth.rs       # ZKP authentication
+│       ├── secure_hls.rs     # Secure HLS streaming
+│       └── ...
+└── RockZeroOS-UI/            # Flutter cross-platform client
+    └── lib/
+        ├── services/
+        │   ├── bulletproofs_ffi.dart
+        │   ├── sae_client_curve25519.dart
+        │   └── secure_hls_player.dart
+        └── features/
+            ├── auth/
+            ├── files/
+            └── ...
+```
+
+## Quick Start
+
+### Prerequisites
+
+- Rust 1.90+
+- FFmpeg 6.0+
+- SQLite 3.x
+- Flutter 3.19+
+
+### Build Backend
+
+```bash
+git clone https://github.com/blueokanna/rockzero-service.git
+cd rockzero-service
+
+cargo build --workspace --release
+cargo test --workspace
+cargo run -p rockzero-service --release
+```
+
+### Configuration
+
+Create `.env` file:
+
+```env
+HOST=0.0.0.0
+PORT=8080
+RUST_LOG=info
+
+DATA_DIR=./data
+DATABASE_URL=./data/rockzero.db
+
+JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
+JWT_EXPIRATION_HOURS=24
+REFRESH_TOKEN_EXPIRATION_DAYS=7
+
+STORAGE_ROOT=/mnt/storage
+MAX_UPLOAD_SIZE=10737418240
+HLS_CACHE_PATH=./data/hls_cache
+```
+
+### Run Flutter Client
+
+```bash
+cd RockZeroOS-UI
+flutter pub get
+flutter run
+```
+
+## API Reference
+
+### Authentication
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    
+    C->>S: POST /api/v1/auth/register
+    Note right of S: Create user with<br/>EdDSA JWT + ZKP registration
+    S-->>C: {tokens, user}
+    
+    C->>S: POST /api/v1/auth/login
+    Note right of S: Verify password<br/>Generate EdDSA JWT
+    S-->>C: {tokens, user}
+    
+    C->>S: POST /api/v1/auth/zkp/login
+    Note right of S: Verify Bulletproofs<br/>RangeProof
+    S-->>C: {tokens, user}
+```
+
+### Secure HLS
+
+```http
+POST /api/v1/secure-hls/sae/init
+POST /api/v1/secure-hls/sae/commit
+POST /api/v1/secure-hls/sae/confirm
+POST /api/v1/secure-hls/session/create
+POST /api/v1/secure-hls/{session_id}/segment_{n}.ts
+```
+
+### ZKP
+
+```http
+POST /api/v1/zkp/range-proof/create
+POST /api/v1/zkp/range-proof/verify
+POST /api/v1/zkp/video/proof
+POST /api/v1/zkp/video/verify
+```
+
+## Performance
+
+| Operation | Performance |
+|-----------|-------------|
+| EdDSA JWT Sign | ~0.1ms |
+| EdDSA JWT Verify | ~0.2ms |
+| SAE Handshake | ~5-10ms |
+| Bulletproofs RangeProof | ~50ms |
+| AES-256-GCM Encryption | ~500 MB/s |
+| BLAKE3 Hash | ~1 GB/s |
+| Hardware Transcode (NVENC) | ~300 FPS (1080p) |
+| Hardware Transcode (QSV) | ~150 FPS (1080p) |
+
+## Docker Deployment
+
+```bash
+docker build -t rockzero-service .
+docker run -d \
+  -p 8080:8080 \
+  -v /mnt/storage:/mnt/storage \
+  -v ./data:/app/data \
+  --name rockzero \
+  rockzero-service
+```
+
+## Roadmap
+
+- [x] EdDSA (Ed25519) JWT authentication
+- [x] WPA3-SAE key exchange
+- [x] Bulletproofs RangeProof ZKP
+- [x] AES-256-GCM encrypted HLS streaming
+- [x] FIDO2/WebAuthn hardware authentication
+- [x] Professional storage management
+- [x] Hardware accelerated video transcoding
+- [x] CasaOS/iStoreOS app store
+- [x] Docker container management
+- [x] Flutter cross-platform client
+- [ ] RAID support
+- [ ] Snapshot and backup
+- [ ] Multi-user permission management
+- [ ] SMB/NFS file sharing
+- [ ] Remote access (DDNS, VPN)
+- [ ] AI smart album
+
+## License
+
+This project is licensed under AGPL-3.0 - see [LICENSE](LICENSE) for details.
+
+## Dependencies
+
+- [Actix Web](https://actix.rs/) - High-performance web framework
+- [Tokio](https://tokio.rs/) - Async runtime
+- [ed25519-dalek](https://github.com/dalek-cryptography/ed25519-dalek) - Ed25519 signatures
+- [curve25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) - Curve25519
+- [bulletproofs](https://github.com/dalek-cryptography/bulletproofs) - Zero-knowledge proofs
+- [blake3](https://github.com/BLAKE3-team/BLAKE3) - Fast hashing
+- [FFmpeg](https://ffmpeg.org/) - Media processing
+- [Flutter](https://flutter.dev/) - Cross-platform UI
+
+## Contact
+
+- **Author**: blueokanna
+- **Email**: blueokanna@gmail.com
+- **GitHub**: [https://github.com/blueokanna/rockzero-service](https://github.com/blueokanna/rockzero-service)
+
+---
+
+<p align="center">
+  <strong>Made with ❤️ by blueokanna</strong>
+</p>
+
+<p align="center">
+  Powered by Rust 🦀 | Secured by EdDSA + Bulletproofs 🔐 | Accelerated by Hardware 🚀
+</p>

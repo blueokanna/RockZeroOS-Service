@@ -1,0 +1,107 @@
+[package]
+name = "rockzero-service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "RockZero Main Service - Cross-platform Secure Service with Hardware Detection and Media Support"
+license.workspace = true
+
+[[bin]]
+name = "rockzero-service"
+path = "src/main.rs"
+
+[features]
+default = []
+fido = ["webauthn-rs", "webauthn-rs-proto"]
+
+[dependencies]
+# Internal dependencies
+rockzero-common = { path = "../rockzero-common", features = ["db", "actix"] }
+rockzero-crypto = { path = "../rockzero-crypto" }
+rockzero-db = { path = "../rockzero-db" }
+rockzero-media = { path = "../rockzero-media" }
+rockzero-sae = { path = "../rockzero-sae" }
+
+# Actix web framework
+actix-cors = { workspace = true }
+actix-files = { workspace = true }
+actix-multipart = { workspace = true }
+actix-web = { workspace = true }
+
+# Async runtime
+futures = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true }
+
+# Cryptography
+aes-gcm = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+crc32fast = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+lazy_static = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+sha3 = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+
+# JWT
+jsonwebtoken = { workspace = true }
+
+# Logging
+chrono = { workspace = true }
+log = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Media processing
+symphonia = { workspace = true }
+
+# Serialization
+bincode = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# System info
+sysinfo = { workspace = true }
+
+# TLS
+tokio-rustls = { workspace = true }
+
+# Utilities
+dotenvy = { workspace = true }
+image = { workspace = true }
+mime_guess = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+urlencoding = { workspace = true }
+uuid = { workspace = true }
+validator = { workspace = true }
+walkdir = { workspace = true }
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
+which = { workspace = true }
+
+# Docker API (Unix socket)
+hyper = { workspace = true }
+serde_yaml = { workspace = true }
+
+# FIDO2/WebAuthn (optional)
+webauthn-rs = { workspace = true, optional = true }
+webauthn-rs-proto = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true }
+hyperlocal = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }

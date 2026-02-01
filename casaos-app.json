@@ -3,8 +3,8 @@
   "title": "RockZero 安全服务",
   "name": "rockzero-service",
   "icon": "https://cdn.jsdelivr.net/gh/IceWhaleTech/CasaOS-AppStore@main/Apps/rockzero/icon.png",
-  "tagline": "零知识证明安全服务 - 支持文件管理、媒体播放、小组件",
-  "overview": "RockZero 是一个基于 Rust 的高性能安全服务，集成零知识证明、文件管理、媒体播放和小组件功能。采用 Argon2 密码哈希、单调时钟防篡改推荐码系统，确保极致安全性。",
+  "tagline": "零知识证明安全服务 - 支持文件管理、媒体播放、磁盘管理、应用商店",
+  "overview": "RockZero 是一个基于 Rust 的高性能安全服务，集成零知识证明、文件管理、媒体播放、磁盘管理和应用商店功能。采用 Argon2 密码哈希、FIDO2/Passkey 认证、单调时钟防篡改推荐码系统，确保极致安全性。支持硬件加速视频转码、Docker 应用管理、系统监控等企业级功能。",
   "thumbnail": "https://cdn.jsdelivr.net/gh/IceWhaleTech/CasaOS-AppStore@main/Apps/rockzero/thumbnail.png",
   "screenshots": [],
   "category": "Security",
@@ -17,7 +17,7 @@
     "name": "RockZero",
     "image": "rockzero/rockzero-service:latest",
     "index": "/",
-    "port": "8443",
+    "port": "8080",
     "scheme": "http"
   },
   "support": "https://github.com/rockzero/rockzero-service/issues",
@@ -25,13 +25,13 @@
   "container": {
     "image": "rockzero/rockzero-service:latest",
     "shell": "bash",
-    "privileged": false,
-    "network_mode": "bridge",
+    "privileged": true,
+    "network_mode": "host",
     "web_ui": {
-      "http": "8443",
+      "http": "8080",
       "path": "/"
     },
-    "health_check": "curl -f http://localhost:8443/health || exit 1",
+    "health_check": "curl -f http://localhost:8080/health || exit 1",
     "envs": [
       {
         "key": "RUST_LOG",
@@ -56,12 +56,24 @@
         "value": "false",
         "configurable": "yes",
         "description": "是否启用 TLS (true/false)"
+      },
+      {
+        "key": "BIND_ADDRESS",
+        "value": "0.0.0.0:8080",
+        "configurable": "yes",
+        "description": "服务绑定地址"
+      },
+      {
+        "key": "DATABASE_URL",
+        "value": "sqlite:///app/data/rockzero.db",
+        "configurable": "no",
+        "description": "数据库路径"
       }
     ],
     "ports": [
       {
-        "container": "8443",
-        "host": "8443",
+        "container": "8080",
+        "host": "8080",
         "type": "tcp",
         "allocation": "automatic",
         "configurable": "advanced",
@@ -75,7 +87,7 @@
         "mode": "rw",
         "allocation": "automatic",
         "configurable": "advanced",
-        "description": "数据库存储"
+        "description": "数据库和配置存储"
       },
       {
         "container": "/app/uploads",
@@ -84,18 +96,66 @@
         "allocation": "automatic",
         "configurable": "advanced",
         "description": "文件上传存储"
+      },
+      {
+        "container": "/app/storage",
+        "host": "/DATA/AppData/rockzero/storage",
+        "mode": "rw",
+        "allocation": "automatic",
+        "configurable": "advanced",
+        "description": "文件管理器存储"
+      },
+      {
+        "container": "/app/media",
+        "host": "/DATA/Media",
+        "mode": "rw",
+        "allocation": "automatic",
+        "configurable": "advanced",
+        "description": "媒体文件存储"
+      },
+      {
+        "container": "/var/run/docker.sock",
+        "host": "/var/run/docker.sock",
+        "mode": "rw",
+        "allocation": "automatic",
+        "configurable": "no",
+        "description": "Docker socket（应用商店功能必需）"
+      },
+      {
+        "container": "/mnt",
+        "host": "/mnt",
+        "mode": "rw",
+        "allocation": "automatic",
+        "configurable": "no",
+        "description": "挂载点访问（磁盘管理必需）"
       }
     ],
-    "devices": [],
+    "devices": [
+      {
+        "container": "/dev/video10",
+        "host": "/dev/video10",
+        "description": "Rockchip MPP 视频编码器"
+      },
+      {
+        "container": "/dev/video11",
+        "host": "/dev/video11",
+        "description": "Rockchip MPP 视频解码器"
+      },
+      {
+        "container": "/dev/dri",
+        "host": "/dev/dri",
+        "description": "DRI 设备（硬件加速）"
+      }
+    ],
     "constraints": {
-      "min_memory": 256,
-      "min_storage": 1024
+      "min_memory": 512,
+      "min_storage": 2048
     },
     "restart_policy": "unless-stopped",
     "sysctls": [],
-    "cap_add": ["NET_BIND_SERVICE"],
-    "cap_drop": ["ALL"],
-    "security_opt": ["no-new-privileges:true"]
+    "cap_add": ["NET_BIND_SERVICE", "SYS_ADMIN", "DAC_OVERRIDE"],
+    "cap_drop": [],
+    "security_opt": []
   },
   "abilities": {
     "notification": false,
@@ -117,11 +177,23 @@
       {
         "content": "📝 后续用户注册需要超级管理员生成的推荐码（1小时有效）",
         "value": "info"
+      },
+      {
+        "content": "💾 磁盘管理功能需要 privileged 模式和 host 网络",
+        "value": "info"
+      },
+      {
+        "content": "🐳 应用商店功能需要挂载 Docker socket",
+        "value": "info"
+      },
+      {
+        "content": "🎬 支持硬件加速：Rockchip MPP, Intel QSV, NVIDIA NVENC",
+        "value": "info"
       }
     ]
   },
   "changelog": {
-    "latest_updates": "v0.1.0 - 初始版本：零知识证明、文件管理、媒体播放、小组件"
+    "latest_updates": "v0.1.1 - 修复磁盘管理404错误、优化App Store网络请求、添加壁纸主题系统"
   },
-  "latest_update_date": "2026-01-12"
+  "latest_update_date": "2026-01-20"
 }
