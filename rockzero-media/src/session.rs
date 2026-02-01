@@ -32,31 +32,17 @@ struct HkdfBlake3 {
 
 impl HkdfBlake3 {
     /// Create HKDF instance with salt derived from session_id
-    /// 
-    /// Salt derivation: salt = blake3("hls-session-salt:" + session_id)
-    /// PRK derivation: prk = blake3(salt + ikm)
     fn new_with_session_salt(session_id: &str, ikm: &[u8]) -> Self {
         // Derive salt from session_id: blake3("hls-session-salt:" + session_id)
         let salt_input = format!("hls-session-salt:{}", session_id);
         let salt_input_bytes = salt_input.as_bytes();
         let salt = *blake3::hash(salt_input_bytes).as_bytes();
 
-        tracing::info!("========== [HKDF Server] ==========");
-        tracing::info!("[HKDF] Session: {}", session_id);
-        tracing::info!("[HKDF] Salt input: \"{}\"", salt_input);
-        tracing::info!("[HKDF] Salt: {}", hex::encode(&salt));
-        tracing::info!("[HKDF] IKM (PMK) length: {}", ikm.len());
-        tracing::info!("[HKDF] IKM (PMK): {}", hex::encode(ikm));
-
         // PRK = blake3(salt + ikm)
         let mut input = Vec::with_capacity(32 + ikm.len());
         input.extend_from_slice(&salt);
         input.extend_from_slice(ikm);
         let prk = *blake3::hash(&input).as_bytes();
-
-        tracing::info!("[HKDF] PRK input length: {}", input.len());
-        tracing::info!("[HKDF] PRK: {}", hex::encode(&prk));
-        tracing::info!("====================================");
 
         Self { prk }
     }
@@ -112,7 +98,7 @@ impl HkdfBlake3 {
         }
 
         let info_str = String::from_utf8_lossy(info);
-        tracing::info!("[HKDF] Expand info: \"{}\", key: {}", info_str, hex::encode(okm));
+        tracing::debug!("[HKDF] Expand info: \"{}\"", info_str);
 
         Ok(())
     }
@@ -140,7 +126,6 @@ impl HlsSession {
         let expires_at = created_at + Duration::hours(3);
 
         tracing::info!("[HlsSession] Creating session: {}", session_id);
-        tracing::info!("[HlsSession] PMK: {}", hex::encode(&pmk));
 
         // Use session-derived salt for HKDF
         let hk = HkdfBlake3::new_with_session_salt(&session_id, &pmk);
@@ -149,7 +134,7 @@ impl HlsSession {
         hk.expand(b"hls-master-key", &mut encryption_key)
             .map_err(|e| HlsError::EncryptionError(format!("HKDF expand failed: {}", e)))?;
 
-        tracing::info!("[HlsSession] Encryption key: {}", hex::encode(&encryption_key));
+        tracing::debug!("[HlsSession] Encryption key derived");
 
         let mut segment_keys = Vec::with_capacity(max_segments);
         for i in 0..max_segments {
@@ -258,8 +243,6 @@ impl HlsSessionManager {
         }
 
         let pmk = sae_server.get_pmk()?;
-        
-        tracing::info!("[SAE Complete] PMK from SAE server: {}", hex::encode(&pmk));
         
         let session =
             HlsSession::new_with_registration(user_id, file_path, pmk, 1000, zkp_registration)?;
