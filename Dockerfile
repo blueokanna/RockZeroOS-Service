@@ -7,23 +7,20 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制依赖文件
 COPY Cargo.toml Cargo.lock ./
+COPY rockzero-common ./rockzero-common
+COPY rockzero-crypto ./rockzero-crypto
+COPY rockzero-db ./rockzero-db
+COPY rockzero-media ./rockzero-media
+COPY rockzero-sae ./rockzero-sae
+COPY rockzero-service ./rockzero-service
 
-# 创建虚拟源文件以缓存依赖
-RUN mkdir src && \
-    echo "fn main() {}" > src/main.rs && \
-    cargo build --release && \
-    rm -rf src
-
-# 复制实际源代码
-COPY src ./src
-
-# 构建应用（依赖已缓存）
-RUN touch src/main.rs && \
-    cargo build --release --locked
+# 构建应用
+RUN cargo build --release --locked
 
 # 运行时镜像 - 最小化
 FROM debian:bookworm-slim
@@ -34,15 +31,27 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    libsqlite3-0 \
+    ffmpeg \
+    xz-utils \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # 创建非root用户
 RUN useradd -m -u 1000 rockzero && \
-    mkdir -p /app/uploads /app/data && \
+    mkdir -p /app/uploads /app/data /app/data/ffmpeg /app/data/hls_cache /app/assets && \
     chown -R rockzero:rockzero /app
 
 # 从构建阶段复制二进制文件
 COPY --from=builder /app/target/release/rockzero-service /app/rockzero-service
+
+# 复制 assets 目录（包含静态编译的 FFmpeg）
+COPY --chown=rockzero:rockzero assets /app/assets
+
+# 设置环境变量
+ENV DATA_DIR=/app/data
+ENV FFMPEG_ASSETS_PATH=/app/assets
+ENV HLS_CACHE_PATH=/app/data/hls_cache
 
 # 切换到非root用户
 USER rockzero

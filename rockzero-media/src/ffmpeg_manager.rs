@@ -16,7 +16,7 @@ const FFMPEG_GITHUB_RELEASES: &str =
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest";
 
 #[cfg(target_os = "windows")]
-const LOCAL_ASSETS_PATH: &str = r"D:\RustProject\RockZeroOS-Service\assets";
+const LOCAL_ASSETS_PATH: &str = r".\assets";
 
 #[cfg(not(target_os = "windows"))]
 const LOCAL_ASSETS_PATH: &str = "./assets";
@@ -575,14 +575,15 @@ fn find_system_ffmpeg() -> Option<String> {
     let paths = [
         "ffmpeg",
         "ffmpeg.exe",
+        r".\assets\ffmpeg.exe",
         r"C:\ffmpeg\bin\ffmpeg.exe",
         r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-        r"D:\RustProject\RockZeroOS-Service\assets\ffmpeg.exe",
     ];
 
     #[cfg(not(target_os = "windows"))]
     let paths = [
         "ffmpeg",
+        "./assets/ffmpeg",
         "/usr/bin/ffmpeg",
         "/usr/local/bin/ffmpeg",
         "/opt/ffmpeg/bin/ffmpeg",
@@ -610,14 +611,15 @@ fn find_system_ffprobe() -> Option<String> {
     let paths = [
         "ffprobe",
         "ffprobe.exe",
+        r".\assets\ffprobe.exe",
         r"C:\ffmpeg\bin\ffprobe.exe",
         r"C:\Program Files\ffmpeg\bin\ffprobe.exe",
-        r"D:\RustProject\RockZeroOS-Service\assets\ffprobe.exe",
     ];
 
     #[cfg(not(target_os = "windows"))]
     let paths = [
         "ffprobe",
+        "./assets/ffprobe",
         "/usr/bin/ffprobe",
         "/usr/local/bin/ffprobe",
         "/opt/ffmpeg/bin/ffprobe",

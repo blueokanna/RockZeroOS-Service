@@ -1,6 +1,3 @@
-# 多架构 Dockerfile for RockZero
-# 支持: amd64, arm64, armv7, i386
-
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 
@@ -55,7 +52,12 @@ RUN RUST_TARGET=$(cat /rust_target.txt) && \
 
 # 复制项目文件
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY rockzero-common ./rockzero-common
+COPY rockzero-crypto ./rockzero-crypto
+COPY rockzero-db ./rockzero-db
+COPY rockzero-media ./rockzero-media
+COPY rockzero-sae ./rockzero-sae
+COPY rockzero-service ./rockzero-service
 
 # 构建项目
 RUN RUST_TARGET=$(cat /rust_target.txt) && \
@@ -86,6 +88,8 @@ RUN apt-get update && apt-get install -y \
     libpcsclite1 \
     usbutils \
     v4l-utils \
+    xz-utils \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # ARM 特定依赖
@@ -100,11 +104,19 @@ RUN if [ "$TARGETPLATFORM" = "linux/arm64" ] || [ "$TARGETPLATFORM" = "linux/arm
 # 复制二进制文件
 COPY --from=builder /app/rockzero-service /usr/local/bin/rockzero-service
 
+# 复制 assets 目录（包含静态编译的 FFmpeg）
+COPY assets /app/assets
+
 # 创建必要的目录
-RUN mkdir -p /app/data /app/uploads /app/certs /app/storage
+RUN mkdir -p /app/data /app/uploads /app/certs /app/storage /app/data/ffmpeg /app/data/hls_cache
 
 # 设置权限
 RUN chmod +x /usr/local/bin/rockzero-service
+
+# 设置环境变量
+ENV DATA_DIR=/app/data
+ENV FFMPEG_ASSETS_PATH=/app/assets
+ENV HLS_CACHE_PATH=/app/data/hls_cache
 
 # 暴露端口
 EXPOSE 8443

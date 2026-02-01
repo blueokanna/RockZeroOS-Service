@@ -53,15 +53,42 @@ async fn main() -> std::io::Result<()> {
     std::fs::create_dir_all(&data_dir).ok();
 
     info!("Initializing FFmpeg manager...");
-    let mut ffmpeg_manager = ffmpeg_manager::FfmpegManager::new(&data_dir);
+    
+    // 确定 assets 目录路径
+    let assets_path = std::env::var("FFMPEG_ASSETS_PATH").unwrap_or_else(|_| {
+        // 尝试多个可能的 assets 路径
+        let candidates = [
+            "./assets",
+            "../assets",
+            "/app/assets",
+            "/opt/rockzero/assets",
+        ];
+        for candidate in &candidates {
+            let path = std::path::Path::new(candidate);
+            if path.exists() && path.is_dir() {
+                info!("Found assets directory at: {}", candidate);
+                return candidate.to_string();
+            }
+        }
+        "./assets".to_string()
+    });
+    
+    info!("Using assets path: {}", assets_path);
+    
+    let mut ffmpeg_manager = ffmpeg_manager::FfmpegManager::with_assets_path(&data_dir, &assets_path);
     match ffmpeg_manager.ensure_available().await {
         Ok(_) => {
             if let Some(path) = ffmpeg_manager.ffmpeg_path() {
-                info!("FFmpeg ready: {}", path.display());
-                ffmpeg_manager::set_global_ffmpeg_path(Some(path.to_string_lossy().to_string()));
+                let ffmpeg_path_str = path.to_string_lossy().to_string();
+                info!("FFmpeg ready: {}", ffmpeg_path_str);
+                ffmpeg_manager::set_global_ffmpeg_path(Some(ffmpeg_path_str.clone()));
+                // 同时设置环境变量，确保其他模块也能找到
+                std::env::set_var("FFMPEG_PATH", &ffmpeg_path_str);
             }
             if let Some(path) = ffmpeg_manager.ffprobe_path() {
-                ffmpeg_manager::set_global_ffprobe_path(Some(path.to_string_lossy().to_string()));
+                let ffprobe_path_str = path.to_string_lossy().to_string();
+                ffmpeg_manager::set_global_ffprobe_path(Some(ffprobe_path_str.clone()));
+                std::env::set_var("FFPROBE_PATH", &ffprobe_path_str);
             }
             if let Some(version) = ffmpeg_manager.get_version() {
                 info!("FFmpeg version: {}", version);

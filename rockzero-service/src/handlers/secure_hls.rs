@@ -747,9 +747,7 @@ async fn probe_video_info(video_path: &std::path::Path) -> Result<VideoInfo, App
     use tokio::process::Command;
     use tokio::time::{timeout, Duration};
 
-    let ffprobe_path = std::env::var("FFPROBE_PATH")
-        .or_else(|_| rockzero_media::get_global_ffprobe_path().ok_or(""))
-        .unwrap_or_else(|_| "ffprobe".to_string());
+    let ffprobe_path = get_ffprobe_path();
 
     let output = timeout(
         Duration::from_secs(30),
@@ -765,7 +763,7 @@ async fn probe_video_info(video_path: &std::path::Path) -> Result<VideoInfo, App
     )
     .await
     .map_err(|_| AppError::InternalServerError("FFprobe timeout".to_string()))?
-    .map_err(|e| AppError::IoError(format!("Failed to probe video: {}", e)))?;
+    .map_err(|e| AppError::IoError(format!("Failed to probe video: {}. FFprobe path: {}", e, ffprobe_path)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -917,9 +915,7 @@ async fn check_ffmpeg_encoder(encoder: &str) -> bool {
     use tokio::process::Command;
     use tokio::time::{timeout, Duration};
 
-    let ffmpeg_path = std::env::var("FFMPEG_PATH")
-        .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
-        .unwrap_or_else(|_| "ffmpeg".to_string());
+    let ffmpeg_path = get_ffmpeg_path();
 
     let result = timeout(
         Duration::from_secs(10),
@@ -955,9 +951,7 @@ async fn check_ffmpeg_decoder(decoder: &str) -> bool {
     use tokio::process::Command;
     use tokio::time::{timeout, Duration};
 
-    let ffmpeg_path = std::env::var("FFMPEG_PATH")
-        .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
-        .unwrap_or_else(|_| "ffmpeg".to_string());
+    let ffmpeg_path = get_ffmpeg_path();
 
     let result = timeout(
         Duration::from_secs(10),
@@ -973,6 +967,100 @@ async fn check_ffmpeg_decoder(decoder: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// 获取 FFmpeg 可执行文件路径
+/// 按优先级查找：环境变量 -> 全局设置 -> 数据目录 -> 系统路径
+fn get_ffmpeg_path() -> String {
+    // 1. 首先检查环境变量
+    if let Ok(path) = std::env::var("FFMPEG_PATH") {
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+    }
+    
+    // 2. 检查全局设置
+    if let Some(path) = rockzero_media::get_global_ffmpeg_path() {
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+    }
+    
+    // 3. 检查常见安装位置
+    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+    let candidates = [
+        format!("{}/ffmpeg/ffmpeg", data_dir),
+        "./data/ffmpeg/ffmpeg".to_string(),
+        "/usr/bin/ffmpeg".to_string(),
+        "/usr/local/bin/ffmpeg".to_string(),
+        "/opt/ffmpeg/bin/ffmpeg".to_string(),
+        "ffmpeg".to_string(),
+    ];
+    
+    for candidate in &candidates {
+        if std::path::Path::new(candidate).exists() {
+            return candidate.clone();
+        }
+    }
+    
+    // 4. 尝试使用 which 命令查找
+    if let Ok(output) = std::process::Command::new("which").arg("ffmpeg").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return path;
+            }
+        }
+    }
+    
+    // 5. 默认返回 ffmpeg，让系统 PATH 处理
+    "ffmpeg".to_string()
+}
+
+/// 获取 FFprobe 可执行文件路径
+fn get_ffprobe_path() -> String {
+    // 1. 首先检查环境变量
+    if let Ok(path) = std::env::var("FFPROBE_PATH") {
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+    }
+    
+    // 2. 检查全局设置
+    if let Some(path) = rockzero_media::get_global_ffprobe_path() {
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+    }
+    
+    // 3. 检查常见安装位置
+    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+    let candidates = [
+        format!("{}/ffmpeg/ffprobe", data_dir),
+        "./data/ffmpeg/ffprobe".to_string(),
+        "/usr/bin/ffprobe".to_string(),
+        "/usr/local/bin/ffprobe".to_string(),
+        "/opt/ffmpeg/bin/ffprobe".to_string(),
+        "ffprobe".to_string(),
+    ];
+    
+    for candidate in &candidates {
+        if std::path::Path::new(candidate).exists() {
+            return candidate.clone();
+        }
+    }
+    
+    // 4. 尝试使用 which 命令查找
+    if let Ok(output) = std::process::Command::new("which").arg("ffprobe").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return path;
+            }
+        }
+    }
+    
+    "ffprobe".to_string()
 }
 
 async fn read_video_segment_from_ffmpeg(
@@ -1092,21 +1180,17 @@ async fn transcode_segment_with_seek(
         }
     }
 
-    let ffmpeg_path = std::env::var("FFMPEG_PATH")
-        .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
-        .unwrap_or_else(|_| "ffmpeg".to_string());
+    let ffmpeg_path = get_ffmpeg_path();
+    info!("Using FFmpeg at: {}", ffmpeg_path);
 
-    // 检查 FFmpeg 是否存在
-    let ffmpeg_exists = std::path::Path::new(&ffmpeg_path).exists() 
-        || which::which(&ffmpeg_path).is_ok();
-    
-    if !ffmpeg_exists {
-        warn!("FFmpeg not found at path: {}", ffmpeg_path);
-        // 尝试使用系统默认的 ffmpeg
-        let system_ffmpeg = which::which("ffmpeg")
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "ffmpeg".to_string());
-        info!("Trying system FFmpeg: {}", system_ffmpeg);
+    // 验证 FFmpeg 是否真的存在且可执行
+    let ffmpeg_exists = std::path::Path::new(&ffmpeg_path).exists();
+    if !ffmpeg_exists && ffmpeg_path != "ffmpeg" {
+        warn!("FFmpeg not found at configured path: {}", ffmpeg_path);
+        return Err(AppError::InternalServerError(format!(
+            "FFmpeg not found at: {}. Please ensure FFmpeg is installed or the archive is extracted.",
+            ffmpeg_path
+        )));
     }
 
     let hw_accel = detect_hardware_acceleration().await;
@@ -1307,8 +1391,8 @@ fn build_ffmpeg_args(
     match hw_accel {
         HardwareAccel::AmlogicV4l2 => {
             // Amlogic A311D V4L2 M2M 硬件解码
-            // 注意：不要在输入前添加 -hwaccel，让 FFmpeg 自动选择
-            // V4L2 M2M 主要用于编码，解码通常使用软件解码器
+            // 对于 Amlogic 设备，使用 V4L2 M2M 解码器
+            // 注意：需要确保 /dev/video* 设备可访问
         }
         HardwareAccel::Vaapi => {
             args.extend([
@@ -1352,17 +1436,18 @@ fn build_ffmpeg_args(
             HardwareAccel::AmlogicV4l2 => {
                 // Amlogic A311D V4L2 M2M 硬件编码
                 // 使用 h264_v4l2m2m 编码器
+                // 针对 A311D 优化的参数
                 args.extend([
                     "-c:v".to_string(),
                     "h264_v4l2m2m".to_string(),
-                    // 比特率控制
+                    // 比特率控制 - A311D 支持较高比特率
                     "-b:v".to_string(),
                     "4M".to_string(),
                     "-maxrate".to_string(),
                     "6M".to_string(),
                     "-bufsize".to_string(),
                     "8M".to_string(),
-                    // GOP 设置
+                    // GOP 设置 - 适合 HLS 流
                     "-g".to_string(),
                     "30".to_string(),
                     "-keyint_min".to_string(),
@@ -1416,19 +1501,20 @@ fn build_ffmpeg_args(
             }
             HardwareAccel::None => {
                 // 软件编码 (libx264)
+                // 针对 ARM 设备优化，使用较快的预设
                 args.extend([
                     "-c:v".to_string(),
                     "libx264".to_string(),
                     "-preset".to_string(),
-                    "fast".to_string(),
+                    "veryfast".to_string(),  // ARM 设备使用更快的预设
                     "-tune".to_string(),
                     "zerolatency".to_string(),
                     "-profile:v".to_string(),
-                    "high".to_string(),
+                    "main".to_string(),  // 使用 main profile 以获得更好的兼容性
                     "-level".to_string(),
-                    "4.1".to_string(),
+                    "4.0".to_string(),
                     "-crf".to_string(),
-                    "22".to_string(),
+                    "23".to_string(),
                     "-g".to_string(),
                     "30".to_string(),
                     "-keyint_min".to_string(),
@@ -1436,19 +1522,22 @@ fn build_ffmpeg_args(
                     "-sc_threshold".to_string(),
                     "0".to_string(),
                     "-bf".to_string(),
-                    "2".to_string(),
+                    "0".to_string(),  // 禁用 B 帧以加快编码
                     "-refs".to_string(),
-                    "3".to_string(),
+                    "1".to_string(),  // 减少参考帧以加快编码
+                    // 线程设置
+                    "-threads".to_string(),
+                    "4".to_string(),
                 ]);
             }
         }
 
-        // 视频缩放（如果需要）
+        // 视频缩放（如果需要）- 针对移动设备优化
         let target_height = video_info
             .as_ref()
             .map(|info| {
                 if info.height > 1080 {
-                    1080
+                    720  // 4K 视频降到 720p 以提高性能
                 } else if info.height > 720 {
                     720
                 } else {
@@ -1487,11 +1576,11 @@ fn build_ffmpeg_args(
             "-c:a".to_string(),
             "aac".to_string(),
             "-b:a".to_string(),
-            "192k".to_string(),
+            "128k".to_string(),  // 降低音频比特率以提高性能
             "-ac".to_string(),
             "2".to_string(),
             "-ar".to_string(),
-            "48000".to_string(),
+            "44100".to_string(),  // 使用 44.1kHz 以提高兼容性
             "-async".to_string(),
             "1".to_string(),
             "-af".to_string(),
@@ -1501,6 +1590,7 @@ fn build_ffmpeg_args(
         args.push("-an".to_string());
     }
 
+    // MPEG-TS 输出参数
     args.extend([
         "-f".to_string(),
         "mpegts".to_string(),
@@ -1512,7 +1602,7 @@ fn build_ffmpeg_args(
         "make_zero".to_string(),
         "-start_at_zero".to_string(),
         "-max_muxing_queue_size".to_string(),
-        "2048".to_string(),
+        "1024".to_string(),
         "-muxdelay".to_string(),
         "0".to_string(),
         "-muxpreload".to_string(),
