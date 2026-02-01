@@ -1,43 +1,57 @@
 use std::env;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::io;
-use std::fs;
+use std::sync::OnceLock;
 use tracing::{info, warn};
 
-/// FFmpeg 下载源配置
-const FFMPEG_STATIC_BASE_URL: &str = "https://johnvansickle.com/ffmpeg/releases";
-#[allow(dead_code)]
-const FFMPEG_GITHUB_RELEASES: &str = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest";
+static GLOBAL_FFMPEG_PATH: OnceLock<Option<String>> = OnceLock::new();
+static GLOBAL_FFPROBE_PATH: OnceLock<Option<String>> = OnceLock::new();
 
-/// 系统架构类型
-#[derive(Debug, Clone, Copy, PartialEq)]
+const FFMPEG_STATIC_BASE_URL: &str = "https://johnvansickle.com/ffmpeg/releases";
+
 #[allow(dead_code)]
+const FFMPEG_GITHUB_RELEASES: &str =
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest";
+
+#[cfg(target_os = "windows")]
+const LOCAL_ASSETS_PATH: &str = r"D:\RustProject\RockZeroOS-Service\assets";
+
+#[cfg(not(target_os = "windows"))]
+const LOCAL_ASSETS_PATH: &str = "./assets";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Architecture {
     X86_64,
-    Aarch64,  // ARM64
-    Armhf,    // ARM 32-bit
+    Aarch64,
+    Armhf,
     Unknown,
 }
 
-#[allow(dead_code)]
 impl Architecture {
-    /// 检测当前系统架构
     pub fn detect() -> Self {
         #[cfg(target_arch = "x86_64")]
-        return Architecture::X86_64;
-        
+        {
+            return Architecture::X86_64;
+        }
+
         #[cfg(target_arch = "aarch64")]
-        return Architecture::Aarch64;
-        
+        {
+            return Architecture::Aarch64;
+        }
+
         #[cfg(target_arch = "arm")]
-        return Architecture::Armhf;
-        
+        {
+            return Architecture::Armhf;
+        }
+
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "arm")))]
         {
-            // 尝试通过 uname 命令检测
             if let Ok(output) = Command::new("uname").arg("-m").output() {
-                let arch = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+                let arch = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .to_lowercase();
                 match arch.as_str() {
                     "x86_64" | "amd64" => return Architecture::X86_64,
                     "aarch64" | "arm64" => return Architecture::Aarch64,
@@ -48,8 +62,7 @@ impl Architecture {
             Architecture::Unknown
         }
     }
-    
-    /// 获取架构名称字符串
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Architecture::X86_64 => "x86_64",
@@ -58,34 +71,64 @@ impl Architecture {
             Architecture::Unknown => "unknown",
         }
     }
+
+    pub fn download_slug(&self) -> &'static str {
+        match self {
+            Architecture::Aarch64 => "arm64",
+            Architecture::Armhf => "armhf",
+            Architecture::X86_64 => "amd64",
+            Architecture::Unknown => "unknown",
+        }
+    }
 }
 
-/// FFmpeg 管理器
 pub struct FfmpegManager {
-    /// FFmpeg 安装目录
     install_dir: PathBuf,
-    /// FFmpeg 可执行文件路径
     ffmpeg_path: Option<PathBuf>,
-    /// FFprobe 可执行文件路径
     ffprobe_path: Option<PathBuf>,
+    local_assets_dir: PathBuf,
 }
 
-#[allow(dead_code)]
 impl FfmpegManager {
-    /// 创建新的 FFmpeg 管理器
     pub fn new(data_dir: &str) -> Self {
         let install_dir = PathBuf::from(data_dir).join("ffmpeg");
+        let local_assets_dir = if let Ok(path) = env::var("FFMPEG_ASSETS_PATH") {
+            PathBuf::from(path)
+        } else {
+            PathBuf::from(LOCAL_ASSETS_PATH)
+        };
+
+        info!("FFmpeg manager initialized");
+        info!("  Install directory: {}", install_dir.display());
+        info!("  Local assets directory: {}", local_assets_dir.display());
+
         Self {
             install_dir,
             ffmpeg_path: None,
             ffprobe_path: None,
+            local_assets_dir,
         }
     }
-    
-    /// 初始化 FFmpeg（检查系统安装或自动下载）
+
+    pub fn with_assets_path(data_dir: &str, assets_path: &str) -> Self {
+        let install_dir = PathBuf::from(data_dir).join("ffmpeg");
+        let local_assets_dir = PathBuf::from(assets_path);
+
+        info!("FFmpeg manager initialized with custom assets path");
+        info!("  Install directory: {}", install_dir.display());
+        info!("  Local assets directory: {}", local_assets_dir.display());
+
+        Self {
+            install_dir,
+            ffmpeg_path: None,
+            ffprobe_path: None,
+            local_assets_dir,
+        }
+    }
+
     pub async fn ensure_available(&mut self) -> io::Result<()> {
         info!("Checking FFmpeg availability...");
-        
+
         // 1. 首先检查系统是否已安装 FFmpeg
         if let Some(path) = find_system_ffmpeg() {
             info!("Found system FFmpeg: {}", path);
@@ -93,18 +136,17 @@ impl FfmpegManager {
             self.ffprobe_path = find_system_ffprobe().map(PathBuf::from);
             return Ok(());
         }
-        
-        // 2. 检查我们的安装目录是否有 FFmpeg
+
         #[cfg(not(target_os = "windows"))]
         let local_ffmpeg = self.install_dir.join("ffmpeg");
         #[cfg(not(target_os = "windows"))]
         let local_ffprobe = self.install_dir.join("ffprobe");
-        
+
         #[cfg(target_os = "windows")]
         let local_ffmpeg = self.install_dir.join("ffmpeg.exe");
         #[cfg(target_os = "windows")]
         let local_ffprobe = self.install_dir.join("ffprobe.exe");
-        
+
         if local_ffmpeg.exists() && is_executable(&local_ffmpeg) {
             info!("Found local FFmpeg: {}", local_ffmpeg.display());
             self.ffmpeg_path = Some(local_ffmpeg);
@@ -113,255 +155,241 @@ impl FfmpegManager {
             }
             return Ok(());
         }
-        
-        // 3. 需要下载 FFmpeg
-        info!("FFmpeg not found, attempting to download...");
-        self.download_ffmpeg().await
+
+        info!("FFmpeg not found, attempting to install from local assets or download...");
+        self.install_ffmpeg().await
     }
-    
-    /// 下载 FFmpeg
-    async fn download_ffmpeg(&mut self) -> io::Result<()> {
+
+    async fn install_ffmpeg(&mut self) -> io::Result<()> {
         let arch = Architecture::detect();
         info!("Detected architecture: {:?}", arch);
-        
+
         if arch == Architecture::Unknown {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "Unknown architecture, cannot download FFmpeg automatically"
+                "Unknown architecture, cannot install FFmpeg automatically",
             ));
         }
-        
-        let arch_slug = match arch {
-            Architecture::Aarch64 => "arm64",
-            Architecture::Armhf => "armhf",
-            Architecture::X86_64 => "amd64",
-            Architecture::Unknown => "unknown",
-        };
 
-        // 创建安装目录
+        let arch_slug = arch.download_slug();
+
         fs::create_dir_all(&self.install_dir)?;
 
-        // 优先使用本地离线包（用户预置的 ffmpeg-release-<arch>-static.tar.xz）
         let archive_name = format!("ffmpeg-release-{}-static.tar.xz", arch_slug);
-        if let Some(local_archive) = self.locate_local_archive(&archive_name) {
-            info!("Using local FFmpeg archive: {}", local_archive.display());
-            match self.install_from_archive(&local_archive) {
-                Ok(_) => return Ok(()),
-                Err(err) => warn!("Failed to install FFmpeg from local archive: {}. Will try online download...", err),
+        let local_archive = self.locate_local_archive(&archive_name);
+
+        if let Some(archive_path) = local_archive {
+            info!("Found local FFmpeg archive: {}", archive_path.display());
+            match self.install_from_archive(&archive_path) {
+                Ok(_) => {
+                    info!("FFmpeg installed successfully from local archive");
+                    return Ok(());
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to install FFmpeg from local archive: {}. Will try online download...",
+                        err
+                    );
+                }
             }
+        } else {
+            info!("No local FFmpeg archive found, will try online download");
+            info!("  Searched for: {}", archive_name);
+            info!("  In directories:");
+            info!("    - {}", self.local_assets_dir.display());
+            info!("    - {}", self.install_dir.display());
+            if let Some(parent) = self.install_dir.parent() {
+                info!("    - {}", parent.display());
+            }
+            info!("    - ./");
         }
-        
-        // 根据架构选择下载源
-        let download_result = match arch {
-            Architecture::Aarch64 => self.download_from_johnvansickle(arch_slug).await,
-            Architecture::Armhf => self.download_from_johnvansickle(arch_slug).await,
-            Architecture::X86_64 => self.download_from_johnvansickle(arch_slug).await,
-            Architecture::Unknown => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Unknown architecture"
-            )),
-        };
-        
-        // 如果第一个源失败，尝试使用包管理器
+
+        let download_result = self.download_from_johnvansickle(arch_slug).await;
         if download_result.is_err() {
             warn!("Static download failed, trying package manager...");
             return self.install_via_package_manager().await;
         }
-        
+
         download_result
     }
-    
-    /// 从 John Van Sickle 网站下载静态编译的 FFmpeg
+
     async fn download_from_johnvansickle(&mut self, arch: &str) -> io::Result<()> {
         let filename = format!("ffmpeg-release-{}-static.tar.xz", arch);
         let url = format!("{}/{}", FFMPEG_STATIC_BASE_URL, filename);
-        
+
         info!("Downloading FFmpeg from: {}", url);
-        
+
         let temp_dir = self.install_dir.join("temp");
         fs::create_dir_all(&temp_dir)?;
-        
+
         let archive_path = temp_dir.join(&filename);
-        
-        // 使用 curl 或 wget 下载
         let download_success = self.download_file(&url, &archive_path).await?;
-        
+
         if !download_success {
-            return Err(io::Error::other("Failed to download FFmpeg"));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to download FFmpeg",
+            ));
         }
-        
+
         self.install_from_archive(&archive_path)
     }
-    
-    /// 使用系统下载工具下载文件
+
     async fn download_file(&self, url: &str, dest: &Path) -> io::Result<bool> {
-        // 尝试使用 curl
-        let curl_result = Command::new("curl")
+        if let Ok(status) = Command::new("curl")
             .args(["-fSL", "-o", dest.to_str().unwrap(), "--progress-bar", url])
-            .status();
-        
-        if let Ok(status) = curl_result {
+            .status()
+        {
             if status.success() {
                 return Ok(true);
             }
         }
-        
-        // 尝试使用 wget
-        let wget_result = Command::new("wget")
+
+        if let Ok(status) = Command::new("wget")
             .args(["-q", "--show-progress", "-O", dest.to_str().unwrap(), url])
-            .status();
-        
-        if let Ok(status) = wget_result {
+            .status()
+        {
             if status.success() {
                 return Ok(true);
             }
         }
-        
-        // 使用 Rust 内置的 HTTP 客户端
-        self.download_with_reqwest(url, dest).await
-    }
-    
-    /// 使用 reqwest 下载（备用方案）
-    async fn download_with_reqwest(&self, url: &str, dest: &Path) -> io::Result<bool> {
-        // 使用简单的 HTTP 请求
-        // 注意：这需要 reqwest 依赖，如果没有就跳过
-        
-        // 尝试使用系统的 curl 命令（不带进度条）
-        let result = Command::new("curl")
+
+        if let Ok(status) = Command::new("curl")
             .args(["-fsSL", "-o", dest.to_str().unwrap(), url])
-            .status();
-        
-        if let Ok(status) = result {
-            return Ok(status.success());
+            .status()
+        {
+            if status.success() {
+                return Ok(true);
+            }
         }
-        
-        // 尝试使用 busybox wget
-        let result = Command::new("busybox")
+
+        if let Ok(status) = Command::new("busybox")
             .args(["wget", "-O", dest.to_str().unwrap(), url])
-            .status();
-        
-        if let Ok(status) = result {
-            return Ok(status.success());
+            .status()
+        {
+            if status.success() {
+                return Ok(true);
+            }
         }
-        
-        Err(io::Error::other("No download tool available (curl, wget, or busybox)"))
+
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "No download tool available (curl, wget, or busybox)",
+        ))
     }
-    
-    /// 解压 tar.xz 文件
+
     fn extract_tar_xz(&self, archive: &Path, dest: &Path) -> io::Result<()> {
-        // 尝试使用 tar 命令
-        let status = Command::new("tar")
-            .args(["-xJf", archive.to_str().unwrap(), "-C", dest.to_str().unwrap()])
-            .status()?;
-        
-        if !status.success() {
-            // 尝试使用 xz + tar 分步解压
-            let xz_output = archive.with_extension("");
-            
-            let xz_status = Command::new("xz")
-                .args(["-dk", archive.to_str().unwrap()])
-                .status();
-            
-            if let Ok(s) = xz_status {
-                if s.success() {
-                    let tar_status = Command::new("tar")
-                        .args(["-xf", xz_output.to_str().unwrap(), "-C", dest.to_str().unwrap()])
-                        .status()?;
-                    
-                    let _ = fs::remove_file(&xz_output);
-                    
-                    if !tar_status.success() {
-                        return Err(io::Error::other("Failed to extract tar archive"));
+        if let Ok(status) = Command::new("tar")
+            .args([
+                "-xJf",
+                archive.to_str().unwrap(),
+                "-C",
+                dest.to_str().unwrap(),
+            ])
+            .status()
+        {
+            if status.success() {
+                return Ok(());
+            }
+        }
+
+        let xz_output = archive.with_extension("");
+
+        if let Ok(xz_status) = Command::new("xz")
+            .args(["-dk", archive.to_str().unwrap()])
+            .status()
+        {
+            if xz_status.success() {
+                let tar_result = Command::new("tar")
+                    .args([
+                        "-xf",
+                        xz_output.to_str().unwrap(),
+                        "-C",
+                        dest.to_str().unwrap(),
+                    ])
+                    .status();
+
+                let _ = fs::remove_file(&xz_output);
+
+                if let Ok(tar_status) = tar_result {
+                    if tar_status.success() {
+                        return Ok(());
                     }
-                    return Ok(());
                 }
             }
-            
-            return Err(io::Error::other("Failed to extract tar.xz archive"));
         }
-        
-        Ok(())
+
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Failed to extract tar.xz archive",
+        ))
     }
-    
-    /// 查找解压后的 FFmpeg 目录
+
     fn find_extracted_ffmpeg_dir(&self, temp_dir: &Path) -> io::Result<PathBuf> {
         for entry in fs::read_dir(temp_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() && path.file_name()
-                .map(|n| n.to_string_lossy().contains("ffmpeg"))
-                .unwrap_or(false) 
+            if path.is_dir()
+                && path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().contains("ffmpeg"))
+                    .unwrap_or(false)
             {
                 return Ok(path);
             }
         }
-        
+
         Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "Could not find extracted FFmpeg directory"
+            "Could not find extracted FFmpeg directory",
         ))
     }
-    
-    /// 通过包管理器安装 FFmpeg
+
     async fn install_via_package_manager(&mut self) -> io::Result<()> {
         info!("Attempting to install FFmpeg via package manager...");
-        
-        // 检测包管理器并安装
+
         let install_result = if Path::new("/usr/bin/apt-get").exists() {
-            // Debian/Ubuntu/Armbian
             info!("Using apt-get to install FFmpeg...");
-            Command::new("sudo")
+            let _ = Command::new("sudo")
                 .args(["apt-get", "update", "-qq"])
-                .status()
-                .ok();
+                .status();
             Command::new("sudo")
                 .args(["apt-get", "install", "-y", "ffmpeg"])
                 .status()
         } else if Path::new("/usr/bin/apt").exists() {
-            // 较新的 Debian/Ubuntu
             info!("Using apt to install FFmpeg...");
-            Command::new("sudo")
-                .args(["apt", "update", "-qq"])
-                .status()
-                .ok();
+            let _ = Command::new("sudo").args(["apt", "update", "-qq"]).status();
             Command::new("sudo")
                 .args(["apt", "install", "-y", "ffmpeg"])
                 .status()
         } else if Path::new("/usr/bin/dnf").exists() {
-            // Fedora/RHEL
             info!("Using dnf to install FFmpeg...");
             Command::new("sudo")
                 .args(["dnf", "install", "-y", "ffmpeg"])
                 .status()
         } else if Path::new("/usr/bin/yum").exists() {
-            // CentOS/RHEL (older)
             info!("Using yum to install FFmpeg...");
             Command::new("sudo")
                 .args(["yum", "install", "-y", "ffmpeg"])
                 .status()
         } else if Path::new("/usr/bin/pacman").exists() {
-            // Arch Linux
             info!("Using pacman to install FFmpeg...");
             Command::new("sudo")
                 .args(["pacman", "-S", "--noconfirm", "ffmpeg"])
                 .status()
         } else if Path::new("/sbin/apk").exists() {
-            // Alpine Linux
             info!("Using apk to install FFmpeg...");
-            Command::new("sudo")
-                .args(["apk", "add", "ffmpeg"])
-                .status()
+            Command::new("sudo").args(["apk", "add", "ffmpeg"]).status()
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "No supported package manager found"
+                "No supported package manager found",
             ));
         };
-        
+
         match install_result {
             Ok(status) if status.success() => {
                 info!("FFmpeg installed successfully via package manager");
-                // 重新查找系统 FFmpeg
                 if let Some(path) = find_system_ffmpeg() {
                     self.ffmpeg_path = Some(PathBuf::from(&path));
                     self.ffprobe_path = find_system_ffprobe().map(PathBuf::from);
@@ -369,43 +397,17 @@ impl FfmpegManager {
                 }
                 Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    "FFmpeg installed but not found in PATH"
+                    "FFmpeg installed but not found in PATH",
                 ))
             }
-            Ok(_) => Err(io::Error::other("Package manager failed to install FFmpeg")),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Package manager failed to install FFmpeg",
+            )),
             Err(e) => Err(e),
         }
     }
-    
-    /// 获取 FFmpeg 路径
-    pub fn ffmpeg_path(&self) -> Option<&Path> {
-        self.ffmpeg_path.as_deref()
-    }
-    
-    /// 获取 FFprobe 路径
-    pub fn ffprobe_path(&self) -> Option<&Path> {
-        self.ffprobe_path.as_deref()
-    }
-    
-    /// 检查 FFmpeg 是否可用
-    pub fn is_available(&self) -> bool {
-        self.ffmpeg_path.is_some()
-    }
-    
-    /// 获取 FFmpeg 版本信息
-    pub fn get_version(&self) -> Option<String> {
-        let ffmpeg_path = self.ffmpeg_path.as_ref()?;
-        
-        let output = Command::new(ffmpeg_path)
-            .arg("-version")
-            .output()
-            .ok()?;
-        
-        let version_str = String::from_utf8_lossy(&output.stdout);
-        version_str.lines().next().map(|s| s.to_string())
-    }
 
-    /// 从本地或下载好的压缩包安装 FFmpeg
     fn install_from_archive(&mut self, archive_path: &Path) -> io::Result<()> {
         let temp_dir = self.install_dir.join("temp");
 
@@ -414,153 +416,230 @@ impl FfmpegManager {
         }
         fs::create_dir_all(&temp_dir)?;
 
-        // 将压缩包放到安装临时目录，避免跨分区解压失败
-        let archive_in_temp = temp_dir.join(
-            archive_path
-                .file_name()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Archive file name missing"))?
-        );
+        let archive_in_temp = temp_dir.join(archive_path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Archive file name missing")
+        })?);
 
         if archive_path != archive_in_temp {
+            info!("Copying archive to temp directory...");
             fs::copy(archive_path, &archive_in_temp)?;
         }
 
-        info!("Extracting FFmpeg from archive: {}", archive_in_temp.display());
+        info!(
+            "Extracting FFmpeg from archive: {}",
+            archive_in_temp.display()
+        );
         self.extract_tar_xz(&archive_in_temp, &temp_dir)?;
 
         let extracted_dir = self.find_extracted_ffmpeg_dir(&temp_dir)?;
+        info!("Found extracted directory: {}", extracted_dir.display());
 
-        let ffmpeg_src = extracted_dir.join("ffmpeg");
-        let ffprobe_src = extracted_dir.join("ffprobe");
-        let ffmpeg_dst = self.install_dir.join("ffmpeg");
-        let ffprobe_dst = self.install_dir.join("ffprobe");
+        #[cfg(not(target_os = "windows"))]
+        let (ffmpeg_src, ffprobe_src) =
+            (extracted_dir.join("ffmpeg"), extracted_dir.join("ffprobe"));
+        #[cfg(not(target_os = "windows"))]
+        let (ffmpeg_dst, ffprobe_dst) = (
+            self.install_dir.join("ffmpeg"),
+            self.install_dir.join("ffprobe"),
+        );
+
+        #[cfg(target_os = "windows")]
+        let (ffmpeg_src, ffprobe_src) = (
+            extracted_dir.join("ffmpeg.exe"),
+            extracted_dir.join("ffprobe.exe"),
+        );
+        #[cfg(target_os = "windows")]
+        let (ffmpeg_dst, ffprobe_dst) = (
+            self.install_dir.join("ffmpeg.exe"),
+            self.install_dir.join("ffprobe.exe"),
+        );
 
         if ffmpeg_src.exists() {
+            info!("Installing ffmpeg binary...");
             fs::copy(&ffmpeg_src, &ffmpeg_dst)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&ffmpeg_dst, fs::Permissions::from_mode(0o755))?;
             }
-            self.ffmpeg_path = Some(ffmpeg_dst);
-            info!("FFmpeg installed successfully");
+            self.ffmpeg_path = Some(ffmpeg_dst.clone());
+            info!("FFmpeg installed: {}", ffmpeg_dst.display());
         } else {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "ffmpeg binary missing in archive"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "ffmpeg binary missing in archive",
+            ));
         }
 
         if ffprobe_src.exists() {
+            info!("Installing ffprobe binary...");
             fs::copy(&ffprobe_src, &ffprobe_dst)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&ffprobe_dst, fs::Permissions::from_mode(0o755))?;
             }
-            self.ffprobe_path = Some(ffprobe_dst);
-            info!("FFprobe installed successfully");
+            self.ffprobe_path = Some(ffprobe_dst.clone());
+            info!("FFprobe installed: {}", ffprobe_dst.display());
         }
 
+        info!("Cleaning up temp directory...");
         let _ = fs::remove_dir_all(&temp_dir);
+
         Ok(())
     }
 
-    /// 查找本地预置的 FFmpeg 压缩包
     fn locate_local_archive(&self, filename: &str) -> Option<PathBuf> {
-        // 1) 显式环境变量
-        if let Some(path) = env::var_os("FFMPEG_ARCHIVE_PATH") {
-            let candidate = PathBuf::from(path);
+        if let Ok(path) = env::var("FFMPEG_ARCHIVE_PATH") {
+            let candidate = PathBuf::from(&path);
             if candidate.is_file() {
+                info!(
+                    "Found FFmpeg archive via FFMPEG_ARCHIVE_PATH: {}",
+                    candidate.display()
+                );
                 return Some(candidate);
             }
         }
 
-        // 2) 安装目录下
-        let candidate = self.install_dir.join(filename);
+        let candidate = self.local_assets_dir.join(filename);
         if candidate.is_file() {
+            info!(
+                "Found FFmpeg archive in local assets: {}",
+                candidate.display()
+            );
             return Some(candidate);
         }
 
-        // 3) 数据目录下（install_dir 的上一级）
+        let candidate = self.install_dir.join(filename);
+        if candidate.is_file() {
+            info!(
+                "Found FFmpeg archive in install dir: {}",
+                candidate.display()
+            );
+            return Some(candidate);
+        }
+
         if let Some(parent) = self.install_dir.parent() {
             let candidate = parent.join(filename);
             if candidate.is_file() {
+                info!(
+                    "Found FFmpeg archive in parent dir: {}",
+                    candidate.display()
+                );
                 return Some(candidate);
             }
         }
 
-        // 4) 当前工作目录
         let candidate = PathBuf::from(filename);
         if candidate.is_file() {
+            info!(
+                "Found FFmpeg archive in current dir: {}",
+                candidate.display()
+            );
             return Some(candidate);
         }
 
         None
     }
+
+    pub fn ffmpeg_path(&self) -> Option<&Path> {
+        self.ffmpeg_path.as_deref()
+    }
+
+    pub fn ffprobe_path(&self) -> Option<&Path> {
+        self.ffprobe_path.as_deref()
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.ffmpeg_path.is_some()
+    }
+
+    pub fn get_version(&self) -> Option<String> {
+        let ffmpeg_path = self.ffmpeg_path.as_ref()?;
+        let output = Command::new(ffmpeg_path).arg("-version").output().ok()?;
+        let version_str = String::from_utf8_lossy(&output.stdout);
+        version_str.lines().next().map(|s| s.to_string())
+    }
+
+    pub fn local_assets_dir(&self) -> &Path {
+        &self.local_assets_dir
+    }
+
+    pub fn install_dir(&self) -> &Path {
+        &self.install_dir
+    }
 }
 
-/// 查找系统安装的 FFmpeg
 fn find_system_ffmpeg() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    let paths = [
+        "ffmpeg",
+        "ffmpeg.exe",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"D:\RustProject\RockZeroOS-Service\assets\ffmpeg.exe",
+    ];
+
+    #[cfg(not(target_os = "windows"))]
     let paths = [
         "ffmpeg",
         "/usr/bin/ffmpeg",
         "/usr/local/bin/ffmpeg",
         "/opt/ffmpeg/bin/ffmpeg",
         "/snap/bin/ffmpeg",
-        #[cfg(target_os = "windows")]
-        "C:\\ffmpeg\\bin\\ffmpeg.exe",
-        #[cfg(target_os = "windows")]
-        "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
     ];
-    
+
     for path in paths {
-        let result = Command::new(path)
+        if let Ok(status) = Command::new(path)
             .arg("-version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
-        
-        if let Ok(status) = result {
+            .status()
+        {
             if status.success() {
                 return Some(path.to_string());
             }
         }
     }
-    
+
     None
 }
 
-/// 查找系统安装的 FFprobe
 fn find_system_ffprobe() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    let paths = [
+        "ffprobe",
+        "ffprobe.exe",
+        r"C:\ffmpeg\bin\ffprobe.exe",
+        r"C:\Program Files\ffmpeg\bin\ffprobe.exe",
+        r"D:\RustProject\RockZeroOS-Service\assets\ffprobe.exe",
+    ];
+
+    #[cfg(not(target_os = "windows"))]
     let paths = [
         "ffprobe",
         "/usr/bin/ffprobe",
         "/usr/local/bin/ffprobe",
         "/opt/ffmpeg/bin/ffprobe",
         "/snap/bin/ffprobe",
-        #[cfg(target_os = "windows")]
-        "C:\\ffmpeg\\bin\\ffprobe.exe",
-        #[cfg(target_os = "windows")]
-        "C:\\Program Files\\ffmpeg\\bin\\ffprobe.exe",
     ];
-    
+
     for path in paths {
-        let result = Command::new(path)
+        if let Ok(status) = Command::new(path)
             .arg("-version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
-        
-        if let Ok(status) = result {
+            .status()
+        {
             if status.success() {
                 return Some(path.to_string());
             }
         }
     }
-    
+
     None
 }
 
-/// 检查文件是否可执行
-#[allow(unreachable_code)]
 fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -568,34 +647,72 @@ fn is_executable(path: &Path) -> bool {
         if let Ok(metadata) = fs::metadata(path) {
             return metadata.permissions().mode() & 0o111 != 0;
         }
-        return false;
+        false
     }
+
     #[cfg(not(unix))]
     {
         path.exists()
     }
 }
 
-/// 全局 FFmpeg 路径缓存
-static FFMPEG_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-static FFPROBE_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-
-/// 设置全局 FFmpeg 路径
 pub fn set_global_ffmpeg_path(path: Option<String>) {
-    let _ = FFMPEG_PATH.set(path);
+    let _ = GLOBAL_FFMPEG_PATH.set(path);
 }
 
-/// 设置全局 FFprobe 路径
 pub fn set_global_ffprobe_path(path: Option<String>) {
-    let _ = FFPROBE_PATH.set(path);
+    let _ = GLOBAL_FFPROBE_PATH.set(path);
 }
 
-/// 获取全局 FFmpeg 路径
 pub fn get_global_ffmpeg_path() -> Option<String> {
-    FFMPEG_PATH.get().and_then(|p| p.clone())
+    GLOBAL_FFMPEG_PATH.get().and_then(|p| p.clone())
 }
 
-/// 获取全局 FFprobe 路径
 pub fn get_global_ffprobe_path() -> Option<String> {
-    FFPROBE_PATH.get().and_then(|p| p.clone())
+    GLOBAL_FFPROBE_PATH.get().and_then(|p| p.clone())
+}
+
+// ============================================================================
+// 测试模块
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_architecture_detect() {
+        let arch = Architecture::detect();
+        assert_ne!(arch, Architecture::Unknown);
+    }
+
+    #[test]
+    fn test_architecture_as_str() {
+        assert_eq!(Architecture::X86_64.as_str(), "x86_64");
+        assert_eq!(Architecture::Aarch64.as_str(), "aarch64");
+        assert_eq!(Architecture::Armhf.as_str(), "armhf");
+        assert_eq!(Architecture::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn test_architecture_download_slug() {
+        assert_eq!(Architecture::X86_64.download_slug(), "amd64");
+        assert_eq!(Architecture::Aarch64.download_slug(), "arm64");
+        assert_eq!(Architecture::Armhf.download_slug(), "armhf");
+        assert_eq!(Architecture::Unknown.download_slug(), "unknown");
+    }
+
+    #[test]
+    fn test_ffmpeg_manager_new() {
+        let manager = FfmpegManager::new("/tmp/test");
+        assert!(!manager.is_available());
+        assert!(manager.ffmpeg_path().is_none());
+        assert!(manager.ffprobe_path().is_none());
+    }
+
+    #[test]
+    fn test_ffmpeg_manager_with_assets_path() {
+        let manager = FfmpegManager::with_assets_path("/tmp/test", "/custom/assets");
+        assert_eq!(manager.local_assets_dir(), Path::new("/custom/assets"));
+    }
 }
