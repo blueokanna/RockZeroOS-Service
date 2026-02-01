@@ -115,6 +115,8 @@ pub fn compute_pmk(
 
     let k_bytes = shared_secret.compress().to_bytes();
 
+    tracing::info!("[SAE Server] Computed shared secret (K): {}", hex::encode(&k_bytes));
+
     Ok(k_bytes)
 }
 
@@ -125,15 +127,21 @@ pub fn derive_kck_pmk(
     _local_element: &EdwardsPoint,
     _peer_element: &EdwardsPoint,
 ) -> Result<([u8; 32], [u8; 32])> {
+    tracing::info!("[SAE Server] Deriving keys from shared secret");
+    tracing::info!("[SAE Server] Shared secret: {}", hex::encode(shared_secret));
+    
     let zero_key = [0u8; 32];
     let keyseed = blake3_keyed_hash(&zero_key, shared_secret);
+    tracing::info!("[SAE Server] Keyseed: {}", hex::encode(&keyseed));
 
     let value = local_scalar + peer_scalar;
     let value_bytes = value.to_bytes();
+    tracing::info!("[SAE Server] Value (scalar sum): {}", hex::encode(&value_bytes));
 
     let mut info = Vec::with_capacity(16 + 32);
     info.extend_from_slice(b"SAE KCK and PMK");
     info.extend_from_slice(&value_bytes);
+    tracing::info!("[SAE Server] Info length: {}", info.len());
 
     let kck_pmk = hkdf_blake3_expand(&keyseed, &info, 64)?;
 
@@ -141,6 +149,9 @@ pub fn derive_kck_pmk(
     let mut pmk = [0u8; 32];
     kck.copy_from_slice(&kck_pmk[0..32]);
     pmk.copy_from_slice(&kck_pmk[32..64]);
+
+    tracing::info!("[SAE Server] KCK: {}", hex::encode(&kck));
+    tracing::info!("[SAE Server] PMK: {}", hex::encode(&pmk));
 
     Ok((kck, pmk))
 }
