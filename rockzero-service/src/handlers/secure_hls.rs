@@ -727,11 +727,12 @@ fn get_hls_cache_dir() -> std::path::PathBuf {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HardwareAccel {
-    AmlogicV4l2,    // Amlogic A311D/S905/S922 等芯片
-    Vaapi,          // Intel/AMD GPU
-    V4l2Generic,    // 通用 V4L2
-    RockchipRga,    // Rockchip RK3588 等
-    None,           // 软件编码
+    AmlogicV4l2,       // Amlogic A311D/S905/S922 - V4L2 M2M 硬件编码
+    AmlogicDecodeOnly, // Amlogic 仅硬件解码 (meson_vdec)，软件编码
+    Vaapi,             // Intel/AMD GPU
+    V4l2Generic,       // 通用 V4L2
+    RockchipRga,       // Rockchip RK3588 等
+    None,              // 纯软件编解码
 }
 
 struct VideoInfo {
@@ -753,21 +754,31 @@ async fn probe_video_info(video_path: &std::path::Path) -> Result<VideoInfo, App
         Duration::from_secs(30),
         Command::new(&ffprobe_path)
             .args([
-                "-v", "quiet",
-                "-print_format", "json",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
                 "-show_format",
                 "-show_streams",
                 video_path.to_str().unwrap_or(""),
             ])
-            .output()
+            .output(),
     )
     .await
     .map_err(|_| AppError::InternalServerError("FFprobe timeout".to_string()))?
-    .map_err(|e| AppError::IoError(format!("Failed to probe video: {}. FFprobe path: {}", e, ffprobe_path)))?;
+    .map_err(|e| {
+        AppError::IoError(format!(
+            "Failed to probe video: {}. FFprobe path: {}",
+            e, ffprobe_path
+        ))
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::InternalServerError(format!("FFprobe failed: {}", stderr)));
+        return Err(AppError::InternalServerError(format!(
+            "FFprobe failed: {}",
+            stderr
+        )));
     }
 
     let json_str = String::from_utf8_lossy(&output.stdout);
@@ -810,69 +821,299 @@ async fn probe_video_info(video_path: &std::path::Path) -> Result<VideoInfo, App
     })
 }
 
-/// 检测硬件加速能力
-/// 针对 Amlogic A311D 等芯片进行优化
 async fn detect_hardware_acceleration() -> HardwareAccel {
     use tokio::fs;
 
-    // 1. 首先检测是否是 Amlogic 设备（A311D, S905, S922 等）
+    // 1. 首先检测 Amlogic 设备 (A311D, S905, S922 等)
+    // Amlogic 设备有 /dev/dri/renderD128 (Mali GPU) 但不支持 VAAPI
+    // 必须在 VAAPI 检测之前处理，避免误判
     if is_amlogic_device().await {
-        info!("Detected Amlogic device, checking V4L2 M2M support...");
-        
-        // 检查 V4L2 M2M 设备
-        let v4l2_devices = ["/dev/video10", "/dev/video11", "/dev/video12"];
-        let mut has_v4l2_device = false;
-        
-        for device in &v4l2_devices {
-            if fs::metadata(device).await.is_ok() {
-                info!("Found V4L2 device: {}", device);
-                has_v4l2_device = true;
-                break;
-            }
-        }
-        
-        if has_v4l2_device {
-            // 检查 FFmpeg 是否支持 h264_v4l2m2m 编码器
-            if check_ffmpeg_encoder("h264_v4l2m2m").await {
-                info!("Amlogic V4L2 M2M hardware acceleration available");
+        info!("Detected Amlogic device (A311D/S905/S922)");
+
+        // 检查是否有 meson_vdec 模块（硬件解码支持）
+        let has_meson_vdec = check_meson_vdec_available().await;
+
+        // 检查 V4L2 编码器是否可用
+        let has_v4l2_encoder = check_ffmpeg_encoder_available("h264_v4l2m2m").await;
+
+        if has_v4l2_encoder {
+            if check_v4l2m2m_actually_works().await {
+                info!("Amlogic V4L2 M2M hardware encoding available");
                 return HardwareAccel::AmlogicV4l2;
+            }
+        }
+
+        if has_meson_vdec {
+            info!("Amlogic meson_vdec detected - using hardware decode + software encode");
+            return HardwareAccel::AmlogicDecodeOnly;
+        }
+
+        // Amlogic 设备不支持 VAAPI (Mali GPU 不是 Intel/AMD)
+        info!("Amlogic device: using pure software encoding (libx264)");
+        return HardwareAccel::None;
+    }
+
+    // 2. 检测 Rockchip 设备 (RK3588, RK3399 等)
+    // Rockchip 设备也可能有 /dev/dri 但不支持 VAAPI
+    if is_rockchip_device().await {
+        info!("Detected Rockchip device, checking MPP support...");
+        if fs::metadata("/dev/rga").await.is_ok() || fs::metadata("/dev/mpp_service").await.is_ok()
+        {
+            if check_ffmpeg_encoder_available("h264_rkmpp").await {
+                info!("Rockchip MPP hardware acceleration available");
+                return HardwareAccel::RockchipRga;
+            }
+        }
+        // Rockchip 设备不支持 VAAPI，直接返回软件编码
+        info!("Rockchip device: using software encoding - MPP not available");
+        return HardwareAccel::None;
+    }
+
+    // 3. 检测 VAAPI (仅限 Intel/AMD GPU)
+    // 只有在确认是 Intel/AMD GPU 时才尝试 VAAPI
+    if fs::metadata("/dev/dri/renderD128").await.is_ok() {
+        if check_for_intel_amd_gpu().await {
+            if check_vaapi_actually_works().await {
+                if check_ffmpeg_encoder_available("h264_vaapi").await {
+                    info!("VAAPI hardware acceleration available and verified (Intel/AMD GPU)");
+                    return HardwareAccel::Vaapi;
+                }
             } else {
-                warn!("h264_v4l2m2m encoder not available in FFmpeg");
+                info!("VAAPI device exists but initialization failed");
+            }
+        } else {
+            info!("/dev/dri/renderD128 exists but no Intel/AMD GPU detected - skipping VAAPI");
+        }
+    }
+
+    // 4. 通用 V4L2 检测（最后尝试，用于其他 ARM 设备）
+    if fs::metadata("/dev/video10").await.is_ok() || fs::metadata("/dev/video11").await.is_ok() {
+        if check_ffmpeg_encoder_available("h264_v4l2m2m").await {
+            if check_v4l2m2m_actually_works().await {
+                info!("Generic V4L2 M2M hardware acceleration available");
+                return HardwareAccel::V4l2Generic;
             }
         }
     }
 
-    // 2. 检测 VAAPI (Intel/AMD GPU)
-    if fs::metadata("/dev/dri/renderD128").await.is_ok() {
-        if check_ffmpeg_encoder("h264_vaapi").await {
-            info!("VAAPI hardware acceleration available");
-            return HardwareAccel::Vaapi;
-        }
-    }
-
-    // 3. 检测 Rockchip RGA
-    if fs::metadata("/dev/rga").await.is_ok() || fs::metadata("/dev/mpp_service").await.is_ok() {
-        if check_ffmpeg_encoder("h264_rkmpp").await {
-            info!("Rockchip RGA hardware acceleration available");
-            return HardwareAccel::RockchipRga;
-        }
-    }
-
-    // 4. 通用 V4L2 检测
-    if fs::metadata("/dev/video10").await.is_ok() || fs::metadata("/dev/video11").await.is_ok() {
-        if check_ffmpeg_encoder("h264_v4l2m2m").await {
-            info!("Generic V4L2 M2M hardware acceleration available");
-            return HardwareAccel::V4l2Generic;
-        }
-    }
-
-    info!("No hardware acceleration available, using software encoding");
+    info!("No hardware acceleration available, using software encoding (libx264)");
     HardwareAccel::None
 }
 
-/// 检测是否是 Amlogic 设备
+/// 检测是否是 Rockchip 设备
+async fn is_rockchip_device() -> bool {
+    if let Ok(content) = tokio::fs::read_to_string("/proc/cpuinfo").await {
+        let content_lower = content.to_lowercase();
+        if content_lower.contains("rockchip")
+            || content_lower.contains("rk3588")
+            || content_lower.contains("rk3399")
+            || content_lower.contains("rk3568")
+            || content_lower.contains("rk3566")
+        {
+            return true;
+        }
+    }
+
+    // 检查设备树
+    if let Ok(content) = tokio::fs::read_to_string("/sys/firmware/devicetree/base/compatible").await
+    {
+        let content_lower = content.to_lowercase();
+        if content_lower.contains("rockchip") {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// 验证 VAAPI 是否真的可用（不仅仅是设备文件存在）
+/// 这个函数会实际尝试初始化 VAAPI 设备来验证
+async fn check_vaapi_actually_works() -> bool {
+    use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
+
+    let has_intel_amd_gpu = check_for_intel_amd_gpu().await;
+    if !has_intel_amd_gpu {
+        info!(
+            "No Intel/AMD GPU detected, VAAPI not applicable (Mali/ARM GPU does not support VAAPI)"
+        );
+        return false;
+    }
+
+    let ffmpeg_path = get_ffmpeg_path();
+
+    // 检查 FFmpeg 是否存在
+    if !std::path::Path::new(&ffmpeg_path).exists() && ffmpeg_path != "ffmpeg" {
+        warn!("FFmpeg not found at {}, cannot verify VAAPI", ffmpeg_path);
+        return false;
+    }
+
+    info!("Testing VAAPI initialization with FFmpeg...");
+
+    // 尝试初始化 VAAPI 设备
+    let result = timeout(
+        Duration::from_secs(5),
+        Command::new(&ffmpeg_path)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-init_hw_device",
+                "vaapi=va:/dev/dri/renderD128",
+                "-f",
+                "lavfi",
+                "-i",
+                "nullsrc=s=64x64:d=0.1",
+                "-frames:v",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ])
+            .output(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) => {
+            if output.status.success() {
+                info!("VAAPI device initialization successful");
+                return true;
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // 检查常见的 VAAPI 错误
+            if stderr.contains("Failed to initialise VAAPI")
+                || stderr.contains("libva error")
+                || stderr.contains("Device creation failed")
+                || stderr.contains("unknown libva error")
+                || stderr.contains("No device available")
+            {
+                info!("VAAPI device initialization failed: {}", stderr.trim());
+                return false;
+            }
+            warn!("VAAPI test returned error: {}", stderr.trim());
+            false
+        }
+        Ok(Err(e)) => {
+            warn!("Failed to execute VAAPI test: {}", e);
+            false
+        }
+        Err(_) => {
+            warn!("VAAPI test timeout (5s)");
+            false
+        }
+    }
+}
+
+async fn check_for_intel_amd_gpu() -> bool {
+    if let Ok(mut entries) = tokio::fs::read_dir("/sys/class/drm").await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let device_path = path.join("device/vendor");
+            if let Ok(vendor) = tokio::fs::read_to_string(&device_path).await {
+                let vendor = vendor.trim();
+                // Intel: 0x8086, AMD: 0x1002
+                if vendor == "0x8086" || vendor == "0x1002" {
+                    info!("Found Intel/AMD GPU: vendor {}", vendor);
+                    return true;
+                }
+                if !vendor.is_empty() && vendor != "0x0000" {
+                    info!("Found GPU with vendor {}, not Intel/AMD", vendor);
+                }
+            }
+        }
+    }
+
+    // 方法 2: 检查 lspci 输出
+    if let Ok(output) = tokio::process::Command::new("lspci")
+        .args(["-n"])
+        .output()
+        .await
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if line.contains("0300") || line.contains("0302") {
+                    if line.contains("8086:") {
+                        info!("Found Intel GPU via lspci: {}", line);
+                        return true;
+                    }
+                    if line.contains("1002:") {
+                        info!("Found AMD GPU via lspci: {}", line);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    if tokio::fs::metadata("/proc/driver/nvidia").await.is_ok() {
+        info!("NVIDIA GPU detected - VAAPI not supported, use NVENC instead");
+        return false;
+    }
+
+    if tokio::fs::metadata("/sys/class/misc/mali0").await.is_ok()
+        || tokio::fs::metadata("/dev/mali0").await.is_ok()
+        || tokio::fs::metadata("/dev/mali").await.is_ok()
+    {
+        info!("Mali GPU detected - VAAPI not supported on ARM GPUs");
+        return false;
+    }
+
+    info!("No Intel/AMD GPU found");
+    false
+}
+
+async fn check_v4l2m2m_actually_works() -> bool {
+    use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
+
+    let ffmpeg_path = get_ffmpeg_path();
+    let result = timeout(
+        Duration::from_secs(10),
+        Command::new(&ffmpeg_path)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "nullsrc=s=64x64:d=0.1",
+                "-c:v",
+                "h264_v4l2m2m",
+                "-frames:v",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ])
+            .output(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) => {
+            if output.status.success() {
+                info!("V4L2 M2M encoder test successful");
+                return true;
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("V4L2 M2M encoder test failed: {}", stderr.trim());
+            false
+        }
+        Ok(Err(e)) => {
+            warn!("Failed to test V4L2 M2M: {}", e);
+            false
+        }
+        Err(_) => {
+            warn!("V4L2 M2M test timeout");
+            false
+        }
+    }
+}
+
 async fn is_amlogic_device() -> bool {
-    // 检查 /proc/cpuinfo
     if let Ok(content) = tokio::fs::read_to_string("/proc/cpuinfo").await {
         let content_lower = content.to_lowercase();
         if content_lower.contains("amlogic")
@@ -885,33 +1126,63 @@ async fn is_amlogic_device() -> bool {
             return true;
         }
     }
-    
-    // 检查设备树
-    if let Ok(content) = tokio::fs::read_to_string("/sys/firmware/devicetree/base/compatible").await {
+
+    if let Ok(content) = tokio::fs::read_to_string("/sys/firmware/devicetree/base/compatible").await
+    {
         let content_lower = content.to_lowercase();
         if content_lower.contains("amlogic") || content_lower.contains("meson") {
             info!("Amlogic device detected via device tree");
             return true;
         }
     }
-    
+
     // 检查 /sys/class/amhdmitx 目录（Amlogic 特有）
     if tokio::fs::metadata("/sys/class/amhdmitx").await.is_ok() {
         info!("Amlogic device detected via /sys/class/amhdmitx");
         return true;
     }
-    
+
     // 检查 /dev/amvideo 设备（Amlogic 视频设备）
     if tokio::fs::metadata("/dev/amvideo").await.is_ok() {
         info!("Amlogic device detected via /dev/amvideo");
         return true;
     }
-    
+
     false
 }
 
-/// 检查 FFmpeg 是否支持指定的编码器
-async fn check_ffmpeg_encoder(encoder: &str) -> bool {
+/// 检查 Amlogic meson_vdec 硬件解码模块是否可用
+async fn check_meson_vdec_available() -> bool {
+    if tokio::fs::metadata("/dev/video0").await.is_ok() {
+        if let Ok(content) = tokio::fs::read_to_string("/sys/class/video4linux/video0/name").await {
+            if content.to_lowercase().contains("meson")
+                || content.to_lowercase().contains("vdec")
+                || content.to_lowercase().contains("amlogic")
+            {
+                info!("meson_vdec device found: {}", content.trim());
+                return true;
+            }
+        }
+    }
+
+    if let Ok(content) = tokio::fs::read_to_string("/proc/modules").await {
+        if content.contains("meson_vdec") {
+            info!("meson_vdec kernel module is loaded");
+            return true;
+        }
+    }
+
+    if check_ffmpeg_decoder_available("h264_v4l2m2m").await {
+        if tokio::fs::metadata("/dev/video0").await.is_ok() {
+            info!("V4L2 M2M decoder available with /dev/video0");
+            return true;
+        }
+    }
+
+    false
+}
+
+async fn check_ffmpeg_decoder_available(decoder: &str) -> bool {
     use tokio::process::Command;
     use tokio::time::{timeout, Duration};
 
@@ -919,17 +1190,41 @@ async fn check_ffmpeg_encoder(encoder: &str) -> bool {
 
     let result = timeout(
         Duration::from_secs(10),
-        Command::new(&ffmpeg_path)
-            .args(["-encoders"])
-            .output()
-    ).await;
+        Command::new(&ffmpeg_path).args(["-decoders"]).output(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let has_decoder = stdout.contains(decoder);
+            if has_decoder {
+                info!("FFmpeg decoder '{}' is available", decoder);
+            }
+            has_decoder
+        }
+        _ => false,
+    }
+}
+
+async fn check_ffmpeg_encoder_available(encoder: &str) -> bool {
+    use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
+
+    let ffmpeg_path = get_ffmpeg_path();
+
+    let result = timeout(
+        Duration::from_secs(10),
+        Command::new(&ffmpeg_path).args(["-encoders"]).output(),
+    )
+    .await;
 
     match result {
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let has_encoder = stdout.contains(encoder);
             if has_encoder {
-                info!("FFmpeg encoder '{}' is available", encoder);
+                info!("FFmpeg encoder '{}' is compiled in", encoder);
             } else {
                 warn!("FFmpeg encoder '{}' is NOT available", encoder);
             }
@@ -946,47 +1241,19 @@ async fn check_ffmpeg_encoder(encoder: &str) -> bool {
     }
 }
 
-/// 检查 FFmpeg 是否支持指定的解码器
-async fn check_ffmpeg_decoder(decoder: &str) -> bool {
-    use tokio::process::Command;
-    use tokio::time::{timeout, Duration};
-
-    let ffmpeg_path = get_ffmpeg_path();
-
-    let result = timeout(
-        Duration::from_secs(10),
-        Command::new(&ffmpeg_path)
-            .args(["-decoders"])
-            .output()
-    ).await;
-
-    match result {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout.contains(decoder)
-        }
-        _ => false,
-    }
-}
-
-/// 获取 FFmpeg 可执行文件路径
-/// 按优先级查找：环境变量 -> 全局设置 -> 数据目录 -> 系统路径
 fn get_ffmpeg_path() -> String {
-    // 1. 首先检查环境变量
     if let Ok(path) = std::env::var("FFMPEG_PATH") {
         if std::path::Path::new(&path).exists() {
             return path;
         }
     }
-    
-    // 2. 检查全局设置
+
     if let Some(path) = rockzero_media::get_global_ffmpeg_path() {
         if std::path::Path::new(&path).exists() {
             return path;
         }
     }
-    
-    // 3. 检查常见安装位置
+
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
     let candidates = [
         format!("{}/ffmpeg/ffmpeg", data_dir),
@@ -996,14 +1263,13 @@ fn get_ffmpeg_path() -> String {
         "/opt/ffmpeg/bin/ffmpeg".to_string(),
         "ffmpeg".to_string(),
     ];
-    
+
     for candidate in &candidates {
         if std::path::Path::new(candidate).exists() {
             return candidate.clone();
         }
     }
-    
-    // 4. 尝试使用 which 命令查找
+
     if let Ok(output) = std::process::Command::new("which").arg("ffmpeg").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1012,28 +1278,23 @@ fn get_ffmpeg_path() -> String {
             }
         }
     }
-    
-    // 5. 默认返回 ffmpeg，让系统 PATH 处理
+
     "ffmpeg".to_string()
 }
 
-/// 获取 FFprobe 可执行文件路径
 fn get_ffprobe_path() -> String {
-    // 1. 首先检查环境变量
     if let Ok(path) = std::env::var("FFPROBE_PATH") {
         if std::path::Path::new(&path).exists() {
             return path;
         }
     }
-    
-    // 2. 检查全局设置
+
     if let Some(path) = rockzero_media::get_global_ffprobe_path() {
         if std::path::Path::new(&path).exists() {
             return path;
         }
     }
-    
-    // 3. 检查常见安装位置
+
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
     let candidates = [
         format!("{}/ffmpeg/ffprobe", data_dir),
@@ -1043,14 +1304,13 @@ fn get_ffprobe_path() -> String {
         "/opt/ffmpeg/bin/ffprobe".to_string(),
         "ffprobe".to_string(),
     ];
-    
+
     for candidate in &candidates {
         if std::path::Path::new(candidate).exists() {
             return candidate.clone();
         }
     }
-    
-    // 4. 尝试使用 which 命令查找
+
     if let Ok(output) = std::process::Command::new("which").arg("ffprobe").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1059,7 +1319,7 @@ fn get_ffprobe_path() -> String {
             }
         }
     }
-    
+
     "ffprobe".to_string()
 }
 
@@ -1162,7 +1422,7 @@ async fn transcode_segment_with_seek(
 
     const SEGMENT_DURATION: f64 = 10.0;
     const TRANSCODE_TIMEOUT_SECS: u64 = 120;
-    
+
     let start_time = segment_index as f64 * SEGMENT_DURATION;
     let output_path = output_dir.join(format!("segment_{}.ts", segment_index));
 
@@ -1220,10 +1480,9 @@ async fn transcode_segment_with_seek(
     // 使用超时执行 FFmpeg
     let output_result = timeout(
         Duration::from_secs(TRANSCODE_TIMEOUT_SECS),
-        Command::new(&ffmpeg_path)
-            .args(&args)
-            .output()
-    ).await;
+        Command::new(&ffmpeg_path).args(&args).output(),
+    )
+    .await;
 
     let output = match output_result {
         Ok(Ok(output)) => output,
@@ -1275,10 +1534,9 @@ async fn transcode_segment_with_seek(
 
             let fallback_result = timeout(
                 Duration::from_secs(TRANSCODE_TIMEOUT_SECS),
-                Command::new(&ffmpeg_path)
-                    .args(&fallback_args)
-                    .output()
-            ).await;
+                Command::new(&ffmpeg_path).args(&fallback_args).output(),
+            )
+            .await;
 
             match fallback_result {
                 Ok(Ok(fallback_output)) => {
@@ -1383,18 +1641,21 @@ fn build_ffmpeg_args(
         "warning".to_string(),
     ]);
 
-    // 输入前的 seek（更快）
-    args.push("-ss".to_string());
-    args.push(format!("{:.3}", start_time));
-
     // 根据硬件加速类型添加解码参数
     match hw_accel {
         HardwareAccel::AmlogicV4l2 => {
-            // Amlogic A311D V4L2 M2M 硬件解码
-            // 对于 Amlogic 设备，使用 V4L2 M2M 解码器
-            // 注意：需要确保 /dev/video* 设备可访问
+            // Amlogic A311D V4L2 M2M 完整硬件加速
+            // 不添加 -hwaccel 参数，让 FFmpeg 使用软件解码
+            // V4L2 M2M 主要用于编码
+        }
+        HardwareAccel::AmlogicDecodeOnly => {
+            // Amlogic 硬件解码 + 软件编码模式
+            // 使用 V4L2 M2M 进行硬件解码，减轻 CPU 负担
+            // 注意：需要 FFmpeg 支持 h264_v4l2m2m 解码器
+            // 如果不支持，FFmpeg 会自动回退到软件解码
         }
         HardwareAccel::Vaapi => {
+            // VAAPI 硬件加速（仅限 Intel/AMD GPU）
             args.extend([
                 "-hwaccel".to_string(),
                 "vaapi".to_string(),
@@ -1406,15 +1667,21 @@ fn build_ffmpeg_args(
         }
         HardwareAccel::RockchipRga => {
             // Rockchip MPP 硬件解码
-            args.extend([
-                "-hwaccel".to_string(),
-                "rkmpp".to_string(),
-            ]);
+            args.extend(["-hwaccel".to_string(), "rkmpp".to_string()]);
         }
-        HardwareAccel::V4l2Generic | HardwareAccel::None => {
-            // 不添加硬件解码参数
+        HardwareAccel::V4l2Generic => {
+            // 通用 V4L2，不添加硬件解码参数
+        }
+        HardwareAccel::None => {
+            // 显式禁用所有硬件加速，强制使用软件解码
+            // 这对于 Amlogic 等设备很重要，因为它们可能有 /dev/dri 但不支持 VAAPI
+            args.extend(["-hwaccel".to_string(), "none".to_string()]);
         }
     }
+
+    // 输入前的 seek（更快）
+    args.push("-ss".to_string());
+    args.push(format!("{:.3}", start_time));
 
     // 输入文件
     args.push("-i".to_string());
@@ -1425,38 +1692,61 @@ fn build_ffmpeg_args(
     args.push(format!("{:.3}", duration));
 
     // 强制关键帧
-    args.extend([
-        "-force_key_frames".to_string(),
-        "expr:gte(t,0)".to_string(),
-    ]);
+    args.extend(["-force_key_frames".to_string(), "expr:gte(t,0)".to_string()]);
 
     if needs_transcode {
         // 视频编码参数
         match hw_accel {
             HardwareAccel::AmlogicV4l2 => {
                 // Amlogic A311D V4L2 M2M 硬件编码
-                // 使用 h264_v4l2m2m 编码器
-                // 针对 A311D 优化的参数
                 args.extend([
                     "-c:v".to_string(),
                     "h264_v4l2m2m".to_string(),
-                    // 比特率控制 - A311D 支持较高比特率
                     "-b:v".to_string(),
                     "4M".to_string(),
                     "-maxrate".to_string(),
                     "6M".to_string(),
                     "-bufsize".to_string(),
                     "8M".to_string(),
-                    // GOP 设置 - 适合 HLS 流
                     "-g".to_string(),
                     "30".to_string(),
                     "-keyint_min".to_string(),
                     "30".to_string(),
-                    // V4L2 M2M 特定参数
                     "-num_output_buffers".to_string(),
                     "32".to_string(),
                     "-num_capture_buffers".to_string(),
                     "16".to_string(),
+                ]);
+            }
+            HardwareAccel::AmlogicDecodeOnly => {
+                // Amlogic 硬件解码 + 软件编码
+                // 使用 libx264 编码，但参数针对 ARM 优化
+                // A311D 有 4 个 A73 大核 + 2 个 A53 小核，可以适当提高质量
+                args.extend([
+                    "-c:v".to_string(),
+                    "libx264".to_string(),
+                    "-preset".to_string(),
+                    "fast".to_string(), // fast 比 ultrafast 质量好，A311D 性能足够
+                    "-tune".to_string(),
+                    "zerolatency".to_string(),
+                    "-profile:v".to_string(),
+                    "main".to_string(), // main profile 兼容性好
+                    "-level".to_string(),
+                    "4.0".to_string(),
+                    "-crf".to_string(),
+                    "23".to_string(), // 平衡质量和速度
+                    "-g".to_string(),
+                    "30".to_string(),
+                    "-keyint_min".to_string(),
+                    "30".to_string(),
+                    "-sc_threshold".to_string(),
+                    "0".to_string(),
+                    "-bf".to_string(),
+                    "2".to_string(), // B帧可以提高压缩率
+                    "-refs".to_string(),
+                    "2".to_string(),
+                    "-threads".to_string(),
+                    "4".to_string(), // 使用 4 个线程（A73 大核）
                 ]);
             }
             HardwareAccel::Vaapi => {
@@ -1500,21 +1790,21 @@ fn build_ffmpeg_args(
                 ]);
             }
             HardwareAccel::None => {
-                // 软件编码 (libx264)
-                // 针对 ARM 设备优化，使用较快的预设
+                // 纯软件编码 (libx264)
+                // 针对低性能 ARM 设备优化
                 args.extend([
                     "-c:v".to_string(),
                     "libx264".to_string(),
                     "-preset".to_string(),
-                    "veryfast".to_string(),  // ARM 设备使用更快的预设
+                    "ultrafast".to_string(), // 最快的预设
                     "-tune".to_string(),
                     "zerolatency".to_string(),
                     "-profile:v".to_string(),
-                    "main".to_string(),  // 使用 main profile 以获得更好的兼容性
+                    "baseline".to_string(), // baseline 最兼容且编码最快
                     "-level".to_string(),
-                    "4.0".to_string(),
+                    "3.1".to_string(),
                     "-crf".to_string(),
-                    "23".to_string(),
+                    "28".to_string(), // 稍微降低质量以提高速度
                     "-g".to_string(),
                     "30".to_string(),
                     "-keyint_min".to_string(),
@@ -1522,46 +1812,69 @@ fn build_ffmpeg_args(
                     "-sc_threshold".to_string(),
                     "0".to_string(),
                     "-bf".to_string(),
-                    "0".to_string(),  // 禁用 B 帧以加快编码
+                    "0".to_string(),
                     "-refs".to_string(),
-                    "1".to_string(),  // 减少参考帧以加快编码
-                    // 线程设置
+                    "1".to_string(),
                     "-threads".to_string(),
-                    "4".to_string(),
+                    "0".to_string(), // 自动检测线程数
+                    "-x264-params".to_string(),
+                    "nal-hrd=cbr:force-cfr=1".to_string(),
                 ]);
             }
         }
 
-        // 视频缩放（如果需要）- 针对移动设备优化
+        // 视频缩放 - 针对性能优化
         let target_height = video_info
             .as_ref()
             .map(|info| {
-                if info.height > 1080 {
-                    720  // 4K 视频降到 720p 以提高性能
-                } else if info.height > 720 {
-                    720
-                } else {
-                    info.height
-                }
-            })
-            .unwrap_or(720);
-
-        if video_info.as_ref().map(|i| i.height > target_height).unwrap_or(false) {
-            match hw_accel {
-                HardwareAccel::Vaapi => {
-                    // VAAPI 使用硬件缩放
-                }
-                HardwareAccel::AmlogicV4l2 | HardwareAccel::V4l2Generic => {
-                    // V4L2 M2M 不支持缩放滤镜，需要在编码前使用软件缩放
-                    // 但这会影响性能，所以只在必要时使用
-                    if target_height < 720 {
-                        args.push("-vf".to_string());
-                        args.push(format!("scale=-2:{}", target_height));
+                // 根据硬件加速类型决定目标分辨率
+                match hw_accel {
+                    HardwareAccel::None => {
+                        // 纯软件编码时降低分辨率以提高性能
+                        if info.height > 720 {
+                            480
+                        } else {
+                            info.height.min(480)
+                        }
+                    }
+                    HardwareAccel::AmlogicDecodeOnly => {
+                        // A311D 性能较好，可以保持 720p
+                        if info.height > 1080 {
+                            720
+                        } else if info.height > 720 {
+                            720
+                        } else {
+                            info.height
+                        }
+                    }
+                    _ => {
+                        // 硬件编码可以保持更高分辨率
+                        if info.height > 1080 {
+                            720
+                        } else if info.height > 720 {
+                            720
+                        } else {
+                            info.height
+                        }
                     }
                 }
+            })
+            .unwrap_or(480);
+
+        // 添加缩放滤镜
+        let needs_scale = video_info
+            .as_ref()
+            .map(|i| i.height > target_height)
+            .unwrap_or(true);
+        if needs_scale {
+            match hw_accel {
+                HardwareAccel::Vaapi => {
+                    // VAAPI 已经在上面设置了滤镜
+                }
                 _ => {
+                    // 使用快速缩放算法
                     args.push("-vf".to_string());
-                    args.push(format!("scale=-2:{}", target_height));
+                    args.push(format!("scale=-2:{}:flags=fast_bilinear", target_height));
                 }
             }
         }
@@ -1576,15 +1889,13 @@ fn build_ffmpeg_args(
             "-c:a".to_string(),
             "aac".to_string(),
             "-b:a".to_string(),
-            "128k".to_string(),  // 降低音频比特率以提高性能
+            "128k".to_string(), // A311D 性能足够，使用 128k
             "-ac".to_string(),
             "2".to_string(),
             "-ar".to_string(),
-            "44100".to_string(),  // 使用 44.1kHz 以提高兼容性
+            "44100".to_string(),
             "-async".to_string(),
             "1".to_string(),
-            "-af".to_string(),
-            "aresample=async=1:first_pts=0".to_string(),
         ]);
     } else {
         args.push("-an".to_string());
