@@ -202,9 +202,14 @@ impl HlsSessionManager {
     pub fn init_sae_handshake(&self, user_id: String, password: Vec<u8>) -> Result<String> {
         let temp_session_id = Uuid::new_v4().to_string();
 
-        let server_id = blake3::hash(b"rockzero-server-device-id").into();
+        let server_id: [u8; 32] = blake3::hash(b"rockzero-server-device-id").into();
+        let client_id: [u8; 32] = blake3::hash(user_id.as_bytes()).into();
 
-        let client_id = blake3::hash(user_id.as_bytes()).into();
+        tracing::info!(
+            "[SAE] Initializing handshake - temp_session: {}, user: {}",
+            temp_session_id,
+            user_id
+        );
 
         let sae_server = SaeServer::new(password, server_id, client_id);
 
