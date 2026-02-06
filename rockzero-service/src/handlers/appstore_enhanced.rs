@@ -18,17 +18,27 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 const DEFAULT_APPSTORE_ROOT: &str = "./data/appstore";
-const ISTOREOS_STORE_URL: &str = "https://fw.koolcenter.com/iStoreOS/apps";
 
-// CasaOS App Store URLs - 使用多个镜像源
+const ISTOREOS_STORE_URLS: &[&str] = &[
+    "https://istore.linkease.com/repo/all/store/Packages.json",
+    "https://ghp.ci/https://raw.githubusercontent.com/linkease/istore-packages/main/Packages.json",
+    "https://gh-proxy.com/https://raw.githubusercontent.com/linkease/istore-packages/main/Packages.json",
+];
+
+// CasaOS App Store URLs - 使用中国大陆可访问的镜像源
+// jsdelivr.net 在中国大陆已不可用，raw.githubusercontent.com 也经常被墙
+// 使用 GitHub 加速镜像和多个备用源
 const CASAOS_STORE_URLS: &[&str] = &[
-    // 优先使用 Cp0204 的 AppStore-Play 镜像
-    "https://play.cuse.eu.org/Cp0204-AppStore-Play/apps.json",
-    "https://cdn.jsdelivr.net/gh/Cp0204/CasaOS-AppStore-Play@main/Apps/apps.json",
-    // 备用源
-    "https://raw.githubusercontent.com/Cp0204/CasaOS-AppStore-Play/main/Apps/apps.json",
+    // Cp0204 AppStore-Play - 使用 GitHub 加速代理（中国大陆友好）
+    "https://ghp.ci/https://raw.githubusercontent.com/Cp0204/CasaOS-AppStore-Play/main/Apps/appstore.json",
+    "https://gh-proxy.com/https://raw.githubusercontent.com/Cp0204/CasaOS-AppStore-Play/main/Apps/appstore.json",
+    "https://mirror.ghproxy.com/https://raw.githubusercontent.com/Cp0204/CasaOS-AppStore-Play/main/Apps/appstore.json",
+    // BigBearTechWorld 官方 CasaOS 应用商店
+    "https://ghp.ci/https://raw.githubusercontent.com/bigbeartechworld/big-bear-casaos/master/Apps/big-bear-casaos-apps.json",
+    "https://gh-proxy.com/https://raw.githubusercontent.com/bigbeartechworld/big-bear-casaos/master/Apps/big-bear-casaos-apps.json",
+    // 直连 GitHub（作为最后的备用）
+    "https://raw.githubusercontent.com/Cp0204/CasaOS-AppStore-Play/main/Apps/appstore.json",
     "https://raw.githubusercontent.com/bigbeartechworld/big-bear-casaos/master/Apps/big-bear-casaos-apps.json",
-    "https://raw.githubusercontent.com/WisdomSky/CasaOS-Coolstore/main/apps.json",
 ];
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -110,17 +120,41 @@ pub struct AppStoreList {
 pub struct AppStoreItem {
     pub id: String,
     pub name: String,
-    pub title: String,
+    pub display_name: String,
     pub description: String,
-    pub version: String,
-    pub icon: Option<String>,
+    pub icon: String,
     pub category: String,
+    pub docker_image: String,
+    pub recommended_tag: String,
+    pub default_ports: Vec<PortMappingInfo>,
+    pub default_volumes: Vec<VolumeMappingInfo>,
+    pub required_env: Vec<String>,
+    // 额外的元数据字段（Flutter 端可选使用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
-    pub source: String, // "casaos", "istoreos", "docker"
-    pub install_url: String,
-    pub manifest_url: Option<String>,
-    pub architectures: Vec<String>,
-    pub installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architectures: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PortMappingInfo {
+    pub container_port: u16,
+    pub host_port: u16,
+    pub protocol: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VolumeMappingInfo {
+    pub container_path: String,
+    pub host_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
@@ -279,7 +313,7 @@ fn parse_casaos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<Ap
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())?;
     
-    let title = app.get("title")
+    let display_name = app.get("title")
         .or_else(|| app.get("name"))
         .and_then(|v| v.as_str())
         .unwrap_or(&name)
@@ -308,7 +342,8 @@ fn parse_casaos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<Ap
         .or_else(|| app.get("thumbnail"))
         .or_else(|| app.get("logo"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .unwrap_or("")
+        .to_string();
     
     let category = app.get("category")
         .or_else(|| app.get("categories").and_then(|c| c.as_array()).and_then(|arr| arr.first()))
@@ -322,13 +357,103 @@ fn parse_casaos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<Ap
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     
-    let install_url = app.get("compose_url")
+    // 提取 docker image 信息
+    let docker_image = app.get("docker_image")
+        .or_else(|| app.get("image"))
+        .or_else(|| app.get("container").and_then(|c| c.get("image")))
+        .or_else(|| app.get("compose_url"))
         .or_else(|| app.get("url"))
         .or_else(|| app.get("source"))
-        .or_else(|| app.get("docker_image"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("docker://{}", id));
+
+    let recommended_tag = app.get("recommended_tag")
+        .or_else(|| app.get("tag"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(&version)
+        .to_string();
+
+    // 提取端口映射
+    let default_ports = app.get("ports")
+        .or_else(|| app.get("container").and_then(|c| c.get("ports")))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    let container_port = p.get("container")
+                        .or_else(|| p.get("container_port"))
+                        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                        .unwrap_or(0) as u16;
+                    let host_port = p.get("host")
+                        .or_else(|| p.get("host_port"))
+                        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                        .unwrap_or(container_port as u64) as u16;
+                    if container_port > 0 {
+                        Some(PortMappingInfo {
+                            container_port,
+                            host_port,
+                            protocol: p.get("protocol")
+                                .or_else(|| p.get("type"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("tcp")
+                                .to_string(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 提取卷映射
+    let default_volumes = app.get("volumes")
+        .or_else(|| app.get("container").and_then(|c| c.get("volumes")))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let container_path = v.get("container")
+                        .or_else(|| v.get("container_path"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let host_path = v.get("host")
+                        .or_else(|| v.get("host_path"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !container_path.is_empty() {
+                        Some(VolumeMappingInfo {
+                            container_path,
+                            host_path,
+                            mode: v.get("mode").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 提取必需的环境变量
+    let required_env = app.get("envs")
+        .or_else(|| app.get("environment"))
+        .or_else(|| app.get("container").and_then(|c| c.get("envs")))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    e.get("key")
+                        .or_else(|| e.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let architectures = app
         .get("arch")
@@ -345,17 +470,20 @@ fn parse_casaos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<Ap
     Some(AppStoreItem {
         id: id.clone(),
         name,
-        title,
+        display_name: display_name,
         description,
-        version,
         icon,
         category,
+        docker_image,
+        recommended_tag,
+        default_ports,
+        default_volumes,
+        required_env,
+        source: Some("casaos".to_string()),
+        version: Some(version),
         author,
-        source: "casaos".to_string(),
-        install_url,
-        manifest_url: None,
-        architectures,
-        installed: installed.contains_key(&id),
+        architectures: Some(architectures),
+        installed: Some(installed.contains_key(&id)),
     })
 }
 
@@ -364,127 +492,205 @@ pub async fn list_istoreos_apps() -> Result<HttpResponse, AppError> {
 
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .user_agent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36")
+        .gzip(true)
+        .brotli(true)
+        .deflate(true)
+        .use_rustls_tls()
         .danger_accept_invalid_certs(true)
         .build()
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
-    match client.get(ISTOREOS_STORE_URL).send().await {
-        Ok(response) => {
-            if !response.status().is_success() {
-                warn!("iStoreOS store returned error: {}", response.status());
-                return Ok(HttpResponse::Ok().json(AppStoreList {
-                    apps: Vec::new(),
-                    total: 0,
-                    source: "istoreos".to_string(),
-                }));
-            }
+    let mut last_error = String::new();
 
-            match response.json::<Value>().await {
-                Ok(apps_json) => {
-                    let installed_packages = load_packages()?;
-                    let installed_ids: HashMap<String, bool> = installed_packages
-                        .iter()
-                        .map(|p| (p.id.clone(), true))
-                        .collect();
+    for store_url in ISTOREOS_STORE_URLS {
+        for attempt in 1..=2 {
+            info!("Attempt {} to fetch iStoreOS store from {}", attempt, store_url);
 
-                    let mut apps = Vec::new();
-                    if let Some(app_list) = apps_json.as_array() {
-                        for app in app_list {
-                            if let Some(item) = parse_istoreos_app(app, &installed_ids) {
-                                apps.push(item);
+            match client
+                .get(*store_url)
+                .header("Accept", "application/json, text/plain, */*")
+                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .header("Cache-Control", "no-cache")
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    info!("iStoreOS response status: {}", status);
+
+                    if !status.is_success() {
+                        warn!("iStoreOS store returned error: {}", status);
+                        last_error = format!("iStoreOS store returned status: {}", status);
+                        if attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
+                    } else {
+                        match response.text().await {
+                            Ok(text) => {
+                                info!("iStoreOS received {} bytes of data", text.len());
+
+                                match serde_json::from_str::<Value>(&text) {
+                                    Ok(apps_json) => {
+                                        let installed_packages = load_packages()?;
+                                        let installed_ids: HashMap<String, bool> = installed_packages
+                                            .iter()
+                                            .map(|p| (p.id.clone(), true))
+                                            .collect();
+
+                                        let mut apps = Vec::new();
+                                        if let Some(app_list) = apps_json.as_array() {
+                                            for app in app_list {
+                                                if let Some(item) = parse_istoreos_app(app, &installed_ids) {
+                                                    apps.push(item);
+                                                }
+                                            }
+                                        } else if let Some(data) = apps_json.get("packages").and_then(|d| d.as_array()) {
+                                            for app in data {
+                                                if let Some(item) = parse_istoreos_app(app, &installed_ids) {
+                                                    apps.push(item);
+                                                }
+                                            }
+                                        } else if apps_json.is_object() {
+                                            // 尝试解析对象格式
+                                            for (key, app) in apps_json.as_object().unwrap() {
+                                                if app.is_object() {
+                                                    let mut app_with_id = app.clone();
+                                                    if app_with_id.get("name").is_none() {
+                                                        if let Some(obj) = app_with_id.as_object_mut() {
+                                                            obj.insert("name".to_string(), Value::String(key.clone()));
+                                                        }
+                                                    }
+                                                    if let Some(item) = parse_istoreos_app(&app_with_id, &installed_ids) {
+                                                        apps.push(item);
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        let total = apps.len();
+                                        info!("Successfully parsed {} iStoreOS apps", total);
+
+                                        return Ok(HttpResponse::Ok().json(AppStoreList {
+                                            apps,
+                                            total,
+                                            source: "istoreos".to_string(),
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to parse iStoreOS JSON: {}", e);
+                                        last_error = format!("Invalid JSON from iStoreOS: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to read iStoreOS response: {}", e);
+                                last_error = format!("Failed to read response: {}", e);
                             }
                         }
                     }
-
-                    let total = apps.len();
-                    info!("Found {} iStoreOS apps", total);
-
-                    Ok(HttpResponse::Ok().json(AppStoreList {
-                        apps,
-                        total,
-                        source: "istoreos".to_string(),
-                    }))
                 }
                 Err(e) => {
-                    warn!("Failed to parse iStoreOS response: {}", e);
-                    Ok(HttpResponse::Ok().json(AppStoreList {
-                        apps: Vec::new(),
-                        total: 0,
-                        source: "istoreos".to_string(),
-                    }))
+                    error!("iStoreOS network error (attempt {}): {}", attempt, e);
+                    last_error = format!("Network error: {}", e);
+                    if attempt < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
                 }
             }
         }
-        Err(e) => {
-            warn!("Failed to fetch iStoreOS store: {}", e);
-            Ok(HttpResponse::Ok().json(AppStoreList {
-                apps: Vec::new(),
-                total: 0,
-                source: "istoreos".to_string(),
-            }))
-        }
     }
+
+    warn!("iStoreOS store unavailable, returning empty list. Last error: {}", last_error);
+    Ok(HttpResponse::Ok().json(AppStoreList {
+        apps: Vec::new(),
+        total: 0,
+        source: "istoreos".to_string(),
+    }))
 }
 
 fn parse_istoreos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<AppStoreItem> {
-    let name = app.get("name").and_then(|v| v.as_str())?.to_string();
+    let name = app.get("name")
+        .or_else(|| app.get("Package"))
+        .and_then(|v| v.as_str())?
+        .to_string();
     let id = format!("istoreos_{}", name);
-    let title = app
+    let display_name = app
         .get("title")
+        .or_else(|| app.get("Title"))
+        .or_else(|| app.get("Description"))
         .and_then(|v| v.as_str())
         .unwrap_or(&name)
         .to_string();
     let description = app.get("summary")
         .or_else(|| app.get("description"))
+        .or_else(|| app.get("Description"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
     let version = app.get("version")
+        .or_else(|| app.get("Version"))
         .and_then(|v| v.as_str())
         .unwrap_or("latest")
         .to_string();
     let icon = app
         .get("icon")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .unwrap_or("")
+        .to_string();
     let category = app
         .get("category")
+        .or_else(|| app.get("Section"))
         .and_then(|v| v.as_str())
-        .unwrap_or("Other")
+        .unwrap_or("iStoreOS")
         .to_string();
     let author = app
         .get("maintainer")
+        .or_else(|| app.get("Maintainer"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let install_url = app.get("download_url")
+    let docker_image = app.get("download_url")
+        .or_else(|| app.get("Filename"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
 
     let architectures = app
         .get("platforms")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
+        .or_else(|| app.get("Architecture"))
+        .and_then(|v| {
+            if let Some(arr) = v.as_array() {
+                Some(arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>())
+            } else if let Some(s) = v.as_str() {
+                Some(vec![s.to_string()])
+            } else {
+                None
+            }
         })
         .unwrap_or_else(|| vec!["all".to_string()]);
 
     Some(AppStoreItem {
         id: id.clone(),
         name,
-        title,
+        display_name,
         description,
-        version,
         icon,
         category,
+        docker_image,
+        recommended_tag: version.clone(),
+        default_ports: Vec::new(),
+        default_volumes: Vec::new(),
+        required_env: Vec::new(),
+        source: Some("istoreos".to_string()),
+        version: Some(version),
         author,
-        source: "istoreos".to_string(),
-        install_url,
-        manifest_url: None,
-        architectures,
-        installed: installed.contains_key(&id),
+        architectures: Some(architectures),
+        installed: Some(installed.contains_key(&id)),
     })
 }
 
@@ -582,7 +788,6 @@ pub async fn install_ipk_package(
     Ok(HttpResponse::Created().json(record))
 }
 
-// Helper functions
 fn appstore_root() -> PathBuf {
     std::env::var("APPSTORE_ROOT")
         .map(PathBuf::from)
