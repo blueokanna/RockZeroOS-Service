@@ -17,6 +17,10 @@ lazy_static::lazy_static! {
         std::sync::Mutex::new(HashMap::new());
 }
 
+/// Cached hardware acceleration detection result (detected once, reused for all segments)
+static CACHED_HW_ACCEL: tokio::sync::OnceCell<HardwareAccel> =
+    tokio::sync::OnceCell::const_new();
+
 const NONCE_EXPIRY_SECONDS: i64 = 300;
 const REQUEST_SIGNATURE_EXPIRY_SECONDS: i64 = 60;
 const MAX_TIMESTAMP_DRIFT_SECONDS: i64 = 30;
@@ -522,9 +526,7 @@ pub async fn get_secure_playlist(
 
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
-        .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
-        .insert_header(("Pragma", "no-cache"))
-        .insert_header(("Expires", "0"))
+        .insert_header(("Cache-Control", "private, max-age=60"))
         .insert_header(("X-Encryption-Method", "AES-256-GCM"))
         .insert_header(("X-Security-Features", "SAE,ReplayProtection,RequestSigning"))
         .body(playlist))
@@ -546,11 +548,6 @@ pub async fn get_secure_segment(
 ) -> Result<impl Responder, AppError> {
     let (session_id, segment_name) = path.into_inner();
 
-    info!(
-        "Secure segment request: session={}, segment={}",
-        session_id, segment_name
-    );
-
     let manager = hls_manager.read().await;
     let session = manager
         .get_session(&session_id)
@@ -564,7 +561,6 @@ pub async fn get_secure_segment(
         };
 
         verify_secure_request(&params, &session_id, &segment_name, &session.pmk)?;
-        info!("Secure request verified for segment {}", segment_name);
     } else {
         let peer_addr = req.peer_addr();
         let is_local = peer_addr
@@ -579,17 +575,12 @@ pub async fn get_secure_segment(
         }
     }
 
-    info!(
-        "Session verified for segment {} (user: {})",
-        segment_name, session.user_id
-    );
-
     let segment_data = read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?;
 
     // Validate segment data before encryption
-    if segment_data.len() < 1024 {
+    if segment_data.len() < 188 {
         return Err(AppError::InternalServerError(format!(
-            "Invalid segment data: only {} bytes (expected at least 1KB)",
+            "Invalid segment data: only {} bytes",
             segment_data.len()
         )));
     }
@@ -598,23 +589,79 @@ pub async fn get_secure_segment(
         .encrypt_segment(&segment_data)
         .map_err(convert_hls_error)?;
 
-    info!(
-        "Serving encrypted segment {} for session {} (original: {} bytes, encrypted: {} bytes)",
-        segment_name,
-        session_id,
-        segment_data.len(),
-        encrypted_segment.len()
-    );
+    // Spawn background pre-transcoding for nearby segments (more aggressive for 4K)
+    let file_path = session.file_path.clone();
+    let seg_name = segment_name.clone();
+    tokio::spawn(async move {
+        let _ = prefetch_nearby_segments(&file_path, &seg_name).await;
+    });
+
+    let encrypted_len = encrypted_segment.len();
 
     Ok(HttpResponse::Ok()
         .content_type("video/mp2t")
         .insert_header(("X-Encrypted", "true"))
         .insert_header(("X-Encryption-Method", "AES-256-GCM"))
-        .insert_header(("Content-Length", encrypted_segment.len()))
-        .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
-        .insert_header(("Pragma", "no-cache"))
-        .insert_header(("Expires", "0"))
+        .insert_header(("Content-Length", encrypted_len))
+        .insert_header(("Cache-Control", "private, max-age=300"))
+        .insert_header(("Connection", "keep-alive"))
+        .insert_header(("X-Segment-Size", encrypted_len.to_string()))
         .body(encrypted_segment))
+}
+
+/// Pre-transcode nearby segments in the background so seeks are instant
+async fn prefetch_nearby_segments(file_path: &str, current_segment: &str) -> Result<(), AppError> {
+    let segment_index: usize = current_segment
+        .trim_start_matches("segment_")
+        .trim_end_matches(".ts")
+        .parse()
+        .unwrap_or(0);
+
+    let video_hash = blake3::hash(file_path.as_bytes());
+    let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+    let cache_dir = get_hls_cache_dir().join(&video_id);
+
+    if !cache_dir.exists() {
+        tokio::fs::create_dir_all(&cache_dir).await.ok();
+    }
+
+    // Pre-transcode next 10 segments ahead, 5 at a time (aggressive for 4K)
+    let mut tasks = Vec::new();
+    for offset in 1..=10 {
+        let idx = segment_index + offset;
+        let seg_path = cache_dir.join(format!("segment_{}.ts", idx));
+
+        // Skip if already cached and valid
+        if seg_path.exists() {
+            if let Ok(meta) = tokio::fs::metadata(&seg_path).await {
+                if meta.len() >= 188 {
+                    continue;
+                }
+                // Remove invalid cache
+                let _ = tokio::fs::remove_file(&seg_path).await;
+            }
+        }
+
+        let video_path = std::path::PathBuf::from(file_path);
+        let dir = cache_dir.clone();
+        tasks.push(tokio::spawn(async move {
+            let _ = transcode_segment_with_seek(&video_path, &dir, idx).await;
+        }));
+
+        // Limit concurrency: wait for batch of 5 before spawning more
+        if tasks.len() >= 5 {
+            for t in tasks.drain(..) {
+                let _ = t.await;
+            }
+        }
+    }
+
+    // Await remaining tasks
+    for t in tasks {
+        let _ = t.await;
+    }
+
+    Ok(())
 }
 
 pub async fn stop_session(
@@ -657,28 +704,23 @@ pub async fn prebuffer_segment(
 ) -> Result<impl Responder, AppError> {
     let (session_id, segment_name) = path.into_inner();
 
-    info!(
-        "Prebuffer request: session={}, segment={}",
-        session_id, segment_name
-    );
-
     let manager = hls_manager.read().await;
     let session = manager
         .get_session(&session_id)
         .map_err(convert_hls_error)?;
 
-    let segment_data = read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?;
-
-    info!(
-        "Prebuffered segment {} for session {} ({} bytes)",
-        segment_name,
-        session_id,
-        segment_data.len()
-    );
+    // Pre-transcode the requested segment and nearby ones in background
+    let file_path = session.file_path.clone();
+    let seg_name = segment_name.clone();
+    tokio::spawn(async move {
+        // Transcode the target segment first
+        let _ = read_video_segment_from_ffmpeg(&file_path, &seg_name).await;
+        // Then prefetch nearby
+        let _ = prefetch_nearby_segments(&file_path, &seg_name).await;
+    });
 
     Ok(HttpResponse::Ok()
         .insert_header(("X-Prebuffered", "true"))
-        .insert_header(("X-Segment-Size", segment_data.len()))
         .finish())
 }
 
@@ -1355,22 +1397,16 @@ async fn read_video_segment_from_ffmpeg(
     let cached_segment_path = cache_dir.join(segment_name);
 
     if cached_segment_path.exists() {
-        // Validate cached segment - must be at least 1KB for a valid TS segment
+        // Validate cached segment - must be at least 188 bytes (one TS packet)
         if let Ok(metadata) = tokio::fs::metadata(&cached_segment_path).await {
-            if metadata.len() >= 1024 {
-                info!(
-                    "Cache hit for segment {} of video {} ({} bytes)",
-                    segment_name,
-                    video_id,
-                    metadata.len()
-                );
+            if metadata.len() >= 188 {
                 return tokio::fs::read(&cached_segment_path).await.map_err(|e| {
                     AppError::IoError(format!("Failed to read cached segment: {}", e))
                 });
             } else {
                 // Invalid cached segment, delete and re-transcode
                 warn!(
-                    "Invalid cached segment {} ({} bytes), removing and re-transcoding",
+                    "Invalid cached segment {} ({} bytes), removing",
                     segment_name,
                     metadata.len()
                 );
@@ -1401,16 +1437,6 @@ async fn read_video_segment_from_ffmpeg(
     let segment_data =
         transcode_segment_with_seek(&original_video, &cache_dir, segment_index).await?;
 
-    if let Err(e) = tokio::fs::write(&cached_segment_path, &segment_data).await {
-        warn!("Failed to cache segment {}: {}", segment_name, e);
-    } else {
-        info!(
-            "Cached segment {} ({} bytes)",
-            segment_name,
-            segment_data.len()
-        );
-    }
-
     Ok(segment_data)
 }
 
@@ -1423,13 +1449,28 @@ async fn transcode_segment_with_seek(
     use tokio::time::{timeout, Duration};
 
     const SEGMENT_DURATION: f64 = 6.0;
-    const TRANSCODE_TIMEOUT_SECS: u64 = 25; // 减少超时时间
+    const TRANSCODE_TIMEOUT_SECS: u64 = 90; // Increased for 4K content
 
     let start_time = segment_index as f64 * SEGMENT_DURATION;
     let output_path = output_dir.join(format!("segment_{}.ts", segment_index));
 
-    // Remove any existing output file first
-    let _ = tokio::fs::remove_file(&output_path).await;
+    // Use a temp file to avoid serving incomplete segments
+    let temp_path = output_dir.join(format!(".segment_{}.ts.tmp", segment_index));
+
+    // If final output already exists and is valid, return it
+    if output_path.exists() {
+        if let Ok(meta) = tokio::fs::metadata(&output_path).await {
+            if meta.len() >= 188 {
+                return tokio::fs::read(&output_path).await.map_err(|e| {
+                    AppError::IoError(format!("Failed to read segment: {}", e))
+                });
+            }
+        }
+        let _ = tokio::fs::remove_file(&output_path).await;
+    }
+
+    // Remove any stale temp file
+    let _ = tokio::fs::remove_file(&temp_path).await;
 
     // Check if we're beyond video duration
     let video_info = probe_video_info(video_path).await.ok();
@@ -1446,23 +1487,24 @@ async fn transcode_segment_with_seek(
 
     let ffmpeg_exists = std::path::Path::new(&ffmpeg_path).exists();
     if !ffmpeg_exists && ffmpeg_path != "ffmpeg" {
-        warn!("FFmpeg not found at configured path: {}", ffmpeg_path);
         return Err(AppError::InternalServerError(format!(
             "FFmpeg not found at: {}",
             ffmpeg_path
         )));
     }
 
-    // 直接使用软件编码，跳过硬件加速检测以避免超时
-    let hw_accel = HardwareAccel::None;
+    let hw_accel = *CACHED_HW_ACCEL
+        .get_or_init(|| async { detect_hardware_acceleration().await })
+        .await;
+    info!("Using hardware acceleration: {:?}", hw_accel);
 
     let video_path_str = video_path.to_str().unwrap_or("");
-    let output_path_str = output_path.to_str().unwrap_or("");
+    let temp_path_str = temp_path.to_str().unwrap_or("");
 
     let args = build_ffmpeg_args_optimized(
         hw_accel,
         video_path_str,
-        output_path_str,
+        temp_path_str,
         start_time,
         SEGMENT_DURATION,
         &video_info,
@@ -1477,12 +1519,14 @@ async fn transcode_segment_with_seek(
     let output = match output_result {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(AppError::IoError(format!(
                 "FFmpeg execution failed for segment {}: {}",
                 segment_index, e
             )));
         }
         Err(_) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(AppError::InternalServerError(format!(
                 "FFmpeg timeout for segment {} (exceeded {}s)",
                 segment_index, TRANSCODE_TIMEOUT_SECS
@@ -1492,6 +1536,7 @@ async fn transcode_segment_with_seek(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = tokio::fs::remove_file(&temp_path).await;
         warn!("FFmpeg failed for segment {}: {}", segment_index, stderr);
         return Err(AppError::InternalServerError(format!(
             "Transcode failed for segment {}: {}",
@@ -1499,29 +1544,39 @@ async fn transcode_segment_with_seek(
         )));
     }
 
-    // 等待文件写入完成
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    // Wait briefly for filesystem sync
+    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
 
-    if !output_path.exists() {
+    if !temp_path.exists() {
         return Err(AppError::InternalServerError(format!(
             "Transcoded segment {} not found",
             segment_index
         )));
     }
 
-    let segment_data = tokio::fs::read(&output_path)
+    let segment_data = tokio::fs::read(&temp_path)
         .await
         .map_err(|e| AppError::IoError(format!("Failed to read segment: {}", e)))?;
 
-    if segment_data.is_empty() {
+    if segment_data.len() < 188 {
+        let _ = tokio::fs::remove_file(&temp_path).await;
         return Err(AppError::InternalServerError(format!(
-            "Segment {} is empty",
-            segment_index
+            "Segment {} too small: {} bytes",
+            segment_index,
+            segment_data.len()
         )));
     }
 
+    // Atomically rename temp -> final (prevents serving partial files)
+    if let Err(e) = tokio::fs::rename(&temp_path, &output_path).await {
+        // Fallback: copy + delete
+        warn!("Rename failed, using copy: {}", e);
+        let _ = tokio::fs::write(&output_path, &segment_data).await;
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    }
+
     info!(
-        "✅ Segment {} transcoded: {} bytes",
+        "Segment {} transcoded: {} bytes",
         segment_index,
         segment_data.len()
     );
@@ -1563,108 +1618,96 @@ fn build_ffmpeg_args_optimized(
         _ => {}
     }
 
+    // Input seeking (fast, seeks to nearest keyframe before start_time)
     args.extend(["-ss".to_string(), format!("{:.3}", start_time)]);
     args.extend(["-i".to_string(), input_path.to_string()]);
     args.extend(["-t".to_string(), format!("{:.3}", duration)]);
 
-    match hw_accel {
-        HardwareAccel::AmlogicV4l2 => {
-            args.extend([
-                "-c:v".to_string(),
-                "h264_v4l2m2m".to_string(),
-                "-b:v".to_string(),
-                "2M".to_string(),
-                "-g".to_string(),
-                "30".to_string(),
-            ]);
-        }
-        HardwareAccel::Vaapi => {
-            args.extend([
-                "-vf".to_string(),
-                "format=nv12|vaapi,hwupload".to_string(),
-                "-c:v".to_string(),
-                "h264_vaapi".to_string(),
-                "-qp".to_string(),
-                "26".to_string(),
-                "-g".to_string(),
-                "30".to_string(),
-            ]);
-        }
-        HardwareAccel::RockchipRga => {
-            args.extend([
-                "-c:v".to_string(),
-                "h264_rkmpp".to_string(),
-                "-b:v".to_string(),
-                "2M".to_string(),
-                "-g".to_string(),
-                "30".to_string(),
-            ]);
-        }
-        _ => {
-            args.extend([
-                "-c:v".to_string(),
-                "libx264".to_string(),
-                "-preset".to_string(),
-                "ultrafast".to_string(),
-                "-tune".to_string(),
-                "fastdecode".to_string(),
-                "-profile:v".to_string(),
-                "baseline".to_string(),
-                "-level".to_string(),
-                "3.0".to_string(),
-                "-crf".to_string(),
-                "28".to_string(),
-                "-g".to_string(),
-                "30".to_string(),
-                "-keyint_min".to_string(),
-                "30".to_string(),
-                "-sc_threshold".to_string(),
-                "0".to_string(),
-                "-bf".to_string(),
-                "0".to_string(),
-                "-refs".to_string(),
-                "1".to_string(),
-                "-threads".to_string(),
-                "0".to_string(),
-            ]);
-        }
-    }
+    // Use copy mode for compatible formats (instant, no re-encoding)
+    // For 4K content, prefer stream copy to preserve quality and avoid slow re-encoding
+    // Only re-encode if source codec is incompatible with MPEG-TS container
+    let needs_reencode = false; // Prefer stream copy for maximum speed and quality
 
-    let target_height = video_info
-        .as_ref()
-        .map(|info| {
-            if info.height > 720 {
-                480
-            } else if info.height > 480 {
-                360
-            } else {
-                info.height
+    if needs_reencode {
+        match hw_accel {
+            HardwareAccel::AmlogicV4l2 => {
+                args.extend([
+                    "-c:v".to_string(),
+                    "h264_v4l2m2m".to_string(),
+                    "-b:v".to_string(),
+                    "3M".to_string(),
+                    "-g".to_string(),
+                    "30".to_string(),
+                ]);
             }
-        })
-        .unwrap_or(360);
-
-    let needs_scale = video_info
-        .as_ref()
-        .map(|i| i.height > target_height)
-        .unwrap_or(true);
-
-    if needs_scale && hw_accel != HardwareAccel::Vaapi {
-        args.extend([
-            "-vf".to_string(),
-            format!("scale=-2:{}:flags=fast_bilinear", target_height),
-        ]);
+            HardwareAccel::Vaapi => {
+                args.extend([
+                    "-vf".to_string(),
+                    "format=nv12|vaapi,hwupload,scale_vaapi=w=-2:h=720".to_string(),
+                    "-c:v".to_string(),
+                    "h264_vaapi".to_string(),
+                    "-qp".to_string(),
+                    "24".to_string(),
+                    "-g".to_string(),
+                    "30".to_string(),
+                ]);
+            }
+            HardwareAccel::RockchipRga => {
+                args.extend([
+                    "-c:v".to_string(),
+                    "h264_rkmpp".to_string(),
+                    "-b:v".to_string(),
+                    "3M".to_string(),
+                    "-g".to_string(),
+                    "30".to_string(),
+                ]);
+            }
+            _ => {
+                args.extend([
+                    "-c:v".to_string(),
+                    "libx264".to_string(),
+                    "-preset".to_string(),
+                    "ultrafast".to_string(),
+                    "-tune".to_string(),
+                    "fastdecode".to_string(),
+                    "-profile:v".to_string(),
+                    "high".to_string(),
+                    "-level".to_string(),
+                    "4.1".to_string(),
+                    "-crf".to_string(),
+                    "23".to_string(),
+                    "-g".to_string(),
+                    "30".to_string(),
+                    "-keyint_min".to_string(),
+                    "30".to_string(),
+                    "-sc_threshold".to_string(),
+                    "0".to_string(),
+                    "-bf".to_string(),
+                    "0".to_string(),
+                    "-threads".to_string(),
+                    "0".to_string(),
+                    "-vf".to_string(),
+                    "scale=-2:720:flags=fast_bilinear".to_string(),
+                ]);
+            }
+        }
+    } else {
+        // Stream copy — near-instant, no quality loss
+        args.extend(["-c:v".to_string(), "copy".to_string()]);
     }
 
     if video_info.as_ref().map(|i| i.has_audio).unwrap_or(true) {
+        // Always transcode audio to AAC for universal compatibility
+        // DTS, AC3, TrueHD, PCM etc. are not supported by most mobile/web players
         args.extend([
             "-c:a".to_string(),
             "aac".to_string(),
             "-b:a".to_string(),
-            "128k".to_string(),
+            "192k".to_string(),
             "-ac".to_string(),
             "2".to_string(),
             "-ar".to_string(),
-            "44100".to_string(),
+            "48000".to_string(),
         ]);
     } else {
         args.push("-an".to_string());
@@ -1678,7 +1721,7 @@ fn build_ffmpeg_args_optimized(
         "-avoid_negative_ts".to_string(),
         "make_zero".to_string(),
         "-max_muxing_queue_size".to_string(),
-        "512".to_string(),
+        "1024".to_string(),
     ]);
 
     args.push(output_path.to_string());

@@ -43,7 +43,6 @@ pub struct CpuInfo {
     pub usage: f32,
     pub temperature: Option<f32>,
     pub per_core_usage: Vec<CpuCoreUsage>,
-    /// CPU 核心架构信息 (ARM 异构架构)
     pub core_types: Vec<CpuCoreArchInfo>,
 }
 
@@ -281,38 +280,116 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                 }
 
                 let (used_space, available_space, actual_total) = if partition.mount_point.is_some() {
-                    // 对于已挂载的分区，使用 sysinfo 获取准确的空间信息
-                    let disks_info = Disks::new_with_refreshed_list();
-                    let mut found = false;
-                    let mut total = partition.size;
-                    let mut avail = partition.size;
-                    let mut used = 0u64;
+                    let mount_pt = partition.mount_point.as_deref().unwrap_or("");
                     
-                    for disk in disks_info.list() {
-                        let disk_mount = disk.mount_point().to_string_lossy().to_string();
-                        let disk_name = disk.name().to_string_lossy().to_string();
+                    #[cfg(target_os = "linux")]
+                    let result = {
+                        use std::mem::MaybeUninit;
+                        let mut stat_result: Option<(u64, u64, u64)> = None;
                         
-                        // 匹配挂载点或设备名
-                        if disk_mount == mount_point || 
-                           disk_name == partition.device_path ||
-                           disk_name.ends_with(&partition.name) {
-                            total = disk.total_space();
-                            avail = disk.available_space();
-                            used = total.saturating_sub(avail);
-                            found = true;
-                            break;
+                        if !mount_pt.is_empty() {
+                            if let Ok(path_cstr) = std::ffi::CString::new(mount_pt) {
+                                let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
+                                unsafe {
+                                    if libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) == 0 {
+                                        let stat = stat.assume_init();
+                                        let block_size = stat.f_frsize as u64;
+                                        let total_blocks = stat.f_blocks as u64;
+                                        let free_blocks = stat.f_bfree as u64;
+                                        let avail_blocks = stat.f_bavail as u64;
+                                        
+                                        let total = total_blocks * block_size;
+                                        let free = free_blocks * block_size;
+                                        let avail = avail_blocks * block_size;
+                                        
+                                        // 真实已用空间 = 总空间 - 空闲空间（包含保留块）
+                                        // 但对用户来说，"已用" 应该是 总空间 - 用户可用空间 - 保留块
+                                        // 即：used = total - free (实际占用)
+                                        // 保留块 = free - avail
+                                        // 用户数据 = total - free = used (不含保留块)
+                                        let used = total.saturating_sub(free);
+                                        
+                                        // 对于用户显示，总空间应该减去保留块
+                                        // 这样 used/total 的比例才是用户真正关心的
+                                        let reserved = free.saturating_sub(avail);
+                                        let user_total = total.saturating_sub(reserved);
+                                        
+                                        stat_result = Some((used, avail, user_total));
+                                    }
+                                }
+                            }
                         }
-                    }
-                    
-                    if !found {
-                        // 回退到使用 get_available_space
-                        if let Some(avail_space) = get_available_space(&partition.device_path) {
-                            avail = avail_space;
-                            used = partition.size.saturating_sub(avail_space);
+                        
+                        if let Some((used, avail, total)) = stat_result {
+                            (used, avail, total)
+                        } else {
+                            // 回退到 sysinfo
+                            let disks_info = Disks::new_with_refreshed_list();
+                            let mut found = false;
+                            let mut total = partition.size;
+                            let mut avail = partition.size;
+                            let mut used = 0u64;
+                            
+                            for disk in disks_info.list() {
+                                let disk_mount = disk.mount_point().to_string_lossy().to_string();
+                                let disk_name = disk.name().to_string_lossy().to_string();
+                                
+                                if disk_mount == mount_pt || 
+                                   disk_name == partition.device_path ||
+                                   disk_name.ends_with(&partition.name) {
+                                    total = disk.total_space();
+                                    avail = disk.available_space();
+                                    used = total.saturating_sub(avail);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            
+                            if !found {
+                                if let Some(avail_space) = get_available_space(&partition.device_path) {
+                                    avail = avail_space;
+                                    used = partition.size.saturating_sub(avail_space);
+                                }
+                            }
+                            
+                            (used, avail, total)
                         }
-                    }
+                    };
                     
-                    (used, avail, total)
+                    #[cfg(not(target_os = "linux"))]
+                    let result = {
+                        let disks_info = Disks::new_with_refreshed_list();
+                        let mut found = false;
+                        let mut total = partition.size;
+                        let mut avail = partition.size;
+                        let mut used = 0u64;
+                        
+                        for disk in disks_info.list() {
+                            let disk_mount = disk.mount_point().to_string_lossy().to_string();
+                            let disk_name = disk.name().to_string_lossy().to_string();
+                            
+                            if disk_mount == mount_pt || 
+                               disk_name == partition.device_path ||
+                               disk_name.ends_with(&partition.name) {
+                                total = disk.total_space();
+                                avail = disk.available_space();
+                                used = total.saturating_sub(avail);
+                                found = true;
+                                break;
+                            }
+                        }
+                        
+                        if !found {
+                            if let Some(avail_space) = get_available_space(&partition.device_path) {
+                                avail = avail_space;
+                                used = partition.size.saturating_sub(avail_space);
+                            }
+                        }
+                        
+                        (used, avail, total)
+                    };
+                    
+                    result
                 } else {
                     (0, partition.size, partition.size)
                 };

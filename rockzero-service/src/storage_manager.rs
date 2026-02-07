@@ -180,14 +180,26 @@ impl StorageManager {
     /// Start background cleanup tasks
     pub fn start_cleanup_tasks(self: std::sync::Arc<Self>) {
         let manager = self.clone();
+        // Hourly full cleanup
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(3600)); // Run every hour
+            let mut interval = interval(Duration::from_secs(3600));
             loop {
                 interval.tick().await;
                 info!("🧹 Starting scheduled cleanup tasks...");
-
                 if let Err(e) = manager.run_cleanup().await {
                     error!("Cleanup task failed: {}", e);
+                }
+            }
+        });
+
+        // HLS cache: delete segments not accessed in 30 minutes (check every 5 min)
+        let manager2 = self.clone();
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                if let Err(e) = manager2.cleanup_stale_hls_cache(30 * 60).await {
+                    warn!("Stale HLS cache cleanup failed: {}", e);
                 }
             }
         });
@@ -261,6 +273,56 @@ impl StorageManager {
 
         if deleted > 0 {
             info!("🗑️ Cleaned up {} old HLS cache files", deleted);
+        }
+
+        Ok(())
+    }
+
+    /// Clean HLS cache entries not accessed within `max_idle_secs` seconds
+    pub async fn cleanup_stale_hls_cache(&self, max_idle_secs: u64) -> std::io::Result<()> {
+        let path = &self.config.hls_cache_path;
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut deleted_dirs = 0u64;
+        let mut freed_bytes = 0u64;
+        let mut entries = fs::read_dir(path).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let metadata = entry.metadata().await?;
+            if !metadata.is_dir() {
+                continue;
+            }
+
+            // Check the most recent access/modification time of any file in this dir
+            let most_recent = most_recent_access_in_dir(&entry.path()).await;
+            let age = now.saturating_sub(most_recent);
+
+            if age > max_idle_secs {
+                if let Ok(size) = get_directory_size(&entry.path()).await {
+                    freed_bytes += size;
+                }
+                if let Err(e) = fs::remove_dir_all(entry.path()).await {
+                    warn!("Failed to remove stale HLS cache dir {:?}: {}", entry.path(), e);
+                } else {
+                    deleted_dirs += 1;
+                }
+            }
+        }
+
+        if deleted_dirs > 0 {
+            info!(
+                "🗑️ Removed {} stale HLS cache dirs (idle > {}min), freed {:.2} MB",
+                deleted_dirs,
+                max_idle_secs / 60,
+                freed_bytes as f64 / 1024.0 / 1024.0
+            );
         }
 
         Ok(())
@@ -562,6 +624,31 @@ fn get_directory_size(
 
         Ok(total_size)
     })
+}
+
+/// Get the most recent access/modification timestamp of any file in a directory
+async fn most_recent_access_in_dir(path: &Path) -> u64 {
+    let mut most_recent = 0u64;
+
+    if let Ok(mut entries) = fs::read_dir(path).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(metadata) = entry.metadata().await {
+                // Use the later of accessed and modified time
+                let ts = metadata
+                    .accessed()
+                    .or_else(|_| metadata.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if ts > most_recent {
+                    most_recent = ts;
+                }
+            }
+        }
+    }
+
+    most_recent
 }
 
 /// Clean up old files

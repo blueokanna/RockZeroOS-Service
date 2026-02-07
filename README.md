@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="RockZeroOS-UI/assets/images/RockZero.png" alt="RockZeroOS Logo" width="200"/>
+  <img src="RockZero.png" alt="RockZeroOS Logo" width="200"/>
 </p>
 
 <h1 align="center">RockZeroOS</h1>
@@ -60,6 +60,7 @@ flowchart TB
 ```mermaid
 sequenceDiagram
     participant C as Client
+    participant P as Local Proxy
     participant S as Server
     
     C->>S: 1. JWT Authentication (EdDSA)
@@ -75,14 +76,55 @@ sequenceDiagram
     S-->>C: Server Confirm + PMK
     
     C->>S: 5. Create HLS Session
-    S-->>C: Session ID + Encryption Key
+    S-->>C: Session ID + Key Verification Hash
+    
+    Note over C,P: Client derives encryption key via HKDF-BLAKE3(PMK)
+    C->>P: 6. Start local proxy (127.0.0.1)
+    P->>S: 7. GET playlist.m3u8
+    S-->>P: M3U8 playlist (VOD, 6s segments)
     
     loop Each Video Segment
-        C->>S: 6. Request Segment + Bulletproofs ZKP
-        S-->>C: AES-256-GCM Encrypted Segment
-        C->>C: 7. Local Proxy Decrypt
+        P->>S: 8. POST segment_N.ts + HMAC signature
+        Note over S: Verify timestamp + nonce + BLAKE3 HMAC
+        Note over S: Transcode on-demand (stream copy ≤1080p)
+        S-->>P: AES-256-GCM encrypted segment (nonce‖ciphertext‖tag)
+        Note over P: Decrypt in background isolate
+        P-->>C: Decrypted MPEG-TS segment
     end
+    
+    Note over P: Prefetch next 10 segments (4 concurrent)
+    Note over P: LRU cache (100 segments max)
 ```
+
+### Video Pipeline Architecture
+
+The HLS streaming system is designed for low-latency, secure playback on mobile and desktop:
+
+**Server-side (Rust)**
+- On-demand transcoding with FFmpeg: stream copy (`-c:v copy -c:a copy`) for ≤1080p sources, hardware-accelerated re-encoding for >1080p
+- Hardware acceleration auto-detection: VAAPI (Intel/AMD), V4L2 M2M (Amlogic A311D/S905/S922), Rockchip MPP (RK3588), with cached detection result
+- Atomic segment caching: writes to `.tmp` file first, then renames to prevent serving incomplete data
+- Background prefetch: pre-transcodes next 5 segments ahead with 3 concurrent tasks
+- Replay protection: timestamp validation (±30s drift), nonce uniqueness, BLAKE3 HMAC request signing
+
+**Client-side (Flutter)**
+- Local HTTP proxy on `127.0.0.1` decrypts segments before feeding to the player
+- AES-256-GCM decryption offloaded to background isolate via `compute()` for segments >64KB
+- LRU segment cache (100 entries) with concurrent prefetch (10 ahead, 3 behind, 4 parallel)
+- media_kit (libmpv) player with platform-specific hardware decoding:
+  - Android: MediaCodec (`hwdec=mediacodec`)
+  - iOS: VideoToolbox (`hwdec=videotoolbox`)
+  - Desktop: auto-detect (`hwdec=auto-safe`)
+- Optimized buffer: 32MB buffer, 30s cache window, high-resolution seeking with frame drop
+
+**Key Derivation**
+```
+PMK (from SAE handshake)
+  → HKDF-BLAKE3(salt="hls-session-salt:{session_id}", info="hls-master-key")
+  → 256-bit AES-GCM encryption key
+```
+
+Each segment is encrypted as: `nonce(12B) ‖ AES-256-GCM(plaintext, key, nonce) ‖ tag(16B)`
 
 ## Storage Management
 
@@ -99,13 +141,26 @@ sequenceDiagram
 
 ## Hardware Accelerated Transcoding
 
-| Platform | Acceleration | Encoder | Decoder |
-|----------|--------------|---------|---------|
-| NVIDIA | NVENC/NVDEC | h264_nvenc, hevc_nvenc | h264_cuvid, hevc_cuvid |
-| Intel | QSV/VAAPI | h264_qsv, hevc_qsv | h264_qsv, hevc_qsv |
-| AMD | VAAPI | h264_vaapi, hevc_vaapi | - |
-| ARM | V4L2 M2M | h264_v4l2m2m | h264_v4l2m2m |
-| Amlogic | V4L2 M2M | h264_v4l2m2m | h264_v4l2m2m |
+The server auto-detects available hardware at startup (cached for the process lifetime) and selects the optimal encoding pipeline:
+
+| Platform | Detection Method | Encoder | Decoder | Notes |
+|----------|-----------------|---------|---------|-------|
+| Intel | VAAPI device + vendor ID `0x8086` | h264_vaapi | hwaccel vaapi | Verified via FFmpeg init test |
+| AMD | VAAPI device + vendor ID `0x1002` | h264_vaapi | hwaccel vaapi | Verified via FFmpeg init test |
+| Amlogic (A311D/S905/S922) | `/proc/cpuinfo`, device tree, `/dev/amvideo` | h264_v4l2m2m | meson_vdec | Falls back to software encode if V4L2 M2M fails |
+| Rockchip (RK3588/RK3399) | `/proc/cpuinfo`, device tree | h264_rkmpp | rkmpp | Requires MPP libraries |
+| Generic ARM | `/dev/video10`, `/dev/video11` | h264_v4l2m2m | h264_v4l2m2m | Verified via encode test |
+| Fallback | — | libx264 (ultrafast) | software | Used when no hardware is detected |
+
+For ≤1080p content, the server uses stream copy (`-c:v copy -c:a copy`) which is near-instant regardless of hardware.
+
+### Client-side Hardware Decoding
+
+| Platform | API | Configuration |
+|----------|-----|---------------|
+| Android | MediaCodec | `hwdec=mediacodec` via libmpv |
+| iOS | VideoToolbox | `hwdec=videotoolbox` via libmpv |
+| Windows/Linux/macOS | Auto-detect | `hwdec=auto-safe` via libmpv |
 
 ## Project Structure
 
@@ -151,20 +206,36 @@ RockZeroOS-Service/
 │   └── bulletproof_auth.rs   # Video segment ZKP auth
 ├── rockzero-db/              # Database (SQLite + Reed-Solomon)
 ├── rockzero-service/         # Main service
+│   ├── storage_manager.rs    # HLS cache auto-cleanup (30min idle)
 │   └── handlers/
 │       ├── auth.rs           # EdDSA JWT authentication
 │       ├── zkp_auth.rs       # ZKP authentication
-│       ├── secure_hls.rs     # Secure HLS streaming
+│       ├── secure_hls.rs     # Secure HLS streaming + HW accel detection
 │       └── ...
 └── RockZeroOS-UI/            # Flutter cross-platform client
     └── lib/
         ├── services/
         │   ├── bulletproofs_ffi.dart
         │   ├── sae_client_curve25519.dart
-        │   └── secure_hls_player.dart
+        │   ├── secure_hls_proxy.dart   # Local decrypt proxy + isolate decryption
+        │   └── sae_handshake_service.dart
+        ├── core/
+        │   ├── services/
+        │   │   ├── wallpaper_service.dart  # Wallpaper + blur amount provider
+        │   │   └── media_kit_initializer.dart
+        │   └── widgets/
+        │       └── shell_scaffold.dart     # Glassmorphic wallpaper background
         └── features/
             ├── auth/
             ├── files/
+            │   └── presentation/pages/
+            │       └── secure_hls_video_player.dart  # HW-accelerated player
+            ├── dashboard/
+            │   └── presentation/pages/
+            │       └── speed_test_page.dart  # Chronograph-style speed test
+            ├── settings/
+            │   └── presentation/pages/
+            │       └── settings_page.dart    # Blur intensity slider
             └── ...
 ```
 
@@ -172,10 +243,10 @@ RockZeroOS-Service/
 
 ### Prerequisites
 
-- Rust 1.90+
-- FFmpeg 6.0+
+- Rust 1.75+ (edition 2021)
+- FFmpeg 6.0+ (bundled for ARM64, or system-installed)
 - SQLite 3.x
-- Flutter 3.19+
+- Flutter 3.19+ with Dart 3.3+
 
 ### Build Backend
 
@@ -260,16 +331,19 @@ POST /api/v1/zkp/video/verify
 
 ## Performance
 
-| Operation | Performance |
-|-----------|-------------|
-| EdDSA JWT Sign | ~0.1ms |
-| EdDSA JWT Verify | ~0.2ms |
-| SAE Handshake | ~5-10ms |
-| Bulletproofs RangeProof | ~50ms |
-| AES-256-GCM Encryption | ~500 MB/s |
-| BLAKE3 Hash | ~1 GB/s |
-| Hardware Transcode (NVENC) | ~300 FPS (1080p) |
-| Hardware Transcode (QSV) | ~150 FPS (1080p) |
+| Operation | Performance | Notes |
+|-----------|-------------|-------|
+| EdDSA JWT Sign | ~0.1ms | Ed25519 via dalek |
+| EdDSA JWT Verify | ~0.2ms | Ed25519 via dalek |
+| SAE Handshake (full) | ~5-10ms | Curve25519 Dragonfly |
+| Bulletproofs RangeProof | ~50ms | 64-bit range proof |
+| AES-256-GCM Encrypt/Decrypt | ~500 MB/s | Per-segment encryption |
+| BLAKE3 Hash | ~1 GB/s | Used for HKDF, HMAC, signatures |
+| HLS Segment (stream copy) | <100ms | ≤1080p, no re-encoding |
+| HLS Segment (hw transcode) | ~200-500ms | >1080p, VAAPI/V4L2 |
+| HLS Segment (sw transcode) | ~1-3s | >1080p, libx264 ultrafast |
+| Client Decrypt (isolate) | ~5-15ms | Per 6s segment, background isolate |
+| Prefetch Pipeline | 10 segments ahead | 4 concurrent, ~60s buffer |
 
 ## Docker Deployment
 

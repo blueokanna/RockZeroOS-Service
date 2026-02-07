@@ -269,14 +269,66 @@ pub async fn list_disks() -> Result<HttpResponse, AppError> {
             continue;
         }
         
-        let total_space = disk.total_space();
-        let available_space = disk.available_space();
-        let used_space = total_space.saturating_sub(available_space);
-        let usage_percentage = if total_space > 0 {
-            (used_space as f64 / total_space as f64) * 100.0
-        } else {
-            0.0
+        // 使用 statvfs 获取准确的空间信息（排除保留块）
+        #[cfg(target_os = "linux")]
+        let (total_space, available_space, used_space, usage_percentage) = {
+            use std::mem::MaybeUninit;
+            let mut stat_result: Option<(u64, u64, u64, f64)> = None;
+            
+            if !mount_point.is_empty() {
+                if let Ok(path_cstr) = std::ffi::CString::new(mount_point.as_bytes()) {
+                    let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
+                    unsafe {
+                        if libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) == 0 {
+                            let stat = stat.assume_init();
+                            let block_size = stat.f_frsize as u64;
+                            let total_blocks = stat.f_blocks as u64;
+                            let free_blocks = stat.f_bfree as u64;
+                            let avail_blocks = stat.f_bavail as u64;
+                            
+                            let raw_total = total_blocks * block_size;
+                            let free = free_blocks * block_size;
+                            let avail = avail_blocks * block_size;
+                            
+                            // 实际已用 = 总空间 - 空闲空间
+                            let used = raw_total.saturating_sub(free);
+                            // 保留块 = 空闲 - 用户可用
+                            let reserved = free.saturating_sub(avail);
+                            // 用户可见总空间 = 总空间 - 保留块
+                            let user_total = raw_total.saturating_sub(reserved);
+                            
+                            let pct = if user_total > 0 {
+                                (used as f64 / user_total as f64) * 100.0
+                            } else {
+                                0.0
+                            };
+                            
+                            stat_result = Some((user_total, avail, used, pct));
+                        }
+                    }
+                }
+            }
+            
+            if let Some(result) = stat_result {
+                result
+            } else {
+                let total = disk.total_space();
+                let avail = disk.available_space();
+                let used = total.saturating_sub(avail);
+                let pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
+                (total, avail, used, pct)
+            }
         };
+        
+        #[cfg(not(target_os = "linux"))]
+        let (total_space, available_space, used_space, usage_percentage) = {
+            let total = disk.total_space();
+            let avail = disk.available_space();
+            let used = total.saturating_sub(avail);
+            let pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
+            (total, avail, used, pct)
+        };
+        
         let is_removable = disk.is_removable();
         let disk_type = format!("{:?}", disk.kind());
         
