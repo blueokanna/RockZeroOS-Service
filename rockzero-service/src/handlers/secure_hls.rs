@@ -758,10 +758,19 @@ fn generate_secure_m3u8(
 }
 
 fn get_hls_cache_dir() -> std::path::PathBuf {
+    // 优先使用环境变量指定的 HLS 缓存路径
+    // 然后使用外部存储路径（用户选择的外部存储设备，不是 eMMC）
+    // 最后使用默认路径
     std::env::var("HLS_CACHE_PATH")
         .or_else(|_| std::env::var("ROCKZERO_HLS_CACHE_DIR"))
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("./data/hls_cache"))
+        .unwrap_or_else(|_| {
+            if let Ok(ext) = std::env::var("EXTERNAL_STORAGE_PATH") {
+                std::path::PathBuf::from(ext).join("hls_cache")
+            } else {
+                std::path::PathBuf::from("/mnt/external/hls_cache")
+            }
+        })
 }
 
 #[allow(dead_code)]
@@ -1449,7 +1458,7 @@ async fn transcode_segment_with_seek(
     use tokio::time::{timeout, Duration};
 
     const SEGMENT_DURATION: f64 = 6.0;
-    const TRANSCODE_TIMEOUT_SECS: u64 = 90; // Increased for 4K content
+    const TRANSCODE_TIMEOUT_SECS: u64 = 180; // 180s for re-encoding (4K needs more time)
 
     let start_time = segment_index as f64 * SEGMENT_DURATION;
     let output_path = output_dir.join(format!("segment_{}.ts", segment_index));
@@ -1501,6 +1510,8 @@ async fn transcode_segment_with_seek(
     let video_path_str = video_path.to_str().unwrap_or("");
     let temp_path_str = temp_path.to_str().unwrap_or("");
 
+    // 首先尝试精确 seek 模式（-ss 在 -i 之后，更精确但更慢）
+    // 对于非零段落，使用两阶段 seek：先快速跳到附近关键帧，再精确定位
     let args = build_ffmpeg_args_optimized(
         hw_accel,
         video_path_str,
@@ -1527,10 +1538,15 @@ async fn transcode_segment_with_seek(
         }
         Err(_) => {
             let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(AppError::InternalServerError(format!(
-                "FFmpeg timeout for segment {} (exceeded {}s)",
+            // 超时后尝试使用更快的 stream copy 模式作为 fallback
+            warn!(
+                "FFmpeg timeout for segment {} ({}s), trying fast fallback",
                 segment_index, TRANSCODE_TIMEOUT_SECS
-            )));
+            );
+            return transcode_segment_fast_fallback(
+                video_path, output_dir, segment_index, start_time, SEGMENT_DURATION,
+            )
+            .await;
         }
     };
 
@@ -1538,6 +1554,16 @@ async fn transcode_segment_with_seek(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let _ = tokio::fs::remove_file(&temp_path).await;
         warn!("FFmpeg failed for segment {}: {}", segment_index, stderr);
+
+        // 如果 re-encode 失败，尝试 stream copy fallback
+        if stderr.contains("Error") || stderr.contains("error") {
+            warn!("Trying fast fallback for segment {}", segment_index);
+            return transcode_segment_fast_fallback(
+                video_path, output_dir, segment_index, start_time, SEGMENT_DURATION,
+            )
+            .await;
+        }
+
         return Err(AppError::InternalServerError(format!(
             "Transcode failed for segment {}: {}",
             segment_index, stderr
@@ -1584,6 +1610,133 @@ async fn transcode_segment_with_seek(
     Ok(segment_data)
 }
 
+/// Fast fallback: 使用 stream copy 模式快速生成段落
+/// 当 re-encode 超时或失败时使用，牺牲精确性换取速度
+async fn transcode_segment_fast_fallback(
+    video_path: &std::path::Path,
+    output_dir: &std::path::Path,
+    segment_index: usize,
+    start_time: f64,
+    duration: f64,
+) -> Result<Vec<u8>, AppError> {
+    use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
+
+    let output_path = output_dir.join(format!("segment_{}.ts", segment_index));
+    let temp_path = output_dir.join(format!(".segment_{}.ts.fast_tmp", segment_index));
+    let _ = tokio::fs::remove_file(&temp_path).await;
+
+    let ffmpeg_path = get_ffmpeg_path();
+    let video_path_str = video_path.to_str().unwrap_or("");
+    let temp_path_str = temp_path.to_str().unwrap_or("");
+
+    // Stream copy 模式：不重新编码，直接复制流
+    // 使用 -ss 在 -i 之前（input seeking）快速跳到关键帧
+    // 然后 -ss 在 -i 之后做精确裁剪（output seeking）
+    // 这种两阶段 seek 比纯 re-encode 快得多
+    let coarse_seek = if start_time > 10.0 {
+        start_time - 10.0 // 粗略跳到目标前 10 秒
+    } else {
+        0.0
+    };
+    let fine_seek = start_time - coarse_seek;
+
+    let mut args = vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "warning".to_string(),
+    ];
+
+    // 粗略 seek（在 -i 之前，快速跳到关键帧）
+    if coarse_seek > 0.0 {
+        args.extend(["-ss".to_string(), format!("{:.3}", coarse_seek)]);
+    }
+
+    args.extend(["-i".to_string(), video_path_str.to_string()]);
+
+    // 精确 seek（在 -i 之后，精确定位）
+    if fine_seek > 0.1 {
+        args.extend(["-ss".to_string(), format!("{:.3}", fine_seek)]);
+    }
+
+    args.extend([
+        "-t".to_string(),
+        format!("{:.3}", duration),
+        "-c:v".to_string(),
+        "copy".to_string(),
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-b:a".to_string(),
+        "192k".to_string(),
+        "-f".to_string(),
+        "mpegts".to_string(),
+        "-mpegts_copyts".to_string(),
+        "0".to_string(),
+        "-avoid_negative_ts".to_string(),
+        "make_zero".to_string(),
+        "-fflags".to_string(),
+        "+genpts+discardcorrupt".to_string(),
+        temp_path_str.to_string(),
+    ]);
+
+    let output = timeout(
+        Duration::from_secs(30), // stream copy 应该很快
+        Command::new(&ffmpeg_path).args(&args).output(),
+    )
+    .await
+    .map_err(|_| {
+        AppError::InternalServerError(format!(
+            "Fast fallback timeout for segment {}",
+            segment_index
+        ))
+    })?
+    .map_err(|e| {
+        AppError::IoError(format!(
+            "Fast fallback failed for segment {}: {}",
+            segment_index, e
+        ))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(AppError::InternalServerError(format!(
+            "Fast fallback transcode failed for segment {}: {}",
+            segment_index, stderr
+        )));
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    let segment_data = tokio::fs::read(&temp_path)
+        .await
+        .map_err(|e| AppError::IoError(format!("Failed to read fast segment: {}", e)))?;
+
+    if segment_data.len() < 188 {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(AppError::InternalServerError(format!(
+            "Fast segment {} too small: {} bytes",
+            segment_index,
+            segment_data.len()
+        )));
+    }
+
+    if let Err(e) = tokio::fs::rename(&temp_path, &output_path).await {
+        let _ = tokio::fs::write(&output_path, &segment_data).await;
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        warn!("Fast fallback rename failed: {}", e);
+    }
+
+    info!(
+        "Segment {} fast-fallback: {} bytes (stream copy)",
+        segment_index,
+        segment_data.len()
+    );
+
+    Ok(segment_data)
+}
+
 fn build_ffmpeg_args_optimized(
     hw_accel: HardwareAccel,
     input_path: &str,
@@ -1598,8 +1751,19 @@ fn build_ffmpeg_args_optimized(
         "-y".to_string(),
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
-        "error".to_string(),
+        "warning".to_string(),
     ]);
+
+    // 两阶段 seek 策略：
+    // 1. -ss 在 -i 之前：快速跳到目标附近的关键帧（input seeking）
+    // 2. -ss 在 -i 之后：精确定位到目标时间（output seeking）
+    // 这比纯 output seeking 快得多，同时保持精确性
+    let coarse_seek = if start_time > 15.0 {
+        start_time - 15.0 // 粗略跳到目标前 15 秒（确保包含关键帧）
+    } else {
+        0.0
+    };
+    let fine_seek = start_time - coarse_seek;
 
     match hw_accel {
         HardwareAccel::Vaapi => {
@@ -1615,90 +1779,108 @@ fn build_ffmpeg_args_optimized(
         HardwareAccel::RockchipRga => {
             args.extend(["-hwaccel".to_string(), "rkmpp".to_string()]);
         }
-        _ => {}
-    }
-
-    // Input seeking (fast, seeks to nearest keyframe before start_time)
-    args.extend(["-ss".to_string(), format!("{:.3}", start_time)]);
-    args.extend(["-i".to_string(), input_path.to_string()]);
-    args.extend(["-t".to_string(), format!("{:.3}", duration)]);
-
-    // Use copy mode for compatible formats (instant, no re-encoding)
-    // For 4K content, prefer stream copy to preserve quality and avoid slow re-encoding
-    // Only re-encode if source codec is incompatible with MPEG-TS container
-    let needs_reencode = false; // Prefer stream copy for maximum speed and quality
-
-    if needs_reencode {
-        match hw_accel {
-            HardwareAccel::AmlogicV4l2 => {
+        HardwareAccel::AmlogicDecodeOnly => {
+            if std::path::Path::new("/dev/video0").exists() {
                 args.extend([
-                    "-c:v".to_string(),
-                    "h264_v4l2m2m".to_string(),
-                    "-b:v".to_string(),
-                    "3M".to_string(),
-                    "-g".to_string(),
-                    "30".to_string(),
-                ]);
-            }
-            HardwareAccel::Vaapi => {
-                args.extend([
-                    "-vf".to_string(),
-                    "format=nv12|vaapi,hwupload,scale_vaapi=w=-2:h=720".to_string(),
-                    "-c:v".to_string(),
-                    "h264_vaapi".to_string(),
-                    "-qp".to_string(),
-                    "24".to_string(),
-                    "-g".to_string(),
-                    "30".to_string(),
-                ]);
-            }
-            HardwareAccel::RockchipRga => {
-                args.extend([
-                    "-c:v".to_string(),
-                    "h264_rkmpp".to_string(),
-                    "-b:v".to_string(),
-                    "3M".to_string(),
-                    "-g".to_string(),
-                    "30".to_string(),
-                ]);
-            }
-            _ => {
-                args.extend([
-                    "-c:v".to_string(),
-                    "libx264".to_string(),
-                    "-preset".to_string(),
-                    "ultrafast".to_string(),
-                    "-tune".to_string(),
-                    "fastdecode".to_string(),
-                    "-profile:v".to_string(),
-                    "high".to_string(),
-                    "-level".to_string(),
-                    "4.1".to_string(),
-                    "-crf".to_string(),
-                    "23".to_string(),
-                    "-g".to_string(),
-                    "30".to_string(),
-                    "-keyint_min".to_string(),
-                    "30".to_string(),
-                    "-sc_threshold".to_string(),
-                    "0".to_string(),
-                    "-bf".to_string(),
-                    "0".to_string(),
-                    "-threads".to_string(),
-                    "0".to_string(),
-                    "-vf".to_string(),
-                    "scale=-2:720:flags=fast_bilinear".to_string(),
+                    "-hwaccel".to_string(),
+                    "v4l2m2m".to_string(),
                 ]);
             }
         }
-    } else {
-        // Stream copy — near-instant, no quality loss
-        args.extend(["-c:v".to_string(), "copy".to_string()]);
+        _ => {}
     }
 
+    // 阶段 1: 粗略 seek（在 -i 之前，跳到关键帧）
+    if coarse_seek > 0.0 {
+        args.extend(["-ss".to_string(), format!("{:.3}", coarse_seek)]);
+    }
+
+    args.extend(["-i".to_string(), input_path.to_string()]);
+
+    // 阶段 2: 精确 seek（在 -i 之后，精确定位）
+    if fine_seek > 0.1 {
+        args.extend(["-ss".to_string(), format!("{:.3}", fine_seek)]);
+    }
+
+    // 精确持续时间
+    args.extend(["-t".to_string(), format!("{:.3}", duration)]);
+
+    // 视频编码 - 必须 re-encode 以保证精确的段落边界
+    match hw_accel {
+        HardwareAccel::AmlogicV4l2 => {
+            args.extend([
+                "-c:v".to_string(),
+                "h264_v4l2m2m".to_string(),
+                "-b:v".to_string(),
+                "4M".to_string(),
+                "-g".to_string(),
+                "60".to_string(),
+            ]);
+        }
+        HardwareAccel::Vaapi => {
+            args.extend([
+                "-vf".to_string(),
+                "format=nv12|vaapi,hwupload".to_string(),
+                "-c:v".to_string(),
+                "h264_vaapi".to_string(),
+                "-qp".to_string(),
+                "24".to_string(),
+                "-g".to_string(),
+                "60".to_string(),
+            ]);
+        }
+        HardwareAccel::RockchipRga => {
+            args.extend([
+                "-c:v".to_string(),
+                "h264_rkmpp".to_string(),
+                "-b:v".to_string(),
+                "4M".to_string(),
+                "-g".to_string(),
+                "60".to_string(),
+            ]);
+        }
+        _ => {
+            let height = video_info.as_ref().map(|i| i.height).unwrap_or(0);
+
+            let scale_filter = if height > 1080 {
+                Some("scale=-2:1080:flags=fast_bilinear".to_string())
+            } else {
+                None
+            };
+
+            if let Some(filter) = scale_filter {
+                args.extend(["-vf".to_string(), filter]);
+            }
+
+            args.extend([
+                "-c:v".to_string(),
+                "libx264".to_string(),
+                "-preset".to_string(),
+                "ultrafast".to_string(),
+                "-tune".to_string(),
+                "zerolatency".to_string(),
+                "-profile:v".to_string(),
+                "high".to_string(),
+                "-level".to_string(),
+                "4.1".to_string(),
+                "-crf".to_string(),
+                "23".to_string(),
+                "-g".to_string(),
+                "150".to_string(),
+                "-keyint_min".to_string(),
+                "25".to_string(),
+                "-sc_threshold".to_string(),
+                "0".to_string(),
+                "-bf".to_string(),
+                "0".to_string(),
+                "-threads".to_string(),
+                "0".to_string(),
+            ]);
+        }
+    }
+
+    // 音频编码
     if video_info.as_ref().map(|i| i.has_audio).unwrap_or(true) {
-        // Always transcode audio to AAC for universal compatibility
-        // DTS, AC3, TrueHD, PCM etc. are not supported by most mobile/web players
         args.extend([
             "-c:a".to_string(),
             "aac".to_string(),
@@ -1713,6 +1895,7 @@ fn build_ffmpeg_args_optimized(
         args.push("-an".to_string());
     }
 
+    // MPEG-TS 输出参数
     args.extend([
         "-f".to_string(),
         "mpegts".to_string(),
@@ -1720,8 +1903,12 @@ fn build_ffmpeg_args_optimized(
         "0".to_string(),
         "-avoid_negative_ts".to_string(),
         "make_zero".to_string(),
+        "-output_ts_offset".to_string(),
+        "0".to_string(),
         "-max_muxing_queue_size".to_string(),
-        "1024".to_string(),
+        "2048".to_string(),
+        "-fflags".to_string(),
+        "+genpts+discardcorrupt".to_string(),
     ]);
 
     args.push(output_path.to_string());

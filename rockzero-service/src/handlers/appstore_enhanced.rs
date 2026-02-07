@@ -7,92 +7,34 @@ use reqwest::Client;
 use rockzero_common::AppError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::{fs, time::SystemTime};
-use tracing::warn;
-
-#[cfg(target_os = "linux")]
-use std::process::Command;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const DEFAULT_APPSTORE_ROOT: &str = "./data/appstore";
 
-const ISTOREOS_STORE_URLS: &[&str] = &[
-    "https://istore.linkease.com/repo/all/store/Packages.json",
-    "https://ghp.ci/https://raw.githubusercontent.com/linkease/istore-packages/main/Packages.json",
-    "https://gh-proxy.com/https://raw.githubusercontent.com/linkease/istore-packages/main/Packages.json",
-];
-
-// CasaOS App Store URLs - 使用中国大陆可访问的镜像源
-// jsdelivr.net 在中国大陆已不可用，raw.githubusercontent.com 也经常被墙
-// 使用 GitHub 加速镜像和多个备用源
-const CASAOS_STORE_URLS: &[&str] = &[
-    // Cp0204 AppStore-Play - 使用 GitHub 加速代理（中国大陆友好）
-    "https://ghp.ci/https://raw.githubusercontent.com/Cp0204/CasaOS-AppStore-Play/main/Apps/appstore.json",
-    "https://gh-proxy.com/https://raw.githubusercontent.com/Cp0204/CasaOS-AppStore-Play/main/Apps/appstore.json",
-    "https://mirror.ghproxy.com/https://raw.githubusercontent.com/Cp0204/CasaOS-AppStore-Play/main/Apps/appstore.json",
-    // BigBearTechWorld 官方 CasaOS 应用商店
-    "https://ghp.ci/https://raw.githubusercontent.com/bigbeartechworld/big-bear-casaos/master/Apps/big-bear-casaos-apps.json",
-    "https://gh-proxy.com/https://raw.githubusercontent.com/bigbeartechworld/big-bear-casaos/master/Apps/big-bear-casaos-apps.json",
-    // 直连 GitHub（作为最后的备用）
-    "https://raw.githubusercontent.com/Cp0204/CasaOS-AppStore-Play/main/Apps/appstore.json",
-    "https://raw.githubusercontent.com/bigbeartechworld/big-bear-casaos/master/Apps/big-bear-casaos-apps.json",
-];
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "lowercase")]
-pub enum AppPackageKind {
-    Wasm,
-    Docker,
-    Ipk,
-}
-
-impl AppPackageKind {
-    fn dir_name(&self) -> &'static str {
-        match self {
-            AppPackageKind::Wasm => "wasm",
-            AppPackageKind::Docker => "docker",
-            AppPackageKind::Ipk => "ipk",
-        }
-    }
-
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            AppPackageKind::Wasm => "WASM Application",
-            AppPackageKind::Docker => "Docker Container (CasaOS)",
-            AppPackageKind::Ipk => "IPK Package (iStoreOS/OpenWRT)",
-        }
-    }
-
-    pub fn description(&self) -> &'static str {
-        match self {
-            AppPackageKind::Wasm => "Custom WASM-based online application with flexible rules",
-            AppPackageKind::Docker => "Docker-based application from CasaOS App Store",
-            AppPackageKind::Ipk => "OpenWRT IPK package from iStoreOS",
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct AppPackage {
+pub struct WasmAppPackage {
     pub id: String,
     pub name: String,
-    pub kind: AppPackageKind,
     pub source_url: String,
     pub installed_path: String,
     pub blake3: String,
     pub size_bytes: u64,
     pub created_at: i64,
     pub manifest: Option<Value>,
-    pub status: AppStatus,
-    pub container_id: Option<String>,
+    pub status: WasmAppStatus,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    pub author: Option<String>,
+    pub icon_url: Option<String>,
+    pub permissions: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
-pub enum AppStatus {
+pub enum WasmAppStatus {
     Installed,
     Running,
     Stopped,
@@ -100,692 +42,27 @@ pub enum AppStatus {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct PackageInstallRequest {
+pub struct WasmInstallRequest {
     pub name: Option<String>,
     pub url: String,
-    pub kind: AppPackageKind,
     pub expected_blake3: Option<String>,
     pub manifest_url: Option<String>,
-    pub auto_start: Option<bool>,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    pub author: Option<String>,
+    pub icon_url: Option<String>,
+    pub permissions: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct AppStoreList {
-    pub apps: Vec<AppStoreItem>,
+pub struct WasmAppList {
+    pub apps: Vec<WasmAppPackage>,
     pub total: usize,
-    pub source: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct AppStoreItem {
-    pub id: String,
-    pub name: String,
-    pub display_name: String,
-    pub description: String,
-    pub icon: String,
-    pub category: String,
-    pub docker_image: String,
-    pub recommended_tag: String,
-    pub default_ports: Vec<PortMappingInfo>,
-    pub default_volumes: Vec<VolumeMappingInfo>,
-    pub required_env: Vec<String>,
-    // 额外的元数据字段（Flutter 端可选使用）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub author: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub architectures: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub installed: Option<bool>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct PortMappingInfo {
-    pub container_port: u16,
-    pub host_port: u16,
-    pub protocol: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct VolumeMappingInfo {
-    pub container_path: String,
-    pub host_path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
-}
-
-pub async fn list_casaos_apps() -> Result<HttpResponse, AppError> {
-    info!("Fetching CasaOS app store...");
-
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .pool_max_idle_per_host(10)
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .gzip(true)
-        .brotli(true)
-        .deflate(true)
-        .use_rustls_tls()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(|e| {
-            error!("Failed to create HTTP client: {}", e);
-            AppError::InternalServerError(e.to_string())
-        })?;
-
-    let mut last_error = String::new();
-    
-    for store_url in CASAOS_STORE_URLS {
-        for attempt in 1..=2 {
-            info!("Attempt {} to fetch CasaOS store from {}", attempt, store_url);
-
-            match client
-                .get(*store_url)
-                .header("Accept", "application/json, text/plain, */*")
-                .header("Accept-Language", "en-US,en;q=0.9")
-                .header("Cache-Control", "no-cache")
-                .header("Connection", "keep-alive")
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    let status = response.status();
-                    info!("Response status: {}", status);
-
-                    if !status.is_success() {
-                        error!("CasaOS store returned error: {}", status);
-                        last_error = format!("CasaOS store returned status: {}", status);
-                        if attempt < 2 {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            continue;
-                        }
-                    } else {
-                        match response.text().await {
-                            Ok(text) => {
-                                info!("Received {} bytes of data", text.len());
-
-                                match serde_json::from_str::<Value>(&text) {
-                                    Ok(apps_json) => {
-                                        let installed_packages = load_packages()?;
-                                        let installed_ids: HashMap<String, bool> = installed_packages
-                                            .iter()
-                                            .map(|p| (p.id.clone(), true))
-                                            .collect();
-
-                                        let mut apps = Vec::new();
-                                        
-                                        if let Some(app_list) = apps_json.as_array() {
-                                            info!("Processing {} apps from CasaOS store", app_list.len());
-                                            for app in app_list {
-                                                if let Some(item) = parse_casaos_app(app, &installed_ids) {
-                                                    apps.push(item);
-                                                }
-                                            }
-                                        } else if let Some(data) = apps_json.get("data").and_then(|d| d.as_array()) {
-                                            info!("Processing {} apps from CasaOS store (nested data)", data.len());
-                                            for app in data {
-                                                if let Some(item) = parse_casaos_app(app, &installed_ids) {
-                                                    apps.push(item);
-                                                }
-                                            }
-                                        } else if let Some(data) = apps_json.get("apps").and_then(|d| d.as_array()) {
-                                            info!("Processing {} apps from CasaOS store (apps field)", data.len());
-                                            for app in data {
-                                                if let Some(item) = parse_casaos_app(app, &installed_ids) {
-                                                    apps.push(item);
-                                                }
-                                            }
-                                        } else if apps_json.is_object() {
-                                            info!("Processing apps from CasaOS store (object format)");
-                                            for (key, app) in apps_json.as_object().unwrap() {
-                                                if app.is_object() {
-                                                    let mut app_with_id = app.clone();
-                                                    if app_with_id.get("id").is_none() {
-                                                        if let Some(obj) = app_with_id.as_object_mut() {
-                                                            obj.insert("id".to_string(), Value::String(key.clone()));
-                                                        }
-                                                    }
-                                                    if let Some(item) = parse_casaos_app(&app_with_id, &installed_ids) {
-                                                        apps.push(item);
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            warn!("Unexpected JSON structure from CasaOS store");
-                                        }
-
-                                        let total = apps.len();
-                                        info!("Successfully parsed {} CasaOS apps", total);
-
-                                        return Ok(HttpResponse::Ok().json(AppStoreList {
-                                            apps,
-                                            total,
-                                            source: "casaos".to_string(),
-                                        }));
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to parse JSON: {}", e);
-                                        last_error = format!("Invalid JSON from CasaOS store: {}", e);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to read response text: {}", e);
-                                last_error = format!("Failed to read response: {}", e);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Network error (attempt {}): {}", attempt, e);
-                    last_error = format!("Network error: {}", e);
-                    if attempt < 2 {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        continue;
-                    }
-                }
-            }
-        }
-    }
-
-    warn!("CasaOS store unavailable, returning empty list. Last error: {}", last_error);
-    Ok(HttpResponse::Ok().json(AppStoreList {
-        apps: Vec::new(),
-        total: 0,
-        source: "casaos".to_string(),
-    }))
-}
-
-fn parse_casaos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<AppStoreItem> {
-    let id = app.get("id")
-        .or_else(|| app.get("name"))
-        .or_else(|| app.get("title"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())?;
-    
-    let name = app.get("name")
-        .or_else(|| app.get("title"))
-        .or_else(|| app.get("id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())?;
-    
-    let display_name = app.get("title")
-        .or_else(|| app.get("name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(&name)
-        .to_string();
-    
-    let description = app.get("description")
-        .or_else(|| app.get("tagline"))
-        .or_else(|| app.get("short_description"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    
-    let version = app.get("version")
-        .or_else(|| app.get("main").and_then(|m| m.get("version")))
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            app.get("image")
-                .and_then(|i| i.as_str())
-                .and_then(|s| s.split(':').last())
-        })
-        .unwrap_or("latest")
-        .to_string();
-    
-    let icon = app.get("icon")
-        .or_else(|| app.get("image"))
-        .or_else(|| app.get("thumbnail"))
-        .or_else(|| app.get("logo"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    
-    let category = app.get("category")
-        .or_else(|| app.get("categories").and_then(|c| c.as_array()).and_then(|arr| arr.first()))
-        .and_then(|v| v.as_str())
-        .unwrap_or("Other")
-        .to_string();
-    
-    let author = app.get("author")
-        .or_else(|| app.get("developer"))
-        .or_else(|| app.get("maintainer"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    
-    // 提取 docker image 信息
-    let docker_image = app.get("docker_image")
-        .or_else(|| app.get("image"))
-        .or_else(|| app.get("container").and_then(|c| c.get("image")))
-        .or_else(|| app.get("compose_url"))
-        .or_else(|| app.get("url"))
-        .or_else(|| app.get("source"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("docker://{}", id));
-
-    let recommended_tag = app.get("recommended_tag")
-        .or_else(|| app.get("tag"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(&version)
-        .to_string();
-
-    // 提取端口映射
-    let default_ports = app.get("ports")
-        .or_else(|| app.get("container").and_then(|c| c.get("ports")))
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|p| {
-                    let container_port = p.get("container")
-                        .or_else(|| p.get("container_port"))
-                        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-                        .unwrap_or(0) as u16;
-                    let host_port = p.get("host")
-                        .or_else(|| p.get("host_port"))
-                        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-                        .unwrap_or(container_port as u64) as u16;
-                    if container_port > 0 {
-                        Some(PortMappingInfo {
-                            container_port,
-                            host_port,
-                            protocol: p.get("protocol")
-                                .or_else(|| p.get("type"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("tcp")
-                                .to_string(),
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // 提取卷映射
-    let default_volumes = app.get("volumes")
-        .or_else(|| app.get("container").and_then(|c| c.get("volumes")))
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| {
-                    let container_path = v.get("container")
-                        .or_else(|| v.get("container_path"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let host_path = v.get("host")
-                        .or_else(|| v.get("host_path"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if !container_path.is_empty() {
-                        Some(VolumeMappingInfo {
-                            container_path,
-                            host_path,
-                            mode: v.get("mode").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // 提取必需的环境变量
-    let required_env = app.get("envs")
-        .or_else(|| app.get("environment"))
-        .or_else(|| app.get("container").and_then(|c| c.get("envs")))
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|e| {
-                    e.get("key")
-                        .or_else(|| e.get("name"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let architectures = app
-        .get("arch")
-        .or_else(|| app.get("architectures"))
-        .or_else(|| app.get("supported_architectures"))
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_else(|| vec!["amd64".to_string(), "arm64".to_string()]);
-
-    Some(AppStoreItem {
-        id: id.clone(),
-        name,
-        display_name: display_name,
-        description,
-        icon,
-        category,
-        docker_image,
-        recommended_tag,
-        default_ports,
-        default_volumes,
-        required_env,
-        source: Some("casaos".to_string()),
-        version: Some(version),
-        author,
-        architectures: Some(architectures),
-        installed: Some(installed.contains_key(&id)),
-    })
-}
-
-pub async fn list_istoreos_apps() -> Result<HttpResponse, AppError> {
-    info!("Fetching iStoreOS app store...");
-
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .user_agent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36")
-        .gzip(true)
-        .brotli(true)
-        .deflate(true)
-        .use_rustls_tls()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-
-    let mut last_error = String::new();
-
-    for store_url in ISTOREOS_STORE_URLS {
-        for attempt in 1..=2 {
-            info!("Attempt {} to fetch iStoreOS store from {}", attempt, store_url);
-
-            match client
-                .get(*store_url)
-                .header("Accept", "application/json, text/plain, */*")
-                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-                .header("Cache-Control", "no-cache")
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    let status = response.status();
-                    info!("iStoreOS response status: {}", status);
-
-                    if !status.is_success() {
-                        warn!("iStoreOS store returned error: {}", status);
-                        last_error = format!("iStoreOS store returned status: {}", status);
-                        if attempt < 2 {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            continue;
-                        }
-                    } else {
-                        match response.text().await {
-                            Ok(text) => {
-                                info!("iStoreOS received {} bytes of data", text.len());
-
-                                match serde_json::from_str::<Value>(&text) {
-                                    Ok(apps_json) => {
-                                        let installed_packages = load_packages()?;
-                                        let installed_ids: HashMap<String, bool> = installed_packages
-                                            .iter()
-                                            .map(|p| (p.id.clone(), true))
-                                            .collect();
-
-                                        let mut apps = Vec::new();
-                                        if let Some(app_list) = apps_json.as_array() {
-                                            for app in app_list {
-                                                if let Some(item) = parse_istoreos_app(app, &installed_ids) {
-                                                    apps.push(item);
-                                                }
-                                            }
-                                        } else if let Some(data) = apps_json.get("packages").and_then(|d| d.as_array()) {
-                                            for app in data {
-                                                if let Some(item) = parse_istoreos_app(app, &installed_ids) {
-                                                    apps.push(item);
-                                                }
-                                            }
-                                        } else if apps_json.is_object() {
-                                            // 尝试解析对象格式
-                                            for (key, app) in apps_json.as_object().unwrap() {
-                                                if app.is_object() {
-                                                    let mut app_with_id = app.clone();
-                                                    if app_with_id.get("name").is_none() {
-                                                        if let Some(obj) = app_with_id.as_object_mut() {
-                                                            obj.insert("name".to_string(), Value::String(key.clone()));
-                                                        }
-                                                    }
-                                                    if let Some(item) = parse_istoreos_app(&app_with_id, &installed_ids) {
-                                                        apps.push(item);
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        let total = apps.len();
-                                        info!("Successfully parsed {} iStoreOS apps", total);
-
-                                        return Ok(HttpResponse::Ok().json(AppStoreList {
-                                            apps,
-                                            total,
-                                            source: "istoreos".to_string(),
-                                        }));
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to parse iStoreOS JSON: {}", e);
-                                        last_error = format!("Invalid JSON from iStoreOS: {}", e);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to read iStoreOS response: {}", e);
-                                last_error = format!("Failed to read response: {}", e);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("iStoreOS network error (attempt {}): {}", attempt, e);
-                    last_error = format!("Network error: {}", e);
-                    if attempt < 2 {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        continue;
-                    }
-                }
-            }
-        }
-    }
-
-    warn!("iStoreOS store unavailable, returning empty list. Last error: {}", last_error);
-    Ok(HttpResponse::Ok().json(AppStoreList {
-        apps: Vec::new(),
-        total: 0,
-        source: "istoreos".to_string(),
-    }))
-}
-
-fn parse_istoreos_app(app: &Value, installed: &HashMap<String, bool>) -> Option<AppStoreItem> {
-    let name = app.get("name")
-        .or_else(|| app.get("Package"))
-        .and_then(|v| v.as_str())?
-        .to_string();
-    let id = format!("istoreos_{}", name);
-    let display_name = app
-        .get("title")
-        .or_else(|| app.get("Title"))
-        .or_else(|| app.get("Description"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(&name)
-        .to_string();
-    let description = app.get("summary")
-        .or_else(|| app.get("description"))
-        .or_else(|| app.get("Description"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let version = app.get("version")
-        .or_else(|| app.get("Version"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("latest")
-        .to_string();
-    let icon = app
-        .get("icon")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let category = app
-        .get("category")
-        .or_else(|| app.get("Section"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("iStoreOS")
-        .to_string();
-    let author = app
-        .get("maintainer")
-        .or_else(|| app.get("Maintainer"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let docker_image = app.get("download_url")
-        .or_else(|| app.get("Filename"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let architectures = app
-        .get("platforms")
-        .or_else(|| app.get("Architecture"))
-        .and_then(|v| {
-            if let Some(arr) = v.as_array() {
-                Some(arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<_>>())
-            } else if let Some(s) = v.as_str() {
-                Some(vec![s.to_string()])
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| vec!["all".to_string()]);
-
-    Some(AppStoreItem {
-        id: id.clone(),
-        name,
-        display_name,
-        description,
-        icon,
-        category,
-        docker_image,
-        recommended_tag: version.clone(),
-        default_ports: Vec::new(),
-        default_volumes: Vec::new(),
-        required_env: Vec::new(),
-        source: Some("istoreos".to_string()),
-        version: Some(version),
-        author,
-        architectures: Some(architectures),
-        installed: Some(installed.contains_key(&id)),
-    })
-}
-
-pub async fn install_ipk_package(
-    body: web::Json<PackageInstallRequest>,
-    req: HttpRequest,
-) -> Result<HttpResponse, AppError> {
-    crate::middleware::verify_fido2_or_passkey(&req).await?;
-
-    info!("Installing IPK package from {}", body.url);
-
-    let client = Client::builder()
-        .build()
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-
-    let response = client
-        .get(&body.url)
-        .send()
-        .await
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
-
-    if !response.status().is_success() {
-        return Err(AppError::BadRequest(
-            "Failed to download IPK package".to_string(),
-        ));
-    }
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
-
-    let digest = blake3_hex(&bytes);
-    if let Some(expected) = &body.expected_blake3 {
-        if expected != &digest {
-            return Err(AppError::PreconditionFailed("BLAKE3 mismatch".to_string()));
-        }
-    }
-
-    let dir = ensure_storage(&AppPackageKind::Ipk)?;
-    let filename = body.name.clone().unwrap_or_else(|| {
-        body.url
-            .rsplit('/')
-            .next()
-            .unwrap_or("package.ipk")
-            .to_string()
-    });
-    let safe_filename = sanitize_filename(&filename);
-    let target = dir.join(&safe_filename);
-
-    fs::write(&target, &bytes).map_err(|e| AppError::IoError(e.to_string()))?;
-
-    #[cfg(target_os = "linux")]
-    {
-        info!("Installing IPK with opkg...");
-        let output = Command::new("opkg")
-            .args(["install", target.to_str().unwrap()])
-            .output()
-            .map_err(|e| AppError::BadRequest(format!("Failed to run opkg: {}", e)))?;
-
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr);
-            error!("IPK installation failed: {}", err);
-            return Err(AppError::BadRequest(format!(
-                "IPK installation failed: {}",
-                err
-            )));
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        warn!("IPK installation is only supported on Linux");
-    }
-
-    let mut packages = load_packages()?;
-    let record = AppPackage {
-        id: Uuid::new_v4().to_string(),
-        name: safe_filename,
-        kind: AppPackageKind::Ipk,
-        source_url: body.url.clone(),
-        installed_path: target.to_str().unwrap().to_string(),
-        blake3: digest,
-        size_bytes: bytes.len() as u64,
-        created_at: now_epoch_seconds(),
-        manifest: None,
-        status: AppStatus::Installed,
-        container_id: None,
-    };
-
-    packages.push(record.clone());
-    save_packages(&packages)?;
-
-    info!("IPK package installed successfully");
-    Ok(HttpResponse::Created().json(record))
+#[derive(Debug, Deserialize)]
+pub struct UpdateStatusRequest {
+    pub status: WasmAppStatus,
 }
 
 fn appstore_root() -> PathBuf {
@@ -795,19 +72,19 @@ fn appstore_root() -> PathBuf {
 }
 
 fn index_path(root: &Path) -> PathBuf {
-    root.join("index.json")
+    root.join("wasm_enhanced_index.json")
 }
 
-fn ensure_storage(kind: &AppPackageKind) -> Result<PathBuf, AppError> {
+fn ensure_wasm_storage() -> Result<PathBuf, AppError> {
     let root = appstore_root();
     fs::create_dir_all(&root).map_err(|e| AppError::IoError(e.to_string()))?;
 
-    let dir = root.join(kind.dir_name());
+    let dir = root.join("wasm");
     fs::create_dir_all(&dir).map_err(|e| AppError::IoError(e.to_string()))?;
     Ok(dir)
 }
 
-fn load_packages() -> Result<Vec<AppPackage>, AppError> {
+fn load_packages() -> Result<Vec<WasmAppPackage>, AppError> {
     let root = appstore_root();
     fs::create_dir_all(&root).map_err(|e| AppError::IoError(e.to_string()))?;
     let path = index_path(&root);
@@ -819,7 +96,7 @@ fn load_packages() -> Result<Vec<AppPackage>, AppError> {
     serde_json::from_str(&data).map_err(|e| AppError::BadRequest(e.to_string()))
 }
 
-fn save_packages(entries: &[AppPackage]) -> Result<(), AppError> {
+fn save_packages(entries: &[WasmAppPackage]) -> Result<(), AppError> {
     let root = appstore_root();
     fs::create_dir_all(&root).map_err(|e| AppError::IoError(e.to_string()))?;
     let path = index_path(&root);
@@ -843,4 +120,397 @@ fn now_epoch_seconds() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// GET /api/v1/appstore-enhanced/wasm/apps - 列出所有已安装的 WASM 应用
+pub async fn list_wasm_apps() -> Result<HttpResponse, AppError> {
+    info!("📦 Listing enhanced WASM apps");
+
+    let packages = match load_packages() {
+        Ok(pkgs) => {
+            info!("✅ Found {} WASM apps", pkgs.len());
+            pkgs
+        }
+        Err(e) => {
+            warn!("⚠️ Failed to load WASM apps: {:?}, returning empty list", e);
+            Vec::new()
+        }
+    };
+
+    let total = packages.len();
+    Ok(HttpResponse::Ok().json(WasmAppList {
+        apps: packages,
+        total,
+    }))
+}
+
+/// GET /api/v1/appstore-enhanced/wasm/apps/{id} - 获取单个 WASM 应用详情
+pub async fn get_wasm_app(path: web::Path<String>) -> Result<HttpResponse, AppError> {
+    let app_id = path.into_inner();
+    info!("📦 Getting WASM app details: {}", app_id);
+
+    let packages = load_packages()?;
+    let package = packages
+        .iter()
+        .find(|p| p.id == app_id)
+        .ok_or_else(|| AppError::NotFound(format!("WASM app {} not found", app_id)))?;
+
+    Ok(HttpResponse::Ok().json(package))
+}
+
+/// POST /api/v1/appstore-enhanced/wasm/install - 安装 WASM 应用（增强版，带验证和元数据）
+pub async fn install_wasm_app(
+    body: web::Json<WasmInstallRequest>,
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+
+    info!("📦 Installing WASM app from {}", body.url);
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+    let response = client
+        .get(&body.url)
+        .send()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Failed to download WASM package: {}", e)))?;
+
+    if !response.status().is_success() {
+        return Err(AppError::BadRequest(
+            "Failed to download WASM package".to_string(),
+        ));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Failed to read response: {}", e)))?;
+
+    let digest = blake3_hex(&bytes);
+    if let Some(expected) = &body.expected_blake3 {
+        if expected != &digest {
+            return Err(AppError::PreconditionFailed(format!(
+                "BLAKE3 mismatch: expected {}, got {}",
+                expected, digest
+            )));
+        }
+    }
+
+    // Validate that the downloaded bytes are a valid WASM module
+    let engine = wasmtime::Engine::default();
+    wasmtime::Module::new(&engine, &bytes)
+        .map_err(|e| AppError::BadRequest(format!("Invalid WASM module: {}", e)))?;
+
+    let dir = ensure_wasm_storage()?;
+    let filename = body.name.clone().unwrap_or_else(|| {
+        body.url
+            .rsplit('/')
+            .next()
+            .unwrap_or("module.wasm")
+            .to_string()
+    });
+    let safe_filename = sanitize_filename(&filename);
+    let target = dir.join(&safe_filename);
+
+    if target.exists() {
+        return Err(AppError::Conflict(
+            "WASM package already exists".to_string(),
+        ));
+    }
+
+    fs::write(&target, &bytes).map_err(|e| AppError::IoError(e.to_string()))?;
+
+    // Fetch optional manifest
+    let manifest = if let Some(manifest_url) = &body.manifest_url {
+        if !manifest_url.is_empty() {
+            match client.get(manifest_url).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.text().await {
+                    Ok(text) => serde_json::from_str::<Value>(&text).ok(),
+                    Err(e) => {
+                        warn!("Failed to read manifest response: {}", e);
+                        None
+                    }
+                },
+                Ok(resp) => {
+                    warn!("Manifest download returned status: {}", resp.status());
+                    None
+                }
+                Err(e) => {
+                    warn!("Failed to download manifest: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut packages = load_packages()?;
+    let record = WasmAppPackage {
+        id: Uuid::new_v4().to_string(),
+        name: safe_filename,
+        source_url: body.url.clone(),
+        installed_path: target.to_str().unwrap_or(DEFAULT_APPSTORE_ROOT).to_string(),
+        blake3: digest.clone(),
+        size_bytes: bytes.len() as u64,
+        created_at: now_epoch_seconds(),
+        manifest,
+        status: WasmAppStatus::Installed,
+        version: body.version.clone(),
+        description: body.description.clone(),
+        author: body.author.clone(),
+        icon_url: body.icon_url.clone(),
+        permissions: body.permissions.clone().unwrap_or_default(),
+    };
+
+    packages.push(record.clone());
+    save_packages(&packages)?;
+
+    info!(
+        "✅ WASM app installed: {} (blake3: {})",
+        record.name, digest
+    );
+    Ok(HttpResponse::Created().json(record))
+}
+
+/// DELETE /api/v1/appstore-enhanced/wasm/apps/{id} - 卸载 WASM 应用
+pub async fn uninstall_wasm_app(
+    path: web::Path<String>,
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+
+    let app_id = path.into_inner();
+    info!("🗑️ Uninstalling WASM app: {}", app_id);
+
+    let mut packages = load_packages()?;
+
+    if let Some(index) = packages.iter().position(|p| p.id == app_id) {
+        let entry = packages.remove(index);
+        if !entry.installed_path.is_empty() {
+            let file_path = Path::new(&entry.installed_path);
+            if file_path.exists() {
+                if let Err(e) = fs::remove_file(file_path) {
+                    warn!("Failed to remove WASM file {}: {}", entry.installed_path, e);
+                }
+            }
+        }
+        save_packages(&packages)?;
+
+        info!("✅ WASM app uninstalled: {}", entry.name);
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "status": "removed",
+            "id": app_id,
+            "name": entry.name,
+        })));
+    }
+
+    Err(AppError::NotFound(format!("WASM app {} not found", app_id)))
+}
+
+/// PUT /api/v1/appstore-enhanced/wasm/apps/{id}/status - 更新 WASM 应用状态
+pub async fn update_wasm_app_status(
+    path: web::Path<String>,
+    body: web::Json<UpdateStatusRequest>,
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+
+    let app_id = path.into_inner();
+    info!(
+        "📦 Updating WASM app status: {} -> {:?}",
+        app_id, body.status
+    );
+
+    let mut packages = load_packages()?;
+
+    if let Some(app) = packages.iter_mut().find(|p| p.id == app_id) {
+        app.status = body.status.clone();
+        save_packages(&packages)?;
+
+        info!(
+            "✅ WASM app status updated: {} -> {:?}",
+            app_id, body.status
+        );
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "status": "updated",
+            "id": app_id,
+            "new_status": body.status,
+        })));
+    }
+
+    Err(AppError::NotFound(format!("WASM app {} not found", app_id)))
+}
+
+/// POST /api/v1/appstore-enhanced/wasm/apps/{id}/run - 运行 WASM 应用
+pub async fn run_wasm_app(
+    path: web::Path<String>,
+    body: web::Json<RunWasmAppRequest>,
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+
+    let app_id = path.into_inner();
+    info!("▶️ Running WASM app: {}", app_id);
+
+    let mut packages = load_packages()?;
+    let app = packages
+        .iter()
+        .find(|p| p.id == app_id)
+        .ok_or_else(|| AppError::NotFound(format!("WASM app {} not found", app_id)))?;
+
+    let wasm_path = &app.installed_path;
+    if !Path::new(wasm_path).exists() {
+        return Err(AppError::NotFound(
+            "WASM module file not found on disk".to_string(),
+        ));
+    }
+
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::from_file(&engine, wasm_path)
+        .map_err(|e| AppError::BadRequest(format!("Failed to load WASM module: {}", e)))?;
+
+    let mut linker = wasmtime::Linker::new(&engine);
+    wasmtime_wasi::add_to_linker(&mut linker, |cx| cx)
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+    let mut builder = wasmtime_wasi::sync::WasiCtxBuilder::new();
+    builder.inherit_stdio();
+
+    if let Some(args) = &body.args {
+        for arg in args {
+            builder
+                .arg(arg)
+                .map_err(|e| AppError::ValidationError(format!("Invalid WASM arg: {}", e)))?;
+        }
+    }
+
+    if let Some(env) = &body.env {
+        for (key, value) in env {
+            builder
+                .env(key, value)
+                .map_err(|e| AppError::ValidationError(format!("Invalid env var: {}", e)))?;
+        }
+    }
+
+    let mut store = wasmtime::Store::new(&engine, builder.build());
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .map_err(|e| AppError::BadRequest(format!("Failed to instantiate WASM: {}", e)))?;
+
+    let func_name = body
+        .function
+        .clone()
+        .unwrap_or_else(|| "_start".to_string());
+
+    // Update status to Running
+    if let Some(app_mut) = packages.iter_mut().find(|p| p.id == app_id) {
+        app_mut.status = WasmAppStatus::Running;
+        let _ = save_packages(&packages);
+    }
+
+    let exec_result = if let Ok(entry) = instance.get_typed_func::<(), ()>(&mut store, &func_name) {
+        entry.call(&mut store, ()).map_err(|e| e.to_string())
+    } else if let Some(func) = instance.get_func(&mut store, &func_name) {
+        func.call(&mut store, &[], &mut [])
+            .map_err(|e| e.to_string())
+    } else {
+        Err(format!("Function '{}' not found in WASM module", func_name))
+    };
+
+    // Update status based on result
+    let mut packages = load_packages().unwrap_or_default();
+    match &exec_result {
+        Ok(()) => {
+            if let Some(app_mut) = packages.iter_mut().find(|p| p.id == app_id) {
+                app_mut.status = WasmAppStatus::Stopped;
+                let _ = save_packages(&packages);
+            }
+            info!("✅ WASM app executed successfully: {}", app_id);
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "status": "completed",
+                "id": app_id,
+                "function": func_name,
+            })))
+        }
+        Err(err_msg) => {
+            if let Some(app_mut) = packages.iter_mut().find(|p| p.id == app_id) {
+                app_mut.status = WasmAppStatus::Error;
+                let _ = save_packages(&packages);
+            }
+            error!("❌ WASM app execution failed: {}: {}", app_id, err_msg);
+            Err(AppError::BadRequest(format!(
+                "WASM execution failed: {}",
+                err_msg
+            )))
+        }
+    }
+}
+
+/// 运行 WASM 应用请求
+#[derive(Debug, Deserialize)]
+pub struct RunWasmAppRequest {
+    pub function: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub env: Option<std::collections::HashMap<String, String>>,
+}
+
+/// POST /api/v1/appstore-enhanced/wasm/validate - 验证 WASM 模块（不安装）
+pub async fn validate_wasm_module(
+    body: web::Bytes,
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+
+    info!("🔍 Validating WASM module ({} bytes)", body.len());
+
+    if body.is_empty() {
+        return Err(AppError::BadRequest(
+            "Empty WASM module provided".to_string(),
+        ));
+    }
+
+    let engine = wasmtime::Engine::default();
+    match wasmtime::Module::new(&engine, &body) {
+        Ok(module) => {
+            let exports: Vec<String> = module
+                .exports()
+                .map(|e| format!("{}:{:?}", e.name(), e.ty()))
+                .collect();
+            let imports: Vec<String> = module
+                .imports()
+                .map(|i| format!("{}::{}", i.module(), i.name()))
+                .collect();
+
+            let hash = blake3_hex(&body);
+
+            info!(
+                "✅ WASM module is valid ({} exports, {} imports)",
+                exports.len(),
+                imports.len()
+            );
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "valid": true,
+                "size_bytes": body.len(),
+                "blake3": hash,
+                "exports_count": exports.len(),
+                "imports_count": imports.len(),
+                "exports": exports,
+                "imports": imports,
+            })))
+        }
+        Err(e) => {
+            warn!("❌ Invalid WASM module: {}", e);
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "valid": false,
+                "error": e.to_string(),
+                "size_bytes": body.len(),
+            })))
+        }
+    }
 }
