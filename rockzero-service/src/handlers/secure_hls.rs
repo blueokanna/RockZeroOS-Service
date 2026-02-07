@@ -1555,6 +1555,45 @@ async fn transcode_segment_with_seek(
         let _ = tokio::fs::remove_file(&temp_path).await;
         warn!("FFmpeg failed for segment {}: {}", segment_index, stderr);
 
+        // 如果是 hwaccel 相关错误，使用纯软件模式重试一次
+        if stderr.contains("hwaccel") || stderr.contains("Unrecognized") || stderr.contains("hwaccel_device") {
+            warn!("Hardware acceleration error detected, retrying with software encoding for segment {}", segment_index);
+            let sw_args = build_ffmpeg_args_optimized(
+                HardwareAccel::None,
+                video_path_str,
+                temp_path_str,
+                start_time,
+                SEGMENT_DURATION,
+                &video_info,
+            );
+            let sw_result = timeout(
+                Duration::from_secs(TRANSCODE_TIMEOUT_SECS),
+                Command::new(&ffmpeg_path).args(&sw_args).output(),
+            )
+            .await;
+
+            if let Ok(Ok(sw_output)) = sw_result {
+                if sw_output.status.success() {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    if temp_path.exists() {
+                        let segment_data = tokio::fs::read(&temp_path)
+                            .await
+                            .map_err(|e| AppError::IoError(format!("Failed to read segment: {}", e)))?;
+                        if segment_data.len() >= 188 {
+                            if let Err(e) = tokio::fs::rename(&temp_path, &output_path).await {
+                                warn!("Rename failed, using copy: {}", e);
+                                let _ = tokio::fs::write(&output_path, &segment_data).await;
+                                let _ = tokio::fs::remove_file(&temp_path).await;
+                            }
+                            info!("Segment {} transcoded (software fallback): {} bytes", segment_index, segment_data.len());
+                            return Ok(segment_data);
+                        }
+                    }
+                }
+            }
+            let _ = tokio::fs::remove_file(&temp_path).await;
+        }
+
         // 如果 re-encode 失败，尝试 stream copy fallback
         if stderr.contains("Error") || stderr.contains("error") {
             warn!("Trying fast fallback for segment {}", segment_index);
@@ -1777,15 +1816,23 @@ fn build_ffmpeg_args_optimized(
             ]);
         }
         HardwareAccel::RockchipRga => {
-            args.extend(["-hwaccel".to_string(), "rkmpp".to_string()]);
+            // rkmpp 不是标准 FFmpeg hwaccel，需要通过 decoder 使用
+            // 不设置 -hwaccel，而是在编码阶段使用 h264_rkmpp 编码器
         }
         HardwareAccel::AmlogicDecodeOnly => {
-            if std::path::Path::new("/dev/video0").exists() {
+            // Amlogic meson_vdec 通过 V4L2 暴露，但 FFmpeg 的 -hwaccel 不支持 "v4l2m2m"
+            // 支持的 hwaccel 值: vdpau cuda vaapi drm opencl vulkan
+            // 对于 Amlogic 设备，使用 DRM 模式进行硬件解码（如果 /dev/dri 存在）
+            // 否则不设置 hwaccel，让 FFmpeg 自动选择软件解码
+            if std::path::Path::new("/dev/dri/renderD128").exists() {
                 args.extend([
                     "-hwaccel".to_string(),
-                    "v4l2m2m".to_string(),
+                    "drm".to_string(),
+                    "-hwaccel_device".to_string(),
+                    "/dev/dri/renderD128".to_string(),
                 ]);
             }
+            // 不设置 -hwaccel_output_format，让 FFmpeg 自动处理格式转换
         }
         _ => {}
     }

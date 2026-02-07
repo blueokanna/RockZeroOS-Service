@@ -530,6 +530,20 @@ async fn main() -> std::io::Result<()> {
                                 "/overview",
                                 web::get().to(handlers::wasm_store::get_store_overview),
                             )
+                            // Steam 游戏
+                            .route(
+                                "/steam/featured",
+                                web::get().to(handlers::wasm_store::get_steam_featured),
+                            )
+                            .route(
+                                "/steam/app/{app_id}",
+                                web::get().to(handlers::wasm_store::get_steam_app_details),
+                            )
+                            // Epic 免费游戏
+                            .route(
+                                "/epic/free",
+                                web::get().to(handlers::wasm_store::get_epic_free_games),
+                            )
                             // WASM 应用搜索
                             .route(
                                 "/search",
