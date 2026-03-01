@@ -24,7 +24,6 @@ hmac = { workspace = true }
 lazy_static = "1.4"
 merlin = { workspace = true }
 rand = { workspace = true }
-sha2 = { workspace = true }
 sha3 = { workspace = true }
 
 # Serialization

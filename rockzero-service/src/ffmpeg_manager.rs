@@ -8,9 +8,11 @@ static GLOBAL_FFMPEG_PATH: Mutex<Option<String>> = Mutex::new(None);
 static GLOBAL_FFPROBE_PATH: Mutex<Option<String>> = Mutex::new(None);
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 const LOCAL_ASSETS_PATH: &str = r".\assets";
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 const LOCAL_ASSETS_PATH: &str = "./assets";
 
 pub fn set_global_ffmpeg_path(path: Option<String>) {
@@ -39,6 +41,7 @@ pub struct FfmpegManager {
     local_assets_dir: PathBuf,
 }
 
+#[allow(dead_code)]
 impl FfmpegManager {
     pub fn new(base_dir: &str) -> Self {
         let base = PathBuf::from(base_dir).join("ffmpeg");

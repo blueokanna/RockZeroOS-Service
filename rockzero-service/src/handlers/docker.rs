@@ -8,6 +8,7 @@ use std::process::Command;
 use serde_json::Value;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct DockerImage {
     pub id: String,
     pub repository: String,
@@ -17,6 +18,7 @@ pub struct DockerImage {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct DockerContainer {
     pub id: String,
     pub name: String,
@@ -26,6 +28,7 @@ pub struct DockerContainer {
     pub created: String,
 }
 
+#[allow(dead_code)]
 pub async fn list_images(req: HttpRequest) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
 
@@ -55,6 +58,7 @@ pub async fn list_images(req: HttpRequest) -> Result<HttpResponse, AppError> {
     }
 }
 
+#[allow(dead_code)]
 pub async fn list_containers(req: HttpRequest) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
 
@@ -84,6 +88,7 @@ pub async fn list_containers(req: HttpRequest) -> Result<HttpResponse, AppError>
     }
 }
 
+#[allow(dead_code)]
 pub async fn inspect_container(
     path: web::Path<String>,
     req: HttpRequest,
@@ -115,6 +120,7 @@ pub async fn inspect_container(
     }
 }
 
+#[allow(dead_code)]
 pub async fn prune_system(req: HttpRequest) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
 

@@ -131,53 +131,77 @@ async fn fetch_manifest(client: &Client, url: &str) -> Result<Option<Value>, App
     Ok(Some(manifest))
 }
 
+/// Execute a WASM module in a blocking thread with a 30-second timeout.
+/// This prevents WASM execution from blocking the tokio async runtime.
 async fn execute_wasm_module(
     wasm_path: &str,
     function: Option<String>,
     args: &[String],
 ) -> Result<(), AppError> {
-    let engine = Engine::default();
-    let module = Module::from_file(&engine, wasm_path).map_err(|e| {
-        AppError::BadRequest(format!("Failed to load WASM module '{}': {}", wasm_path, e))
-    })?;
+    let wasm_path = wasm_path.to_string();
+    let args = args.to_vec();
 
-    let mut linker = Linker::new(&engine);
-    add_to_linker(&mut linker, |cx| cx)
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+            let engine = Engine::default();
+            let module = Module::from_file(&engine, &wasm_path).map_err(|e| {
+                AppError::BadRequest(format!("Failed to load WASM module '{}': {}", wasm_path, e))
+            })?;
 
-    let mut builder = WasiCtxBuilder::new();
-    builder.inherit_stdio();
-    let _ = builder.inherit_env();
-    for arg in args {
-        builder
-            .arg(arg)
-            .map_err(|e| AppError::ValidationError(format!("Invalid WASM arg '{}': {}", arg, e)))?;
+            let mut linker = Linker::new(&engine);
+            #[allow(deprecated)]
+            add_to_linker(&mut linker, |cx| cx)
+                .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+            #[allow(deprecated)]
+            let mut builder = WasiCtxBuilder::new();
+            builder.inherit_stdio();
+            let _ = builder.inherit_env();
+            for arg in &args {
+                builder
+                    .arg(arg)
+                    .map_err(|e| AppError::ValidationError(format!("Invalid WASM arg '{}': {}", arg, e)))?;
+            }
+
+            let mut store = Store::new(&engine, builder.build());
+            let instance = linker
+                .instantiate(&mut store, &module)
+                .map_err(|e| AppError::BadRequest(format!("Failed to instantiate WASM: {}", e)))?;
+
+            let func_name = function.unwrap_or_else(|| "_start".to_string());
+
+            if let Ok(entry) = instance.get_typed_func::<(), ()>(&mut store, &func_name) {
+                entry
+                    .call(&mut store, ())
+                    .map_err(|e| AppError::BadRequest(format!("WASM call failed: {}", e)))?;
+                return Ok(());
+            }
+
+            if let Some(func) = instance.get_func(&mut store, &func_name) {
+                func.call(&mut store, &[], &mut [])
+                    .map_err(|e| AppError::BadRequest(format!("WASM call failed: {}", e)))?;
+                return Ok(());
+            }
+
+            Err(AppError::NotFound(format!(
+                "Function '{}' not found in WASM module",
+                func_name
+            )))
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(join_err)) => Err(AppError::InternalServerError(format!(
+            "WASM execution task panicked: {}",
+            join_err
+        ))),
+        Err(_timeout) => Err(AppError::InternalServerError(
+            "WASM execution timed out (30s)".to_string(),
+        )),
     }
-
-    let mut store = Store::new(&engine, builder.build());
-    let instance = linker
-        .instantiate(&mut store, &module)
-        .map_err(|e| AppError::BadRequest(format!("Failed to instantiate WASM: {}", e)))?;
-
-    let func_name = function.unwrap_or_else(|| "_start".to_string());
-
-    if let Ok(entry) = instance.get_typed_func::<(), ()>(&mut store, &func_name) {
-        entry
-            .call(&mut store, ())
-            .map_err(|e| AppError::BadRequest(format!("WASM call failed: {}", e)))?;
-        return Ok(());
-    }
-
-    if let Some(func) = instance.get_func(&mut store, &func_name) {
-        func.call(&mut store, &[], &mut [])
-            .map_err(|e| AppError::BadRequest(format!("WASM call failed: {}", e)))?;
-        return Ok(());
-    }
-
-    Err(AppError::NotFound(format!(
-        "Function '{}' not found in WASM module",
-        func_name
-    )))
 }
 
 pub async fn list_packages(_req: HttpRequest) -> Result<HttpResponse, AppError> {

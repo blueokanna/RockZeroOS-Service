@@ -356,7 +356,7 @@ pub async fn run_wasm_app(
     crate::middleware::verify_fido2_or_passkey(&req).await?;
 
     let app_id = path.into_inner();
-    info!("▶️ Running WASM app: {}", app_id);
+    info!("Running WASM app: {}", app_id);
 
     let mut packages = load_packages()?;
     let app = packages
@@ -364,49 +364,19 @@ pub async fn run_wasm_app(
         .find(|p| p.id == app_id)
         .ok_or_else(|| AppError::NotFound(format!("WASM app {} not found", app_id)))?;
 
-    let wasm_path = &app.installed_path;
-    if !Path::new(wasm_path).exists() {
+    let wasm_path = app.installed_path.clone();
+    if !Path::new(&wasm_path).exists() {
         return Err(AppError::NotFound(
             "WASM module file not found on disk".to_string(),
         ));
     }
 
-    let engine = wasmtime::Engine::default();
-    let module = wasmtime::Module::from_file(&engine, wasm_path)
-        .map_err(|e| AppError::BadRequest(format!("Failed to load WASM module: {}", e)))?;
-
-    let mut linker = wasmtime::Linker::new(&engine);
-    wasmtime_wasi::add_to_linker(&mut linker, |cx| cx)
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-
-    let mut builder = wasmtime_wasi::sync::WasiCtxBuilder::new();
-    builder.inherit_stdio();
-
-    if let Some(args) = &body.args {
-        for arg in args {
-            builder
-                .arg(arg)
-                .map_err(|e| AppError::ValidationError(format!("Invalid WASM arg: {}", e)))?;
-        }
-    }
-
-    if let Some(env) = &body.env {
-        for (key, value) in env {
-            builder
-                .env(key, value)
-                .map_err(|e| AppError::ValidationError(format!("Invalid env var: {}", e)))?;
-        }
-    }
-
-    let mut store = wasmtime::Store::new(&engine, builder.build());
-    let instance = linker
-        .instantiate(&mut store, &module)
-        .map_err(|e| AppError::BadRequest(format!("Failed to instantiate WASM: {}", e)))?;
-
     let func_name = body
         .function
         .clone()
         .unwrap_or_else(|| "_start".to_string());
+    let args = body.args.clone().unwrap_or_default();
+    let env = body.env.clone().unwrap_or_default();
 
     // Update status to Running
     if let Some(app_mut) = packages.iter_mut().find(|p| p.id == app_id) {
@@ -414,39 +384,90 @@ pub async fn run_wasm_app(
         let _ = save_packages(&packages);
     }
 
-    let exec_result = if let Ok(entry) = instance.get_typed_func::<(), ()>(&mut store, &func_name) {
-        entry.call(&mut store, ()).map_err(|e| e.to_string())
-    } else if let Some(func) = instance.get_func(&mut store, &func_name) {
-        func.call(&mut store, &[], &mut [])
-            .map_err(|e| e.to_string())
-    } else {
-        Err(format!("Function '{}' not found in WASM module", func_name))
-    };
+    let func_name_clone = func_name.clone();
+    let app_id_clone = app_id.clone();
+
+    // WASM execution in blocking thread pool with 30s timeout
+    let exec_result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let engine = wasmtime::Engine::default();
+            let module = wasmtime::Module::from_file(&engine, &wasm_path)
+                .map_err(|e| format!("Failed to load WASM module: {}", e))?;
+
+            let mut linker = wasmtime::Linker::new(&engine);
+            #[allow(deprecated)]
+            wasmtime_wasi::add_to_linker(&mut linker, |cx| cx)
+                .map_err(|e| e.to_string())?;
+
+            #[allow(deprecated)]
+            let mut builder = wasmtime_wasi::sync::WasiCtxBuilder::new();
+            builder.inherit_stdio();
+
+            for arg in &args {
+                builder.arg(arg).map_err(|e| format!("Invalid WASM arg: {}", e))?;
+            }
+            for (key, value) in &env {
+                builder.env(key, value).map_err(|e| format!("Invalid env var: {}", e))?;
+            }
+
+            let mut store = wasmtime::Store::new(&engine, builder.build());
+            let instance = linker
+                .instantiate(&mut store, &module)
+                .map_err(|e| format!("Failed to instantiate WASM: {}", e))?;
+
+            if let Ok(entry) = instance.get_typed_func::<(), ()>(&mut store, &func_name_clone) {
+                entry.call(&mut store, ()).map_err(|e| e.to_string())?;
+            } else if let Some(func) = instance.get_func(&mut store, &func_name_clone) {
+                func.call(&mut store, &[], &mut [])
+                    .map_err(|e| e.to_string())?;
+            } else {
+                return Err(format!("Function '{}' not found in WASM module", func_name_clone));
+            }
+
+            Ok(())
+        }),
+    )
+    .await;
 
     // Update status based on result
     let mut packages = load_packages().unwrap_or_default();
-    match &exec_result {
-        Ok(()) => {
+    match exec_result {
+        Ok(Ok(Ok(()))) => {
             if let Some(app_mut) = packages.iter_mut().find(|p| p.id == app_id) {
                 app_mut.status = WasmAppStatus::Stopped;
                 let _ = save_packages(&packages);
             }
-            info!("✅ WASM app executed successfully: {}", app_id);
+            info!("WASM app executed successfully: {}", app_id);
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "status": "completed",
                 "id": app_id,
                 "function": func_name,
             })))
         }
-        Err(err_msg) => {
+        Ok(Ok(Err(err_msg))) => {
             if let Some(app_mut) = packages.iter_mut().find(|p| p.id == app_id) {
                 app_mut.status = WasmAppStatus::Error;
                 let _ = save_packages(&packages);
             }
-            error!("❌ WASM app execution failed: {}: {}", app_id, err_msg);
-            Err(AppError::BadRequest(format!(
-                "WASM execution failed: {}",
-                err_msg
+            error!("WASM app execution failed: {}: {}", app_id, err_msg);
+            Err(AppError::BadRequest(format!("WASM execution failed: {}", err_msg)))
+        }
+        Ok(Err(join_err)) => {
+            if let Some(app_mut) = packages.iter_mut().find(|p| p.id == app_id) {
+                app_mut.status = WasmAppStatus::Error;
+                let _ = save_packages(&packages);
+            }
+            Err(AppError::InternalServerError(format!("WASM task panicked: {}", join_err)))
+        }
+        Err(_timeout) => {
+            if let Some(app_mut) = packages.iter_mut().find(|p| p.id == app_id) {
+                app_mut.status = WasmAppStatus::Error;
+                let _ = save_packages(&packages);
+            }
+            warn!("WASM app execution timed out (30s): {}", app_id_clone);
+            Err(AppError::InternalServerError(format!(
+                "WASM execution timed out (30s): {}", app_id_clone
             )))
         }
     }
@@ -467,7 +488,7 @@ pub async fn validate_wasm_module(
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
 
-    info!("🔍 Validating WASM module ({} bytes)", body.len());
+    info!("Validating WASM module ({} bytes)", body.len());
 
     if body.is_empty() {
         return Err(AppError::BadRequest(
@@ -475,42 +496,50 @@ pub async fn validate_wasm_module(
         ));
     }
 
-    let engine = wasmtime::Engine::default();
-    match wasmtime::Module::new(&engine, &body) {
-        Ok(module) => {
-            let exports: Vec<String> = module
-                .exports()
-                .map(|e| format!("{}:{:?}", e.name(), e.ty()))
-                .collect();
-            let imports: Vec<String> = module
-                .imports()
-                .map(|i| format!("{}::{}", i.module(), i.name()))
-                .collect();
+    let bytes = body.to_vec();
+    let validation = tokio::task::spawn_blocking(move || {
+        let engine = wasmtime::Engine::default();
+        match wasmtime::Module::new(&engine, &bytes) {
+            Ok(module) => {
+                let exports: Vec<String> = module
+                    .exports()
+                    .map(|e| format!("{}:{:?}", e.name(), e.ty()))
+                    .collect();
+                let imports: Vec<String> = module
+                    .imports()
+                    .map(|i| format!("{}::{}", i.module(), i.name()))
+                    .collect();
 
-            let hash = blake3_hex(&body);
+                let hash = blake3_hex(&bytes);
 
-            info!(
-                "✅ WASM module is valid ({} exports, {} imports)",
-                exports.len(),
-                imports.len()
-            );
-            Ok(HttpResponse::Ok().json(serde_json::json!({
-                "valid": true,
-                "size_bytes": body.len(),
-                "blake3": hash,
-                "exports_count": exports.len(),
-                "imports_count": imports.len(),
-                "exports": exports,
-                "imports": imports,
-            })))
+                info!(
+                    "WASM module is valid ({} exports, {} imports)",
+                    exports.len(),
+                    imports.len()
+                );
+                Ok(serde_json::json!({
+                    "valid": true,
+                    "size_bytes": bytes.len(),
+                    "blake3": hash,
+                    "exports_count": exports.len(),
+                    "imports_count": imports.len(),
+                    "exports": exports,
+                    "imports": imports,
+                }))
+            }
+            Err(e) => {
+                warn!("Invalid WASM module: {}", e);
+                Ok(serde_json::json!({
+                    "valid": false,
+                    "error": e.to_string(),
+                    "size_bytes": bytes.len(),
+                }))
+            }
         }
-        Err(e) => {
-            warn!("❌ Invalid WASM module: {}", e);
-            Ok(HttpResponse::Ok().json(serde_json::json!({
-                "valid": false,
-                "error": e.to_string(),
-                "size_bytes": body.len(),
-            })))
-        }
-    }
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("Validation task failed: {}", e)))?;
+
+    let result: Result<Value, AppError> = validation;
+    Ok(HttpResponse::Ok().json(result?))
 }

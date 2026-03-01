@@ -253,6 +253,7 @@ pub struct DiskOperationResult {
 }
 
 pub async fn list_disks() -> Result<HttpResponse, AppError> {
+    let disks = tokio::task::spawn_blocking(move || -> Vec<DiskDetail> {
     let disks_info = Disks::new_with_refreshed_list();
     let mut disks = Vec::new();
 
@@ -397,6 +398,9 @@ pub async fn list_disks() -> Result<HttpResponse, AppError> {
             }
         }
     }
+
+    disks
+    }).await.map_err(|_| AppError::InternalError)?;
 
     Ok(HttpResponse::Ok().json(disks))
 }
@@ -715,7 +719,7 @@ pub async fn list_partitions() -> Result<impl Responder, AppError> {
 pub async fn get_disk_io_stats() -> Result<impl Responder, AppError> {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(content) = std::fs::read_to_string("/proc/diskstats") {
+        if let Ok(content) = tokio::fs::read_to_string("/proc/diskstats").await {
             let mut stats = Vec::new();
             for line in content.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
@@ -847,7 +851,7 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
         };
 
         // 创建挂载点目录
-        std::fs::create_dir_all(&body.mount_point)
+        tokio::fs::create_dir_all(&body.mount_point).await
             .map_err(|e| AppError::BadRequest(format!("Failed to create mount point: {}", e)))?;
 
         let mut cmd = Command::new("mount");
@@ -1058,7 +1062,7 @@ pub async fn format_disk(
                         .output();
                     
                     // 等待进程终止
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     
                     // 尝试卸载
                     let unmount_output = Command::new("umount")
@@ -1093,7 +1097,7 @@ pub async fn format_disk(
                     }
                     
                     // 等待卸载完成
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     log::info!("Successfully unmounted {} from '{}'", device, mount_point);
                 }
             }
@@ -1205,7 +1209,7 @@ pub async fn format_disk(
             let _ = Command::new("partprobe").arg(device).output();
             
             // 额外等待确保文件系统信息已更新
-            std::thread::sleep(std::time::Duration::from_millis(1000));
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
             // 如果之前有挂载点，自动重新挂载
             let mut remounted = false;
@@ -1213,7 +1217,7 @@ pub async fn format_disk(
                 log::info!("Re-mounting {} to '{}'...", device, mount_point);
                 
                 // 确保挂载点目录存在
-                let _ = std::fs::create_dir_all(mount_point);
+                let _ = tokio::fs::create_dir_all(mount_point).await;
                 
                 // 重新挂载
                 let remount_output = Command::new("mount")
@@ -1519,7 +1523,7 @@ pub async fn initialize_disk(
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // Step 2: Create partition table using parted with optimal alignment (4096 sector)
         let parted_label = Command::new("parted")
@@ -1535,7 +1539,7 @@ pub async fn initialize_disk(
             )));
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // Step 3: Create a single partition using all space with 4096 alignment
         // Start at 1MiB (2048 sectors for 512-byte sectors, aligned to 4096)
@@ -1556,7 +1560,7 @@ pub async fn initialize_disk(
 
         // Step 4: Notify kernel about partition table changes
         let _ = Command::new("partprobe").arg(device).output();
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         
         let _ = Command::new("udevadm")
             .args(["settle", "--timeout=10"])
@@ -1567,7 +1571,7 @@ pub async fn initialize_disk(
             .args(["--rereadpt", device])
             .output();
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // Determine partition device name
         let partition_device = if device.contains("nvme") || device.contains("mmcblk") {
@@ -1583,7 +1587,7 @@ pub async fn initialize_disk(
                 partition_exists = true;
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let _ = Command::new("partprobe").arg(device).output();
         }
 
@@ -1701,7 +1705,7 @@ pub async fn initialize_disk(
             .output();
         
         // Additional wait to ensure filesystem is recognized
-        std::thread::sleep(std::time::Duration::from_millis(2000));
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
         
         // Verify the filesystem was created correctly
         let verify_output = Command::new("blkid")
@@ -1924,7 +1928,7 @@ pub async fn scan_disks() -> Result<HttpResponse, AppError> {
             .output();
 
         // Wait a moment for devices to be recognized
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // Return updated disk list
         return list_disks().await;

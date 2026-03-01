@@ -926,11 +926,6 @@ async fn main() -> std::io::Result<()> {
                                 "/{session_id}/stop",
                                 web::post().to(handlers::secure_hls::stop_session),
                             )
-                            // Prebuffer segment
-                            .route(
-                                "/{session_id}/prebuffer/{segment}",
-                                web::post().to(handlers::secure_hls::prebuffer_segment),
-                            )
                             // Video segments (POST with ZKP proof)
                             .route(
                                 "/{session_id}/{segment}",
