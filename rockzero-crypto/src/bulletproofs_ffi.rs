@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 use rockzero_common::error::AppError;
 
 const RANGE_PROOF_BITS: usize = 64;
-const MIN_VALUE: u64 = 0;
-const MAX_VALUE: u64 = u64::MAX;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[repr(C)]
@@ -51,13 +49,6 @@ impl BulletproofsContext {
     }
 
     pub fn create_range_proof(&self, value: u64) -> Result<BulletproofsRangeProof, AppError> {
-        if value < MIN_VALUE || value > MAX_VALUE {
-            return Err(AppError::CryptoError(format!(
-                "Value {} out of range [{}, {}]",
-                value, MIN_VALUE, MAX_VALUE
-            )));
-        }
-
         let blinding = Self::generate_random_scalar()?;
 
         let mut transcript = Transcript::new(b"RockZero-Bulletproofs-RangeProof");
@@ -225,8 +216,12 @@ fn constant_time_compare(a: &str, b: &str) -> bool {
     result == 0
 }
 
+/// # Safety
+///
+/// `out_proof` and `out_proof_len` must be valid, non-null, aligned pointers.
+/// The caller is responsible for freeing the returned buffer via `bulletproofs_free`.
 #[no_mangle]
-pub extern "C" fn bulletproofs_create_range_proof(
+pub unsafe extern "C" fn bulletproofs_create_range_proof(
     value: u64,
     out_proof: *mut *mut u8,
     out_proof_len: *mut usize,
@@ -244,10 +239,8 @@ pub extern "C" fn bulletproofs_create_range_proof(
             let len = bytes.len();
             let ptr = bytes.as_ptr();
 
-            unsafe {
-                *out_proof = ptr as *mut u8;
-                *out_proof_len = len;
-            }
+            *out_proof = ptr as *mut u8;
+            *out_proof_len = len;
 
             std::mem::forget(bytes);
             0
@@ -256,12 +249,15 @@ pub extern "C" fn bulletproofs_create_range_proof(
     }
 }
 
+/// # Safety
+///
+/// `proof_json` must point to a valid UTF-8 byte buffer of at least `proof_json_len` bytes.
 #[no_mangle]
-pub extern "C" fn bulletproofs_verify_range_proof(
+pub unsafe extern "C" fn bulletproofs_verify_range_proof(
     proof_json: *const u8,
     proof_json_len: usize,
 ) -> i32 {
-    let json_slice = unsafe { std::slice::from_raw_parts(proof_json, proof_json_len) };
+    let json_slice = std::slice::from_raw_parts(proof_json, proof_json_len);
 
     let json_str = match std::str::from_utf8(json_slice) {
         Ok(s) => s,
@@ -287,12 +283,14 @@ pub extern "C" fn bulletproofs_verify_range_proof(
     }
 }
 
+/// # Safety
+///
+/// `ptr` must have been allocated by `bulletproofs_create_range_proof` with the given `len`.
+/// After calling this function the pointer is invalid and must not be used again.
 #[no_mangle]
-pub extern "C" fn bulletproofs_free(ptr: *mut u8, len: usize) {
+pub unsafe extern "C" fn bulletproofs_free(ptr: *mut u8, len: usize) {
     if !ptr.is_null() && len > 0 {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, len, len);
-        }
+        let _ = Vec::from_raw_parts(ptr, len, len);
     }
 }
 

@@ -253,6 +253,7 @@ pub struct DiskOperationResult {
 }
 
 pub async fn list_disks() -> Result<HttpResponse, AppError> {
+    let disks = tokio::task::spawn_blocking(move || -> Vec<DiskDetail> {
     let disks_info = Disks::new_with_refreshed_list();
     let mut disks = Vec::new();
 
@@ -269,14 +270,66 @@ pub async fn list_disks() -> Result<HttpResponse, AppError> {
             continue;
         }
         
-        let total_space = disk.total_space();
-        let available_space = disk.available_space();
-        let used_space = total_space.saturating_sub(available_space);
-        let usage_percentage = if total_space > 0 {
-            (used_space as f64 / total_space as f64) * 100.0
-        } else {
-            0.0
+        // 使用 statvfs 获取准确的空间信息（排除保留块）
+        #[cfg(target_os = "linux")]
+        let (total_space, available_space, used_space, usage_percentage) = {
+            use std::mem::MaybeUninit;
+            let mut stat_result: Option<(u64, u64, u64, f64)> = None;
+            
+            if !mount_point.is_empty() {
+                if let Ok(path_cstr) = std::ffi::CString::new(mount_point.as_bytes()) {
+                    let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
+                    unsafe {
+                        if libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) == 0 {
+                            let stat = stat.assume_init();
+                            let block_size = stat.f_frsize as u64;
+                            let total_blocks = stat.f_blocks as u64;
+                            let free_blocks = stat.f_bfree as u64;
+                            let avail_blocks = stat.f_bavail as u64;
+                            
+                            let raw_total = total_blocks * block_size;
+                            let free = free_blocks * block_size;
+                            let avail = avail_blocks * block_size;
+                            
+                            // 实际已用 = 总空间 - 空闲空间
+                            let used = raw_total.saturating_sub(free);
+                            // 保留块 = 空闲 - 用户可用
+                            let reserved = free.saturating_sub(avail);
+                            // 用户可见总空间 = 总空间 - 保留块
+                            let user_total = raw_total.saturating_sub(reserved);
+                            
+                            let pct = if user_total > 0 {
+                                (used as f64 / user_total as f64) * 100.0
+                            } else {
+                                0.0
+                            };
+                            
+                            stat_result = Some((user_total, avail, used, pct));
+                        }
+                    }
+                }
+            }
+            
+            if let Some(result) = stat_result {
+                result
+            } else {
+                let total = disk.total_space();
+                let avail = disk.available_space();
+                let used = total.saturating_sub(avail);
+                let pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
+                (total, avail, used, pct)
+            }
         };
+        
+        #[cfg(not(target_os = "linux"))]
+        let (total_space, available_space, used_space, usage_percentage) = {
+            let total = disk.total_space();
+            let avail = disk.available_space();
+            let used = total.saturating_sub(avail);
+            let pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
+            (total, avail, used, pct)
+        };
+        
         let is_removable = disk.is_removable();
         let disk_type = format!("{:?}", disk.kind());
         
@@ -345,6 +398,9 @@ pub async fn list_disks() -> Result<HttpResponse, AppError> {
             }
         }
     }
+
+    disks
+    }).await.map_err(|_| AppError::InternalError)?;
 
     Ok(HttpResponse::Ok().json(disks))
 }
@@ -663,7 +719,7 @@ pub async fn list_partitions() -> Result<impl Responder, AppError> {
 pub async fn get_disk_io_stats() -> Result<impl Responder, AppError> {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(content) = std::fs::read_to_string("/proc/diskstats") {
+        if let Ok(content) = tokio::fs::read_to_string("/proc/diskstats").await {
             let mut stats = Vec::new();
             for line in content.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
@@ -795,7 +851,7 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
         };
 
         // 创建挂载点目录
-        std::fs::create_dir_all(&body.mount_point)
+        tokio::fs::create_dir_all(&body.mount_point).await
             .map_err(|e| AppError::BadRequest(format!("Failed to create mount point: {}", e)))?;
 
         let mut cmd = Command::new("mount");
@@ -1006,7 +1062,7 @@ pub async fn format_disk(
                         .output();
                     
                     // 等待进程终止
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     
                     // 尝试卸载
                     let unmount_output = Command::new("umount")
@@ -1041,7 +1097,7 @@ pub async fn format_disk(
                     }
                     
                     // 等待卸载完成
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     log::info!("Successfully unmounted {} from '{}'", device, mount_point);
                 }
             }
@@ -1153,7 +1209,7 @@ pub async fn format_disk(
             let _ = Command::new("partprobe").arg(device).output();
             
             // 额外等待确保文件系统信息已更新
-            std::thread::sleep(std::time::Duration::from_millis(1000));
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
             // 如果之前有挂载点，自动重新挂载
             let mut remounted = false;
@@ -1161,7 +1217,7 @@ pub async fn format_disk(
                 log::info!("Re-mounting {} to '{}'...", device, mount_point);
                 
                 // 确保挂载点目录存在
-                let _ = std::fs::create_dir_all(mount_point);
+                let _ = tokio::fs::create_dir_all(mount_point).await;
                 
                 // 重新挂载
                 let remount_output = Command::new("mount")
@@ -1467,7 +1523,7 @@ pub async fn initialize_disk(
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // Step 2: Create partition table using parted with optimal alignment (4096 sector)
         let parted_label = Command::new("parted")
@@ -1483,7 +1539,7 @@ pub async fn initialize_disk(
             )));
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // Step 3: Create a single partition using all space with 4096 alignment
         // Start at 1MiB (2048 sectors for 512-byte sectors, aligned to 4096)
@@ -1504,7 +1560,7 @@ pub async fn initialize_disk(
 
         // Step 4: Notify kernel about partition table changes
         let _ = Command::new("partprobe").arg(device).output();
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         
         let _ = Command::new("udevadm")
             .args(["settle", "--timeout=10"])
@@ -1515,7 +1571,7 @@ pub async fn initialize_disk(
             .args(["--rereadpt", device])
             .output();
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // Determine partition device name
         let partition_device = if device.contains("nvme") || device.contains("mmcblk") {
@@ -1531,7 +1587,7 @@ pub async fn initialize_disk(
                 partition_exists = true;
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let _ = Command::new("partprobe").arg(device).output();
         }
 
@@ -1649,7 +1705,7 @@ pub async fn initialize_disk(
             .output();
         
         // Additional wait to ensure filesystem is recognized
-        std::thread::sleep(std::time::Duration::from_millis(2000));
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
         
         // Verify the filesystem was created correctly
         let verify_output = Command::new("blkid")
@@ -1872,7 +1928,7 @@ pub async fn scan_disks() -> Result<HttpResponse, AppError> {
             .output();
 
         // Wait a moment for devices to be recognized
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // Return updated disk list
         return list_disks().await;

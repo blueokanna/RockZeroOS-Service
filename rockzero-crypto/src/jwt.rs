@@ -98,8 +98,7 @@ pub fn signing_key_from_pem(pem: &str) -> Result<SigningKey, AppError> {
     let pem_content = pem
         .replace("-----BEGIN PRIVATE KEY-----", "")
         .replace("-----END PRIVATE KEY-----", "")
-        .replace('\n', "")
-        .replace('\r', "")
+        .replace(['\n', '\r'], "")
         .trim()
         .to_string();
 

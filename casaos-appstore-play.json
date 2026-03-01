@@ -2,10 +2,10 @@
   "version": "2",
   "title": "RockZero Secure Service",
   "name": "rockzero-service",
-  "icon": "https://cdn.jsdelivr.net/gh/IceWhaleTech/CasaOS-AppStore@main/Apps/rockzero/icon.png",
+  "icon": "https://ghp.ci/https://raw.githubusercontent.com/IceWhaleTech/CasaOS-AppStore/main/Apps/rockzero/icon.png",
   "tagline": "Enterprise-grade secure service with disk management, app store, and hardware acceleration",
   "overview": "Production-grade secure service built with Rust. Features: Zero-knowledge proof authentication, FIDO2/Passkey support, Blake3 password hashing, hardware detection (CPU/Memory/Disk/USB), disk management (mount/format/unmount), FFmpeg media transcoding with hardware acceleration (Rockchip MPP, Amlogic, Intel QSV, NVIDIA NVENC), Docker app store (CasaOS/iStoreOS), file manager with preview, and widget system. Supports aarch64, armv7, x86_64. Fixed: Disk operation 404 errors, App Store network issues, wallpaper theme system.",
-  "thumbnail": "https://cdn.jsdelivr.net/gh/IceWhaleTech/CasaOS-AppStore@main/Apps/rockzero/thumbnail.png",
+  "thumbnail": "https://ghp.ci/https://raw.githubusercontent.com/IceWhaleTech/CasaOS-AppStore/main/Apps/rockzero/thumbnail.png",
   "screenshots": [],
   "category": "Security",
   "developer": {

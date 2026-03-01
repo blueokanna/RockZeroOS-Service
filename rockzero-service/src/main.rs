@@ -173,6 +173,8 @@ async fn main() -> std::io::Result<()> {
     let _event_notifier = event_notifier::init_global_notifier(200);
     info!("Event notifier initialized");
 
+    info!("WASM store initialized");
+
     // Initialize video access manager
     let _video_access_manager = secure_video_access::init_global_video_access_manager();
     info!("Video access manager initialized");
@@ -246,12 +248,17 @@ async fn main() -> std::io::Result<()> {
                             .route("/register", web::post().to(handlers::auth::register))
                             .route("/login", web::post().to(handlers::auth::login))
                             .route("/refresh", web::post().to(handlers::auth::refresh_token))
-                            .route("/me", web::get().to(handlers::auth::me))
                             // ZKP zero-knowledge proof authentication
                             .route("/zkp/login", web::post().to(handlers::zkp_auth::zkp_login))
                             .route(
                                 "/zkp/registration",
                                 web::post().to(handlers::zkp_auth::get_zkp_registration),
+                            )
+                            // Protected auth endpoints (require JWT)
+                            .service(
+                                web::scope("")
+                                    .wrap(middleware::JwtAuth)
+                                    .route("/me", web::get().to(handlers::auth::me)),
                             ),
                     )
                     .service(
@@ -296,6 +303,7 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(
                         web::scope("/system")
+                            .wrap(middleware::JwtAuth)
                             .route("/hardware", web::get().to(hardware_info_endpoint))
                             .route("/info", web::get().to(handlers::system::get_system_info))
                             .route("/cpu", web::get().to(handlers::system::get_cpu_info))
@@ -318,6 +326,7 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(
                         web::scope("/storage")
+                            .wrap(middleware::JwtAuth)
                             .route(
                                 "/devices",
                                 web::get().to(handlers::storage::list_storage_devices),
@@ -356,6 +365,7 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(
                         web::scope("/storage-management")
+                            .wrap(middleware::JwtAuth)
                             .route(
                                 "/stats",
                                 web::get().to(handlers::storage_management::get_storage_stats),
@@ -389,6 +399,7 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(
                         web::scope("/speedtest")
+                            .wrap(middleware::JwtAuth)
                             .route(
                                 "/download",
                                 web::get().to(handlers::speedtest::download_test),
@@ -407,14 +418,7 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(
                         web::scope("/fido")
-                            .route(
-                                "/register/start",
-                                web::post().to(fido::start_fido_registration),
-                            )
-                            .route(
-                                "/register/finish",
-                                web::post().to(fido::finish_fido_registration),
-                            )
+                            // FIDO2 authentication (public - used for passwordless login)
                             .route(
                                 "/auth/start",
                                 web::post().to(fido::start_fido_authentication),
@@ -423,14 +427,28 @@ async fn main() -> std::io::Result<()> {
                                 "/auth/finish",
                                 web::post().to(fido::finish_fido_authentication),
                             )
-                            .route("/credentials", web::get().to(fido::list_fido_credentials))
-                            .route(
-                                "/credentials/{id}",
-                                web::delete().to(fido::delete_fido_credential),
+                            // FIDO2 registration and credential management (requires JWT)
+                            .service(
+                                web::scope("")
+                                    .wrap(middleware::JwtAuth)
+                                    .route(
+                                        "/register/start",
+                                        web::post().to(fido::start_fido_registration),
+                                    )
+                                    .route(
+                                        "/register/finish",
+                                        web::post().to(fido::finish_fido_registration),
+                                    )
+                                    .route("/credentials", web::get().to(fido::list_fido_credentials))
+                                    .route(
+                                        "/credentials/{id}",
+                                        web::delete().to(fido::delete_fido_credential),
+                                    ),
                             ),
                     )
                     .service(
                         web::scope("/filemanager")
+                            .wrap(middleware::JwtAuth)
                             .route(
                                 "/list",
                                 web::get().to(handlers::filemanager::list_directory),
@@ -482,8 +500,11 @@ async fn main() -> std::io::Result<()> {
                                 web::get().to(handlers::filemanager::get_thumbnail),
                             ),
                     )
+                    // ============ WASM 商店 (纯 WASM 应用) ============
+                    // 旧的 /appstore 路径（向后兼容，仅 WASM 包管理）
                     .service(
                         web::scope("/appstore")
+                            .wrap(middleware::JwtAuth)
                             .route(
                                 "/packages",
                                 web::get().to(handlers::appstore::list_packages),
@@ -499,61 +520,73 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/packages/{id}/run",
                                 web::post().to(handlers::appstore::run_wasm_package),
-                            )
-                            // CasaOS and iStoreOS support
+                            ),
+                    )
+                    .service(
+                        web::scope("/wasm-store")
+                            .wrap(middleware::JwtAuth)
+                            // 商店概览
                             .route(
-                                "/casaos",
-                                web::get().to(handlers::appstore_enhanced::list_casaos_apps),
+                                "/overview",
+                                web::get().to(handlers::wasm_store::get_store_overview),
                             )
+                            // Steam 游戏
                             .route(
-                                "/istoreos",
-                                web::get().to(handlers::appstore_enhanced::list_istoreos_apps),
-                            )
-                            .route(
-                                "/ipk/install",
-                                web::post().to(handlers::appstore_enhanced::install_ipk_package),
-                            )
-                            // Docker container management
-                            .route(
-                                "/containers",
-                                web::get().to(handlers::appstore::list_containers),
+                                "/steam/featured",
+                                web::get().to(handlers::wasm_store::get_steam_featured),
                             )
                             .route(
-                                "/containers",
-                                web::post().to(handlers::appstore::create_container),
+                                "/steam/app/{app_id}",
+                                web::get().to(handlers::wasm_store::get_steam_app_details),
+                            )
+                            // Epic 免费游戏
+                            .route(
+                                "/epic/free",
+                                web::get().to(handlers::wasm_store::get_epic_free_games),
+                            )
+                            // WASM 应用搜索
+                            .route(
+                                "/search",
+                                web::get().to(handlers::wasm_store::search_wasm_apps),
+                            )
+                            // WASM 应用管理
+                            .route(
+                                "/wasm/apps",
+                                web::get().to(handlers::wasm_store::list_wasm_apps),
                             )
                             .route(
-                                "/containers/{id}/start",
-                                web::post().to(handlers::appstore::start_container),
+                                "/wasm/apps/{app_id}",
+                                web::get().to(handlers::wasm_store::get_wasm_app_details),
                             )
                             .route(
-                                "/containers/{id}/stop",
-                                web::post().to(handlers::appstore::stop_container),
+                                "/wasm/install",
+                                web::post().to(handlers::wasm_store::install_wasm_app),
                             )
                             .route(
-                                "/containers/{id}/remove",
-                                web::delete().to(handlers::appstore::remove_container),
+                                "/wasm/{app_id}/run",
+                                web::post().to(handlers::wasm_store::run_wasm_app),
                             )
                             .route(
-                                "/containers/{id}/logs",
-                                web::get().to(handlers::appstore::get_container_logs),
+                                "/wasm/{app_id}",
+                                web::delete().to(handlers::wasm_store::uninstall_wasm_app),
+                            )
+                            // 插件系统
+                            .route(
+                                "/plugins",
+                                web::get().to(handlers::wasm_store::list_plugins),
                             )
                             .route(
-                                "/containers/{id}/stats",
-                                web::get().to(handlers::appstore::get_container_stats),
-                            )
-                            .route("/images", web::get().to(handlers::appstore::list_images))
-                            .route(
-                                "/images/pull",
-                                web::post().to(handlers::appstore::pull_image),
+                                "/plugins/register",
+                                web::post().to(handlers::wasm_store::register_plugin),
                             )
                             .route(
-                                "/images/{id}",
-                                web::delete().to(handlers::appstore::remove_image),
+                                "/plugins/{plugin_id}",
+                                web::delete().to(handlers::wasm_store::unregister_plugin),
                             ),
                     )
                     .service(
                         web::scope("/disk")
+                            .wrap(middleware::JwtAuth)
                             .route("/list", web::get().to(handlers::disk_manager::list_disks))
                             .route(
                                 "/{id}/details",
@@ -627,6 +660,7 @@ async fn main() -> std::io::Result<()> {
                     // Professional storage management API
                     .service(
                         web::scope("/storage")
+                            .wrap(middleware::JwtAuth)
                             .route(
                                 "/devices",
                                 web::get().to(handlers::storage::list_storage_devices),
@@ -670,6 +704,7 @@ async fn main() -> std::io::Result<()> {
                     // Video hardware acceleration API
                     .service(
                         web::scope("/video-hardware")
+                            .wrap(middleware::JwtAuth)
                             .route(
                                 "/capabilities",
                                 web::get().to(handlers::video_hardware::get_hardware_capabilities),
@@ -681,6 +716,7 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(
                         web::scope("/files")
+                            .wrap(middleware::JwtAuth)
                             .route("/upload", web::post().to(handlers::files::upload_file))
                             .route("/list", web::get().to(handlers::files::list_files))
                             .route(
@@ -694,6 +730,7 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(
                         web::scope("/widgets")
+                            .wrap(middleware::JwtAuth)
                             .route("", web::get().to(handlers::widgets::list_widgets))
                             .route("", web::post().to(handlers::widgets::create_widget))
                             .route("/{id}", web::put().to(handlers::widgets::update_widget))
@@ -701,6 +738,7 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(
                         web::scope("/transfer")
+                            .wrap(middleware::JwtAuth)
                             .route("/upload", web::post().to(file_transfer::upload_file))
                             .route(
                                 "/download/{id}",
@@ -721,6 +759,7 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(
                         web::scope("/secure")
+                            .wrap(middleware::JwtAuth)
                             .route(
                                 "/db/init",
                                 web::post().to(handlers::secure_storage::init_secure_database),
@@ -851,10 +890,10 @@ async fn main() -> std::io::Result<()> {
                     // ============ Secure HLS Streaming ============
                     .service(
                         web::scope("/secure-hls")
-                            // SAE handshake and session creation (requires JWT auth)
+                            .wrap(middleware::JwtAuth)
+                            // SAE handshake and session creation
                             .service(
                                 web::scope("/sae")
-                                    .wrap(middleware::JwtAuth)
                                     .route(
                                         "/init",
                                         web::post().to(handlers::secure_hls::init_sae_handshake),
@@ -873,27 +912,21 @@ async fn main() -> std::io::Result<()> {
                                             .to(handlers::secure_hls::complete_sae_handshake),
                                     ),
                             )
-                            .service(web::scope("/session").wrap(middleware::JwtAuth).route(
+                            .service(web::scope("/session").route(
                                 "/create",
                                 web::post().to(handlers::secure_hls::create_hls_session),
                             ))
-                            // Secure HLS playlist and segments (authorized by session_id)
-                            // Production-grade security: video segments must use POST + ZKP proof
+                            // Secure HLS playlist and segments (authorized by session_id + JWT)
                             .route(
                                 "/{session_id}/playlist.m3u8",
                                 web::get().to(handlers::secure_hls::get_secure_playlist),
                             )
-                            // Stop HLS session (requires JWT auth)
+                            // Stop HLS session
                             .route(
                                 "/{session_id}/stop",
                                 web::post().to(handlers::secure_hls::stop_session),
                             )
-                            // Prebuffer segment (HEAD request to trigger transcoding without returning data)
-                            .route(
-                                "/{session_id}/{segment}",
-                                web::head().to(handlers::secure_hls::prebuffer_segment),
-                            )
-                            // Video segments only allow POST requests (must include ZKP proof)
+                            // Video segments (POST with ZKP proof)
                             .route(
                                 "/{session_id}/{segment}",
                                 web::post().to(handlers::secure_hls::get_secure_segment),
@@ -936,26 +969,11 @@ async fn main() -> std::io::Result<()> {
                                 "/thumbnail/{path:.*}",
                                 web::get().to(handlers::streaming::get_thumbnail),
                             ),
-                    )
-                    .service(
-                        web::scope("/docker")
-                            .route("/images", web::get().to(handlers::docker::list_images))
-                            .route(
-                                "/containers",
-                                web::get().to(handlers::docker::list_containers),
-                            )
-                            .route(
-                                "/containers/{id}",
-                                web::get().to(handlers::docker::inspect_container),
-                            )
-                            .route(
-                                "/system/prune",
-                                web::post().to(handlers::docker::prune_system),
-                            ),
                     ),
             )
             .service(
                 web::scope("/webdav")
+                    .wrap(middleware::JwtAuth)
                     .route(
                         "",
                         web::method(actix_web::http::Method::OPTIONS)

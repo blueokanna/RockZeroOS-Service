@@ -33,17 +33,17 @@ impl Architecture {
     pub fn detect() -> Self {
         #[cfg(target_arch = "x86_64")]
         {
-            return Architecture::X86_64;
+            Architecture::X86_64
         }
 
         #[cfg(target_arch = "aarch64")]
         {
-            return Architecture::Aarch64;
+            Architecture::Aarch64
         }
 
         #[cfg(target_arch = "arm")]
         {
-            return Architecture::Armhf;
+            Architecture::Armhf
         }
 
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "arm")))]
@@ -226,8 +226,7 @@ impl FfmpegManager {
         let download_success = self.download_file(&url, &archive_path).await?;
 
         if !download_success {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "Failed to download FFmpeg",
             ));
         }
@@ -272,8 +271,7 @@ impl FfmpegManager {
             }
         }
 
-        Err(io::Error::new(
-            io::ErrorKind::Other,
+        Err(io::Error::other(
             "No download tool available (curl, wget, or busybox)",
         ))
     }
@@ -319,8 +317,7 @@ impl FfmpegManager {
             }
         }
 
-        Err(io::Error::new(
-            io::ErrorKind::Other,
+        Err(io::Error::other(
             "Failed to extract tar.xz archive",
         ))
     }
@@ -400,8 +397,7 @@ impl FfmpegManager {
                     "FFmpeg installed but not found in PATH",
                 ))
             }
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::Other,
+            Ok(_) => Err(io::Error::other(
                 "Package manager failed to install FFmpeg",
             )),
             Err(e) => Err(e),

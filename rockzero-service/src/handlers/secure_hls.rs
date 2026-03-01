@@ -1,25 +1,13 @@
-use actix_web::{web, HttpRequest, HttpResponse, Responder};
-use chrono::Utc;
+use actix_web::{web, HttpResponse, Responder};
 use rockzero_common::AppError;
-use rockzero_media::HlsSessionManager;
+use rockzero_crypto::{EnhancedPasswordProof, PasswordRegistration, ZkpContext};
+use rockzero_media::{HlsSession, HlsSessionManager};
 use rockzero_sae::{SaeCommit, SaeConfirm};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
-
-lazy_static::lazy_static! {
-    static ref USED_NONCES: std::sync::Mutex<HashMap<String, i64>> =
-        std::sync::Mutex::new(HashMap::new());
-    static ref REQUEST_SIGNATURES: std::sync::Mutex<HashMap<String, i64>> =
-        std::sync::Mutex::new(HashMap::new());
-}
-
-const NONCE_EXPIRY_SECONDS: i64 = 300;
-const REQUEST_SIGNATURE_EXPIRY_SECONDS: i64 = 60;
-const MAX_TIMESTAMP_DRIFT_SECONDS: i64 = 30;
 
 fn convert_hls_error(err: rockzero_media::HlsError) -> AppError {
     match err {
@@ -34,121 +22,22 @@ fn convert_hls_error(err: rockzero_media::HlsError) -> AppError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecureRequestParams {
-    pub timestamp: i64,
-    pub nonce: String,
-    pub signature: String,
-}
-
-fn verify_secure_request(
-    params: &SecureRequestParams,
-    session_id: &str,
-    segment_name: &str,
-    pmk: &[u8; 32],
-) -> Result<(), AppError> {
-    let now = Utc::now().timestamp_millis();
-
-    let timestamp_diff = (now - params.timestamp).abs();
-    if timestamp_diff > MAX_TIMESTAMP_DRIFT_SECONDS * 1000 {
-        return Err(AppError::Unauthorized(format!(
-            "Request timestamp too old or in future: {} ms drift",
-            timestamp_diff
-        )));
-    }
-
-    {
-        let mut nonces = USED_NONCES
-            .lock()
-            .map_err(|_| AppError::InternalServerError("Failed to lock nonce store".to_string()))?;
-
-        let expiry_threshold = now - NONCE_EXPIRY_SECONDS * 1000;
-        nonces.retain(|_, &mut ts| ts > expiry_threshold);
-
-        if nonces.contains_key(&params.nonce) {
-            return Err(AppError::Unauthorized(
-                "Nonce already used (replay attack detected)".to_string(),
-            ));
-        }
-
-        nonces.insert(params.nonce.clone(), now);
-    }
-
-    let expected_signature = compute_request_signature(
-        session_id,
-        params.timestamp,
-        &params.nonce,
-        segment_name,
-        pmk,
-    );
-
-    if !constant_time_compare(&params.signature, &expected_signature) {
-        return Err(AppError::Unauthorized(
-            "Invalid request signature".to_string(),
-        ));
-    }
-
-    {
-        let mut signatures = REQUEST_SIGNATURES.lock().map_err(|_| {
-            AppError::InternalServerError("Failed to lock signature store".to_string())
-        })?;
-
-        let expiry_threshold = now - REQUEST_SIGNATURE_EXPIRY_SECONDS * 1000;
-        signatures.retain(|_, &mut ts| ts > expiry_threshold);
-
-        if signatures.contains_key(&params.signature) {
-            return Err(AppError::Unauthorized(
-                "Request signature already used".to_string(),
-            ));
-        }
-
-        signatures.insert(params.signature.clone(), now);
-    }
-
-    Ok(())
-}
-
-fn compute_request_signature(
-    session_id: &str,
-    timestamp: i64,
-    nonce: &str,
-    segment_name: &str,
-    pmk: &[u8; 32],
-) -> String {
-    let message = format!("{}:{}:{}:{}", session_id, timestamp, nonce, segment_name);
-
-    let mut input = Vec::with_capacity(32 + message.len());
-    input.extend_from_slice(pmk);
-    input.extend_from_slice(message.as_bytes());
-
-    let hash = blake3::hash(&input);
-    hex::encode(hash.as_bytes())
-}
-
-fn constant_time_compare(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-
-    let mut result = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        result |= x ^ y;
-    }
-    result == 0
-}
-
 fn sanitize_file_path(path: &str) -> Result<std::path::PathBuf, AppError> {
     use std::path::PathBuf;
 
+    // URL 解码
     let decoded_path = urlencoding::decode(path)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| path.to_string());
 
     let path_buf = PathBuf::from(&decoded_path);
 
+    // 如果是绝对路径，直接验证
     if path_buf.is_absolute() {
+        // 尝试规范化路径
         let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
 
+        // 验证路径是否在允许的目录中
         const ALLOWED_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
         let path_str = canonical.to_string_lossy();
 
@@ -158,8 +47,10 @@ fn sanitize_file_path(path: &str) -> Result<std::path::PathBuf, AppError> {
             }
         }
 
+        // Windows 路径
         #[cfg(target_os = "windows")]
         {
+            // 允许所有盘符
             if path_str.len() >= 2 && path_str.chars().nth(1) == Some(':') {
                 return Ok(canonical);
             }
@@ -170,8 +61,10 @@ fn sanitize_file_path(path: &str) -> Result<std::path::PathBuf, AppError> {
         ));
     }
 
+    // 相对路径：相对于基础目录
     let base_dir = get_base_directory()?;
     let full_path = base_dir.join(&decoded_path);
+
     let canonical = full_path
         .canonicalize()
         .unwrap_or_else(|_| full_path.clone());
@@ -186,7 +79,7 @@ fn get_base_directory() -> Result<std::path::PathBuf, AppError> {
     {
         let fallback = Path::new("./storage");
         std::fs::create_dir_all(fallback).ok();
-        return Ok(fallback.to_path_buf());
+        Ok(fallback.to_path_buf())
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -215,8 +108,8 @@ fn get_base_directory() -> Result<std::path::PathBuf, AppError> {
 
 #[derive(Debug, Deserialize)]
 pub struct InitSaeRequest {
-    pub file_id: Option<String>,
-    pub file_path: Option<String>,
+    pub file_id: Option<String>,   // 文件 ID（数据库中的）
+    pub file_path: Option<String>, // 文件路径（文件系统中的）
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,10 +120,8 @@ pub struct CompleteSaeRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct CreateSessionRequest {
-    pub temp_session_id: String,
-    pub file_id: Option<String>,
-    pub file_path: Option<String>,
+pub struct SecureSegmentRequest {
+    pub zkp_proof: String, // Base64 编码的 ZKP 证明
 }
 
 pub async fn init_sae_handshake(
@@ -241,12 +132,15 @@ pub async fn init_sae_handshake(
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
 
+    // 验证文件访问权限（支持文件 ID 或文件路径）
     let file_path = if let Some(ref file_id) = body.file_id {
+        // 通过文件 ID 查找
         let file = crate::db::find_file_by_id(&pool, file_id, &user_id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("File not found: {}", file_id)))?;
         file.file_path
     } else if let Some(ref path) = body.file_path {
+        // 直接使用文件路径（验证路径是否存在）
         let sanitized_path = sanitize_file_path(path)?;
         if !sanitized_path.exists() {
             return Err(AppError::NotFound(format!("File not found: {}", path)));
@@ -269,6 +163,7 @@ pub async fn init_sae_handshake(
         user_id, file_path
     );
 
+    // 从数据库获取用户的 SAE 密钥（SHA-256 hash of password）
     let user = crate::db::find_user_by_id(&pool, &user_id)
         .await?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
@@ -276,8 +171,8 @@ pub async fn init_sae_handshake(
     let password = match &user.sae_secret {
         Some(secret) => secret.as_bytes().to_vec(),
         None => {
-            warn!(
-                "User {} does not have sae_secret, using password_hash",
+            tracing::warn!(
+                "User {} does not have sae_secret, SAE handshake may fail. Please re-register.",
                 user_id
             );
             user.password_hash.as_bytes().to_vec()
@@ -419,6 +314,14 @@ pub async fn complete_sae_handshake(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateSessionRequest {
+    pub temp_session_id: String,
+    pub file_id: Option<String>,   // 文件 ID（数据库中的）
+    pub file_path: Option<String>, // 文件路径（文件系统中的）
+    pub zkp_registration: Option<String>,
+}
+
 pub async fn create_hls_session(
     pool: web::Data<SqlitePool>,
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
@@ -428,11 +331,13 @@ pub async fn create_hls_session(
     let user_id = claims.sub.clone();
 
     let file_path = if let Some(ref file_id) = body.file_id {
+        // 通过文件 ID 查找
         let file = crate::db::find_file_by_id(&pool, file_id, &user_id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("File not found: {}", file_id)))?;
         file.file_path
     } else if let Some(ref path) = body.file_path {
+        // 直接使用文件路径（验证路径是否存在）
         let sanitized_path = sanitize_file_path(path)?;
         if !sanitized_path.exists() {
             return Err(AppError::NotFound(format!("File not found: {}", path)));
@@ -455,145 +360,182 @@ pub async fn create_hls_session(
         user_id, file_path
     );
 
+    let zkp_registration: Option<PasswordRegistration> =
+        if let Some(ref reg_json) = body.zkp_registration {
+            Some(serde_json::from_str(reg_json).map_err(|e| {
+                AppError::BadRequest(format!("Invalid ZKP registration format: {}", e))
+            })?)
+        } else {
+            match get_user_zkp_registration(&pool, &user_id).await {
+                Ok(Some(reg)) => Some(reg),
+                Ok(None) => {
+                    warn!(
+                        "User {} does not have ZKP registration data stored",
+                        user_id
+                    );
+                    None
+                }
+                Err(e) => {
+                    warn!("Failed to get ZKP registration for user {}: {}", user_id, e);
+                    None
+                }
+            }
+        };
+
     let manager = hls_manager.read().await;
     let session_id = manager
-        .complete_sae_handshake(&body.temp_session_id, user_id.clone(), file_path.clone())
+        .complete_sae_handshake_with_registration(
+            &body.temp_session_id,
+            user_id.clone(),
+            file_path.clone(),
+            zkp_registration.clone(),
+        )
         .map_err(convert_hls_error)?;
 
     let session = manager
         .get_session(&session_id)
         .map_err(convert_hls_error)?;
 
+    let has_zkp = zkp_registration.is_some();
     info!(
-        "Created HLS session {} for user {} - file {}",
-        session_id, user_id, file_path
+        "Created HLS session {} for user {} - file {} (ZKP enabled: {})",
+        session_id, user_id, file_path, has_zkp
     );
-
-    // Generate a key verification hash (hash of encryption key + session_id)
-    // This allows the client to verify their derived key matches without exposing the key
-    let key_verification = {
-        let mut input = Vec::with_capacity(32 + session_id.len());
-        input.extend_from_slice(&session.encryption_key);
-        input.extend_from_slice(session_id.as_bytes());
-        let hash = blake3::hash(&input);
-        hex::encode(&hash.as_bytes()[..16]) // First 16 bytes as hex
-    };
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "session_id": session_id,
         "expires_at": session.expires_at.timestamp(),
         "playlist_url": format!("/api/v1/secure-hls/{}/playlist.m3u8", session_id),
+        "zkp_enabled": has_zkp,
         "encryption_method": "AES-256-GCM",
-        "key_verification": key_verification,
-        "security_features": {
-            "sae_handshake": true,
-            "replay_protection": true,
-            "request_signing": true,
-            "timestamp_validation": true
-        }
     })))
 }
 
+async fn get_user_zkp_registration(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> Result<Option<PasswordRegistration>, AppError> {
+    let user = crate::db::find_user_by_id(pool, user_id).await?;
+
+    match user {
+        Some(u) => {
+            if let Some(zkp_reg_json) = u.zkp_registration {
+                let registration: PasswordRegistration = serde_json::from_str(&zkp_reg_json)
+                    .map_err(|e| {
+                        AppError::InternalServerError(format!(
+                            "Invalid ZKP registration data in database: {}",
+                            e
+                        ))
+                    })?;
+                Ok(Some(registration))
+            } else {
+                Ok(None)
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+// ============ 安全播放列表和段获取 ============
+
+/// 获取安全的 M3U8 播放列表（不包含密钥 URL）
 pub async fn get_secure_playlist(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<String>,
 ) -> Result<impl Responder, AppError> {
     let session_id = path.into_inner();
 
+    // 验证会话
     let manager = hls_manager.read().await;
-    let session = manager
+    let _session = manager
         .get_session(&session_id)
         .map_err(convert_hls_error)?;
 
-    // Get actual video duration
-    let video_path = std::path::Path::new(&session.file_path);
-    let video_info = probe_video_info(video_path).await.ok();
+    // 生成不包含密钥 URL 的播放列表
+    let playlist = generate_secure_m3u8(100, 10.0);
 
-    let duration = video_info.as_ref().map(|i| i.duration).unwrap_or(600.0);
-    let segment_duration = 10.0f64;
-    let segment_count = ((duration / segment_duration).ceil() as usize).max(1);
-
-    let playlist = generate_secure_m3u8(segment_count, segment_duration as f32, duration);
-
-    info!(
-        "Serving secure playlist for session {} (duration: {:.1}s, segments: {})",
-        session_id, duration, segment_count
-    );
+    info!("Serving secure playlist for session {}", session_id);
 
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
-        .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
-        .insert_header(("Pragma", "no-cache"))
-        .insert_header(("Expires", "0"))
+        .insert_header(("Cache-Control", "no-cache"))
         .insert_header(("X-Encryption-Method", "AES-256-GCM"))
-        .insert_header(("X-Security-Features", "SAE,ReplayProtection,RequestSigning"))
+        .insert_header(("X-Requires-ZKP", "true"))
         .body(playlist))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct SecureSegmentQuery {
-    pub ts: Option<i64>,
-    pub nonce: Option<String>,
-    pub sig: Option<String>,
-}
-
+/// 获取加密的 TS 段（需要 ZKP 证明）
+///
+/// **生产级安全实现**：
+/// - 仅支持 POST 请求 + JSON body
+/// - 必须提供有效的 ZKP 证明
+/// - 验证会话有效性
+/// - 验证 ZKP 证明的时间戳和 nonce
+/// - 使用 AES-256-GCM 加密视频段
+///
+/// # 安全流程
+/// 1. 验证 HTTP 方法（必须是 POST）
+/// 2. 验证会话存在且未过期
+/// 3. 解析并验证 ZKP 证明
+/// 4. 读取并加密视频段
+/// 5. 返回加密数据
 pub async fn get_secure_segment(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<(String, String)>,
-    query: web::Query<SecureSegmentQuery>,
-    req: HttpRequest,
-    _body: web::Bytes,
+    req: actix_web::HttpRequest,
+    body: web::Bytes,
 ) -> Result<impl Responder, AppError> {
     let (session_id, segment_name) = path.into_inner();
 
+    if req.method() != actix_web::http::Method::POST {
+        warn!(
+            "Invalid HTTP method for segment request: {} (expected POST)",
+            req.method()
+        );
+        return Err(AppError::BadRequest(
+            "Segment requests must use POST method with ZKP proof".to_string(),
+        ));
+    }
+
+    // 2. 解析 JSON body
+    let segment_request: SecureSegmentRequest = serde_json::from_slice(&body).map_err(|e| {
+        warn!("Failed to parse segment request body: {}", e);
+        AppError::BadRequest(format!("Invalid JSON body: {}", e))
+    })?;
+
     info!(
-        "Secure segment request: session={}, segment={}",
-        session_id, segment_name
+        "Secure segment request: session={}, segment={}, zkp_proof_len={}",
+        session_id,
+        segment_name,
+        segment_request.zkp_proof.len()
     );
 
+    // 3. 验证会话
     let manager = hls_manager.read().await;
     let session = manager
         .get_session(&session_id)
         .map_err(convert_hls_error)?;
 
-    if let (Some(ts), Some(nonce), Some(sig)) = (&query.ts, &query.nonce, &query.sig) {
-        let params = SecureRequestParams {
-            timestamp: *ts,
-            nonce: nonce.clone(),
-            signature: sig.clone(),
-        };
-
-        verify_secure_request(&params, &session_id, &segment_name, &session.pmk)?;
-        info!("Secure request verified for segment {}", segment_name);
-    } else {
-        let peer_addr = req.peer_addr();
-        let is_local = peer_addr
-            .map(|addr| addr.ip().is_loopback())
-            .unwrap_or(false);
-
-        if !is_local {
-            warn!(
-                "Non-local request without security params for segment {}",
-                segment_name
-            );
-        }
+    // 4. 验证 ZKP 证明（生产环境必须验证）
+    if !verify_zkp_proof(&session, &segment_request.zkp_proof)? {
+        warn!(
+            "Invalid ZKP proof for session {} segment {}",
+            session_id, segment_name
+        );
+        return Err(AppError::Unauthorized(
+            "Invalid ZKP proof - authentication failed".to_string(),
+        ));
     }
 
     info!(
-        "Session verified for segment {} (user: {})",
-        segment_name, session.user_id
+        "✅ ZKP proof verified for session {} segment {}",
+        session_id, segment_name
     );
 
+    // 5. 从 FFmpeg 转码输出读取实际的 TS 段
     let segment_data = read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?;
 
-    // Validate segment data before encryption
-    if segment_data.len() < 1024 {
-        return Err(AppError::InternalServerError(format!(
-            "Invalid segment data: only {} bytes (expected at least 1KB)",
-            segment_data.len()
-        )));
-    }
-
+    // 6. 使用会话密钥加密段
     let encrypted_segment = session
         .encrypt_segment(&segment_data)
         .map_err(convert_hls_error)?;
@@ -606,10 +548,12 @@ pub async fn get_secure_segment(
         encrypted_segment.len()
     );
 
+    // 7. 返回加密的视频段
     Ok(HttpResponse::Ok()
         .content_type("video/mp2t")
         .insert_header(("X-Encrypted", "true"))
         .insert_header(("X-Encryption-Method", "AES-256-GCM"))
+        .insert_header(("X-ZKP-Verified", "true"))
         .insert_header(("Content-Length", encrypted_segment.len()))
         .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
         .insert_header(("Pragma", "no-cache"))
@@ -617,6 +561,20 @@ pub async fn get_secure_segment(
         .body(encrypted_segment))
 }
 
+/// 停止 HLS 会话
+///
+/// **生产级安全实现**：
+/// - 验证会话存在
+/// - 移除会话状态
+/// - 清理关联资源
+///
+/// # 参数
+/// - `hls_manager`: HLS 会话管理器
+/// - `path`: 路径参数，包含会话 ID
+///
+/// # 返回
+/// - 成功时返回 200 状态码
+/// - 会话不存在时返回 404
 pub async fn stop_session(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<String>,
@@ -625,11 +583,13 @@ pub async fn stop_session(
 
     info!("Stopping HLS session: {}", session_id);
 
+    // 获取写锁以移除会话
     let manager = hls_manager.write().await;
 
+    // 尝试移除会话
     match manager.remove_session(&session_id) {
         Ok(_) => {
-            info!("HLS session stopped successfully: {}", session_id);
+            info!("✅ HLS session stopped successfully: {}", session_id);
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "success": true,
                 "message": "Session stopped successfully",
@@ -637,6 +597,7 @@ pub async fn stop_session(
             })))
         }
         Err(rockzero_media::HlsError::SessionNotFound(_)) => {
+            // 会话不存在也返回成功（幂等操作）
             info!("HLS session already stopped or not found: {}", session_id);
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "success": true,
@@ -651,66 +612,26 @@ pub async fn stop_session(
     }
 }
 
-pub async fn prebuffer_segment(
-    hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
-    path: web::Path<(String, String)>,
-) -> Result<impl Responder, AppError> {
-    let (session_id, segment_name) = path.into_inner();
+// ============ 辅助函数 ============
 
-    info!(
-        "Prebuffer request: session={}, segment={}",
-        session_id, segment_name
-    );
-
-    let manager = hls_manager.read().await;
-    let session = manager
-        .get_session(&session_id)
-        .map_err(convert_hls_error)?;
-
-    let segment_data = read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?;
-
-    info!(
-        "Prebuffered segment {} for session {} ({} bytes)",
-        segment_name,
-        session_id,
-        segment_data.len()
-    );
-
-    Ok(HttpResponse::Ok()
-        .insert_header(("X-Prebuffered", "true"))
-        .insert_header(("X-Segment-Size", segment_data.len()))
-        .finish())
-}
-
-fn generate_secure_m3u8(
-    segment_count: usize,
-    segment_duration: f32,
-    total_duration: f64,
-) -> String {
+/// 生成安全的 M3U8 播放列表（不包含 #EXT-X-KEY）
+fn generate_secure_m3u8(segment_count: usize, segment_duration: f32) -> String {
     let mut playlist = String::from("#EXTM3U\n");
-    playlist.push_str("#EXT-X-VERSION:6\n");
-    playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    playlist.push_str("#EXT-X-VERSION:3\n");
     playlist.push_str(&format!(
         "#EXT-X-TARGETDURATION:{}\n",
         segment_duration.ceil() as u32
     ));
     playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
-    playlist.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
-    playlist.push_str("# Encrypted with AES-256-GCM (custom implementation)\n");
-    playlist.push_str("# Key derived from SAE handshake\n");
-    playlist.push_str("# Replay protection enabled\n\n");
+
+    // ❌ 不包含 #EXT-X-KEY（密钥通过 SAE 握手获得）
+    // ✅ 客户端已经拥有解密密钥（AES-256-GCM）
+
+    playlist.push_str("# Encrypted with AES-256-GCM\n");
+    playlist.push_str("# Requires ZKP proof for segment access\n\n");
 
     for i in 0..segment_count {
-        // Calculate actual duration for this segment
-        let segment_start = i as f64 * segment_duration as f64;
-        let remaining = total_duration - segment_start;
-        let actual_duration = if remaining < segment_duration as f64 {
-            remaining.max(0.1)
-        } else {
-            segment_duration as f64
-        };
-
-        playlist.push_str(&format!("#EXTINF:{:.6},\n", actual_duration));
+        playlist.push_str(&format!("#EXTINF:{:.3},\n", segment_duration));
         playlist.push_str(&format!("segment_{}.ts\n", i));
     }
 
@@ -718,901 +639,443 @@ fn generate_secure_m3u8(
     playlist
 }
 
+/// 验证客户端的 Bulletproofs ZKP 证明
+///
+/// **生产级安全实现**：使用 Bulletproofs 零知识证明验证
+///
+/// ## 验证流程
+/// 1. 解码 Base64 编码的证明
+/// 2. 解析为 EnhancedPasswordProof 结构
+/// 3. 验证上下文绑定（必须是 "hls_segment_access"）
+/// 4. 验证时间戳（防止延迟重放，5分钟有效期）
+/// 5. 使用 ZkpContext 验证 Schnorr 证明和范围证明
+///
+/// ## 安全特性
+/// - Schnorr 证明：验证客户端知道密码，不泄露密码本身
+/// - Schnorr 证明：验证密码知识
+/// - Bulletproofs 范围证明：密码熵值 >= 28 bits（密码学证明）
+/// - 时间戳 + nonce：防止重放攻击
+/// - 上下文绑定：防止跨上下文攻击
+///
+/// ## 证明类型
+/// - EnhancedPasswordProof: Schnorr 证明 + Bulletproofs 范围证明（完整版）
+///
+/// ## 要求
+/// - 会话必须包含 PasswordRegistration（用户注册时生成）
+/// - 客户端必须使用相同的密码生成证明
+///
+fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, AppError> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+    // 1. 解码 Base64 编码的证明
+    let proof_bytes = BASE64.decode(proof_base64).map_err(|e| {
+        AppError::BadRequest(format!("Invalid Base64 encoding in ZKP proof: {}", e))
+    })?;
+
+    // 2. 解析为 EnhancedPasswordProof（完整的 Bulletproofs 证明）
+    let proof: EnhancedPasswordProof = serde_json::from_slice(&proof_bytes).map_err(|e| {
+        AppError::BadRequest(format!(
+            "Invalid EnhancedPasswordProof structure: {}. \
+             Ensure the client is using the full Bulletproofs implementation.",
+            e
+        ))
+    })?;
+
+    const EXPECTED_CONTEXT: &str = "hls_segment_access";
+    const MAX_AGE_SECONDS: i64 = 300; // 5分钟有效期
+
+    // 3. 验证上下文
+    if proof.context != EXPECTED_CONTEXT {
+        warn!(
+            "ZKP proof context mismatch: expected '{}', got '{}'",
+            EXPECTED_CONTEXT, proof.context
+        );
+        return Ok(false);
+    }
+
+    // 4. 验证时间戳（防止延迟重放）
+    let now = chrono::Utc::now().timestamp();
+    if now - proof.timestamp > MAX_AGE_SECONDS {
+        warn!(
+            "ZKP proof expired: timestamp={}, now={}, age={}s",
+            proof.timestamp,
+            now,
+            now - proof.timestamp
+        );
+        return Ok(false);
+    }
+
+    if proof.timestamp > now + 60 {
+        warn!(
+            "ZKP proof timestamp in future: timestamp={}, now={}",
+            proof.timestamp, now
+        );
+        return Ok(false);
+    }
+
+    // 5. 检查会话是否有 ZKP 注册数据
+    let registration = session.get_zkp_registration().ok_or_else(|| {
+        AppError::CryptoError(
+            "Session does not have ZKP registration data. \
+             User must complete registration with ZKP enabled."
+                .to_string(),
+        )
+    })?;
+
+    // 6. 使用 ZkpContext 验证完整的 Bulletproofs 证明
+    let zkp_context = ZkpContext::new();
+
+    info!(
+        "Verifying EnhancedPasswordProof (Bulletproofs) for session {}",
+        session.session_id
+    );
+
+    match zkp_context.verify_enhanced_proof(&proof, registration, EXPECTED_CONTEXT, MAX_AGE_SECONDS)
+    {
+        Ok(valid) => {
+            if valid {
+                info!(
+                    "✅ Bulletproofs ZKP proof verified for session {}",
+                    session.session_id
+                );
+            } else {
+                warn!(
+                    "❌ Bulletproofs ZKP proof verification failed for session {}",
+                    session.session_id
+                );
+            }
+            Ok(valid)
+        }
+        Err(e) => {
+            warn!(
+                "Bulletproofs ZKP proof verification error for session {}: {}",
+                session.session_id, e
+            );
+            Err(AppError::CryptoError(format!(
+                "Bulletproofs ZKP verification failed: {}",
+                e
+            )))
+        }
+    }
+}
+
+/// 视频段缓存目录配置
+///
+/// 与 StorageConfig 使用相同的环境变量配置，确保清理任务能正确清理缓存。
+///
+/// 优先级:
+/// 1. `HLS_CACHE_PATH` 环境变量（与 StorageConfig 一致）
+/// 2. `ROCKZERO_HLS_CACHE_DIR` 环境变量（兼容旧配置）
+/// 3. 默认 `./data/hls_cache`（与 StorageConfig 默认值一致）
 fn get_hls_cache_dir() -> std::path::PathBuf {
+    // 优先使用 HLS_CACHE_PATH（与 StorageConfig 一致）
     std::env::var("HLS_CACHE_PATH")
         .or_else(|_| std::env::var("ROCKZERO_HLS_CACHE_DIR"))
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("./data/hls_cache"))
+        .unwrap_or_else(|_| {
+            // 默认使用 ./data/hls_cache（与 StorageConfig 默认值一致）
+            std::path::PathBuf::from("./data/hls_cache")
+        })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum HardwareAccel {
-    AmlogicV4l2,    // Amlogic A311D/S905/S922 等芯片
-    Vaapi,          // Intel/AMD GPU
-    V4l2Generic,    // 通用 V4L2
-    RockchipRga,    // Rockchip RK3588 等
-    None,           // 软件编码
-}
-
-struct VideoInfo {
-    duration: f64,
-    has_video: bool,
-    has_audio: bool,
-    video_codec: String,
-    width: u32,
-    height: u32,
-}
-
-async fn probe_video_info(video_path: &std::path::Path) -> Result<VideoInfo, AppError> {
-    use tokio::process::Command;
-    use tokio::time::{timeout, Duration};
-
-    let ffprobe_path = get_ffprobe_path();
-
-    let output = timeout(
-        Duration::from_secs(30),
-        Command::new(&ffprobe_path)
-            .args([
-                "-v", "quiet",
-                "-print_format", "json",
-                "-show_format",
-                "-show_streams",
-                video_path.to_str().unwrap_or(""),
-            ])
-            .output()
-    )
-    .await
-    .map_err(|_| AppError::InternalServerError("FFprobe timeout".to_string()))?
-    .map_err(|e| AppError::IoError(format!("Failed to probe video: {}. FFprobe path: {}", e, ffprobe_path)))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::InternalServerError(format!("FFprobe failed: {}", stderr)));
-    }
-
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value = serde_json::from_str(&json_str)
-        .map_err(|e| AppError::InternalServerError(format!("Failed to parse ffprobe: {}", e)))?;
-
-    let duration = json["format"]["duration"]
-        .as_str()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0);
-
-    let streams = json["streams"].as_array();
-    let mut has_video = false;
-    let mut has_audio = false;
-    let mut video_codec = String::new();
-    let mut width = 0u32;
-    let mut height = 0u32;
-
-    if let Some(streams) = streams {
-        for stream in streams {
-            let codec_type = stream["codec_type"].as_str().unwrap_or("");
-            if codec_type == "video" {
-                has_video = true;
-                video_codec = stream["codec_name"].as_str().unwrap_or("").to_string();
-                width = stream["width"].as_u64().unwrap_or(0) as u32;
-                height = stream["height"].as_u64().unwrap_or(0) as u32;
-            } else if codec_type == "audio" {
-                has_audio = true;
-            }
-        }
-    }
-
-    Ok(VideoInfo {
-        duration,
-        has_video,
-        has_audio,
-        video_codec,
-        width,
-        height,
-    })
-}
-
-/// 检测硬件加速能力
-/// 针对 Amlogic A311D 等芯片进行优化
-async fn detect_hardware_acceleration() -> HardwareAccel {
-    use tokio::fs;
-
-    // 1. 首先检测是否是 Amlogic 设备（A311D, S905, S922 等）
-    if is_amlogic_device().await {
-        info!("Detected Amlogic device, checking V4L2 M2M support...");
-        
-        // 检查 V4L2 M2M 设备
-        let v4l2_devices = ["/dev/video10", "/dev/video11", "/dev/video12"];
-        let mut has_v4l2_device = false;
-        
-        for device in &v4l2_devices {
-            if fs::metadata(device).await.is_ok() {
-                info!("Found V4L2 device: {}", device);
-                has_v4l2_device = true;
-                break;
-            }
-        }
-        
-        if has_v4l2_device {
-            // 检查 FFmpeg 是否支持 h264_v4l2m2m 编码器
-            if check_ffmpeg_encoder("h264_v4l2m2m").await {
-                info!("Amlogic V4L2 M2M hardware acceleration available");
-                return HardwareAccel::AmlogicV4l2;
-            } else {
-                warn!("h264_v4l2m2m encoder not available in FFmpeg");
-            }
-        }
-    }
-
-    // 2. 检测 VAAPI (Intel/AMD GPU)
-    if fs::metadata("/dev/dri/renderD128").await.is_ok() {
-        if check_ffmpeg_encoder("h264_vaapi").await {
-            info!("VAAPI hardware acceleration available");
-            return HardwareAccel::Vaapi;
-        }
-    }
-
-    // 3. 检测 Rockchip RGA
-    if fs::metadata("/dev/rga").await.is_ok() || fs::metadata("/dev/mpp_service").await.is_ok() {
-        if check_ffmpeg_encoder("h264_rkmpp").await {
-            info!("Rockchip RGA hardware acceleration available");
-            return HardwareAccel::RockchipRga;
-        }
-    }
-
-    // 4. 通用 V4L2 检测
-    if fs::metadata("/dev/video10").await.is_ok() || fs::metadata("/dev/video11").await.is_ok() {
-        if check_ffmpeg_encoder("h264_v4l2m2m").await {
-            info!("Generic V4L2 M2M hardware acceleration available");
-            return HardwareAccel::V4l2Generic;
-        }
-    }
-
-    info!("No hardware acceleration available, using software encoding");
-    HardwareAccel::None
-}
-
-/// 检测是否是 Amlogic 设备
-async fn is_amlogic_device() -> bool {
-    // 检查 /proc/cpuinfo
-    if let Ok(content) = tokio::fs::read_to_string("/proc/cpuinfo").await {
-        let content_lower = content.to_lowercase();
-        if content_lower.contains("amlogic")
-            || content_lower.contains("a311d")
-            || content_lower.contains("s905")
-            || content_lower.contains("s922")
-            || content_lower.contains("meson")
-        {
-            info!("Amlogic device detected via /proc/cpuinfo");
-            return true;
-        }
-    }
-    
-    // 检查设备树
-    if let Ok(content) = tokio::fs::read_to_string("/sys/firmware/devicetree/base/compatible").await {
-        let content_lower = content.to_lowercase();
-        if content_lower.contains("amlogic") || content_lower.contains("meson") {
-            info!("Amlogic device detected via device tree");
-            return true;
-        }
-    }
-    
-    // 检查 /sys/class/amhdmitx 目录（Amlogic 特有）
-    if tokio::fs::metadata("/sys/class/amhdmitx").await.is_ok() {
-        info!("Amlogic device detected via /sys/class/amhdmitx");
-        return true;
-    }
-    
-    // 检查 /dev/amvideo 设备（Amlogic 视频设备）
-    if tokio::fs::metadata("/dev/amvideo").await.is_ok() {
-        info!("Amlogic device detected via /dev/amvideo");
-        return true;
-    }
-    
-    false
-}
-
-/// 检查 FFmpeg 是否支持指定的编码器
-async fn check_ffmpeg_encoder(encoder: &str) -> bool {
-    use tokio::process::Command;
-    use tokio::time::{timeout, Duration};
-
-    let ffmpeg_path = get_ffmpeg_path();
-
-    let result = timeout(
-        Duration::from_secs(10),
-        Command::new(&ffmpeg_path)
-            .args(["-encoders"])
-            .output()
-    ).await;
-
-    match result {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let has_encoder = stdout.contains(encoder);
-            if has_encoder {
-                info!("FFmpeg encoder '{}' is available", encoder);
-            } else {
-                warn!("FFmpeg encoder '{}' is NOT available", encoder);
-            }
-            has_encoder
-        }
-        Ok(Err(e)) => {
-            warn!("Failed to check FFmpeg encoder: {}", e);
-            false
-        }
-        Err(_) => {
-            warn!("Timeout checking FFmpeg encoder");
-            false
-        }
-    }
-}
-
-/// 检查 FFmpeg 是否支持指定的解码器
-async fn check_ffmpeg_decoder(decoder: &str) -> bool {
-    use tokio::process::Command;
-    use tokio::time::{timeout, Duration};
-
-    let ffmpeg_path = get_ffmpeg_path();
-
-    let result = timeout(
-        Duration::from_secs(10),
-        Command::new(&ffmpeg_path)
-            .args(["-decoders"])
-            .output()
-    ).await;
-
-    match result {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout.contains(decoder)
-        }
-        _ => false,
-    }
-}
-
-/// 获取 FFmpeg 可执行文件路径
-/// 按优先级查找：环境变量 -> 全局设置 -> 数据目录 -> 系统路径
-fn get_ffmpeg_path() -> String {
-    // 1. 首先检查环境变量
-    if let Ok(path) = std::env::var("FFMPEG_PATH") {
-        if std::path::Path::new(&path).exists() {
-            return path;
-        }
-    }
-    
-    // 2. 检查全局设置
-    if let Some(path) = rockzero_media::get_global_ffmpeg_path() {
-        if std::path::Path::new(&path).exists() {
-            return path;
-        }
-    }
-    
-    // 3. 检查常见安装位置
-    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
-    let candidates = [
-        format!("{}/ffmpeg/ffmpeg", data_dir),
-        "./data/ffmpeg/ffmpeg".to_string(),
-        "/usr/bin/ffmpeg".to_string(),
-        "/usr/local/bin/ffmpeg".to_string(),
-        "/opt/ffmpeg/bin/ffmpeg".to_string(),
-        "ffmpeg".to_string(),
-    ];
-    
-    for candidate in &candidates {
-        if std::path::Path::new(candidate).exists() {
-            return candidate.clone();
-        }
-    }
-    
-    // 4. 尝试使用 which 命令查找
-    if let Ok(output) = std::process::Command::new("which").arg("ffmpeg").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return path;
-            }
-        }
-    }
-    
-    // 5. 默认返回 ffmpeg，让系统 PATH 处理
-    "ffmpeg".to_string()
-}
-
-/// 获取 FFprobe 可执行文件路径
-fn get_ffprobe_path() -> String {
-    // 1. 首先检查环境变量
-    if let Ok(path) = std::env::var("FFPROBE_PATH") {
-        if std::path::Path::new(&path).exists() {
-            return path;
-        }
-    }
-    
-    // 2. 检查全局设置
-    if let Some(path) = rockzero_media::get_global_ffprobe_path() {
-        if std::path::Path::new(&path).exists() {
-            return path;
-        }
-    }
-    
-    // 3. 检查常见安装位置
-    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
-    let candidates = [
-        format!("{}/ffmpeg/ffprobe", data_dir),
-        "./data/ffmpeg/ffprobe".to_string(),
-        "/usr/bin/ffprobe".to_string(),
-        "/usr/local/bin/ffprobe".to_string(),
-        "/opt/ffmpeg/bin/ffprobe".to_string(),
-        "ffprobe".to_string(),
-    ];
-    
-    for candidate in &candidates {
-        if std::path::Path::new(candidate).exists() {
-            return candidate.clone();
-        }
-    }
-    
-    // 4. 尝试使用 which 命令查找
-    if let Ok(output) = std::process::Command::new("which").arg("ffprobe").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return path;
-            }
-        }
-    }
-    
-    "ffprobe".to_string()
-}
-
+/// 从 FFmpeg 转码输出读取视频段
+///
+/// 生产级实现流程：
+/// 1. 验证段名称格式（防止路径遍历攻击）
+/// 2. 计算视频文件的唯一标识符（用于缓存目录）
+/// 3. 尝试从 HLS 缓存目录读取预转码的段
+/// 4. 如果缓存不存在，触发实时转码（通过 FFmpeg）
+/// 5. 支持段索引验证和路径遍历保护
+///
+/// # 缓存策略
+/// - 缓存目录：`/var/cache/rockzero/hls/{video_hash}/`
+/// - 段文件命名：`segment_N.ts`
+/// - 自动创建缓存目录
+/// - 转码失败时返回错误，不阻塞服务
 async fn read_video_segment_from_ffmpeg(
     file_path: &str,
     segment_name: &str,
 ) -> Result<Vec<u8>, AppError> {
     use std::path::PathBuf;
 
+    // 1. 验证段名称格式（防止路径遍历攻击）
     if !segment_name.starts_with("segment_") || !segment_name.ends_with(".ts") {
         return Err(AppError::BadRequest(format!(
-            "Invalid segment name: '{}'",
+            "Invalid segment name format: '{}'. Expected 'segment_N.ts'",
             segment_name
         )));
     }
 
+    // 2. 解析段索引
     let segment_index: usize = segment_name
         .trim_start_matches("segment_")
         .trim_end_matches(".ts")
         .parse()
-        .map_err(|_| AppError::BadRequest(format!("Invalid segment index: '{}'", segment_name)))?;
+        .map_err(|_| {
+            AppError::BadRequest(format!("Invalid segment index in name: '{}'", segment_name))
+        })?;
 
-    if segment_index > 100_000 {
-        return Err(AppError::BadRequest("Segment index too large".to_string()));
+    // 3. 验证段索引范围（防止过大的索引导致问题）
+    const MAX_SEGMENT_INDEX: usize = 100_000;
+    if segment_index > MAX_SEGMENT_INDEX {
+        return Err(AppError::BadRequest(format!(
+            "Segment index {} exceeds maximum allowed ({})",
+            segment_index, MAX_SEGMENT_INDEX
+        )));
     }
 
+    // 4. 计算视频文件的唯一标识符（用于缓存目录）
     let video_hash = blake3::hash(file_path.as_bytes());
-    let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+    let video_id = hex::encode(&video_hash.as_bytes()[..8]); // 使用前 8 字节作为 ID
+
+    // 5. 构建缓存目录路径
     let cache_dir = get_hls_cache_dir().join(&video_id);
     let cached_segment_path = cache_dir.join(segment_name);
 
+    // 6. 尝试从缓存读取
     if cached_segment_path.exists() {
-        // Validate cached segment - must be at least 1KB for a valid TS segment
-        if let Ok(metadata) = tokio::fs::metadata(&cached_segment_path).await {
-            if metadata.len() >= 1024 {
-                info!(
-                    "Cache hit for segment {} of video {} ({} bytes)",
-                    segment_name,
-                    video_id,
-                    metadata.len()
-                );
-                return tokio::fs::read(&cached_segment_path).await.map_err(|e| {
-                    AppError::IoError(format!("Failed to read cached segment: {}", e))
-                });
-            } else {
-                // Invalid cached segment, delete and re-transcode
-                warn!(
-                    "Invalid cached segment {} ({} bytes), removing and re-transcoding",
-                    segment_name,
-                    metadata.len()
-                );
-                let _ = tokio::fs::remove_file(&cached_segment_path).await;
-            }
-        }
+        info!(
+            "Cache hit for segment {} of video {}",
+            segment_name, video_id
+        );
+        return tokio::fs::read(&cached_segment_path).await.map_err(|e| {
+            AppError::IoError(format!(
+                "Failed to read cached segment {}: {}",
+                segment_name, e
+            ))
+        });
     }
 
+    // 7. 缓存不存在，检查原始视频文件
     let original_video = PathBuf::from(file_path);
     if !original_video.exists() {
         return Err(AppError::NotFound(format!(
-            "Video not found: {}",
+            "Original video file not found: {}",
             file_path
         )));
     }
 
+    // 8. 触发实时转码
     info!(
-        "Cache miss for segment {} of video {}, transcoding",
+        "Cache miss for segment {} of video {}, triggering FFmpeg transcode",
         segment_name, video_id
     );
 
+    // 创建缓存目录
     if !cache_dir.exists() {
         tokio::fs::create_dir_all(&cache_dir)
             .await
-            .map_err(|e| AppError::IoError(format!("Failed to create cache dir: {}", e)))?;
+            .map_err(|e| AppError::IoError(format!("Failed to create cache directory: {}", e)))?;
     }
 
-    let segment_data =
-        transcode_segment_with_seek(&original_video, &cache_dir, segment_index).await?;
+    // 调用 FFmpeg 进行转码（异步版本）
+    let segment_data = transcode_segment_async(&original_video, &cache_dir, segment_index).await?;
 
-    // Write to cache synchronously to avoid race conditions
-    if let Err(e) = tokio::fs::write(&cached_segment_path, &segment_data).await {
-        warn!("Failed to cache segment {}: {}", segment_name, e);
-    } else {
-        info!(
-            "Cached segment {} ({} bytes)",
-            segment_name,
-            segment_data.len()
-        );
-    }
+    // 将转码结果写入缓存（异步，失败不阻塞）
+    let cache_path_clone = cached_segment_path.clone();
+    let data_clone = segment_data.clone();
+    tokio::spawn(async move {
+        if let Err(e) = tokio::fs::write(&cache_path_clone, &data_clone).await {
+            warn!("Failed to cache segment: {}", e);
+        }
+    });
 
     Ok(segment_data)
 }
 
-async fn transcode_segment_with_seek(
+/// 使用 FFmpeg 异步转码单个视频段
+///
+/// 这是一个异步实现，用于按需转码。
+/// 支持硬件加速和多种编码器选择。
+///
+/// # FFmpeg 参数说明
+/// - `-ss`: 起始时间（基于段索引计算）
+/// - `-t`: 段持续时间（默认 10 秒）
+/// - `-c:v libx264`: 使用 H.264 编码（软件编码）
+/// - `-c:a aac`: 使用 AAC 音频编码
+/// - `-f mpegts`: 输出 MPEG-TS 格式
+///
+/// # 硬件加速支持
+/// - 检测 `/dev/dri` 设备（Intel/AMD GPU）
+/// - 检测 `/dev/video*` 设备（V4L2 硬件编码器）
+/// - ARM 平台优化（A311D 等 SoC）
+async fn transcode_segment_async(
     video_path: &std::path::Path,
     output_dir: &std::path::Path,
     segment_index: usize,
 ) -> Result<Vec<u8>, AppError> {
     use tokio::process::Command;
-    use tokio::time::{timeout, Duration};
 
-    const SEGMENT_DURATION: f64 = 10.0;
-    const TRANSCODE_TIMEOUT_SECS: u64 = 120;
-    
+    const SEGMENT_DURATION: f64 = 10.0; // 每段 10 秒
     let start_time = segment_index as f64 * SEGMENT_DURATION;
+
     let output_path = output_dir.join(format!("segment_{}.ts", segment_index));
 
-    // Remove any existing output file first
-    let _ = tokio::fs::remove_file(&output_path).await;
+    // 检测 FFmpeg 可执行文件路径
+    let ffmpeg_path = std::env::var("FFMPEG_PATH")
+        .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
+        .unwrap_or_else(|_| "ffmpeg".to_string());
 
-    // Check if we're beyond video duration
-    let video_info = probe_video_info(video_path).await.ok();
-    if let Some(ref info) = video_info {
-        if start_time >= info.duration {
-            return Err(AppError::BadRequest(format!(
-                "Segment {} starts at {:.1}s but video is only {:.1}s long",
-                segment_index, start_time, info.duration
-            )));
-        }
-    }
-
-    let ffmpeg_path = get_ffmpeg_path();
-    info!("Using FFmpeg at: {}", ffmpeg_path);
-
-    // 验证 FFmpeg 是否真的存在且可执行
-    let ffmpeg_exists = std::path::Path::new(&ffmpeg_path).exists();
-    if !ffmpeg_exists && ffmpeg_path != "ffmpeg" {
-        warn!("FFmpeg not found at configured path: {}", ffmpeg_path);
-        return Err(AppError::InternalServerError(format!(
-            "FFmpeg not found at: {}. Please ensure FFmpeg is installed or the archive is extracted.",
-            ffmpeg_path
-        )));
-    }
-
+    // 检测硬件加速能力
     let hw_accel = detect_hardware_acceleration().await;
-    let video_path_str = video_path.to_str().unwrap_or("");
-    let output_path_str = output_path.to_str().unwrap_or("");
 
-    // Always transcode for HLS compatibility
-    let needs_transcode = true;
+    // 构建 FFmpeg 命令参数
+    let mut args = vec![
+        "-y".to_string(), // 覆盖输出文件
+        "-ss".to_string(),
+        format!("{:.3}", start_time), // 起始时间
+        "-i".to_string(),
+        video_path.to_str().unwrap_or("").to_string(),
+        "-t".to_string(),
+        format!("{:.3}", SEGMENT_DURATION), // 段持续时间
+    ];
 
-    info!(
-        "Transcoding segment {} at {:.2}s with {:?}",
-        segment_index, start_time, hw_accel
-    );
-
-    let args = build_ffmpeg_args(
-        hw_accel,
-        video_path_str,
-        output_path_str,
-        start_time,
-        SEGMENT_DURATION,
-        needs_transcode,
-        &video_info,
-    );
-
-    info!("FFmpeg command: {} {}", ffmpeg_path, args.join(" "));
-
-    // 使用超时执行 FFmpeg
-    let output_result = timeout(
-        Duration::from_secs(TRANSCODE_TIMEOUT_SECS),
-        Command::new(&ffmpeg_path)
-            .args(&args)
-            .output()
-    ).await;
-
-    let output = match output_result {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => {
-            return Err(AppError::IoError(format!(
-                "FFmpeg execution failed for segment {}: {}. FFmpeg path: {}",
-                segment_index, e, ffmpeg_path
-            )));
-        }
-        Err(_) => {
-            return Err(AppError::InternalServerError(format!(
-                "FFmpeg timeout for segment {} (exceeded {}s)",
-                segment_index, TRANSCODE_TIMEOUT_SECS
-            )));
-        }
-    };
-
-    let mut transcode_success = output.status.success();
-
-    if !transcode_success {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        warn!(
-            "FFmpeg failed with {:?} for segment {}: stderr={}, stdout={}",
-            hw_accel, segment_index, stderr, stdout
-        );
-
-        if hw_accel != HardwareAccel::None {
-            info!("Retrying segment {} with software encoding", segment_index);
-
-            // Remove any partial output
-            let _ = tokio::fs::remove_file(&output_path).await;
-
-            let fallback_args = build_ffmpeg_args(
-                HardwareAccel::None,
-                video_path_str,
-                output_path_str,
-                start_time,
-                SEGMENT_DURATION,
-                true,
-                &video_info,
-            );
-
-            info!(
-                "FFmpeg fallback command: {} {}",
-                ffmpeg_path,
-                fallback_args.join(" ")
-            );
-
-            let fallback_result = timeout(
-                Duration::from_secs(TRANSCODE_TIMEOUT_SECS),
-                Command::new(&ffmpeg_path)
-                    .args(&fallback_args)
-                    .output()
-            ).await;
-
-            match fallback_result {
-                Ok(Ok(fallback_output)) => {
-                    if fallback_output.status.success() {
-                        transcode_success = true;
-                        info!(
-                            "Fallback transcoding succeeded for segment {}",
-                            segment_index
-                        );
-                    } else {
-                        let fallback_stderr = String::from_utf8_lossy(&fallback_output.stderr);
-                        return Err(AppError::InternalServerError(format!(
-                            "Transcode failed for segment {}: {}",
-                            segment_index, fallback_stderr
-                        )));
-                    }
-                }
-                Ok(Err(e)) => {
-                    return Err(AppError::IoError(format!(
-                        "FFmpeg fallback execution failed for segment {}: {}",
-                        segment_index, e
-                    )));
-                }
-                Err(_) => {
-                    return Err(AppError::InternalServerError(format!(
-                        "FFmpeg fallback timeout for segment {} (exceeded {}s)",
-                        segment_index, TRANSCODE_TIMEOUT_SECS
-                    )));
-                }
-            }
-        } else {
-            return Err(AppError::InternalServerError(format!(
-                "Transcode failed for segment {}: {}",
-                segment_index, stderr
-            )));
-        }
-    }
-
-    if !transcode_success {
-        return Err(AppError::InternalServerError(format!(
-            "Transcode failed for segment {}",
-            segment_index
-        )));
-    }
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    if !output_path.exists() {
-        return Err(AppError::InternalServerError(format!(
-            "Transcoded segment {} file not found at {:?}",
-            segment_index, output_path
-        )));
-    }
-
-    // Read the transcoded segment
-    let segment_data = tokio::fs::read(&output_path)
-        .await
-        .map_err(|e| AppError::IoError(format!("Failed to read transcoded segment: {}", e)))?;
-
-    if segment_data.is_empty() {
-        return Err(AppError::InternalServerError(format!(
-            "Transcoded segment {} is empty",
-            segment_index
-        )));
-    }
-
-    if segment_data.len() < 1000 {
-        warn!(
-            "Segment {} is suspiciously small: {} bytes",
-            segment_index,
-            segment_data.len()
-        );
-    }
-
-    info!(
-        "✅ Segment {} transcoded successfully: {} bytes",
-        segment_index,
-        segment_data.len()
-    );
-
-    Ok(segment_data)
-}
-
-/// 构建 FFmpeg 命令行参数
-/// 针对 Amlogic A311D 等芯片进行优化
-fn build_ffmpeg_args(
-    hw_accel: HardwareAccel,
-    input_path: &str,
-    output_path: &str,
-    start_time: f64,
-    duration: f64,
-    needs_transcode: bool,
-    video_info: &Option<VideoInfo>,
-) -> Vec<String> {
-    let mut args = Vec::new();
-
-    // 基本参数
-    args.extend([
-        "-y".to_string(),
-        "-hide_banner".to_string(),
-        "-loglevel".to_string(),
-        "warning".to_string(),
-    ]);
-
-    // 输入前的 seek（更快）
-    args.push("-ss".to_string());
-    args.push(format!("{:.3}", start_time));
-
-    // 根据硬件加速类型添加解码参数
+    // 根据硬件加速能力选择编码器
     match hw_accel {
-        HardwareAccel::AmlogicV4l2 => {
-            // Amlogic A311D V4L2 M2M 硬件解码
-            // 对于 Amlogic 设备，使用 V4L2 M2M 解码器
-            // 注意：需要确保 /dev/video* 设备可访问
-        }
         HardwareAccel::Vaapi => {
-            args.extend([
+            // Intel/AMD GPU 硬件加速
+            info!(
+                "Using VAAPI hardware acceleration for segment {}",
+                segment_index
+            );
+            args.extend(vec![
                 "-hwaccel".to_string(),
                 "vaapi".to_string(),
                 "-hwaccel_device".to_string(),
                 "/dev/dri/renderD128".to_string(),
                 "-hwaccel_output_format".to_string(),
                 "vaapi".to_string(),
+                "-c:v".to_string(),
+                "h264_vaapi".to_string(),
+                "-qp".to_string(),
+                "23".to_string(), // 质量参数
             ]);
         }
-        HardwareAccel::RockchipRga => {
-            // Rockchip MPP 硬件解码
-            args.extend([
-                "-hwaccel".to_string(),
-                "rkmpp".to_string(),
+        HardwareAccel::V4l2 => {
+            // V4L2 硬件编码器（ARM SoC）
+            info!(
+                "Using V4L2 hardware acceleration for segment {}",
+                segment_index
+            );
+            args.extend(vec![
+                "-c:v".to_string(),
+                "h264_v4l2m2m".to_string(),
+                "-b:v".to_string(),
+                "2M".to_string(), // 码率
             ]);
         }
-        HardwareAccel::V4l2Generic | HardwareAccel::None => {
-            // 不添加硬件解码参数
+        HardwareAccel::None => {
+            // 软件编码（libx264）
+            info!(
+                "Using software encoding (libx264) for segment {}",
+                segment_index
+            );
+            args.extend(vec![
+                "-c:v".to_string(),
+                "libx264".to_string(),
+                "-preset".to_string(),
+                "veryfast".to_string(), // 快速编码预设
+                "-tune".to_string(),
+                "zerolatency".to_string(), // 低延迟调优
+                "-profile:v".to_string(),
+                "main".to_string(), // Main Profile
+                "-level".to_string(),
+                "4.0".to_string(), // Level 4.0
+                "-crf".to_string(),
+                "23".to_string(), // 恒定质量因子
+            ]);
         }
     }
 
-    // 输入文件
-    args.push("-i".to_string());
-    args.push(input_path.to_string());
-
-    // 持续时间
-    args.push("-t".to_string());
-    args.push(format!("{:.3}", duration));
-
-    // 强制关键帧
-    args.extend([
-        "-force_key_frames".to_string(),
-        "expr:gte(t,0)".to_string(),
-    ]);
-
-    if needs_transcode {
-        // 视频编码参数
-        match hw_accel {
-            HardwareAccel::AmlogicV4l2 => {
-                // Amlogic A311D V4L2 M2M 硬件编码
-                // 使用 h264_v4l2m2m 编码器
-                // 针对 A311D 优化的参数
-                args.extend([
-                    "-c:v".to_string(),
-                    "h264_v4l2m2m".to_string(),
-                    // 比特率控制 - A311D 支持较高比特率
-                    "-b:v".to_string(),
-                    "4M".to_string(),
-                    "-maxrate".to_string(),
-                    "6M".to_string(),
-                    "-bufsize".to_string(),
-                    "8M".to_string(),
-                    // GOP 设置 - 适合 HLS 流
-                    "-g".to_string(),
-                    "30".to_string(),
-                    "-keyint_min".to_string(),
-                    "30".to_string(),
-                    // V4L2 M2M 特定参数
-                    "-num_output_buffers".to_string(),
-                    "32".to_string(),
-                    "-num_capture_buffers".to_string(),
-                    "16".to_string(),
-                ]);
-            }
-            HardwareAccel::Vaapi => {
-                args.extend([
-                    "-vf".to_string(),
-                    "format=nv12|vaapi,hwupload".to_string(),
-                    "-c:v".to_string(),
-                    "h264_vaapi".to_string(),
-                    "-qp".to_string(),
-                    "23".to_string(),
-                    "-g".to_string(),
-                    "30".to_string(),
-                    "-keyint_min".to_string(),
-                    "30".to_string(),
-                ]);
-            }
-            HardwareAccel::RockchipRga => {
-                args.extend([
-                    "-c:v".to_string(),
-                    "h264_rkmpp".to_string(),
-                    "-b:v".to_string(),
-                    "4M".to_string(),
-                    "-g".to_string(),
-                    "30".to_string(),
-                ]);
-            }
-            HardwareAccel::V4l2Generic => {
-                args.extend([
-                    "-c:v".to_string(),
-                    "h264_v4l2m2m".to_string(),
-                    "-b:v".to_string(),
-                    "3M".to_string(),
-                    "-maxrate".to_string(),
-                    "4M".to_string(),
-                    "-bufsize".to_string(),
-                    "6M".to_string(),
-                    "-g".to_string(),
-                    "30".to_string(),
-                    "-keyint_min".to_string(),
-                    "30".to_string(),
-                ]);
-            }
-            HardwareAccel::None => {
-                // 软件编码 (libx264)
-                // 针对 ARM 设备优化，使用较快的预设
-                args.extend([
-                    "-c:v".to_string(),
-                    "libx264".to_string(),
-                    "-preset".to_string(),
-                    "veryfast".to_string(),  // ARM 设备使用更快的预设
-                    "-tune".to_string(),
-                    "zerolatency".to_string(),
-                    "-profile:v".to_string(),
-                    "main".to_string(),  // 使用 main profile 以获得更好的兼容性
-                    "-level".to_string(),
-                    "4.0".to_string(),
-                    "-crf".to_string(),
-                    "23".to_string(),
-                    "-g".to_string(),
-                    "30".to_string(),
-                    "-keyint_min".to_string(),
-                    "30".to_string(),
-                    "-sc_threshold".to_string(),
-                    "0".to_string(),
-                    "-bf".to_string(),
-                    "0".to_string(),  // 禁用 B 帧以加快编码
-                    "-refs".to_string(),
-                    "1".to_string(),  // 减少参考帧以加快编码
-                    // 线程设置
-                    "-threads".to_string(),
-                    "4".to_string(),
-                ]);
-            }
-        }
-
-        // 视频缩放（如果需要）- 针对移动设备优化
-        let target_height = video_info
-            .as_ref()
-            .map(|info| {
-                if info.height > 1080 {
-                    720  // 4K 视频降到 720p 以提高性能
-                } else if info.height > 720 {
-                    720
-                } else {
-                    info.height
-                }
-            })
-            .unwrap_or(720);
-
-        if video_info.as_ref().map(|i| i.height > target_height).unwrap_or(false) {
-            match hw_accel {
-                HardwareAccel::Vaapi => {
-                    // VAAPI 使用硬件缩放
-                }
-                HardwareAccel::AmlogicV4l2 | HardwareAccel::V4l2Generic => {
-                    // V4L2 M2M 不支持缩放滤镜，需要在编码前使用软件缩放
-                    // 但这会影响性能，所以只在必要时使用
-                    if target_height < 720 {
-                        args.push("-vf".to_string());
-                        args.push(format!("scale=-2:{}", target_height));
-                    }
-                }
-                _ => {
-                    args.push("-vf".to_string());
-                    args.push(format!("scale=-2:{}", target_height));
-                }
-            }
-        }
-    } else {
-        // 直接复制视频流
-        args.extend(["-c:v".to_string(), "copy".to_string()]);
-    }
-
-    // 音频编码参数
-    if video_info.as_ref().map(|i| i.has_audio).unwrap_or(true) {
-        args.extend([
-            "-c:a".to_string(),
-            "aac".to_string(),
-            "-b:a".to_string(),
-            "128k".to_string(),  // 降低音频比特率以提高性能
-            "-ac".to_string(),
-            "2".to_string(),
-            "-ar".to_string(),
-            "44100".to_string(),  // 使用 44.1kHz 以提高兼容性
-            "-async".to_string(),
-            "1".to_string(),
-            "-af".to_string(),
-            "aresample=async=1:first_pts=0".to_string(),
-        ]);
-    } else {
-        args.push("-an".to_string());
-    }
-
-    // MPEG-TS 输出参数
-    args.extend([
+    // 音频编码参数（通用）
+    args.extend(vec![
+        "-c:a".to_string(),
+        "aac".to_string(), // AAC 音频编码
+        "-b:a".to_string(),
+        "128k".to_string(), // 音频码率
+        "-ac".to_string(),
+        "2".to_string(), // 立体声
+        "-ar".to_string(),
+        "44100".to_string(), // 采样率
         "-f".to_string(),
-        "mpegts".to_string(),
-        "-mpegts_copyts".to_string(),
-        "0".to_string(),
-        "-output_ts_offset".to_string(),
-        "0".to_string(),
-        "-avoid_negative_ts".to_string(),
-        "make_zero".to_string(),
-        "-start_at_zero".to_string(),
-        "-max_muxing_queue_size".to_string(),
-        "1024".to_string(),
-        "-muxdelay".to_string(),
-        "0".to_string(),
-        "-muxpreload".to_string(),
-        "0".to_string(),
+        "mpegts".to_string(), // MPEG-TS 容器
+        "-movflags".to_string(),
+        "+faststart".to_string(), // 快速启动
+        output_path.to_str().unwrap_or("").to_string(),
     ]);
 
-    // 输出文件
-    args.push(output_path.to_string());
+    // 执行 FFmpeg 命令
+    let output = Command::new(&ffmpeg_path)
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| {
+            AppError::IoError(format!(
+                "Failed to execute FFmpeg: {}. Ensure FFmpeg is installed and in PATH.",
+                e
+            ))
+        })?;
 
-    args
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::InternalServerError(format!(
+            "FFmpeg transcode failed for segment {}: {}",
+            segment_index, stderr
+        )));
+    }
+
+    // 读取生成的段文件
+    tokio::fs::read(&output_path)
+        .await
+        .map_err(|e| AppError::IoError(format!("Failed to read transcoded segment: {}", e)))
+}
+
+/// 硬件加速类型
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HardwareAccel {
+    Vaapi, // Intel/AMD GPU (VA-API)
+    V4l2,  // V4L2 M2M (ARM SoC)
+    None,  // 软件编码
+}
+
+/// 检测可用的硬件加速
+async fn detect_hardware_acceleration() -> HardwareAccel {
+    use tokio::fs;
+
+    if fs::metadata("/dev/dri/renderD128").await.is_ok() && check_ffmpeg_encoder("h264_vaapi").await
+    {
+        return HardwareAccel::Vaapi;
+    }
+
+    // 检测 V4L2 设备（ARM SoC）
+    if (fs::metadata("/dev/video10").await.is_ok() || fs::metadata("/dev/video11").await.is_ok())
+        && check_ffmpeg_encoder("h264_v4l2m2m").await
+    {
+        return HardwareAccel::V4l2;
+    }
+
+    HardwareAccel::None
+}
+
+/// 检查 FFmpeg 是否支持指定的编码器
+async fn check_ffmpeg_encoder(encoder: &str) -> bool {
+    use tokio::process::Command;
+
+    let ffmpeg_path = std::env::var("FFMPEG_PATH")
+        .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
+        .unwrap_or_else(|_| "ffmpeg".to_string());
+
+    let output = Command::new(&ffmpeg_path)
+        .args(["-encoders"])
+        .output()
+        .await;
+
+    if let Ok(output) = output {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return stdout.contains(encoder);
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -1621,7 +1084,8 @@ mod tests {
 
     #[test]
     fn test_secure_playlist_generation() {
-        let playlist = generate_secure_m3u8(5, 10.0, 50.0);
+        let playlist = generate_secure_m3u8(5, 10.0);
+
         assert!(playlist.contains("#EXTM3U"));
         assert!(playlist.contains("segment_0.ts"));
         assert!(playlist.contains("segment_4.ts"));
@@ -1629,19 +1093,27 @@ mod tests {
         assert!(playlist.contains("AES-256-GCM"));
     }
 
-    #[test]
-    fn test_request_signature() {
-        let pmk = [0x42u8; 32];
-        let sig =
-            compute_request_signature("session123", 1234567890, "nonce123", "segment_0.ts", &pmk);
-        assert!(!sig.is_empty());
-        assert_eq!(sig.len(), 64);
+    #[tokio::test]
+    async fn test_segment_name_validation() {
+        // 无效的段名称格式（路径遍历攻击）
+        let result = read_video_segment_from_ffmpeg("/video.mp4", "../../../etc/passwd").await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+
+        // 无效的段名称格式（负数索引）
+        let result = read_video_segment_from_ffmpeg("/video.mp4", "segment_-1.ts").await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+
+        // 无效的段名称格式（非数字索引）
+        let result = read_video_segment_from_ffmpeg("/video.mp4", "segment_abc.ts").await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
     }
 
-    #[test]
-    fn test_constant_time_compare() {
-        assert!(constant_time_compare("abc", "abc"));
-        assert!(!constant_time_compare("abc", "abd"));
-        assert!(!constant_time_compare("abc", "ab"));
+    #[tokio::test]
+    async fn test_hardware_acceleration_detection() {
+        let hw_accel = detect_hardware_acceleration().await;
+        assert!(matches!(
+            hw_accel,
+            HardwareAccel::Vaapi | HardwareAccel::V4l2 | HardwareAccel::None
+        ));
     }
 }

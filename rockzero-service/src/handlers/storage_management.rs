@@ -182,20 +182,22 @@ pub async fn force_cleanup_all_cache(
     storage_manager: web::Data<Arc<StorageManager>>,
 ) -> Result<HttpResponse, AppError> {
     info!("Force cleanup all cache...");
-    
-    let cleaned_bytes = storage_manager
+
+    let report = storage_manager
         .force_cleanup_all_cache()
         .await
         .map_err(|e| AppError::InternalServerError(format!("Cache cleanup failed: {}", e)))?;
-    
-    let cleaned_mb = cleaned_bytes as f64 / 1024.0 / 1024.0;
-    
+
+    let cleaned_mb = report.total_bytes_freed as f64 / 1024.0 / 1024.0;
+
     info!("Cache cleanup completed, freed {:.2} MB", cleaned_mb);
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "message": format!("Cache cleanup completed, freed {:.2} MB", cleaned_mb),
-        "cleaned_bytes": cleaned_bytes,
-        "cleaned_mb": cleaned_mb
+        "cleaned_bytes": report.total_bytes_freed,
+        "cleaned_mb": cleaned_mb,
+        "hls_bytes_freed": report.hls_bytes_freed,
+        "temp_bytes_freed": report.temp_bytes_freed
     })))
 }

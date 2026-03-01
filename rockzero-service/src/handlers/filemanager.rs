@@ -48,6 +48,7 @@ const ALLOWED_TEXT_EXTENSIONS: &[&str] = &[
     "cpp",
     "h",
     "hpp",
+    "ino",
     "sh",
     "bash",
     "zsh",
@@ -751,7 +752,6 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
 
     tracing::info!("📊 Getting storage info for: {:?}", base_path);
 
-    // 使用 statvfs 获取准确的磁盘空间信息（Linux/Unix）
     #[cfg(target_os = "linux")]
     {
         use std::mem::MaybeUninit;
@@ -770,29 +770,17 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
             if libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) == 0 {
                 let stat = stat.assume_init();
 
-                // 使用 f_frsize（fragment size）而不是 f_bsize（block size）
-                // f_frsize 是文件系统的基本块大小，更准确
                 let block_size = stat.f_frsize as u64;
-
-                // f_blocks: 文件系统总块数
                 let total_blocks = stat.f_blocks as u64;
-
-                // f_bfree: 文件系统空闲块数（包括保留给root的）
                 let free_blocks = stat.f_bfree as u64;
-
-                // f_bavail: 非特权用户可用的空闲块数
                 let available_blocks = stat.f_bavail as u64;
 
-                // 计算空间（字节）
-                let total_space = total_blocks * block_size;
+                let raw_total_space = total_blocks * block_size;
                 let free_space = free_blocks * block_size;
                 let available_space = available_blocks * block_size;
-
-                // 已用空间 = 总空间 - 空闲空间
-                // 注意：这里使用 f_bfree 而不是 f_bavail，因为我们要计算实际使用量
-                let used_space = total_space.saturating_sub(free_space);
-
-                // 使用率 = 已用空间 / 总空间
+                let used_space = raw_total_space.saturating_sub(free_space);
+                let reserved_space = free_space.saturating_sub(available_space);
+                let total_space = raw_total_space.saturating_sub(reserved_space);
                 let usage_percentage = if total_space > 0 {
                     (used_space as f64 / total_space as f64) * 100.0
                 } else {
@@ -803,26 +791,18 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
                     "✅ Storage info (statvfs):\n\
                      - Path: {:?}\n\
                      - Block size: {} bytes\n\
-                     - Total blocks: {}\n\
-                     - Free blocks: {} (system)\n\
-                     - Available blocks: {} (user)\n\
-                     - Total space: {} bytes ({:.2} GB)\n\
-                     - Used space: {} bytes ({:.2} GB)\n\
-                     - Free space: {} bytes ({:.2} GB)\n\
-                     - Available space: {} bytes ({:.2} GB)\n\
+                     - Raw total: {:.2} GB\n\
+                     - Reserved (root): {:.2} GB\n\
+                     - User total: {:.2} GB\n\
+                     - Used space: {:.2} GB\n\
+                     - Available space: {:.2} GB\n\
                      - Usage: {:.2}%",
                     base_path,
                     block_size,
-                    total_blocks,
-                    free_blocks,
-                    available_blocks,
-                    total_space,
+                    raw_total_space as f64 / (1024.0 * 1024.0 * 1024.0),
+                    reserved_space as f64 / (1024.0 * 1024.0 * 1024.0),
                     total_space as f64 / (1024.0 * 1024.0 * 1024.0),
-                    used_space,
                     used_space as f64 / (1024.0 * 1024.0 * 1024.0),
-                    free_space,
-                    free_space as f64 / (1024.0 * 1024.0 * 1024.0),
-                    available_space,
                     available_space as f64 / (1024.0 * 1024.0 * 1024.0),
                     usage_percentage
                 );
@@ -897,7 +877,6 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
         ))
     }
 }
-
 
 /// 获取有效的基础目录
 fn get_base_directory() -> Result<PathBuf, AppError> {
