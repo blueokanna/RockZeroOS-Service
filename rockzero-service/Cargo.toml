@@ -88,6 +88,8 @@ which = { workspace = true }
 
 # Docker API (Unix socket)
 hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
 serde_yaml = { workspace = true }
 
 # FIDO2/WebAuthn (optional)

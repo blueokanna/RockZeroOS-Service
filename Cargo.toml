@@ -98,6 +98,8 @@ crc32fast = "1.3"
 tempfile = "3.8"
 tokio-test = "0.4"
 hyper = { version = "1.4", features = ["full"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
+http-body-util = "0.1"
 serde_yaml = "0.9"
 which = "6.0"
 hyperlocal = "0.9"

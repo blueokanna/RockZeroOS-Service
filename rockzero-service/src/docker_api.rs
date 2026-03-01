@@ -17,7 +17,10 @@ use std::collections::HashMap;
 
 #[cfg(target_os = "linux")]
 use {
-    hyper::{Body, Client, Method, Request, StatusCode},
+    bytes::Bytes,
+    http_body_util::{BodyExt, Full},
+    hyper::{Method, Request, StatusCode},
+    hyper_util::client::legacy::Client,
     hyperlocal::{UnixClientExt, Uri as UnixUri},
 };
 
@@ -187,7 +190,7 @@ impl std::error::Error for DockerError {}
 #[allow(dead_code)]
 pub struct DockerClient {
     #[cfg(target_os = "linux")]
-    client: Client<hyperlocal::UnixConnector>,
+    client: Client<hyperlocal::UnixConnector, Full<Bytes>>,
     #[allow(dead_code)]
     socket_path: String,
 }
@@ -237,7 +240,7 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::GET)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
         let response = self.client.request(req).await
@@ -250,8 +253,9 @@ impl DockerClient {
             )));
         }
 
-        let body = hyper::body::to_bytes(response.into_body()).await
-            .map_err(|e| DockerError::ParseError(e.to_string()))?;
+        let body = response.into_body().collect().await
+            .map_err(|e| DockerError::ParseError(e.to_string()))?
+            .to_bytes();
 
         serde_json::from_slice(&body)
             .map_err(|e| DockerError::ParseError(e.to_string()))
@@ -270,7 +274,7 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::GET)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
         let response = self.client.request(req).await
@@ -283,8 +287,9 @@ impl DockerClient {
             )));
         }
 
-        let body = hyper::body::to_bytes(response.into_body()).await
-            .map_err(|e| DockerError::ParseError(e.to_string()))?;
+        let body = response.into_body().collect().await
+            .map_err(|e| DockerError::ParseError(e.to_string()))?
+            .to_bytes();
 
         serde_json::from_slice(&body)
             .map_err(|e| DockerError::ParseError(e.to_string()))
@@ -317,7 +322,7 @@ impl DockerClient {
             .method(Method::POST)
             .uri(uri)
             .header("Content-Type", "application/json")
-            .body(Body::from(body))
+            .body(Full::new(Bytes::from(body)))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
         let response = self.client.request(req).await
@@ -325,8 +330,9 @@ impl DockerClient {
 
         match response.status() {
             StatusCode::CREATED => {
-                let body = hyper::body::to_bytes(response.into_body()).await
-                    .map_err(|e| DockerError::ParseError(e.to_string()))?;
+                let body = response.into_body().collect().await
+                    .map_err(|e| DockerError::ParseError(e.to_string()))?
+                    .to_bytes();
                 
                 let result: serde_json::Value = serde_json::from_slice(&body)
                     .map_err(|e| DockerError::ParseError(e.to_string()))?;
@@ -372,7 +378,7 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::POST)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
         let response = self.client.request(req).await
@@ -409,7 +415,7 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::POST)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
         let response = self.client.request(req).await
@@ -446,7 +452,7 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::DELETE)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
         let response = self.client.request(req).await
@@ -483,7 +489,7 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::POST)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
         let response = self.client.request(req).await
@@ -520,7 +526,7 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::DELETE)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
         let response = self.client.request(req).await
@@ -564,7 +570,7 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::GET)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
         let response = self.client.request(req).await
@@ -572,8 +578,9 @@ impl DockerClient {
 
         match response.status() {
             StatusCode::OK => {
-                let body = hyper::body::to_bytes(response.into_body()).await
-                    .map_err(|e| DockerError::ParseError(e.to_string()))?;
+                let body = response.into_body().collect().await
+                    .map_err(|e| DockerError::ParseError(e.to_string()))?
+                    .to_bytes();
                 
                 // Docker logs have a special format with 8-byte header per line
                 // We need to strip these headers
