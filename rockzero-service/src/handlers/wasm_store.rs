@@ -759,6 +759,239 @@ pub async fn get_steam_app_details(path: web::Path<String>) -> Result<HttpRespon
     Ok(HttpResponse::Ok().json(data))
 }
 
+// ============================================================================
+// Steam 用户游戏库 — 获取玩家拥有的游戏及游玩时间
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct SteamLibraryQuery {
+    pub steam_id: String,
+    /// Steam Web API Key (optional, reads from env STEAM_API_KEY if unset)
+    pub api_key: Option<String>,
+}
+
+/// GET /api/v1/wasm-store/steam/library - 获取 Steam 用户的游戏库（含游玩时间）
+pub async fn get_steam_user_library(
+    query: web::Query<SteamLibraryQuery>,
+) -> Result<HttpResponse, AppError> {
+    let steam_id = &query.steam_id;
+    info!("获取 Steam 用户游戏库: {}", steam_id);
+
+    let api_key = query
+        .api_key
+        .clone()
+        .or_else(|| std::env::var("STEAM_API_KEY").ok())
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "Steam API Key 未提供。请在请求中提供 api_key 参数或设置 STEAM_API_KEY 环境变量"
+                    .to_string(),
+            )
+        })?;
+
+    // Try cache first
+    let cache_key = format!("steam_library_{}", steam_id);
+    if let Some(cached) = cache_get(&cache_key).await {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "steam_id": steam_id,
+            "games": cached,
+            "total": cached.len(),
+            "cached": true,
+        })));
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    // Call Steam IPlayerService/GetOwnedGames
+    let url = format!(
+        "https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/?key={}&steamid={}&format=json&include_appinfo=1&include_played_free_games=1",
+        api_key, steam_id
+    );
+
+    let resp = client.get(&url).send().await.map_err(|e| {
+        AppError::InternalServerError(format!("Steam API 请求失败: {}", e))
+    })?;
+
+    if !resp.status().is_success() {
+        return Err(AppError::InternalServerError(format!(
+            "Steam API 返回错误: {}",
+            resp.status()
+        )));
+    }
+
+    let json: Value = resp.json().await.map_err(|e| {
+        AppError::InternalServerError(format!("Steam JSON 解析失败: {}", e))
+    })?;
+
+    let mut games = Vec::new();
+
+    if let Some(game_list) = json
+        .pointer("/response/games")
+        .and_then(|v| v.as_array())
+    {
+        for game in game_list {
+            let appid = game.get("appid").and_then(|v| v.as_u64()).unwrap_or(0);
+            let name = game
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown");
+            let playtime_forever = game
+                .get("playtime_forever")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let playtime_2weeks = game
+                .get("playtime_2weeks")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let img_icon_url = game
+                .get("img_icon_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let playtime_linux = game
+                .get("playtime_linux_forever")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let playtime_mac = game
+                .get("playtime_mac_forever")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let playtime_windows = game
+                .get("playtime_windows_forever")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let rtime_last_played = game
+                .get("rtime_last_played")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let header_image = if appid > 0 {
+                format!(
+                    "https://cdn.akamai.steamstatic.com/steam/apps/{}/header.jpg",
+                    appid
+                )
+            } else {
+                String::new()
+            };
+
+            let icon_url = if !img_icon_url.is_empty() && appid > 0 {
+                format!(
+                    "https://media.steampowered.com/steamcommunity/public/images/apps/{}/{}",
+                    appid, img_icon_url
+                )
+            } else {
+                String::new()
+            };
+
+            // Format playtime
+            let hours = playtime_forever / 60;
+            let minutes = playtime_forever % 60;
+            let playtime_formatted = if hours > 0 {
+                format!("{}h {}m", hours, minutes)
+            } else {
+                format!("{}m", minutes)
+            };
+
+            games.push(serde_json::json!({
+                "appid": appid,
+                "name": name,
+                "playtime_forever": playtime_forever,
+                "playtime_2weeks": playtime_2weeks,
+                "playtime_formatted": playtime_formatted,
+                "playtime_hours": playtime_forever as f64 / 60.0,
+                "playtime_linux": playtime_linux,
+                "playtime_mac": playtime_mac,
+                "playtime_windows": playtime_windows,
+                "rtime_last_played": rtime_last_played,
+                "header_image": header_image,
+                "icon_url": icon_url,
+                "store_url": format!("https://store.steampowered.com/app/{}", appid),
+                "platform": "steam",
+            }));
+        }
+    }
+
+    // Sort by playtime descending
+    games.sort_by(|a, b| {
+        let a_time = a
+            .get("playtime_forever")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let b_time = b
+            .get("playtime_forever")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        b_time.cmp(&a_time)
+    });
+
+    let total = games.len();
+
+    // Cache for 10 minutes
+    cache_set(&cache_key, games.clone(), 600).await;
+
+    info!("Steam 用户游戏库: {} 款游戏", total);
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "steam_id": steam_id,
+        "games": games,
+        "total": total,
+        "cached": false,
+    })))
+}
+
+/// GET /api/v1/wasm-store/steam/player - 获取 Steam 用户资料
+pub async fn get_steam_player_summary(
+    query: web::Query<SteamLibraryQuery>,
+) -> Result<HttpResponse, AppError> {
+    let steam_id = &query.steam_id;
+    info!("获取 Steam 用户资料: {}", steam_id);
+
+    let api_key = query
+        .api_key
+        .clone()
+        .or_else(|| std::env::var("STEAM_API_KEY").ok())
+        .ok_or_else(|| {
+            AppError::BadRequest("Steam API Key 未提供".to_string())
+        })?;
+
+    let cache_key = format!("steam_player_{}", steam_id);
+    if let Some(cached) = cache_get(&cache_key).await {
+        if let Some(first) = cached.into_iter().next() {
+            return Ok(HttpResponse::Ok().json(first));
+        }
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(8))
+        .connect_timeout(Duration::from_secs(3))
+        .build()
+        .unwrap_or_default();
+
+    let url = format!(
+        "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key={}&steamids={}",
+        api_key, steam_id
+    );
+
+    let resp = client.get(&url).send().await.map_err(|e| {
+        AppError::InternalServerError(format!("Steam API 请求失败: {}", e))
+    })?;
+
+    let json: Value = resp.json().await.map_err(|e| {
+        AppError::InternalServerError(format!("JSON 解析失败: {}", e))
+    })?;
+
+    let player = json
+        .pointer("/response/players/0")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+
+    cache_set(&cache_key, vec![player.clone()], 300).await;
+
+    Ok(HttpResponse::Ok().json(player))
+}
+
 /// GET /api/v1/wasm-store/epic/free - Epic 免费游戏
 pub async fn get_epic_free_games() -> Result<HttpResponse, AppError> {
     info!("获取 Epic 免费游戏");

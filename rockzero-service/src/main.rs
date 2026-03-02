@@ -539,6 +539,14 @@ async fn main() -> std::io::Result<()> {
                                 "/steam/app/{app_id}",
                                 web::get().to(handlers::wasm_store::get_steam_app_details),
                             )
+                            .route(
+                                "/steam/library",
+                                web::get().to(handlers::wasm_store::get_steam_user_library),
+                            )
+                            .route(
+                                "/steam/player",
+                                web::get().to(handlers::wasm_store::get_steam_player_summary),
+                            )
                             // Epic 免费游戏
                             .route(
                                 "/epic/free",
@@ -605,6 +613,15 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/format",
                                 web::post().to(handlers::disk_manager::format_disk),
+                            )
+                            // Add routes without ID for initialize and rename
+                            .route(
+                                "/initialize",
+                                web::post().to(handlers::disk_manager::initialize_disk),
+                            )
+                            .route(
+                                "/rename",
+                                web::post().to(handlers::disk_manager::rename_disk),
                             )
                             // Keep routes with ID for backward compatibility
                             .route(
