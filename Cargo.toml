@@ -109,9 +109,9 @@ lazy_static = "1.4"
 # 使用环境变量 CARGO_TARGET_DIR 或在 .cargo/config.toml 中配置
 
 [profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
+opt-level = 2          # Reduced from 3 — opt-level 2 uses much less RAM during compilation
+lto = "thin"           # Changed from true (fat LTO) — thin LTO uses far less RAM on ARM
+codegen-units = 4      # Changed from 1 — allows parallel codegen, much faster on multi-core ARM
 strip = true
 # 增量编译关闭以节省空间
 incremental = false

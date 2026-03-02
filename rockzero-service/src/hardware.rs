@@ -213,8 +213,9 @@ pub struct UsbDeviceInfo {
 // ============ Main Detection Functions ============
 
 pub fn detect_hardware() -> HardwareCapabilities {
-    let mut sys = System::new_all();
-    sys.refresh_all();
+    let mut sys = System::new();
+    sys.refresh_cpu();
+    sys.refresh_memory();
 
     let architecture = std::env::consts::ARCH.to_string();
 
@@ -414,8 +415,8 @@ fn get_implementer_name(implementer: &str) -> String {
 
 /// Detect x86 CPU information
 fn detect_x86_cpu_info() -> Vec<CpuCoreInfo> {
-    let mut sys = System::new_all();
-    sys.refresh_all();
+    let mut sys = System::new();
+    sys.refresh_cpu();
 
     if let Some(cpu) = sys.cpus().first() {
         let brand = cpu.brand().to_string();

@@ -131,6 +131,32 @@ async fn fetch_manifest(client: &Client, url: &str) -> Result<Option<Value>, App
     Ok(Some(manifest))
 }
 
+/// Shared HTTP client — avoids TLS handshake + connection overhead per request
+static HTTP_CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+
+fn get_http_client() -> &'static Client {
+    HTTP_CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| Client::new())
+    })
+}
+
+/// Shared WASM engine — creating Engine is expensive (~50-100ms), reuse it
+static WASM_ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
+
+fn get_wasm_engine() -> &'static Engine {
+    WASM_ENGINE.get_or_init(|| {
+        let mut config = wasmtime::Config::new();
+        // Limit memory usage for ARM devices
+        config.max_wasm_stack(1024 * 1024); // 1 MB stack limit
+        config.allocation_strategy(wasmtime::InstanceAllocationStrategy::OnDemand);
+        Engine::new(&config).unwrap_or_else(|_| Engine::default())
+    })
+}
+
 /// Execute a WASM module in a blocking thread with a 30-second timeout.
 async fn execute_wasm_module(
     wasm_path: &str,
@@ -144,12 +170,12 @@ async fn execute_wasm_module(
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-            let engine = Engine::default();
-            let module = Module::from_file(&engine, &wasm_path).map_err(|e| {
+            let engine = get_wasm_engine();
+            let module = Module::from_file(engine, &wasm_path).map_err(|e| {
                 AppError::BadRequest(format!("Failed to load WASM module '{}': {}", wasm_path, e))
             })?;
 
-            let mut linker = Linker::new(&engine);
+            let mut linker = Linker::new(engine);
             #[allow(deprecated)]
             add_to_linker(&mut linker, |cx| cx)
                 .map_err(|e| AppError::InternalServerError(e.to_string()))?;
@@ -164,7 +190,7 @@ async fn execute_wasm_module(
                     .map_err(|e| AppError::ValidationError(format!("Invalid WASM arg '{}': {}", arg, e)))?;
             }
 
-            let mut store = Store::new(&engine, builder.build());
+            let mut store = Store::new(engine, builder.build());
             let instance = linker
                 .instantiate(&mut store, &module)
                 .map_err(|e| AppError::BadRequest(format!("Failed to instantiate WASM: {}", e)))?;
@@ -227,9 +253,7 @@ pub async fn install_package(
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
 
-    let client = Client::builder()
-        .build()
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let client = get_http_client();
 
     let response = client
         .get(&body.url)
@@ -256,8 +280,8 @@ pub async fn install_package(
     }
 
     // Validate that the downloaded bytes are a valid WASM module
-    let engine = Engine::default();
-    Module::new(&engine, &bytes)
+    let engine = get_wasm_engine();
+    Module::new(engine, &bytes)
         .map_err(|e| AppError::BadRequest(format!("Invalid WASM module: {}", e)))?;
 
     let dir = ensure_wasm_storage()?;

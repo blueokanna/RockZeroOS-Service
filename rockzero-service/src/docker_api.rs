@@ -22,6 +22,7 @@ use {
     hyper::{Method, Request, StatusCode},
     hyper_util::client::legacy::Client,
     hyperlocal::{UnixClientExt, Uri as UnixUri},
+    std::time::Duration,
 };
 
 /// Docker socket path
@@ -31,6 +32,10 @@ const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 /// Docker API version
 #[allow(dead_code)]
 const DOCKER_API_VERSION: &str = "v1.41";
+
+/// Default timeout for Docker API requests (seconds)
+#[allow(dead_code)]
+const DOCKER_REQUEST_TIMEOUT_SECS: u64 = 15;
 
 /// Docker container information
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +174,7 @@ pub enum DockerError {
     NotFound(String),
     Unauthorized(String),
     Conflict(String),
+    Timeout(String),
 }
 
 impl std::fmt::Display for DockerError {
@@ -180,6 +186,7 @@ impl std::fmt::Display for DockerError {
             DockerError::NotFound(msg) => write!(f, "Not found: {}", msg),
             DockerError::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
             DockerError::Conflict(msg) => write!(f, "Conflict: {}", msg),
+            DockerError::Timeout(msg) => write!(f, "Docker request timeout: {}", msg),
         }
     }
 }
@@ -231,6 +238,26 @@ impl DockerClient {
         }
     }
 
+    /// Send a request to Docker with a timeout to prevent indefinite hangs
+    #[cfg(target_os = "linux")]
+    async fn request_with_timeout(
+        &self,
+        req: Request<Full<Bytes>>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, DockerError> {
+        tokio::time::timeout(
+            Duration::from_secs(DOCKER_REQUEST_TIMEOUT_SECS),
+            self.client.request(req),
+        )
+        .await
+        .map_err(|_| {
+            DockerError::Timeout(format!(
+                "Docker request timed out after {}s",
+                DOCKER_REQUEST_TIMEOUT_SECS
+            ))
+        })?
+        .map_err(|e| DockerError::ConnectionFailed(e.to_string()))
+    }
+
     /// List all containers
     #[cfg(target_os = "linux")]
     pub async fn list_containers(&self, all: bool) -> Result<Vec<ContainerInfo>, DockerError> {
@@ -243,8 +270,7 @@ impl DockerClient {
             .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         if response.status() != StatusCode::OK {
             return Err(DockerError::ApiError(format!(
@@ -277,8 +303,7 @@ impl DockerClient {
             .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         if response.status() != StatusCode::OK {
             return Err(DockerError::ApiError(format!(
@@ -325,8 +350,7 @@ impl DockerClient {
             .body(Full::new(Bytes::from(body)))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         match response.status() {
             StatusCode::CREATED => {
@@ -381,8 +405,7 @@ impl DockerClient {
             .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         match response.status() {
             StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED => Ok(()),
@@ -418,8 +441,7 @@ impl DockerClient {
             .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         match response.status() {
             StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED => Ok(()),
@@ -455,8 +477,7 @@ impl DockerClient {
             .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         match response.status() {
             StatusCode::NO_CONTENT => Ok(()),
@@ -492,8 +513,7 @@ impl DockerClient {
             .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         match response.status() {
             StatusCode::OK => Ok(()),
@@ -529,8 +549,7 @@ impl DockerClient {
             .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         match response.status() {
             StatusCode::OK => Ok(()),
@@ -573,8 +592,7 @@ impl DockerClient {
             .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         match response.status() {
             StatusCode::OK => {

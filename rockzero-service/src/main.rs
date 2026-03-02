@@ -222,7 +222,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(Logger::default())
             .wrap(cors)
-            .app_data(web::PayloadConfig::default().limit(1000 * 1024 * 1024 * 1024))
+            .app_data(web::PayloadConfig::default().limit(100 * 1024 * 1024)) // 100 MB max payload for ARM devices
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(secure_storage.clone()))
             .app_data(web::Data::new(invite_manager.clone()))

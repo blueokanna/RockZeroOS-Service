@@ -19,6 +19,10 @@ pub struct HlsSession {
     pub encryption_key: [u8; 32],
     pub encryptor: HlsEncryptor,
     pub segment_keys: Vec<[u8; 32]>,
+    /// Max segments this session supports (keys generated lazily)
+    max_segments: usize,
+    /// HKDF instance for lazy key derivation
+    hkdf: HkdfBlake3,
     pub zkp_registration: Option<PasswordRegistration>,
 }
 
@@ -136,8 +140,10 @@ impl HlsSession {
 
         tracing::debug!("[HlsSession] Encryption key derived");
 
+        // Pre-generate only a small batch of segment keys (lazy generation for the rest)
+        let initial_batch = max_segments.min(16);
         let mut segment_keys = Vec::with_capacity(max_segments);
-        for i in 0..max_segments {
+        for i in 0..initial_batch {
             let mut key = [0u8; 32];
             let info = format!("hls-segment-{}", i);
             hk.expand(info.as_bytes(), &mut key)
@@ -157,6 +163,8 @@ impl HlsSession {
             encryption_key,
             encryptor,
             segment_keys,
+            max_segments,
+            hkdf: hk,
             zkp_registration,
         })
     }
@@ -173,7 +181,19 @@ impl HlsSession {
         Utc::now() > self.expires_at
     }
 
-    pub fn get_segment_key(&self, segment_index: usize) -> Option<&[u8; 32]> {
+    pub fn get_segment_key(&mut self, segment_index: usize) -> Option<&[u8; 32]> {
+        if segment_index >= self.max_segments {
+            return None;
+        }
+        // Lazily generate keys up to the requested index
+        while self.segment_keys.len() <= segment_index {
+            let mut key = [0u8; 32];
+            let info = format!("hls-segment-{}", self.segment_keys.len());
+            if self.hkdf.expand(info.as_bytes(), &mut key).is_err() {
+                return None;
+            }
+            self.segment_keys.push(key);
+        }
         self.segment_keys.get(segment_index)
     }
 
@@ -295,6 +315,8 @@ impl HlsSessionManager {
             encryption_key: session.encryption_key,
             encryptor: HlsEncryptor::new(&session.encryption_key)?,
             segment_keys: session.segment_keys.clone(),
+            max_segments: session.max_segments,
+            hkdf: HkdfBlake3::new_with_session_salt(&session.session_id, &session.pmk),
             zkp_registration: session.zkp_registration.clone(),
         })
     }

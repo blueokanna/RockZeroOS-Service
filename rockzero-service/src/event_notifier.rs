@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -144,32 +145,27 @@ impl EventAggregator {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventHistory {
-    pub events: Vec<SystemEvent>,
+    pub events: VecDeque<SystemEvent>,
     pub max_size: usize,
 }
 
 impl EventHistory {
     fn new(max_size: usize) -> Self {
         Self {
-            events: Vec::with_capacity(max_size),
+            events: VecDeque::with_capacity(max_size),
             max_size,
         }
     }
     
     fn add(&mut self, event: SystemEvent) {
         if self.events.len() >= self.max_size {
-            self.events.remove(0);
+            self.events.pop_front(); // O(1) with VecDeque
         }
-        self.events.push(event);
+        self.events.push_back(event);
     }
     
     pub fn get_recent(&self, count: usize) -> Vec<SystemEvent> {
-        let start = if self.events.len() > count {
-            self.events.len() - count
-        } else {
-            0
-        };
-        self.events[start..].to_vec()
+        self.events.iter().rev().take(count).cloned().collect()
     }
     
     pub fn get_by_user(&self, user_id: &str) -> Vec<SystemEvent> {
@@ -212,7 +208,7 @@ impl EventNotifier {
         let aggregator = Arc::new(RwLock::new(EventAggregator::new(
             Duration::from_millis(debounce_ms),
         )));
-        let history = Arc::new(Mutex::new(EventHistory::new(10000)));
+        let history = Arc::new(Mutex::new(EventHistory::new(1000)));  // Reduced from 10000 for ARM devices
 
         Self {
             version_counter: Arc::new(RwLock::new(0)),
@@ -278,7 +274,7 @@ impl EventNotifier {
 
     pub fn start_flush_task(self: Arc<Self>) {
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            let mut interval = tokio::time::interval(Duration::from_millis(1000));  // Reduced from 100ms for ARM devices
             loop {
                 interval.tick().await;
                 

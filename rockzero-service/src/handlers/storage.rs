@@ -1231,7 +1231,7 @@ pub(crate) fn format_linux(opts: &FormatOptions) -> Result<(), AppError> {
     let _ = Command::new("sync").output();
 
     // 等待一下确保设备完全卸载
-    std::thread::sleep(std::time::Duration::from_millis(1000));
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
     // 检查设备是否仍然挂载
     let mount_check = Command::new("mount")
@@ -1245,9 +1245,9 @@ pub(crate) fn format_linux(opts: &FormatOptions) -> Result<(), AppError> {
             opts.device
         );
         let _ = Command::new("fuser").args(["-km", &opts.device]).output();
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let _ = Command::new("umount").args(["-l", &opts.device]).output();
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
     let (mkfs_cmd, mut args) = match opts.file_system.to_lowercase().as_str() {
@@ -1457,7 +1457,7 @@ fn partition_and_format_linux(opts: &PartitionOptions) -> Result<PartitionResult
 
         create_partition(&opts.device, partition_num, &partition_spec.size)?;
 
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
         let partition_device = if opts.device.contains("nvme") || opts.device.contains("mmcblk") {
             format!("{}p{}", opts.device, partition_num)
