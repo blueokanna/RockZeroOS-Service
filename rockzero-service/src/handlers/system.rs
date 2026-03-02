@@ -105,96 +105,108 @@ pub struct HardwareInfo {
 }
 
 pub async fn get_system_info() -> Result<impl Responder, AppError> {
-    let mut sys = System::new_all();
-    sys.refresh_all();
+    let system_info = tokio::task::spawn_blocking(|| {
+        let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
+        let os_name = System::name().unwrap_or_else(|| "unknown".to_string());
+        let os_version = System::os_version().unwrap_or_else(|| "unknown".to_string());
+        let kernel_version = System::kernel_version().unwrap_or_else(|| "unknown".to_string());
+        let architecture = std::env::consts::ARCH.to_string();
+        let uptime = System::uptime();
 
-    let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
-    let os_name = System::name().unwrap_or_else(|| "unknown".to_string());
-    let os_version = System::os_version().unwrap_or_else(|| "unknown".to_string());
-    let kernel_version = System::kernel_version().unwrap_or_else(|| "unknown".to_string());
-    let architecture = std::env::consts::ARCH.to_string();
-    let uptime = System::uptime();
-
-    let system_info = SystemInfo {
-        hostname,
-        os_name,
-        os_version,
-        kernel_version,
-        architecture,
-        uptime,
-    };
+        SystemInfo {
+            hostname,
+            os_name,
+            os_version,
+            kernel_version,
+            architecture,
+            uptime,
+        }
+    })
+    .await
+    .map_err(|_| AppError::InternalError)?;
 
     Ok(HttpResponse::Ok().json(system_info))
 }
 
 pub async fn get_cpu_info() -> Result<impl Responder, AppError> {
-    let mut sys = System::new_all();
-    sys.refresh_cpu();
+    let cpu_info = tokio::task::spawn_blocking(|| -> Result<CpuInfo, AppError> {
+        let mut sys = System::new();
+        sys.refresh_cpu();
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    sys.refresh_cpu();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        sys.refresh_cpu();
 
-    let cpus = sys.cpus();
-    let cpu = cpus.first().ok_or(AppError::InternalError)?;
+        let cpus = sys.cpus();
+        let cpu = cpus.first().ok_or(AppError::InternalError)?;
 
-    let total_usage: f32 = cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32;
+        let total_usage: f32 = cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32;
 
-    // 获取每个核心的使用率
-    let per_core_usage: Vec<CpuCoreUsage> = cpus
-        .iter()
-        .enumerate()
-        .map(|(idx, c)| CpuCoreUsage {
-            core_id: idx,
-            usage: c.cpu_usage(),
-            frequency: c.frequency(),
+        let per_core_usage: Vec<CpuCoreUsage> = cpus
+            .iter()
+            .enumerate()
+            .map(|(idx, c)| CpuCoreUsage {
+                core_id: idx,
+                usage: c.cpu_usage(),
+                frequency: c.frequency(),
+            })
+            .collect();
+
+        // 获取 CPU 核心架构信息 (ARM big.LITTLE 等)
+        let hw_caps = hardware::detect_hardware();
+        let core_types: Vec<CpuCoreArchInfo> = hw_caps
+            .cpu_core_types
+            .into_iter()
+            .map(|ct| CpuCoreArchInfo {
+                core_name: ct.core_name,
+                part_id: ct.part_id,
+                count: ct.count,
+                implementer: ct.implementer,
+            })
+            .collect();
+
+        Ok(CpuInfo {
+            name: cpu.name().to_string(),
+            vendor: cpu.vendor_id().to_string(),
+            brand: cpu.brand().to_string(),
+            frequency: cpu.frequency(),
+            cores: cpus.len(),
+            usage: total_usage,
+            temperature: get_cpu_temperature(),
+            per_core_usage,
+            core_types,
         })
-        .collect();
-
-    // 获取 CPU 核心架构信息 (ARM big.LITTLE 等)
-    let hw_caps = hardware::detect_hardware();
-    let core_types: Vec<CpuCoreArchInfo> = hw_caps
-        .cpu_core_types
-        .into_iter()
-        .map(|ct| CpuCoreArchInfo {
-            core_name: ct.core_name,
-            part_id: ct.part_id,
-            count: ct.count,
-            implementer: ct.implementer,
-        })
-        .collect();
-
-    let cpu_info = CpuInfo {
-        name: cpu.name().to_string(),
-        vendor: cpu.vendor_id().to_string(),
-        brand: cpu.brand().to_string(),
-        frequency: cpu.frequency(),
-        cores: cpus.len(),
-        usage: total_usage,
-        temperature: get_cpu_temperature(),
-        per_core_usage,
-        core_types,
-    };
+    })
+    .await
+    .map_err(|_| AppError::InternalError)??;
 
     Ok(HttpResponse::Ok().json(cpu_info))
 }
 
 pub async fn get_memory_info() -> Result<impl Responder, AppError> {
-    let mut sys = System::new_all();
-    sys.refresh_memory();
+    let memory_info = tokio::task::spawn_blocking(|| {
+        let mut sys = System::new();
+        sys.refresh_memory();
 
-    let total = sys.total_memory();
-    let used = sys.used_memory();
-    let available = sys.available_memory();
-    let usage_percentage = (used as f64 / total as f64) * 100.0;
+        let total = sys.total_memory();
+        let used = sys.used_memory();
+        let available = sys.available_memory();
+        let usage_percentage = if total > 0 {
+            (used as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
 
-    let memory_info = MemoryInfo {
-        total,
-        used,
-        available,
-        usage_percentage,
-        swap_total: sys.total_swap(),
-        swap_used: sys.used_swap(),
-    };
+        MemoryInfo {
+            total,
+            used,
+            available,
+            usage_percentage,
+            swap_total: sys.total_swap(),
+            swap_used: sys.used_swap(),
+        }
+    })
+    .await
+    .map_err(|_| AppError::InternalError)?;
 
     Ok(HttpResponse::Ok().json(memory_info))
 }
@@ -502,126 +514,129 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
 
     debug!("Starting hardware info collection");
 
-    let mut sys = System::new_all();
-    sys.refresh_all();
+    let hardware_info = tokio::task::spawn_blocking(move || -> Result<HardwareInfo, AppError> {
+        let mut sys = System::new();
+        sys.refresh_cpu();
+        sys.refresh_memory();
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    sys.refresh_cpu();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        sys.refresh_cpu();
 
-    let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
-    let os_name = System::name().unwrap_or_else(|| "unknown".to_string());
-    let os_version = System::os_version().unwrap_or_else(|| "unknown".to_string());
-    let kernel_version = System::kernel_version().unwrap_or_else(|| "unknown".to_string());
-    let architecture = std::env::consts::ARCH.to_string();
-    let uptime = System::uptime();
+        let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
+        let os_name = System::name().unwrap_or_else(|| "unknown".to_string());
+        let os_version = System::os_version().unwrap_or_else(|| "unknown".to_string());
+        let kernel_version = System::kernel_version().unwrap_or_else(|| "unknown".to_string());
+        let architecture = std::env::consts::ARCH.to_string();
+        let uptime = System::uptime();
 
-    let system_info = SystemInfo {
-        hostname,
-        os_name,
-        os_version,
-        kernel_version,
-        architecture,
-        uptime,
-    };
+        let system_info = SystemInfo {
+            hostname,
+            os_name,
+            os_version,
+            kernel_version,
+            architecture,
+            uptime,
+        };
 
-    let cpus = sys.cpus();
-    if cpus.is_empty() {
-        return Err(AppError::InternalError);
-    }
+        let cpus = sys.cpus();
+        if cpus.is_empty() {
+            return Err(AppError::InternalError);
+        }
 
-    let cpu = cpus.first().unwrap();
-    let total_usage: f32 = cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32;
+        let cpu = cpus.first().unwrap();
+        let total_usage: f32 = cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32;
 
-    // 获取每个核心的使用率
-    let per_core_usage: Vec<CpuCoreUsage> = cpus
-        .iter()
-        .enumerate()
-        .map(|(idx, c)| CpuCoreUsage {
-            core_id: idx,
-            usage: c.cpu_usage(),
-            frequency: c.frequency(),
-        })
-        .collect();
+        let per_core_usage: Vec<CpuCoreUsage> = cpus
+            .iter()
+            .enumerate()
+            .map(|(idx, c)| CpuCoreUsage {
+                core_id: idx,
+                usage: c.cpu_usage(),
+                frequency: c.frequency(),
+            })
+            .collect();
 
-    // 获取 CPU 核心架构信息 (ARM big.LITTLE 等)
-    let hw_caps = hardware::detect_hardware();
-    let core_types: Vec<CpuCoreArchInfo> = hw_caps
-        .cpu_core_types
-        .into_iter()
-        .map(|ct| CpuCoreArchInfo {
-            core_name: ct.core_name,
-            part_id: ct.part_id,
-            count: ct.count,
-            implementer: ct.implementer,
-        })
-        .collect();
+        let hw_caps = hardware::detect_hardware();
+        let core_types: Vec<CpuCoreArchInfo> = hw_caps
+            .cpu_core_types
+            .into_iter()
+            .map(|ct| CpuCoreArchInfo {
+                core_name: ct.core_name,
+                part_id: ct.part_id,
+                count: ct.count,
+                implementer: ct.implementer,
+            })
+            .collect();
 
-    let cpu_info = CpuInfo {
-        name: cpu.name().to_string(),
-        vendor: cpu.vendor_id().to_string(),
-        brand: cpu.brand().to_string(),
-        frequency: cpu.frequency(),
-        cores: cpus.len(),
-        usage: total_usage,
-        temperature: get_cpu_temperature(),
-        per_core_usage,
-        core_types,
-    };
+        let cpu_info = CpuInfo {
+            name: cpu.name().to_string(),
+            vendor: cpu.vendor_id().to_string(),
+            brand: cpu.brand().to_string(),
+            frequency: cpu.frequency(),
+            cores: cpus.len(),
+            usage: total_usage,
+            temperature: get_cpu_temperature(),
+            per_core_usage,
+            core_types,
+        };
 
-    let total_mem = sys.total_memory();
-    let used_mem = sys.used_memory();
-    let available_mem = sys.available_memory();
-    let usage_percentage = if total_mem > 0 {
-        (used_mem as f64 / total_mem as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let memory_info = MemoryInfo {
-        total: total_mem,
-        used: used_mem,
-        available: available_mem,
-        usage_percentage,
-        swap_total: sys.total_swap(),
-        swap_used: sys.used_swap(),
-    };
-
-    let disks_info = Disks::new_with_refreshed_list();
-    let mut disks = Vec::new();
-    for disk in disks_info.list() {
-        let total_space = disk.total_space();
-        let available_space = disk.available_space();
-        let used_space = total_space.saturating_sub(available_space);
-        let disk_usage_percentage = if total_space > 0 {
-            (used_space as f64 / total_space as f64) * 100.0
+        let total_mem = sys.total_memory();
+        let used_mem = sys.used_memory();
+        let available_mem = sys.available_memory();
+        let usage_percentage = if total_mem > 0 {
+            (used_mem as f64 / total_mem as f64) * 100.0
         } else {
             0.0
         };
 
-        disks.push(DiskInfo {
-            name: disk.name().to_string_lossy().to_string(),
-            mount_point: disk.mount_point().to_string_lossy().to_string(),
-            file_system: disk.file_system().to_string_lossy().to_string(),
-            total_space,
-            available_space,
-            used_space,
-            usage_percentage: disk_usage_percentage,
-            is_removable: disk.is_removable(),
-            disk_type: format!("{:?}", disk.kind()),
-        });
-    }
+        let memory_info = MemoryInfo {
+            total: total_mem,
+            used: used_mem,
+            available: available_mem,
+            usage_percentage,
+            swap_total: sys.total_swap(),
+            swap_used: sys.used_swap(),
+        };
 
-    let usb_devices = detect_usb_devices();
-    let network_interfaces = detect_network_interfaces();
+        let disks_info = Disks::new_with_refreshed_list();
+        let mut disks = Vec::new();
+        for disk in disks_info.list() {
+            let total_space = disk.total_space();
+            let available_space = disk.available_space();
+            let used_space = total_space.saturating_sub(available_space);
+            let disk_usage_percentage = if total_space > 0 {
+                (used_space as f64 / total_space as f64) * 100.0
+            } else {
+                0.0
+            };
 
-    let hardware_info = HardwareInfo {
-        system: system_info,
-        cpu: cpu_info,
-        memory: memory_info,
-        disks,
-        usb_devices,
-        network_interfaces,
-    };
+            disks.push(DiskInfo {
+                name: disk.name().to_string_lossy().to_string(),
+                mount_point: disk.mount_point().to_string_lossy().to_string(),
+                file_system: disk.file_system().to_string_lossy().to_string(),
+                total_space,
+                available_space,
+                used_space,
+                usage_percentage: disk_usage_percentage,
+                is_removable: disk.is_removable(),
+                disk_type: format!("{:?}", disk.kind()),
+            });
+        }
+
+        let usb_devices = detect_usb_devices();
+        let network_interfaces = detect_network_interfaces();
+
+        Ok(HardwareInfo {
+            system: system_info,
+            cpu: cpu_info,
+            memory: memory_info,
+            disks,
+            usb_devices,
+            network_interfaces,
+        })
+    })
+    .await
+    .map_err(|_| AppError::InternalError)??;
 
     debug!("Hardware info collection complete");
     Ok(HttpResponse::Ok().json(hardware_info))

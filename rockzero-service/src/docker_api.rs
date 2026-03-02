@@ -17,8 +17,12 @@ use std::collections::HashMap;
 
 #[cfg(target_os = "linux")]
 use {
-    hyper::{Body, Client, Method, Request, StatusCode},
+    bytes::Bytes,
+    http_body_util::{BodyExt, Full},
+    hyper::{Method, Request, StatusCode},
+    hyper_util::client::legacy::Client,
     hyperlocal::{UnixClientExt, Uri as UnixUri},
+    std::time::Duration,
 };
 
 /// Docker socket path
@@ -28,6 +32,10 @@ const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 /// Docker API version
 #[allow(dead_code)]
 const DOCKER_API_VERSION: &str = "v1.41";
+
+/// Default timeout for Docker API requests (seconds)
+#[allow(dead_code)]
+const DOCKER_REQUEST_TIMEOUT_SECS: u64 = 15;
 
 /// Docker container information
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +174,7 @@ pub enum DockerError {
     NotFound(String),
     Unauthorized(String),
     Conflict(String),
+    Timeout(String),
 }
 
 impl std::fmt::Display for DockerError {
@@ -177,6 +186,7 @@ impl std::fmt::Display for DockerError {
             DockerError::NotFound(msg) => write!(f, "Not found: {}", msg),
             DockerError::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
             DockerError::Conflict(msg) => write!(f, "Conflict: {}", msg),
+            DockerError::Timeout(msg) => write!(f, "Docker request timeout: {}", msg),
         }
     }
 }
@@ -187,7 +197,7 @@ impl std::error::Error for DockerError {}
 #[allow(dead_code)]
 pub struct DockerClient {
     #[cfg(target_os = "linux")]
-    client: Client<hyperlocal::UnixConnector>,
+    client: Client<hyperlocal::UnixConnector, Full<Bytes>>,
     #[allow(dead_code)]
     socket_path: String,
 }
@@ -228,6 +238,26 @@ impl DockerClient {
         }
     }
 
+    /// Send a request to Docker with a timeout to prevent indefinite hangs
+    #[cfg(target_os = "linux")]
+    async fn request_with_timeout(
+        &self,
+        req: Request<Full<Bytes>>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, DockerError> {
+        tokio::time::timeout(
+            Duration::from_secs(DOCKER_REQUEST_TIMEOUT_SECS),
+            self.client.request(req),
+        )
+        .await
+        .map_err(|_| {
+            DockerError::Timeout(format!(
+                "Docker request timed out after {}s",
+                DOCKER_REQUEST_TIMEOUT_SECS
+            ))
+        })?
+        .map_err(|e| DockerError::ConnectionFailed(e.to_string()))
+    }
+
     /// List all containers
     #[cfg(target_os = "linux")]
     pub async fn list_containers(&self, all: bool) -> Result<Vec<ContainerInfo>, DockerError> {
@@ -237,11 +267,10 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::GET)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         if response.status() != StatusCode::OK {
             return Err(DockerError::ApiError(format!(
@@ -250,8 +279,9 @@ impl DockerClient {
             )));
         }
 
-        let body = hyper::body::to_bytes(response.into_body()).await
-            .map_err(|e| DockerError::ParseError(e.to_string()))?;
+        let body = response.into_body().collect().await
+            .map_err(|e| DockerError::ParseError(e.to_string()))?
+            .to_bytes();
 
         serde_json::from_slice(&body)
             .map_err(|e| DockerError::ParseError(e.to_string()))
@@ -270,11 +300,10 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::GET)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         if response.status() != StatusCode::OK {
             return Err(DockerError::ApiError(format!(
@@ -283,8 +312,9 @@ impl DockerClient {
             )));
         }
 
-        let body = hyper::body::to_bytes(response.into_body()).await
-            .map_err(|e| DockerError::ParseError(e.to_string()))?;
+        let body = response.into_body().collect().await
+            .map_err(|e| DockerError::ParseError(e.to_string()))?
+            .to_bytes();
 
         serde_json::from_slice(&body)
             .map_err(|e| DockerError::ParseError(e.to_string()))
@@ -317,16 +347,16 @@ impl DockerClient {
             .method(Method::POST)
             .uri(uri)
             .header("Content-Type", "application/json")
-            .body(Body::from(body))
+            .body(Full::new(Bytes::from(body)))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         match response.status() {
             StatusCode::CREATED => {
-                let body = hyper::body::to_bytes(response.into_body()).await
-                    .map_err(|e| DockerError::ParseError(e.to_string()))?;
+                let body = response.into_body().collect().await
+                    .map_err(|e| DockerError::ParseError(e.to_string()))?
+                    .to_bytes();
                 
                 let result: serde_json::Value = serde_json::from_slice(&body)
                     .map_err(|e| DockerError::ParseError(e.to_string()))?;
@@ -372,11 +402,10 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::POST)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         match response.status() {
             StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED => Ok(()),
@@ -409,11 +438,10 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::POST)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         match response.status() {
             StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED => Ok(()),
@@ -446,11 +474,10 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::DELETE)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         match response.status() {
             StatusCode::NO_CONTENT => Ok(()),
@@ -483,11 +510,10 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::POST)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         match response.status() {
             StatusCode::OK => Ok(()),
@@ -520,11 +546,10 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::DELETE)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         match response.status() {
             StatusCode::OK => Ok(()),
@@ -564,16 +589,16 @@ impl DockerClient {
         let req = Request::builder()
             .method(Method::GET)
             .uri(uri)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .map_err(|e| DockerError::ApiError(e.to_string()))?;
 
-        let response = self.client.request(req).await
-            .map_err(|e| DockerError::ConnectionFailed(e.to_string()))?;
+        let response = self.request_with_timeout(req).await?;
 
         match response.status() {
             StatusCode::OK => {
-                let body = hyper::body::to_bytes(response.into_body()).await
-                    .map_err(|e| DockerError::ParseError(e.to_string()))?;
+                let body = response.into_body().collect().await
+                    .map_err(|e| DockerError::ParseError(e.to_string()))?
+                    .to_bytes();
                 
                 // Docker logs have a special format with 8-byte header per line
                 // We need to strip these headers

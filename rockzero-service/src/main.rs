@@ -222,7 +222,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(Logger::default())
             .wrap(cors)
-            .app_data(web::PayloadConfig::default().limit(1000 * 1024 * 1024 * 1024))
+            .app_data(web::PayloadConfig::default().limit(100 * 1024 * 1024)) // 100 MB max payload for ARM devices
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(secure_storage.clone()))
             .app_data(web::Data::new(invite_manager.clone()))
@@ -890,10 +890,10 @@ async fn main() -> std::io::Result<()> {
                     // ============ Secure HLS Streaming ============
                     .service(
                         web::scope("/secure-hls")
-                            .wrap(middleware::JwtAuth)
-                            // SAE handshake and session creation
+                            // SAE handshake (requires JWT)
                             .service(
                                 web::scope("/sae")
+                                    .wrap(middleware::JwtAuth)
                                     .route(
                                         "/init",
                                         web::post().to(handlers::secure_hls::init_sae_handshake),
@@ -912,21 +912,31 @@ async fn main() -> std::io::Result<()> {
                                             .to(handlers::secure_hls::complete_sae_handshake),
                                     ),
                             )
-                            .service(web::scope("/session").route(
-                                "/create",
-                                web::post().to(handlers::secure_hls::create_hls_session),
-                            ))
-                            // Secure HLS playlist and segments (authorized by session_id + JWT)
+                            // Session management (requires JWT)
+                            .service(
+                                web::scope("/session")
+                                    .wrap(middleware::JwtAuth)
+                                    .route(
+                                        "/create",
+                                        web::post().to(handlers::secure_hls::create_hls_session),
+                                    ),
+                            )
+                            // Playback routes: authenticated by session_id (no JWT needed)
+                            // Session creation already required JWT + SAE handshake
                             .route(
                                 "/{session_id}/playlist.m3u8",
                                 web::get().to(handlers::secure_hls::get_secure_playlist),
                             )
-                            // Stop HLS session
                             .route(
                                 "/{session_id}/stop",
                                 web::post().to(handlers::secure_hls::stop_session),
                             )
-                            // Video segments (POST with ZKP proof)
+                            // Direct segment access (GET, no encryption)
+                            .route(
+                                "/{session_id}/{segment}",
+                                web::get().to(handlers::secure_hls::get_segment_direct),
+                            )
+                            // Encrypted segment access (POST with ZKP proof)
                             .route(
                                 "/{session_id}/{segment}",
                                 web::post().to(handlers::secure_hls::get_secure_segment),

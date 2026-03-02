@@ -88,7 +88,6 @@ pub struct WasmApp {
     pub updated_at: i64,
 }
 
-/// WASM 应用分类
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum WasmAppCategory {
@@ -101,7 +100,6 @@ pub enum WasmAppCategory {
     Other,
 }
 
-/// 插件接口定义
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub id: String,
@@ -115,7 +113,6 @@ pub struct PluginManifest {
     pub config_schema: Option<Value>,
 }
 
-/// 商店分类
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreCategory {
     pub id: String,
@@ -123,10 +120,6 @@ pub struct StoreCategory {
     pub icon: String,
     pub count: i64,
 }
-
-// ============================================================================
-// 请求/响应模型
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {

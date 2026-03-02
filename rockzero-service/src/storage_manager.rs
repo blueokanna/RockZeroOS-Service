@@ -43,17 +43,11 @@ pub struct StorageConfig {
     pub temp_storage_path: PathBuf,
     pub hls_cache_path: PathBuf,
     pub log_path: PathBuf,
-    /// Emergency threshold (bytes) — all caches wiped when free space drops below
     pub min_free_space: u64,
-    /// Warning threshold (bytes) — standard cleanup triggered
     pub warning_free_space: u64,
-    /// Critical threshold (bytes) — aggressive cleanup triggered
     pub critical_free_space: u64,
-    /// Maximum HLS cache size in bytes (0 = unlimited)
     pub max_hls_cache_size: u64,
-    /// Maximum temp storage size in bytes (0 = unlimited)
     pub max_temp_size: u64,
-    /// Maximum log storage size in bytes (0 = unlimited)
     pub max_log_size: u64,
     pub hls_cache_retention_days: u64,
     pub temp_file_retention_days: u64,
@@ -68,12 +62,12 @@ impl Default for StorageConfig {
             temp_storage_path: PathBuf::from("/mnt/external/temp"),
             hls_cache_path: PathBuf::from("./data/hls_cache"),
             log_path: PathBuf::from("./data/logs"),
-            min_free_space: 512 * 1024 * 1024,             // 512 MB
-            warning_free_space: 2 * 1024 * 1024 * 1024,    // 2 GB
-            critical_free_space: 1024 * 1024 * 1024,        // 1 GB
-            max_hls_cache_size: 10 * 1024 * 1024 * 1024,   // 10 GB
-            max_temp_size: 5 * 1024 * 1024 * 1024,          // 5 GB
-            max_log_size: 1024 * 1024 * 1024,                // 1 GB
+            min_free_space: 512 * 1024 * 1024,           // 512 MB
+            warning_free_space: 2 * 1024 * 1024 * 1024,  // 2 GB
+            critical_free_space: 1024 * 1024 * 1024,     // 1 GB
+            max_hls_cache_size: 10 * 1024 * 1024 * 1024, // 10 GB
+            max_temp_size: 5 * 1024 * 1024 * 1024,       // 5 GB
+            max_log_size: 1024 * 1024 * 1024,            // 1 GB
             hls_cache_retention_days: 7,
             temp_file_retention_days: 1,
             log_retention_days: 30,
@@ -333,8 +327,12 @@ impl StorageManager {
             report.temp_bytes_freed = get_directory_size(&self.config.temp_storage_path)
                 .await
                 .unwrap_or(0);
-            fs::remove_dir_all(&self.config.temp_storage_path).await.ok();
-            fs::create_dir_all(&self.config.temp_storage_path).await.ok();
+            fs::remove_dir_all(&self.config.temp_storage_path)
+                .await
+                .ok();
+            fs::create_dir_all(&self.config.temp_storage_path)
+                .await
+                .ok();
             self.temp_bytes.store(0, Ordering::Relaxed);
         }
 
@@ -383,7 +381,6 @@ impl StorageManager {
             }
         });
 
-        // Stale HLS cache: delete segments not accessed in 30 min (check every 5 min)
         let m = self.clone();
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(300));
@@ -395,7 +392,6 @@ impl StorageManager {
             }
         });
 
-        // Pressure monitor every 60s
         let m = self.clone();
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(60));
@@ -425,7 +421,6 @@ impl StorageManager {
             }
         });
 
-        // LRU cache limit enforcement every 10 min
         let m = self.clone();
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(600));
@@ -438,11 +433,9 @@ impl StorageManager {
         });
     }
 
-    /// Enforce maximum cache sizes via LRU eviction
     async fn enforce_cache_limits(&self) -> std::io::Result<()> {
         let _guard = self.cleanup_lock.lock().await;
 
-        // HLS cache
         if self.config.max_hls_cache_size > 0 {
             let cur = get_directory_size(&self.config.hls_cache_path)
                 .await
@@ -450,8 +443,7 @@ impl StorageManager {
             self.hls_cache_bytes.store(cur, Ordering::Relaxed);
             if cur > self.config.max_hls_cache_size {
                 let excess = cur - self.config.max_hls_cache_size;
-                let freed =
-                    lru_evict_from_directory(&self.config.hls_cache_path, excess).await?;
+                let freed = lru_evict_from_directory(&self.config.hls_cache_path, excess).await?;
                 self.hls_cache_bytes
                     .store(cur.saturating_sub(freed), Ordering::Relaxed);
                 info!(
@@ -463,7 +455,6 @@ impl StorageManager {
             }
         }
 
-        // Temp storage
         if self.config.max_temp_size > 0 {
             let cur = get_directory_size(&self.config.temp_storage_path)
                 .await
@@ -484,7 +475,6 @@ impl StorageManager {
             }
         }
 
-        // Logs
         if self.config.max_log_size > 0 {
             let cur = get_directory_size(&self.config.log_path).await.unwrap_or(0);
             self.log_bytes.store(cur, Ordering::Relaxed);
@@ -505,7 +495,6 @@ impl StorageManager {
         Ok(())
     }
 
-    /// Emergency eviction — wipe ALL caches, keep only 24 h of logs
     async fn emergency_eviction(&self) -> std::io::Result<()> {
         let _guard = self.cleanup_lock.lock().await;
         let mut total_freed = 0u64;
@@ -514,7 +503,10 @@ impl StorageManager {
             let sz = get_directory_size(&self.config.hls_cache_path)
                 .await
                 .unwrap_or(0);
-            if fs::remove_dir_all(&self.config.hls_cache_path).await.is_ok() {
+            if fs::remove_dir_all(&self.config.hls_cache_path)
+                .await
+                .is_ok()
+            {
                 total_freed += sz;
                 fs::create_dir_all(&self.config.hls_cache_path).await.ok();
             }
@@ -525,9 +517,14 @@ impl StorageManager {
             let sz = get_directory_size(&self.config.temp_storage_path)
                 .await
                 .unwrap_or(0);
-            if fs::remove_dir_all(&self.config.temp_storage_path).await.is_ok() {
+            if fs::remove_dir_all(&self.config.temp_storage_path)
+                .await
+                .is_ok()
+            {
                 total_freed += sz;
-                fs::create_dir_all(&self.config.temp_storage_path).await.ok();
+                fs::create_dir_all(&self.config.temp_storage_path)
+                    .await
+                    .ok();
             }
             self.temp_bytes.store(0, Ordering::Relaxed);
         }
@@ -547,17 +544,14 @@ impl StorageManager {
     async fn aggressive_cleanup(&self) -> std::io::Result<()> {
         let _guard = self.cleanup_lock.lock().await;
 
-        // HLS cache: delete entries older than 1 hour
         if dir_exists(&self.config.hls_cache_path).await {
             let _ = cleanup_old_entries_bytes(&self.config.hls_cache_path, 3600).await;
         }
 
-        // Temp: delete entries older than 2 hours
         if dir_exists(&self.config.temp_storage_path).await {
             let _ = cleanup_old_files_bytes(&self.config.temp_storage_path, 2 * 3600).await;
         }
 
-        // Logs: keep only last 3 days
         if dir_exists(&self.config.log_path).await {
             let _ = cleanup_old_files_bytes(&self.config.log_path, 3 * 24 * 3600).await;
         }
@@ -566,15 +560,12 @@ impl StorageManager {
         Ok(())
     }
 
-    /// Run all standard cleanup tasks
     pub async fn run_cleanup(&self) -> std::io::Result<()> {
         let _guard = self.cleanup_lock.lock().await;
 
-        // 1. Clean HLS cache by retention
         if dir_exists(&self.config.hls_cache_path).await {
             let retention = self.config.hls_cache_retention_days * 24 * 3600;
-            let freed =
-                cleanup_old_entries_bytes(&self.config.hls_cache_path, retention).await?;
+            let freed = cleanup_old_entries_bytes(&self.config.hls_cache_path, retention).await?;
             if freed > 0 {
                 info!(
                     "Cleaned {} from HLS cache (retention: {}d)",
@@ -584,11 +575,9 @@ impl StorageManager {
             }
         }
 
-        // 2. Clean temp files
         if dir_exists(&self.config.temp_storage_path).await {
             let retention = self.config.temp_file_retention_days * 24 * 3600;
-            let freed =
-                cleanup_old_files_bytes(&self.config.temp_storage_path, retention).await?;
+            let freed = cleanup_old_files_bytes(&self.config.temp_storage_path, retention).await?;
             if freed > 0 {
                 info!(
                     "Cleaned {} from temp (retention: {}d)",
@@ -598,7 +587,6 @@ impl StorageManager {
             }
         }
 
-        // 3. Clean old logs
         if dir_exists(&self.config.log_path).await {
             let retention = self.config.log_retention_days * 24 * 3600;
             let freed = cleanup_old_files_bytes(&self.config.log_path, retention).await?;
@@ -611,10 +599,7 @@ impl StorageManager {
             }
         }
 
-        // 4. Refresh tracked sizes
         self.refresh_cache_sizes().await;
-
-        // 5. Check pressure after cleanup
         let pressure = self.get_pressure_level().await;
         if pressure >= CachePressureLevel::Warning {
             warn!("Disk pressure still at {} after cleanup", pressure);
@@ -624,7 +609,6 @@ impl StorageManager {
         Ok(())
     }
 
-    /// Check storage space and log warnings
     pub async fn check_storage_space(&self) -> std::io::Result<()> {
         let checks = [
             ("External Storage", &self.config.external_storage_path),
@@ -656,7 +640,6 @@ impl StorageManager {
         Ok(())
     }
 
-    /// Clean HLS cache by configured retention
     pub async fn cleanup_hls_cache(&self) -> std::io::Result<()> {
         if !dir_exists(&self.config.hls_cache_path).await {
             return Ok(());
@@ -669,7 +652,6 @@ impl StorageManager {
         Ok(())
     }
 
-    /// Clean HLS cache entries not accessed within `max_idle_secs`
     pub async fn cleanup_stale_hls_cache(&self, max_idle_secs: u64) -> std::io::Result<()> {
         if !dir_exists(&self.config.hls_cache_path).await {
             return Ok(());
@@ -717,21 +699,18 @@ impl StorageManager {
         Ok(())
     }
 
-    /// Clean temporary files by configured retention
     pub async fn cleanup_temp_files(&self) -> std::io::Result<()> {
         if !dir_exists(&self.config.temp_storage_path).await {
             return Ok(());
         }
         let retention = self.config.temp_file_retention_days * 24 * 3600;
-        let freed =
-            cleanup_old_files_bytes(&self.config.temp_storage_path, retention).await?;
+        let freed = cleanup_old_files_bytes(&self.config.temp_storage_path, retention).await?;
         if freed > 0 {
             info!("Cleaned {} from temporary files", format_bytes(freed));
         }
         Ok(())
     }
 
-    /// Clean old logs by configured retention
     #[allow(dead_code)]
     pub async fn cleanup_old_logs(&self) -> std::io::Result<()> {
         if !dir_exists(&self.config.log_path).await {
@@ -745,7 +724,6 @@ impl StorageManager {
         Ok(())
     }
 
-    /// Immediately clean up the HLS session cache for a specific video
     #[allow(dead_code)]
     pub async fn cleanup_session_cache(&self, video_hash: &str) -> std::io::Result<u64> {
         let dir = self.config.hls_cache_path.join(video_hash);
@@ -758,14 +736,14 @@ impl StorageManager {
             std::cmp::min(sz, self.hls_cache_bytes.load(Ordering::Relaxed)),
             Ordering::Relaxed,
         );
-        info!("Cleaned session cache: {} ({})", video_hash, format_bytes(sz));
+        info!(
+            "Cleaned session cache: {} ({})",
+            video_hash,
+            format_bytes(sz)
+        );
         Ok(sz)
     }
 }
-
-// ════════════════════════════════════════════════════════════════
-//  Stats types
-// ════════════════════════════════════════════════════════════════
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct StorageStats {
@@ -778,33 +756,20 @@ pub struct StorageStats {
     pub available_space: u64,
 }
 
-/// Accurate disk usage statistics
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AccurateDiskUsage {
-    /// Total space
     pub total_space: u64,
-    /// Available space
     pub available_space: u64,
-    /// Used space (filesystem level)
     pub used_space: u64,
-    /// Cache occupied space
     pub cache_size: u64,
-    /// Actual user data (excluding cache)
     pub actual_user_data: u64,
-    /// Usage percentage (based on actual used space)
     pub usage_percentage: f64,
 }
 
-// ════════════════════════════════════════════════════════════════
-//  Helper functions
-// ════════════════════════════════════════════════════════════════
-
-/// Async-safe path existence check (avoids blocking `.exists()`)
 async fn dir_exists(path: &Path) -> bool {
     fs::metadata(path).await.is_ok()
 }
 
-/// Human-readable byte formatting
 pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;

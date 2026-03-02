@@ -14,7 +14,12 @@ const PASSWORD_DOMAIN: &str = "RockZero-Password-ZKP-v1";
 const BLINDING_DOMAIN: &str = "RockZero-Blinding-Derive-v1";
 const MIN_PASSWORD_ENTROPY_BITS: u64 = 28;
 const NONCE_EXPIRY_SECONDS: u64 = 600;
-const PBKDF_ITERATIONS: u32 = 100_000;
+
+/// PBKDF iterations — tuned for ARM devices (A311D etc.)
+/// Higher values increase security but cause multi-second blocking on low-power CPUs.
+/// 10,000 iterations of Blake3 still provides strong key derivation while remaining
+/// responsive on ARM v8 (Cortex-A73/A53).
+const PBKDF_ITERATIONS: u32 = 10_000;
 
 lazy_static::lazy_static! {
     static ref USED_NONCES: Mutex<HashMap<String, u64>> = Mutex::new(HashMap::new());
@@ -481,6 +486,11 @@ impl ZkpContext {
                 .as_secs();
             used_nonces.retain(|_, &mut expiry| expiry > current_time);
             
+            // Safety cap: prevent unbounded growth under sustained attack
+            if used_nonces.len() > 10_000 {
+                used_nonces.clear();
+            }
+
             if used_nonces.contains_key(&proof.nonce) {
                 return Err(AppError::CryptoError(
                     "Nonce already used (replay attack detected)".to_string(),

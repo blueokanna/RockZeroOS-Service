@@ -186,14 +186,21 @@ impl VideoAccessManager {
             return Err("User does not have permission to access this file".to_string());
         }
         
-        // Create token
-        let token = VideoAccessToken::new(
-            user_id.clone(),
-            file_path.clone(),
-            password,
-            permissions,
-            ttl_seconds,
-        )?;
+        // Create token in blocking context (ZKP operations are CPU-intensive)
+        let password = password.to_string();
+        let user_id_clone = user_id.clone();
+        let file_path_clone = file_path.clone();
+        let token = tokio::task::spawn_blocking(move || {
+            VideoAccessToken::new(
+                user_id_clone,
+                file_path_clone,
+                &password,
+                permissions,
+                ttl_seconds,
+            )
+        })
+        .await
+        .map_err(|e| format!("Token creation task failed: {}", e))??;
         
         let token_id = token.token_id.clone();
         
@@ -218,12 +225,25 @@ impl VideoAccessManager {
         let tokens = self.tokens.read().await;
         
         let token = tokens.get(token_id)
-            .ok_or_else(|| "Invalid token".to_string())?;
+            .ok_or_else(|| "Invalid token".to_string())?
+            .clone();
         
-        // 验证令牌
-        if !token.verify(password) {
+        // 验证令牌 (ZKP verification is CPU-intensive, run in blocking context)
+        let password = password.to_string();
+        let verified = tokio::task::spawn_blocking(move || {
+            token.verify(&password)
+        })
+        .await
+        .map_err(|e| format!("Verification task failed: {}", e))?;
+        
+        if !verified {
             return Err("Token verification failed".to_string());
         }
+        
+        // Re-read token for permission checks
+        let tokens = self.tokens.read().await;
+        let token = tokens.get(token_id)
+            .ok_or_else(|| "Invalid token".to_string())?;
         
         // 检查文件访问权限
         if !token.can_access_file(file_path) {

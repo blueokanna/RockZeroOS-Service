@@ -279,16 +279,16 @@ impl SecureFileEncryptor {
     }
 
     pub async fn encrypt_file(&self, source: &PathBuf, dest: &PathBuf, key: &[u8]) -> Result<(), AppError> {
-        let data = fs::read(source).map_err(|e| AppError::IoError(e.to_string()))?;
+        let data = tokio::fs::read(source).await.map_err(|e| AppError::IoError(e.to_string()))?;
         let encrypted = aes_encrypt(key, &data)?;
-        fs::write(dest, encrypted).map_err(|e| AppError::IoError(e.to_string()))?;
+        tokio::fs::write(dest, encrypted).await.map_err(|e| AppError::IoError(e.to_string()))?;
         Ok(())
     }
 
     pub async fn decrypt_file(&self, source: &PathBuf, dest: &PathBuf, key: &[u8]) -> Result<(), AppError> {
-        let encrypted = fs::read(source).map_err(|e| AppError::IoError(e.to_string()))?;
+        let encrypted = tokio::fs::read(source).await.map_err(|e| AppError::IoError(e.to_string()))?;
         let data = aes_decrypt(key, &encrypted)?;
-        fs::write(dest, data).map_err(|e| AppError::IoError(e.to_string()))?;
+        tokio::fs::write(dest, data).await.map_err(|e| AppError::IoError(e.to_string()))?;
         Ok(())
     }
 
@@ -300,20 +300,7 @@ impl SecureFileEncryptor {
 
         let _ = self.transfer_manager.list_active();
 
-        let file_payload = EncryptedFileData {
-            encrypted_data: encrypted.clone(),
-            nonce: nonce.clone(),
-        };
-
-        let temp_dir = std::env::temp_dir();
-        let source_path = temp_dir.join("encrypt_source.tmp");
-        let dest_path = temp_dir.join("encrypt_dest.tmp");
-        fs::write(&source_path, data).map_err(|e| AppError::IoError(e.to_string()))?;
-        let _ = self.encrypt_file(&source_path, &dest_path, &key).await;
-        let _ = fs::read(&dest_path);
-        let _ = fs::remove_file(&source_path);
-        let _ = fs::remove_file(&dest_path);
-        let _ = file_payload;
+        // Removed unnecessary temp file round-trip that blocked I/O and wasted disk writes
 
         Ok(EncryptedData {
             ciphertext: encrypted,
