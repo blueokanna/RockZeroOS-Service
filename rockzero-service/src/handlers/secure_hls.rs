@@ -438,30 +438,298 @@ async fn get_user_zkp_registration(
 
 // ============ 安全播放列表和段获取 ============
 
-/// 获取安全的 M3U8 播放列表（不包含密钥 URL）
+/// 使用 ffmpeg 对视频进行 HLS 分片（优先 stream copy，失败时转码）
+///
+/// 生成标准的 VOD HLS 播放列表和 MPEG-TS 分片文件。
+/// 结果缓存在 `hls_cache/{video_hash}/` 目录中。
+async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, String), AppError> {
+    use std::path::PathBuf;
+
+    let video_hash = blake3::hash(file_path.as_bytes());
+    let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+    let cache_dir = get_hls_cache_dir().join(&video_id);
+    let playlist_path = cache_dir.join("playlist.m3u8");
+
+    // If already segmented, return cached playlist
+    if playlist_path.exists() {
+        let content = tokio::fs::read_to_string(&playlist_path)
+            .await
+            .map_err(|e| AppError::IoError(format!("Failed to read cached playlist: {}", e)))?;
+        return Ok((cache_dir, content));
+    }
+
+    // Create cache directory
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(|e| AppError::IoError(format!("Failed to create cache dir: {}", e)))?;
+
+    // Verify source video exists
+    let original = PathBuf::from(file_path);
+    if !original.exists() {
+        return Err(AppError::NotFound(format!(
+            "Video file not found: {}",
+            file_path
+        )));
+    }
+
+    let ffmpeg_path = std::env::var("FFMPEG_PATH")
+        .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
+        .unwrap_or_else(|_| "ffmpeg".to_string());
+
+    let segment_pattern = cache_dir.join("segment_%d.ts");
+    let seg_pattern_str = segment_pattern
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    let playlist_str = playlist_path
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+
+    info!(
+        "🎬 Segmenting video: {} → {}",
+        file_path,
+        cache_dir.display()
+    );
+
+    // Try stream copy first (very fast, no transcoding)
+    let output = tokio::process::Command::new(&ffmpeg_path)
+        .args([
+            "-y",
+            "-i",
+            file_path,
+            "-c",
+            "copy",
+            "-f",
+            "hls",
+            "-hls_time",
+            "10",
+            "-hls_list_size",
+            "0",
+            "-hls_playlist_type",
+            "vod",
+            "-hls_segment_type",
+            "mpegts",
+            "-hls_segment_filename",
+            &seg_pattern_str,
+            &playlist_str,
+        ])
+        .output()
+        .await
+        .map_err(|e| {
+            AppError::IoError(format!(
+                "Failed to run ffmpeg: {}. Ensure ffmpeg is installed.",
+                e
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(
+            "Stream copy segmentation failed, trying transcode: {}",
+            stderr
+        );
+
+        // Clean up partial output
+        let _ = tokio::fs::remove_dir_all(&cache_dir).await;
+        tokio::fs::create_dir_all(&cache_dir)
+            .await
+            .map_err(|e| AppError::IoError(format!("Failed to recreate cache dir: {}", e)))?;
+
+        // Detect hardware acceleration
+        let hw_accel = detect_hardware_acceleration().await;
+
+        let mut args: Vec<String> = vec![
+            "-y".into(),
+            "-i".into(),
+            file_path.into(),
+        ];
+
+        match hw_accel {
+            HardwareAccel::V4l2 => {
+                info!("Using V4L2 hardware encoding for HLS segmentation");
+                args.extend([
+                    "-c:v".into(),
+                    "h264_v4l2m2m".into(),
+                    "-b:v".into(),
+                    "2M".into(),
+                ]);
+            }
+            HardwareAccel::Vaapi => {
+                info!("Using VAAPI hardware encoding for HLS segmentation");
+                args.extend([
+                    "-hwaccel".into(),
+                    "vaapi".into(),
+                    "-hwaccel_device".into(),
+                    "/dev/dri/renderD128".into(),
+                    "-hwaccel_output_format".into(),
+                    "vaapi".into(),
+                    "-c:v".into(),
+                    "h264_vaapi".into(),
+                    "-qp".into(),
+                    "23".into(),
+                ]);
+            }
+            HardwareAccel::None => {
+                info!("Using software encoding (libx264) for HLS segmentation");
+                args.extend([
+                    "-c:v".into(),
+                    "libx264".into(),
+                    "-preset".into(),
+                    "veryfast".into(),
+                    "-crf".into(),
+                    "23".into(),
+                ]);
+            }
+        }
+
+        args.extend([
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "128k".into(),
+            "-ac".into(),
+            "2".into(),
+            "-f".into(),
+            "hls".into(),
+            "-hls_time".into(),
+            "10".into(),
+            "-hls_list_size".into(),
+            "0".into(),
+            "-hls_playlist_type".into(),
+            "vod".into(),
+            "-hls_segment_type".into(),
+            "mpegts".into(),
+            "-hls_segment_filename".into(),
+            seg_pattern_str,
+            playlist_str.clone(),
+        ]);
+
+        let output = tokio::process::Command::new(&ffmpeg_path)
+            .args(&args)
+            .output()
+            .await
+            .map_err(|e| {
+                AppError::IoError(format!("FFmpeg transcode failed: {}", e))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(AppError::InternalServerError(format!(
+                "FFmpeg segmentation failed: {}",
+                stderr
+            )));
+        }
+    }
+
+    info!("✅ Video segmented successfully: {}", video_id);
+
+    let content = tokio::fs::read_to_string(&playlist_path)
+        .await
+        .map_err(|e| {
+            AppError::IoError(format!(
+                "Failed to read playlist after segmentation: {}",
+                e
+            ))
+        })?;
+
+    Ok((cache_dir, content))
+}
+
+/// 获取 HLS 播放列表（基于 ffmpeg 生成的真实分片）
+///
+/// 不需要 JWT 认证 — session_id 本身就是鉴权 token（创建时已验证 JWT + SAE）。
+/// 首次请求时自动触发 ffmpeg 分片（优先 stream copy）。
 pub async fn get_secure_playlist(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<String>,
 ) -> Result<impl Responder, AppError> {
     let session_id = path.into_inner();
 
-    // 验证会话
-    let manager = hls_manager.read().await;
-    let _session = manager
-        .get_session(&session_id)
-        .map_err(convert_hls_error)?;
+    // 验证会话并获取文件路径（然后释放读锁）
+    let file_path = {
+        let manager = hls_manager.read().await;
+        let session = manager
+            .get_session(&session_id)
+            .map_err(convert_hls_error)?;
+        session.file_path.clone()
+    };
 
-    // 生成不包含密钥 URL 的播放列表
-    let playlist = generate_secure_m3u8(100, 10.0);
+    // 确保 HLS 分片存在（首次会触发 ffmpeg 分片）
+    let (_cache_dir, playlist_content) = ensure_hls_segments(&file_path).await?;
 
-    info!("Serving secure playlist for session {}", session_id);
+    info!(
+        "📋 Serving playlist for session {} ({})",
+        session_id, file_path
+    );
 
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
-        .insert_header(("Cache-Control", "no-cache"))
-        .insert_header(("X-Encryption-Method", "AES-256-GCM"))
-        .insert_header(("X-Requires-ZKP", "true"))
-        .body(playlist))
+        .insert_header(("Cache-Control", "no-cache, no-store"))
+        .insert_header(("Access-Control-Allow-Origin", "*"))
+        .body(playlist_content))
+}
+
+/// 直接获取视频段（GET，无加密，session 鉴权）
+///
+/// 标准 HLS 播放器可以直接 GET 请求获取视频段。
+/// 安全性由 session_id（随机 UUID）保证：
+/// - 创建 session 时已验证 JWT + SAE 握手
+/// - session_id 是 128 位随机值，不可猜测
+/// - session 有 3 小时过期时间
+///
+/// 这使得视频可以在 ARM 设备上流畅播放，无需每段进行 ZKP 证明和加解密。
+pub async fn get_segment_direct(
+    hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    path: web::Path<(String, String)>,
+) -> Result<impl Responder, AppError> {
+    let (session_id, segment_name) = path.into_inner();
+
+    // 验证段名称格式
+    if !segment_name.ends_with(".ts") {
+        return Err(AppError::BadRequest(format!(
+            "Invalid segment name: '{}'",
+            segment_name
+        )));
+    }
+
+    // 验证会话并获取文件路径
+    let file_path = {
+        let manager = hls_manager.read().await;
+        let session = manager
+            .get_session(&session_id)
+            .map_err(convert_hls_error)?;
+        session.file_path.clone()
+    };
+
+    // 构建缓存路径
+    let video_hash = blake3::hash(file_path.as_bytes());
+    let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+    let cache_dir = get_hls_cache_dir().join(&video_id);
+    let segment_path = cache_dir.join(&segment_name);
+
+    // 如果段文件不存在，先确保分片完成
+    if !segment_path.exists() {
+        ensure_hls_segments(&file_path).await?;
+
+        if !segment_path.exists() {
+            return Err(AppError::NotFound(format!(
+                "Segment not found: {}",
+                segment_name
+            )));
+        }
+    }
+
+    // 读取并返回段文件
+    let data = tokio::fs::read(&segment_path).await.map_err(|e| {
+        AppError::IoError(format!("Failed to read segment {}: {}", segment_name, e))
+    })?;
+
+    Ok(HttpResponse::Ok()
+        .content_type("video/mp2t")
+        .insert_header(("Cache-Control", "public, max-age=3600"))
+        .insert_header(("Access-Control-Allow-Origin", "*"))
+        .body(data))
 }
 
 /// 获取加密的 TS 段（需要 ZKP 证明）
@@ -532,8 +800,23 @@ pub async fn get_secure_segment(
         session_id, segment_name
     );
 
-    // 5. 从 FFmpeg 转码输出读取实际的 TS 段
-    let segment_data = read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?;
+    // 5. 从缓存或 FFmpeg 转码获取视频段数据
+    let segment_data = {
+        let video_hash = blake3::hash(session.file_path.as_bytes());
+        let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+        let cache_dir = get_hls_cache_dir().join(&video_id);
+        let segment_path = cache_dir.join(&segment_name);
+
+        if segment_path.exists() {
+            // 使用已缓存的分片
+            tokio::fs::read(&segment_path).await.map_err(|e| {
+                AppError::IoError(format!("Failed to read cached segment: {}", e))
+            })?
+        } else {
+            // 回退到按需转码
+            read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?
+        }
+    };
 
     // 6. 使用会话密钥加密段
     let encrypted_segment = session
@@ -614,7 +897,8 @@ pub async fn stop_session(
 
 // ============ 辅助函数 ============
 
-/// 生成安全的 M3U8 播放列表（不包含 #EXT-X-KEY）
+/// 生成安全的 M3U8 播放列表（已被 ffmpeg 生成的播放列表替代，保留作为 fallback）
+#[allow(dead_code)]
 fn generate_secure_m3u8(segment_count: usize, segment_duration: f32) -> String {
     let mut playlist = String::from("#EXTM3U\n");
     playlist.push_str("#EXT-X-VERSION:3\n");
@@ -999,8 +1283,6 @@ async fn transcode_segment_async(
         "44100".to_string(), // 采样率
         "-f".to_string(),
         "mpegts".to_string(), // MPEG-TS 容器
-        "-movflags".to_string(),
-        "+faststart".to_string(), // 快速启动
         output_path.to_str().unwrap_or("").to_string(),
     ]);
 
