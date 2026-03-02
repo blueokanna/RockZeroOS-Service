@@ -566,6 +566,97 @@ pub async fn get_thumbnail(
     }
 }
 
+/// Audio transcode endpoint — converts DTS/AC3/TrueHD/EAC3 audio to AAC for browser/mobile playback.
+///
+/// Uses ffmpeg to transcode audio on-the-fly with fragmented MP4 output (frag_keyframe+empty_moov)
+/// for instant streaming start. Video stream is copied without re-encoding.
+///
+/// The client discovers this URL via the `transcode_url` field in `/streaming/info/{path}`.
+pub async fn transcode_audio(
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, AppError> {
+    let file_path = get_media_path(&path.into_inner())?;
+
+    if !file_path.exists() {
+        return Err(AppError::NotFound("Media file not found".to_string()));
+    }
+
+    let metadata = std::fs::metadata(&file_path).map_err(|_| AppError::InternalError)?;
+
+    if metadata.len() == 0 {
+        return Err(AppError::BadRequest("Empty file".to_string()));
+    }
+
+    // Verify the file actually needs transcoding
+    let media_details = get_detailed_ffprobe_info(&file_path);
+    let needs_transcode = media_details
+        .audio_codec
+        .as_ref()
+        .map(|codec| crate::media_processor::needs_audio_transcode(codec))
+        .unwrap_or(false);
+
+    if !needs_transcode {
+        // No transcoding needed — redirect to direct stream
+        let redirect_path = file_path
+            .strip_prefix(MEDIA_BASE)
+            .unwrap_or(&file_path)
+            .to_string_lossy();
+        return Ok(HttpResponse::TemporaryRedirect()
+            .insert_header(("Location", format!("/api/v1/streaming/play/{}", redirect_path)))
+            .finish());
+    }
+
+    // Parse seek parameter from query string
+    let seek: Option<f64> = req
+        .uri()
+        .query()
+        .and_then(|q| {
+            q.split('&')
+                .find(|p| p.starts_with("seek="))
+                .and_then(|p| p.strip_prefix("seek="))
+                .and_then(|v| v.parse().ok())
+        });
+
+    // Start ffmpeg transcode process
+    let transcoder = crate::media_processor::StreamingTranscoder::new();
+    let child = transcoder
+        .start_audio_transcode(
+            file_path.to_str().unwrap_or(""),
+            seek,
+            Some("192k"),
+            None,
+        )
+        .map_err(|e| {
+            warn!("Failed to start audio transcode: {}", e);
+            AppError::InternalError
+        })?;
+
+    let stream = crate::media_processor::TranscodeStream::new(child);
+
+    let mut response = HttpResponse::Ok();
+    response.insert_header(("Content-Type", "audio/mp4"));
+    response.insert_header(("Accept-Ranges", "none"));
+    response.insert_header(("Cache-Control", "no-cache, no-store"));
+    response.insert_header(("Transfer-Encoding", "chunked"));
+    response.insert_header(("Access-Control-Allow-Origin", "*"));
+    response.insert_header((
+        "Access-Control-Expose-Headers",
+        "Content-Duration, X-Content-Duration, X-Audio-Codec, X-Original-Codec",
+    ));
+
+    if let Some(duration) = media_details.duration {
+        response.insert_header(("Content-Duration", duration.to_string()));
+        response.insert_header(("X-Content-Duration", duration.to_string()));
+    }
+    response.insert_header(("X-Audio-Codec", "aac"));
+    if let Some(ref original_codec) = media_details.audio_codec {
+        response.insert_header(("X-Original-Codec", original_codec.clone()));
+    }
+
+    Ok(response.streaming(stream))
+}
+
 pub async fn get_supported_formats() -> Result<HttpResponse, AppError> {
     let formats = serde_json::json!({
         "video": {

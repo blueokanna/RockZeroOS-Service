@@ -600,9 +600,111 @@ impl StorageManager {
         }
 
         self.refresh_cache_sizes().await;
-        let pressure = self.get_pressure_level().await;
+        let mut pressure = self.get_pressure_level().await;
+
+        // Progressive escalation: if pressure persists after standard cleanup,
+        // try increasingly aggressive retention periods
         if pressure >= CachePressureLevel::Warning {
-            warn!("Disk pressure still at {} after cleanup", pressure);
+            info!(
+                "Disk pressure at {} after standard cleanup — escalating with shorter retention",
+                pressure
+            );
+
+            // Phase 1: 1/4 of normal retention
+            let hls_short = (self.config.hls_cache_retention_days * 24 * 3600) / 4;
+            let temp_short = (self.config.temp_file_retention_days * 24 * 3600) / 4;
+            let log_short = (self.config.log_retention_days * 24 * 3600) / 4;
+
+            if dir_exists(&self.config.hls_cache_path).await {
+                let freed = cleanup_old_entries_bytes(&self.config.hls_cache_path, hls_short)
+                    .await
+                    .unwrap_or(0);
+                if freed > 0 {
+                    info!("Escalated HLS cleanup freed {}", format_bytes(freed));
+                }
+            }
+            if dir_exists(&self.config.temp_storage_path).await {
+                let freed = cleanup_old_files_bytes(&self.config.temp_storage_path, temp_short)
+                    .await
+                    .unwrap_or(0);
+                if freed > 0 {
+                    info!("Escalated temp cleanup freed {}", format_bytes(freed));
+                }
+            }
+            if dir_exists(&self.config.log_path).await {
+                let freed = cleanup_old_files_bytes(&self.config.log_path, log_short)
+                    .await
+                    .unwrap_or(0);
+                if freed > 0 {
+                    info!("Escalated log cleanup freed {}", format_bytes(freed));
+                }
+            }
+
+            self.refresh_cache_sizes().await;
+            pressure = self.get_pressure_level().await;
+        }
+
+        // Phase 2: enforce cache limits regardless of retention
+        if pressure >= CachePressureLevel::Warning {
+            info!(
+                "Disk pressure still at {} — enforcing strict cache limits",
+                pressure
+            );
+
+            // Reduce HLS cache to 50% of limit
+            let hls_cur = get_directory_size(&self.config.hls_cache_path)
+                .await
+                .unwrap_or(0);
+            let half_limit = self.config.max_hls_cache_size / 2;
+            if hls_cur > half_limit && half_limit > 0 {
+                let excess = hls_cur - half_limit;
+                let freed = lru_evict_from_directory(&self.config.hls_cache_path, excess)
+                    .await
+                    .unwrap_or(0);
+                if freed > 0 {
+                    info!(
+                        "Strict HLS LRU eviction freed {} (target: {})",
+                        format_bytes(freed),
+                        format_bytes(excess)
+                    );
+                }
+            }
+
+            // Reduce temp to 50% of limit
+            let temp_cur = get_directory_size(&self.config.temp_storage_path)
+                .await
+                .unwrap_or(0);
+            let half_temp = self.config.max_temp_size / 2;
+            if temp_cur > half_temp && half_temp > 0 {
+                let excess = temp_cur - half_temp;
+                let freed = lru_evict_from_directory(&self.config.temp_storage_path, excess)
+                    .await
+                    .unwrap_or(0);
+                if freed > 0 {
+                    info!(
+                        "Strict temp LRU eviction freed {} (target: {})",
+                        format_bytes(freed),
+                        format_bytes(excess),
+                    );
+                }
+            }
+
+            self.refresh_cache_sizes().await;
+            pressure = self.get_pressure_level().await;
+        }
+
+        if pressure >= CachePressureLevel::Warning {
+            warn!(
+                "Disk pressure remains at {} after all cleanup phases. \
+                 Consider increasing storage or reducing WARNING_FREE_SPACE threshold (current: {}).",
+                pressure,
+                format_bytes(self.config.warning_free_space),
+            );
+        } else {
+            info!(
+                "Disk pressure resolved to {} after cleanup",
+                pressure
+            );
         }
 
         info!("Cleanup completed");

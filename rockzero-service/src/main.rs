@@ -200,6 +200,8 @@ async fn main() -> std::io::Result<()> {
                 "PUT",
                 "DELETE",
                 "OPTIONS",
+                "HEAD",
+                "PATCH",
                 "PROPFIND",
                 "PROPPATCH",
                 "MKCOL",
@@ -212,9 +214,31 @@ async fn main() -> std::io::Result<()> {
                 actix_web::http::header::AUTHORIZATION,
                 actix_web::http::header::CONTENT_TYPE,
                 actix_web::http::header::ACCEPT,
+                actix_web::http::header::RANGE,
+                actix_web::http::header::IF_NONE_MATCH,
+                actix_web::http::header::IF_MODIFIED_SINCE,
+                actix_web::http::header::IF_RANGE,
+                actix_web::http::header::CACHE_CONTROL,
+                actix_web::http::header::CONTENT_LENGTH,
+                actix_web::http::header::CONTENT_RANGE,
+                actix_web::http::header::ORIGIN,
+                actix_web::http::header::HeaderName::from_static("x-requested-with"),
+                actix_web::http::header::HeaderName::from_static("x-upload-id"),
+                actix_web::http::header::HeaderName::from_static("x-chunk-index"),
+                actix_web::http::header::HeaderName::from_static("x-total-chunks"),
+                actix_web::http::header::HeaderName::from_static("x-file-name"),
+                actix_web::http::header::HeaderName::from_static("x-file-size"),
                 actix_web::http::header::HeaderName::from_static("destination"),
                 actix_web::http::header::HeaderName::from_static("overwrite"),
                 actix_web::http::header::HeaderName::from_static("depth"),
+            ])
+            .expose_headers(vec![
+                actix_web::http::header::CONTENT_RANGE,
+                actix_web::http::header::CONTENT_LENGTH,
+                actix_web::http::header::ACCEPT_RANGES,
+                actix_web::http::header::ETAG,
+                actix_web::http::header::HeaderName::from_static("x-upload-id"),
+                actix_web::http::header::HeaderName::from_static("content-duration"),
             ])
             .supports_credentials()
             .max_age(3600);
@@ -995,6 +1019,10 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/thumbnail/{path:.*}",
                                 web::get().to(handlers::streaming::get_thumbnail),
+                            )
+                            .route(
+                                "/transcode/{path:.*}",
+                                web::get().to(handlers::streaming::transcode_audio),
                             ),
                     ),
             )
@@ -1055,6 +1083,9 @@ async fn main() -> std::io::Result<()> {
                     ),
             )
     })
+    .client_request_timeout(std::time::Duration::from_secs(600))
+    .client_disconnect_timeout(std::time::Duration::from_secs(30))
+    .max_connection_rate(512)
     .bind(&bind_addr)?
     .run()
     .await

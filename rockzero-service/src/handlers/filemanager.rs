@@ -1,6 +1,6 @@
 use actix_multipart::Multipart;
 use actix_web::http::header::{
-    ContentDisposition, ContentType, DispositionType, ACCEPT_RANGES, CONTENT_RANGE, RANGE,
+    ContentDisposition, ContentType, DispositionType, CONTENT_RANGE, RANGE,
 };
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use bytes::Bytes;
@@ -8,17 +8,21 @@ use futures::StreamExt;
 use rockzero_common::AppError;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tracing::info;
+use tokio::io::{AsyncRead, AsyncSeekExt};
+use tracing::{info, warn};
 
 const BASE_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
 const MAX_FILE_SIZE: usize = 1000 * 1024 * 1024 * 1024;
 const MAX_TEXT_PREVIEW_SIZE: usize = 1024 * 1024;
-const STREAM_CHUNK_SIZE: u64 = 128 * 1024;
-const MAX_RANGE_SIZE: u64 = 1024 * 1024;
+
+/// Chunk sizes for different streaming scenarios
+const INITIAL_CHUNK_SIZE: usize = 256 * 1024; // 256KB for initial probe
+const STREAMING_CHUNK_SIZE: usize = 2 * 1024 * 1024; // 2MB for sequential streaming
+const SEEK_CHUNK_SIZE: usize = 512 * 1024; // 512KB for seek (faster time-to-first-byte)
 const ALLOWED_TEXT_EXTENSIONS: &[&str] = &[
     "txt",
     "md",
@@ -1137,48 +1141,100 @@ pub async fn get_media_info(
     }))
 }
 
-/// 流式文件读取器 - 用于低内存设备的视频流传输
-struct StreamingFileReader {
-    file: File,
+/// 异步流式文件读取器 - 使用 tokio 异步文件 I/O，不阻塞运行时
+///
+/// 相比旧版同步 StreamingFileReader 的优势：
+/// - 使用 tokio::fs::File 进行真正的异步 I/O，不阻塞 worker 线程
+/// - 根据 seek/sequential 场景自动选择最优 chunk 大小
+/// - 支持任意大文件的流式传输，内存占用恒定
+struct AsyncStreamingReader {
+    file: tokio::fs::File,
     remaining: u64,
-    chunk_size: u64,
+    chunk_size: usize,
+    buf: Vec<u8>,
 }
 
-impl StreamingFileReader {
-    fn new(file: File, total_size: u64) -> Self {
-        Self {
+impl AsyncStreamingReader {
+    async fn open(
+        path: &Path,
+        start: u64,
+        length: u64,
+        is_seek: bool,
+    ) -> Result<Self, std::io::Error> {
+        let mut file = tokio::fs::File::open(path).await?;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+
+        // 根据场景选择最优 chunk 大小：
+        // - seek 操作：小 chunk = 更快的首字节时间
+        // - 顺序读取：大 chunk = 更高吞吐量
+        let chunk_size = if is_seek {
+            SEEK_CHUNK_SIZE
+        } else if length <= INITIAL_CHUNK_SIZE as u64 {
+            INITIAL_CHUNK_SIZE
+        } else {
+            STREAMING_CHUNK_SIZE
+        };
+
+        Ok(Self {
             file,
-            remaining: total_size,
-            chunk_size: STREAM_CHUNK_SIZE,
-        }
+            remaining: length,
+            chunk_size,
+            buf: vec![0u8; chunk_size],
+        })
     }
 }
 
-impl futures::Stream for StreamingFileReader {
+impl futures::Stream for AsyncStreamingReader {
     type Item = Result<Bytes, std::io::Error>;
 
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.remaining == 0 {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        if this.remaining == 0 {
             return Poll::Ready(None);
         }
 
-        let to_read = std::cmp::min(self.remaining, self.chunk_size) as usize;
-        let mut buffer = vec![0u8; to_read];
+        let to_read = std::cmp::min(this.chunk_size as u64, this.remaining) as usize;
 
-        match self.file.read(&mut buffer) {
-            Ok(0) => Poll::Ready(None),
-            Ok(n) => {
-                buffer.truncate(n);
-                self.remaining = self.remaining.saturating_sub(n as u64);
-                Poll::Ready(Some(Ok(Bytes::from(buffer))))
+        // 使用 tokio 的异步读取 — 不会阻塞 runtime 线程
+        let mut read_buf = tokio::io::ReadBuf::new(&mut this.buf[..to_read]);
+        match Pin::new(&mut this.file).poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => {
+                let n = read_buf.filled().len();
+                if n == 0 {
+                    Poll::Ready(None)
+                } else {
+                    let data = Bytes::copy_from_slice(read_buf.filled());
+                    this.remaining -= n as u64;
+                    Poll::Ready(Some(Ok(data)))
+                }
             }
-            Err(e) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
-/// Stream media file with range support - 优化版本，使用流式传输
-/// 避免一次性加载整个文件到内存，防止OOM
+/// 生成 ETag 用于缓存和条件请求
+fn generate_media_etag(metadata: &std::fs::Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let size = metadata.len();
+    format!("\"{:x}-{:x}\"", modified, size)
+}
+
+/// 流式媒体文件传输 - 完整的 HTTP Range 支持 + 异步 I/O
+///
+/// 优化要点：
+/// - 使用 tokio 异步文件 I/O，不阻塞 runtime
+/// - 不限制 Range 大小（由播放器决定需要多少数据）
+/// - 支持 ETag/条件请求减少重复传输
+/// - 自适应 chunk 大小（seek vs 顺序读取）
+/// - 支持 CORS 头，允许跨域播放
 pub async fn stream_media(
     req: HttpRequest,
     query: web::Query<StreamQuery>,
@@ -1209,60 +1265,149 @@ pub async fn stream_media(
     let metadata = fs::metadata(&full_path).map_err(|_| AppError::InternalError)?;
     let file_size = metadata.len();
 
-    // Parse Range header
-    let range_header = req.headers().get(RANGE);
+    if file_size == 0 {
+        return Err(AppError::BadRequest("Empty file".to_string()));
+    }
 
-    if let Some(range_value) = range_header {
-        let range_str = range_value.to_str().unwrap_or("");
-        if let Some((start, mut end)) = parse_range_header(range_str, file_size) {
-            // 限制单次请求的最大范围，防止内存溢出
-            if end - start + 1 > MAX_RANGE_SIZE {
-                end = start + MAX_RANGE_SIZE - 1;
-            }
+    // 优化 Content-Type 映射
+    let extension = full_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
 
-            let length = end - start + 1;
+    let effective_content_type = match extension.as_str() {
+        "mkv" => "video/x-matroska".to_string(),
+        "webm" => "video/webm".to_string(),
+        "avi" => "video/x-msvideo".to_string(),
+        "mov" => "video/quicktime".to_string(),
+        "m2ts" | "ts" => "video/mp2t".to_string(),
+        "mp4" | "m4v" => "video/mp4".to_string(),
+        "flv" => "video/x-flv".to_string(),
+        "wmv" => "video/x-ms-wmv".to_string(),
+        "mp3" => "audio/mpeg".to_string(),
+        "flac" => "audio/flac".to_string(),
+        "wav" => "audio/wav".to_string(),
+        "aac" => "audio/aac".to_string(),
+        "ogg" => "audio/ogg".to_string(),
+        "m4a" => "audio/mp4".to_string(),
+        "opus" => "audio/opus".to_string(),
+        "wma" => "audio/x-ms-wma".to_string(),
+        "ape" => "audio/x-ape".to_string(),
+        _ => mime_type,
+    };
 
-            let mut file = File::open(&full_path).map_err(|_| AppError::InternalError)?;
-            file.seek(SeekFrom::Start(start))
-                .map_err(|_| AppError::InternalError)?;
-
-            // 使用流式传输
-            let stream = StreamingFileReader::new(file, length);
-
-            return Ok(HttpResponse::PartialContent()
-                .insert_header((
-                    CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", start, end, file_size),
-                ))
-                .insert_header((ACCEPT_RANGES, "bytes"))
-                .insert_header(("Cache-Control", "no-cache"))
-                .insert_header(ContentType(
-                    mime_type
-                        .parse()
-                        .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
-                ))
-                .streaming(stream));
+    // ETag 和条件请求支持
+    let etag = generate_media_etag(&metadata);
+    if let Some(if_none_match) = req
+        .headers()
+        .get("If-None-Match")
+        .and_then(|v| v.to_str().ok())
+    {
+        if if_none_match.trim() == etag || if_none_match.trim() == "*" {
+            return Ok(HttpResponse::NotModified().finish());
         }
     }
 
-    // No range requested - 也使用流式传输
-    let file = File::open(&full_path).map_err(|_| AppError::InternalError)?;
-    let stream = StreamingFileReader::new(file, file_size);
+    let ct = effective_content_type.clone();
+    let etag_clone = etag.clone();
 
-    Ok(HttpResponse::Ok()
-        .insert_header((ACCEPT_RANGES, "bytes"))
-        .insert_header(("Cache-Control", "no-cache"))
-        .insert_header(("Content-Length", file_size.to_string()))
-        .insert_header(ContentType(
-            mime_type
-                .parse()
-                .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
-        ))
-        .streaming(stream))
+    // Probe media info for duration and codec headers (non-blocking spawn)
+    // This lets clients display duration and codec info without a separate /streaming/info call
+    let probe_info = {
+        let path = full_path.clone();
+        tokio::task::spawn_blocking(move || get_ffprobe_info(&path))
+            .await
+            .unwrap_or((None, None, None, None, None, None))
+    };
+    let (media_duration, _, _, video_codec, audio_codec, _) = probe_info;
+
+    // 通用头部 — 包含 duration 和 codec 信息供客户端即时使用
+    let apply_headers = move |resp: &mut actix_web::HttpResponseBuilder| {
+        resp.insert_header(("Content-Type", ct.as_str()));
+        resp.insert_header(("Accept-Ranges", "bytes"));
+        resp.insert_header(("ETag", etag_clone.as_str()));
+        resp.insert_header(("Cache-Control", "private, max-age=86400, immutable"));
+        resp.insert_header(("Access-Control-Allow-Origin", "*"));
+        resp.insert_header((
+            "Access-Control-Expose-Headers",
+            "Content-Range, Accept-Ranges, Content-Length, Content-Duration, \
+             X-Content-Duration, X-Video-Codec, X-Audio-Codec, X-Has-Audio, ETag",
+        ));
+        if let Some(dur) = media_duration {
+            resp.insert_header(("Content-Duration", dur.to_string()));
+            resp.insert_header(("X-Content-Duration", dur.to_string()));
+        }
+        if let Some(ref vc) = video_codec {
+            resp.insert_header(("X-Video-Codec", vc.clone()));
+        }
+        if let Some(ref ac) = audio_codec {
+            resp.insert_header(("X-Audio-Codec", ac.clone()));
+            resp.insert_header(("X-Has-Audio", "true"));
+        }
+    };
+
+    // Handle HEAD requests — return headers only, no body (for preflight checks)
+    if req.method() == actix_web::http::Method::HEAD {
+        let mut response = HttpResponse::Ok();
+        apply_headers(&mut response);
+        response.insert_header(("Content-Length", file_size.to_string()));
+        return Ok(response.finish());
+    }
+
+    // Parse Range header
+    let range_header = req.headers().get(RANGE).and_then(|v| v.to_str().ok());
+
+    if let Some(range_str) = range_header {
+        if let Some((start, end)) = parse_range_header(range_str, file_size) {
+            // 不限制 Range 大小 — 播放器知道它需要多少数据
+            // 限制 Range 会导致播放器反复重新缓冲和 seek 卡顿
+            let end = std::cmp::min(end, file_size - 1);
+            let length = end - start + 1;
+            let is_seek = start > 0;
+
+            let stream = AsyncStreamingReader::open(&full_path, start, length, is_seek)
+                .await
+                .map_err(|e| {
+                    warn!("Failed to open file for streaming: {}", e);
+                    AppError::InternalError
+                })?;
+
+            let mut response = HttpResponse::PartialContent();
+            apply_headers(&mut response);
+            response.insert_header((
+                CONTENT_RANGE,
+                format!("bytes {}-{}/{}", start, end, file_size),
+            ));
+            response.insert_header(("Content-Length", length.to_string()));
+
+            return Ok(response.streaming(stream));
+        }
+    }
+
+    // No Range — 完整文件流式传输
+    let stream = AsyncStreamingReader::open(&full_path, 0, file_size, false)
+        .await
+        .map_err(|e| {
+            warn!("Failed to open file for streaming: {}", e);
+            AppError::InternalError
+        })?;
+
+    let mut response = HttpResponse::Ok();
+    apply_headers(&mut response);
+    response.insert_header(("Content-Length", file_size.to_string()));
+
+    Ok(response.streaming(stream))
 }
 
-/// Serve image file with optional resize
-pub async fn serve_image(query: web::Query<ListDirectoryQuery>) -> Result<HttpResponse, AppError> {
+/// 图片文件服务 - 支持缓存、条件请求和流式传输大图
+///
+/// 对于小图片（<10MB）直接返回 body，对于大图使用流式传输。
+/// 支持 ETag 和 If-None-Match 条件请求，避免重复传输。
+pub async fn serve_image(
+    req: HttpRequest,
+    query: web::Query<ListDirectoryQuery>,
+) -> Result<HttpResponse, AppError> {
     let file_path = query
         .path
         .as_deref()
@@ -1283,17 +1428,63 @@ pub async fn serve_image(query: web::Query<ListDirectoryQuery>) -> Result<HttpRe
         return Err(AppError::BadRequest("Not an image file".to_string()));
     }
 
-    let file_content = fs::read(&full_path).map_err(|_| AppError::InternalError)?;
+    let metadata = fs::metadata(&full_path).map_err(|_| AppError::InternalError)?;
+    let file_size = metadata.len();
 
-    Ok(HttpResponse::Ok()
-        .insert_header(ContentType(
-            mime_type.parse().unwrap_or(mime_guess::mime::IMAGE_PNG),
-        ))
-        .insert_header(ContentDisposition {
-            disposition: DispositionType::Inline,
-            parameters: vec![],
-        })
-        .body(file_content))
+    // ETag 和条件请求 — 图片未变化时返回 304
+    let etag = generate_media_etag(&metadata);
+    if let Some(if_none_match) = req
+        .headers()
+        .get("If-None-Match")
+        .and_then(|v| v.to_str().ok())
+    {
+        if if_none_match.trim() == etag || if_none_match.trim() == "*" {
+            return Ok(HttpResponse::NotModified().finish());
+        }
+    }
+
+    let content_type_parsed = mime_type
+        .parse()
+        .unwrap_or(mime_guess::mime::IMAGE_PNG);
+
+    // 10MB 以下直接 body 返回（更高效），以上用流式
+    if file_size <= 10 * 1024 * 1024 {
+        let file_content = tokio::fs::read(&full_path)
+            .await
+            .map_err(|_| AppError::InternalError)?;
+
+        Ok(HttpResponse::Ok()
+            .insert_header(ContentType(content_type_parsed))
+            .insert_header(("Content-Length", file_size.to_string()))
+            .insert_header(("ETag", etag.as_str()))
+            .insert_header(("Cache-Control", "public, max-age=86400, immutable"))
+            .insert_header(("Access-Control-Allow-Origin", "*"))
+            .insert_header(ContentDisposition {
+                disposition: DispositionType::Inline,
+                parameters: vec![],
+            })
+            .body(file_content))
+    } else {
+        // 大图片使用流式传输
+        let stream = AsyncStreamingReader::open(&full_path, 0, file_size, false)
+            .await
+            .map_err(|e| {
+                warn!("Failed to open image for streaming: {}", e);
+                AppError::InternalError
+            })?;
+
+        Ok(HttpResponse::Ok()
+            .insert_header(ContentType(content_type_parsed))
+            .insert_header(("Content-Length", file_size.to_string()))
+            .insert_header(("ETag", etag.as_str()))
+            .insert_header(("Cache-Control", "public, max-age=86400, immutable"))
+            .insert_header(("Access-Control-Allow-Origin", "*"))
+            .insert_header(ContentDisposition {
+                disposition: DispositionType::Inline,
+                parameters: vec![],
+            })
+            .streaming(stream))
+    }
 }
 
 /// Generate thumbnail for media file

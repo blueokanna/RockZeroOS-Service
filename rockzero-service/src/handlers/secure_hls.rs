@@ -438,9 +438,15 @@ async fn get_user_zkp_registration(
 
 // ============ 安全播放列表和段获取 ============
 
-/// 使用 ffmpeg 对视频进行 HLS 分片（优先 stream copy，失败时转码）
+/// 使用 ffmpeg 对视频进行 HLS 分片（渐进式 — 不等待完成）
 ///
-/// 生成标准的 VOD HLS 播放列表和 MPEG-TS 分片文件。
+/// 关键优化：
+/// 1. 后台启动 ffmpeg (spawn, 不 await 完成)
+/// 2. 使用 `-hls_playlist_type event` + `-hls_flags append_list` 实现渐进式分片
+/// 3. 等待第一个 segment 生成后立即返回 playlist
+/// 4. 对于 stream copy 场景（大多数情况），首个 segment 在 1-2 秒内可用
+/// 5. 播放器一边播放，ffmpeg 一边继续生成后续 segments
+///
 /// 结果缓存在 `hls_cache/{video_hash}/` 目录中。
 async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, String), AppError> {
     use std::path::PathBuf;
@@ -449,21 +455,40 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
     let video_id = hex::encode(&video_hash.as_bytes()[..8]);
     let cache_dir = get_hls_cache_dir().join(&video_id);
     let playlist_path = cache_dir.join("playlist.m3u8");
+    // 标记文件表示分片完成 (包含 #EXT-X-ENDLIST)
+    let done_marker = cache_dir.join(".done");
+    // 锁文件防止并发 ffmpeg 进程
+    let lock_file = cache_dir.join(".lock");
 
-    // If already segmented, return cached playlist
-    if playlist_path.exists() {
+    // 如果已完成分片，直接返回缓存的 playlist
+    if done_marker.exists() && playlist_path.exists() {
         let content = tokio::fs::read_to_string(&playlist_path)
             .await
             .map_err(|e| AppError::IoError(format!("Failed to read cached playlist: {}", e)))?;
         return Ok((cache_dir, content));
     }
 
-    // Create cache directory
+    // 如果有播放列表且至少有一个 segment，说明上一次分片正在进行中或中断
+    // 如果 ffmpeg 正在运行（lock 文件存在），直接返回当前 playlist
+    if playlist_path.exists() && lock_file.exists() {
+        let content = tokio::fs::read_to_string(&playlist_path).await.ok();
+        if let Some(content) = content {
+            if content.contains("#EXTINF") {
+                info!(
+                    "FFmpeg still running for {}, returning progressive playlist",
+                    video_id
+                );
+                return Ok((cache_dir, content));
+            }
+        }
+    }
+
+    // 创建缓存目录
     tokio::fs::create_dir_all(&cache_dir)
         .await
         .map_err(|e| AppError::IoError(format!("Failed to create cache dir: {}", e)))?;
 
-    // Verify source video exists
+    // 验证源文件存在
     let original = PathBuf::from(file_path);
     if !original.exists() {
         return Err(AppError::NotFound(format!(
@@ -487,13 +512,107 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
         .to_string();
 
     info!(
-        "🎬 Segmenting video: {} → {}",
+        "🎬 Starting progressive segmentation: {} → {}",
         file_path,
         cache_dir.display()
     );
 
-    // Try stream copy first (very fast, no transcoding)
-    let output = tokio::process::Command::new(&ffmpeg_path)
+    // 清理之前的部分输出（如果有）
+    if !lock_file.exists() {
+        for entry in std::fs::read_dir(&cache_dir).into_iter().flatten() {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if path.extension().map_or(false, |e| e == "ts" || e == "m3u8") {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
+    // 创建 lock 文件
+    let _ = tokio::fs::write(&lock_file, b"").await;
+
+    // 后台启动 ffmpeg - stream copy（渐进模式）
+    let file_path_owned = file_path.to_string();
+    let cache_dir_clone = cache_dir.clone();
+    let done_marker_clone = done_marker.clone();
+    let lock_file_clone = lock_file.clone();
+    let ffmpeg_path_clone = ffmpeg_path.clone();
+
+    tokio::spawn(async move {
+        let result = run_ffmpeg_progressive(
+            &ffmpeg_path_clone,
+            &file_path_owned,
+            &seg_pattern_str,
+            &playlist_str,
+            &cache_dir_clone,
+            &done_marker_clone,
+            &lock_file_clone,
+        )
+        .await;
+
+        match result {
+            Ok(_) => info!("✅ Video segmented successfully: {}", video_id),
+            Err(e) => warn!("❌ FFmpeg segmentation failed: {}", e),
+        }
+
+        // 清理 lock 文件
+        let _ = tokio::fs::remove_file(&lock_file_clone).await;
+    });
+
+    // 等待第一个 segment 生成（最多 30 秒）
+    let first_segment = cache_dir.join("segment_0.ts");
+    let mut waited = 0;
+    let max_wait_ms = 30_000;
+    let poll_interval_ms = 200;
+
+    while waited < max_wait_ms {
+        if first_segment.exists() && playlist_path.exists() {
+            // 等待 playlist 至少包含一个 EXTINF
+            if let Ok(content) = tokio::fs::read_to_string(&playlist_path).await {
+                if content.contains("#EXTINF") {
+                    info!(
+                        "First segment ready after {}ms, returning playlist",
+                        waited
+                    );
+                    return Ok((cache_dir, content));
+                }
+            }
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
+        waited += poll_interval_ms;
+    }
+
+    // 超时检查 — 可能 ffmpeg 失败了
+    if playlist_path.exists() {
+        let content = tokio::fs::read_to_string(&playlist_path)
+            .await
+            .map_err(|e| {
+                AppError::IoError(format!("Failed to read playlist: {}", e))
+            })?;
+        if content.contains("#EXTINF") {
+            return Ok((cache_dir, content));
+        }
+    }
+
+    Err(AppError::InternalServerError(
+        "视频分片超时，请检查 ffmpeg 是否正确安装".to_string(),
+    ))
+}
+
+/// 运行 ffmpeg 渐进式分片（在后台 task 中执行）
+async fn run_ffmpeg_progressive(
+    ffmpeg_path: &str,
+    file_path: &str,
+    seg_pattern: &str,
+    playlist_path: &str,
+    cache_dir: &std::path::Path,
+    done_marker: &std::path::Path,
+    lock_file: &std::path::Path,
+) -> Result<(), String> {
+    // 先尝试 stream copy（极快，不需要转码）
+    let output = tokio::process::Command::new(ffmpeg_path)
         .args([
             "-y",
             "-i",
@@ -503,137 +622,147 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
             "-f",
             "hls",
             "-hls_time",
-            "10",
+            "6",        // 6 秒段更适合移动端
             "-hls_list_size",
             "0",
             "-hls_playlist_type",
-            "vod",
+            "event",    // event 模式 = 渐进式播放列表
+            "-hls_flags",
+            "append_list+independent_segments",
             "-hls_segment_type",
             "mpegts",
             "-hls_segment_filename",
-            &seg_pattern_str,
-            &playlist_str,
+            seg_pattern,
+            playlist_path,
         ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .output()
         .await
-        .map_err(|e| {
-            AppError::IoError(format!(
-                "Failed to run ffmpeg: {}. Ensure ffmpeg is installed.",
-                e
-            ))
-        })?;
+        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(
-            "Stream copy segmentation failed, trying transcode: {}",
-            stderr
-        );
-
-        // Clean up partial output
-        let _ = tokio::fs::remove_dir_all(&cache_dir).await;
-        tokio::fs::create_dir_all(&cache_dir)
-            .await
-            .map_err(|e| AppError::IoError(format!("Failed to recreate cache dir: {}", e)))?;
-
-        // Detect hardware acceleration
-        let hw_accel = detect_hardware_acceleration().await;
-
-        let mut args: Vec<String> = vec![
-            "-y".into(),
-            "-i".into(),
-            file_path.into(),
-        ];
-
-        match hw_accel {
-            HardwareAccel::V4l2 => {
-                info!("Using V4L2 hardware encoding for HLS segmentation");
-                args.extend([
-                    "-c:v".into(),
-                    "h264_v4l2m2m".into(),
-                    "-b:v".into(),
-                    "2M".into(),
-                ]);
-            }
-            HardwareAccel::Vaapi => {
-                info!("Using VAAPI hardware encoding for HLS segmentation");
-                args.extend([
-                    "-hwaccel".into(),
-                    "vaapi".into(),
-                    "-hwaccel_device".into(),
-                    "/dev/dri/renderD128".into(),
-                    "-hwaccel_output_format".into(),
-                    "vaapi".into(),
-                    "-c:v".into(),
-                    "h264_vaapi".into(),
-                    "-qp".into(),
-                    "23".into(),
-                ]);
-            }
-            HardwareAccel::None => {
-                info!("Using software encoding (libx264) for HLS segmentation");
-                args.extend([
-                    "-c:v".into(),
-                    "libx264".into(),
-                    "-preset".into(),
-                    "veryfast".into(),
-                    "-crf".into(),
-                    "23".into(),
-                ]);
+    if output.status.success() {
+        // stream copy 成功 — 添加 #EXT-X-ENDLIST 标记完成
+        if let Ok(mut content) = tokio::fs::read_to_string(playlist_path).await {
+            if !content.contains("#EXT-X-ENDLIST") {
+                content.push_str("\n#EXT-X-ENDLIST\n");
+                let _ = tokio::fs::write(playlist_path, &content).await;
             }
         }
+        let _ = tokio::fs::write(done_marker, b"").await;
+        return Ok(());
+    }
 
-        args.extend([
-            "-c:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            "128k".into(),
-            "-ac".into(),
-            "2".into(),
-            "-f".into(),
-            "hls".into(),
-            "-hls_time".into(),
-            "10".into(),
-            "-hls_list_size".into(),
-            "0".into(),
-            "-hls_playlist_type".into(),
-            "vod".into(),
-            "-hls_segment_type".into(),
-            "mpegts".into(),
-            "-hls_segment_filename".into(),
-            seg_pattern_str,
-            playlist_str.clone(),
-        ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    warn!(
+        "Stream copy failed, trying transcode: {}",
+        &stderr[..stderr.len().min(500)]
+    );
 
-        let output = tokio::process::Command::new(&ffmpeg_path)
-            .args(&args)
-            .output()
-            .await
-            .map_err(|e| {
-                AppError::IoError(format!("FFmpeg transcode failed: {}", e))
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::InternalServerError(format!(
-                "FFmpeg segmentation failed: {}",
-                stderr
-            )));
+    // 清理出错的输出
+    for entry in std::fs::read_dir(cache_dir).into_iter().flatten() {
+        if let Ok(entry) = entry {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "ts" || e == "m3u8") {
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
 
-    info!("✅ Video segmented successfully: {}", video_id);
+    // 检测硬件加速
+    let hw_accel = detect_hardware_acceleration().await;
 
-    let content = tokio::fs::read_to_string(&playlist_path)
+    let mut args: Vec<String> = vec!["-y".into(), "-i".into(), file_path.into()];
+
+    match hw_accel {
+        HardwareAccel::V4l2 => {
+            info!("Using V4L2 hardware encoding for HLS segmentation");
+            args.extend([
+                "-c:v".into(),
+                "h264_v4l2m2m".into(),
+                "-b:v".into(),
+                "2M".into(),
+            ]);
+        }
+        HardwareAccel::Vaapi => {
+            info!("Using VAAPI hardware encoding for HLS segmentation");
+            args.extend([
+                "-hwaccel".into(),
+                "vaapi".into(),
+                "-hwaccel_device".into(),
+                "/dev/dri/renderD128".into(),
+                "-hwaccel_output_format".into(),
+                "vaapi".into(),
+                "-c:v".into(),
+                "h264_vaapi".into(),
+                "-qp".into(),
+                "23".into(),
+            ]);
+        }
+        HardwareAccel::None => {
+            info!("Using software encoding (libx264) for HLS segmentation");
+            args.extend([
+                "-c:v".into(),
+                "libx264".into(),
+                "-preset".into(),
+                "ultrafast".into(), // ultrafast 更快输出首个 segment
+                "-crf".into(),
+                "23".into(),
+            ]);
+        }
+    }
+
+    args.extend([
+        "-c:a".into(),
+        "aac".into(),
+        "-b:a".into(),
+        "128k".into(),
+        "-ac".into(),
+        "2".into(),
+        "-f".into(),
+        "hls".into(),
+        "-hls_time".into(),
+        "6".into(),
+        "-hls_list_size".into(),
+        "0".into(),
+        "-hls_playlist_type".into(),
+        "event".into(),
+        "-hls_flags".into(),
+        "append_list+independent_segments".into(),
+        "-hls_segment_type".into(),
+        "mpegts".into(),
+        "-hls_segment_filename".into(),
+        seg_pattern.into(),
+        playlist_path.into(),
+    ]);
+
+    let output = tokio::process::Command::new(ffmpeg_path)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
         .await
-        .map_err(|e| {
-            AppError::IoError(format!(
-                "Failed to read playlist after segmentation: {}",
-                e
-            ))
-        })?;
+        .map_err(|e| format!("FFmpeg transcode failed: {}", e))?;
 
-    Ok((cache_dir, content))
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "FFmpeg segmentation failed: {}",
+            &stderr[..stderr.len().min(500)]
+        ));
+    }
+
+    // 标记完成
+    if let Ok(mut content) = tokio::fs::read_to_string(playlist_path).await {
+        if !content.contains("#EXT-X-ENDLIST") {
+            content.push_str("\n#EXT-X-ENDLIST\n");
+            let _ = tokio::fs::write(playlist_path, &content).await;
+        }
+    }
+    let _ = tokio::fs::write(done_marker, b"").await;
+    let _ = tokio::fs::remove_file(lock_file).await;
+
+    Ok(())
 }
 
 /// 获取 HLS 播放列表（基于 ffmpeg 生成的真实分片）
