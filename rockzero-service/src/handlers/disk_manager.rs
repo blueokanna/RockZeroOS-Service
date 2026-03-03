@@ -131,6 +131,317 @@ pub fn auto_mount_all_disks() {
     log::info!("Auto-mount not supported on this platform");
 }
 
+/// 格式化后自动挂载分区
+///
+/// 在 `initialize_disk` 完成后自动调用，确保新格式化的分区立即可用。
+/// 创建挂载点目录、执行挂载、设置权限。
+#[cfg(target_os = "linux")]
+fn auto_mount_after_format(partition_device: &str, mount_point: &str) -> Result<(), String> {
+    // 创建挂载点
+    std::fs::create_dir_all(mount_point)
+        .map_err(|e| format!("Failed to create mount point {}: {}", mount_point, e))?;
+
+    // 挂载
+    let output = Command::new("mount")
+        .arg(partition_device)
+        .arg(mount_point)
+        .output()
+        .map_err(|e| format!("Failed to execute mount: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Mount failed: {}", stderr.trim()));
+    }
+
+    // 设置权限 — 确保普通用户可读写
+    let _ = Command::new("chmod").args(["755", mount_point]).output();
+
+    // 写入 fstab 实现持久化挂载（如果尚未存在）
+    if let Ok(fstab) = std::fs::read_to_string("/etc/fstab") {
+        if !fstab.contains(partition_device) {
+            // 获取 UUID 用于 fstab（比设备名更稳定）
+            let uuid = Command::new("blkid")
+                .args(["-s", "UUID", "-o", "value", partition_device])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        Some(
+                            String::from_utf8_lossy(&o.stdout)
+                                .trim()
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    }
+                });
+
+            let fstype = Command::new("blkid")
+                .args(["-s", "TYPE", "-o", "value", partition_device])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        Some(
+                            String::from_utf8_lossy(&o.stdout)
+                                .trim()
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| "auto".to_string());
+
+            if let Some(uuid) = uuid {
+                let fstab_entry = format!(
+                    "\n# Auto-added by RockZeroOS after disk initialization\nUUID={}  {}  {}  defaults,nofail  0  2\n",
+                    uuid, mount_point, fstype
+                );
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open("/etc/fstab")
+                {
+                    use std::io::Write;
+                    let _ = file.write_all(fstab_entry.as_bytes());
+                    log::info!(
+                        "Added fstab entry: UUID={} → {}",
+                        uuid,
+                        mount_point
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// 启动时检测未格式化的磁盘并自动格式化+挂载
+///
+/// 在 `auto_mount_all_disks` 之后调用，处理全新磁盘：
+/// 1. 扫描所有无文件系统的块设备（排除系统盘）
+/// 2. 使用 GPT 分区表 + ext4 自动格式化
+/// 3. 自动挂载到 /mnt/<设备名>
+#[cfg(target_os = "linux")]
+pub fn auto_format_and_mount_uninitialized_disks() {
+    log::info!("Scanning for uninitialized disks...");
+
+    let output = Command::new("lsblk")
+        .args(["-J", "-d", "-o", "NAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,TRAN,RO"])
+        .output();
+
+    let Ok(output) = output else {
+        log::warn!("Failed to run lsblk for uninitialized disk scan");
+        return;
+    };
+
+    if !output.status.success() {
+        return;
+    }
+
+    let lsblk: serde_json::Value = match serde_json::from_str(
+        &String::from_utf8_lossy(&output.stdout),
+    ) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let Some(devices) = lsblk.get("blockdevices").and_then(|v| v.as_array()) else {
+        return;
+    };
+
+    let mount_base = std::env::var("MOUNT_BASE").unwrap_or_else(|_| "/mnt".to_string());
+    let mut formatted_count = 0;
+
+    for device in devices {
+        let name = device.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        let dev_type = device.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let fstype = device.get("fstype").and_then(|f| f.as_str());
+        let mountpoint = device.get("mountpoint").and_then(|m| m.as_str());
+        let ro = device
+            .get("ro")
+            .and_then(|r| r.as_bool())
+            .unwrap_or(false);
+        let size_str = device.get("size").and_then(|s| s.as_str()).unwrap_or("0");
+
+        // 只处理物理磁盘（disk 类型）
+        if dev_type != "disk" {
+            continue;
+        }
+
+        // 跳过只读设备
+        if ro {
+            continue;
+        }
+
+        // 跳过系统盘（mmcblk0 通常是 eMMC 系统盘）
+        if name.starts_with("mmcblk0") || name.starts_with("mmcblk1") {
+            continue;
+        }
+
+        // 跳过回环设备和 RAM 设备
+        if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("zram") {
+            continue;
+        }
+
+        // 跳过已有文件系统或已挂载的磁盘
+        if fstype.is_some_and(|f| !f.is_empty()) {
+            continue;
+        }
+        if mountpoint.is_some_and(|m| !m.is_empty()) {
+            continue;
+        }
+
+        // 跳过太小的磁盘（< 1GB）
+        let size_bytes = parse_size_string(size_str);
+        if size_bytes < 1024 * 1024 * 1024 {
+            log::debug!("Skipping small disk {} ({})", name, size_str);
+            continue;
+        }
+
+        // 检查该磁盘是否有分区
+        let part_check = Command::new("lsblk")
+            .args(["-n", "-o", "TYPE", &format!("/dev/{}", name)])
+            .output();
+
+        if let Ok(output) = part_check {
+            let types = String::from_utf8_lossy(&output.stdout);
+            let has_partitions = types.lines().any(|l| l.trim() == "part");
+            if has_partitions {
+                continue; // 已有分区，跳过
+            }
+        }
+
+        let device_path = format!("/dev/{}", name);
+        let mount_point = format!("{}/{}", mount_base, name);
+
+        log::info!(
+            "🔧 Found uninitialized disk: {} ({}), auto-formatting with GPT + ext4...",
+            device_path,
+            size_str
+        );
+
+        // 创建 GPT 分区表
+        let parted_result = Command::new("parted")
+            .args(["-s", "-a", "optimal", &device_path, "mklabel", "gpt"])
+            .output();
+
+        if !parted_result.as_ref().map_or(false, |o| o.status.success()) {
+            log::warn!("Failed to create GPT partition table on {}", device_path);
+            continue;
+        }
+
+        // 创建分区
+        let mkpart_result = Command::new("parted")
+            .args([
+                "-s",
+                "-a",
+                "optimal",
+                &device_path,
+                "mkpart",
+                "primary",
+                "1MiB",
+                "100%",
+            ])
+            .output();
+
+        if !mkpart_result.as_ref().map_or(false, |o| o.status.success()) {
+            log::warn!("Failed to create partition on {}", device_path);
+            continue;
+        }
+
+        // 通知内核
+        let _ = Command::new("partprobe").arg(&device_path).output();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // 分区设备名
+        let partition_device = if device_path.contains("nvme") || device_path.contains("mmcblk") {
+            format!("{}p1", device_path)
+        } else {
+            format!("{}1", device_path)
+        };
+
+        // 等待分区出现
+        let mut found = false;
+        for _ in 0..10 {
+            if std::path::Path::new(&partition_device).exists() {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+
+        if !found {
+            log::warn!("Partition {} did not appear", partition_device);
+            continue;
+        }
+
+        // 格式化为 ext4
+        let label = format!("rz-{}", name);
+        let mkfs_result = Command::new("mkfs.ext4")
+            .args(["-F", "-m", "1", "-L", &label, &partition_device])
+            .output();
+
+        if !mkfs_result.as_ref().map_or(false, |o| o.status.success()) {
+            log::warn!("Failed to format {} as ext4", partition_device);
+            continue;
+        }
+
+        // 自动挂载
+        match auto_mount_after_format(&partition_device, &mount_point) {
+            Ok(()) => {
+                log::info!(
+                    "✅ Auto-formatted and mounted {} → {} (ext4, label: {})",
+                    partition_device,
+                    mount_point,
+                    label
+                );
+                formatted_count += 1;
+            }
+            Err(e) => {
+                log::warn!("Auto-mount failed for {}: {}", partition_device, e);
+            }
+        }
+    }
+
+    if formatted_count > 0 {
+        log::info!(
+            "Auto-format completed: {} disks formatted and mounted",
+            formatted_count
+        );
+    } else {
+        log::info!("No uninitialized disks found");
+    }
+}
+
+/// 解析 lsblk 的 SIZE 字段（如 "100G", "500M", "1T"）为字节数
+#[cfg(target_os = "linux")]
+fn parse_size_string(size: &str) -> u64 {
+    let s = size.trim().to_uppercase();
+    let (num_str, multiplier) = if s.ends_with('T') {
+        (&s[..s.len() - 1], 1024u64 * 1024 * 1024 * 1024)
+    } else if s.ends_with('G') {
+        (&s[..s.len() - 1], 1024u64 * 1024 * 1024)
+    } else if s.ends_with('M') {
+        (&s[..s.len() - 1], 1024u64 * 1024)
+    } else if s.ends_with('K') {
+        (&s[..s.len() - 1], 1024u64)
+    } else {
+        (s.as_str(), 1u64)
+    };
+
+    num_str
+        .parse::<f64>()
+        .map(|n| (n * multiplier as f64) as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn auto_format_and_mount_uninitialized_disks() {
+    log::info!("Auto-format not supported on this platform");
+}
+
 #[allow(dead_code)]
 pub const SUPPORTED_FILESYSTEMS: &[&str] = &[
     "ext4", "ext3", "ext2", "xfs", "btrfs", "f2fs", "fat32", "exfat", "ntfs",
@@ -1722,11 +2033,38 @@ pub async fn initialize_disk(
             "unknown".to_string()
         };
 
+        // Step 7: 初始化后自动挂载 — 用户无需手动挂载
+        let mount_base = std::env::var("MOUNT_BASE").unwrap_or_else(|_| "/mnt".to_string());
+        let mount_label = body.label.as_deref().unwrap_or(&partition_device
+            .replace("/dev/", "")
+            .replace("/", "_"));
+        let auto_mount_point = format!("{}/{}", mount_base, mount_label);
+
+        let auto_mount_msg = match auto_mount_after_format(&partition_device, &auto_mount_point) {
+            Ok(()) => {
+                log::info!(
+                    "✅ Auto-mounted {} → {} after initialization",
+                    partition_device,
+                    auto_mount_point
+                );
+                format!(" Mounted at {}", auto_mount_point)
+            }
+            Err(e) => {
+                log::warn!(
+                    "Auto-mount failed for {} → {}: {}",
+                    partition_device,
+                    auto_mount_point,
+                    e
+                );
+                format!(" (auto-mount failed: {})", e)
+            }
+        };
+
         return Ok(HttpResponse::Ok().json(DiskOperationResult {
             success: true,
             message: format!(
-                "Disk initialized successfully with {} filesystem on {} (verified: {})",
-                body.file_system, partition_device, actual_fs
+                "Disk initialized successfully with {} filesystem on {} (verified: {}).{}",
+                body.file_system, partition_device, actual_fs, auto_mount_msg
             ),
             device: partition_device,
             operation: "initialize".to_string(),

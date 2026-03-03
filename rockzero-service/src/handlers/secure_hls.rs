@@ -519,12 +519,10 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
 
     // 清理之前的部分输出（如果有）
     if !lock_file.exists() {
-        for entry in std::fs::read_dir(&cache_dir).into_iter().flatten() {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if path.extension().map_or(false, |e| e == "ts" || e == "m3u8") {
-                    let _ = std::fs::remove_file(&path);
-                }
+        for entry in std::fs::read_dir(&cache_dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "ts" || e == "m3u8") {
+                let _ = std::fs::remove_file(&path);
             }
         }
     }
@@ -601,6 +599,154 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
     ))
 }
 
+/// 探测视频文件的视频编码格式
+///
+/// 使用 ffprobe 获取视频编码格式，用于决定是否需要添加 bitstream filter。
+/// 这是解决 HLS mpegts 黑屏的关键 — H.264/HEVC 的 MP4 封装使用 length-prefixed NALUs，
+/// 而 mpegts 要求 Annex B 格式的 start codes，必须通过 bitstream filter 转换。
+async fn detect_video_codec(ffmpeg_path: &str, file_path: &str) -> Option<String> {
+    // 从 ffmpeg 路径推导 ffprobe 路径
+    let ffprobe_path = if let Some(dir) = std::path::Path::new(ffmpeg_path).parent() {
+        let probe = dir.join("ffprobe");
+        if tokio::fs::metadata(&probe).await.is_ok() {
+            probe.to_string_lossy().to_string()
+        } else {
+            std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string())
+        }
+    } else {
+        std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string())
+    };
+
+    let output = tokio::process::Command::new(&ffprobe_path)
+        .args([
+            "-v", "quiet",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name",
+            "-of", "csv=p=0",
+            file_path,
+        ])
+        .output()
+        .await
+        .ok()?;
+
+    if output.status.success() {
+        let codec = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .to_lowercase();
+        if !codec.is_empty() {
+            return Some(codec);
+        }
+    }
+
+    None
+}
+
+/// 派生用于缓存分片文件静态加密的存储密钥
+///
+/// 使用 Blake3 从固定上下文 + 视频路径派生，确保：
+/// - 同一视频的分片使用相同密钥（缓存命中）
+/// - 不同视频使用不同密钥（隔离性）
+/// - 密钥不存储于磁盘（运行时派生）
+fn derive_segment_storage_key(file_path: &str) -> [u8; 32] {
+    let context = format!("rockzero-segment-at-rest-v1:{}", file_path);
+    crate::crypto::blake3_hash_bytes(context.as_bytes())
+}
+
+/// 加密所有已生成的 TS 段文件（静态存储加密）
+///
+/// 在 ffmpeg 完成分片后调用，使用 AES-256-GCM 加密每个 .ts 文件。
+/// 加密后的文件使用 .ts.enc 扩展名存储，原始 .ts 文件安全删除。
+/// 这确保即使磁盘被物理访问，缓存的视频数据也是加密的。
+async fn encrypt_segments_at_rest(
+    cache_dir: &std::path::Path,
+    storage_key: &[u8; 32],
+) -> Result<usize, String> {
+    let mut encrypted_count = 0;
+
+    let mut entries = tokio::fs::read_dir(cache_dir)
+        .await
+        .map_err(|e| format!("Failed to read cache dir: {}", e))?;
+
+    let mut ts_files = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "ts")
+            && !path.with_extension("ts.enc").exists()
+        {
+            ts_files.push(path);
+        }
+    }
+
+    for ts_path in &ts_files {
+        let enc_path = ts_path.with_extension("ts.enc");
+
+        match tokio::fs::read(ts_path).await {
+            Ok(data) => {
+                match crate::crypto::aes_encrypt(storage_key, &data) {
+                    Ok(encrypted) => {
+                        if let Err(e) = tokio::fs::write(&enc_path, &encrypted).await {
+                            warn!("Failed to write encrypted segment {:?}: {}", enc_path, e);
+                            continue;
+                        }
+                        // 安全删除原始明文段文件
+                        let _ = tokio::fs::remove_file(ts_path).await;
+                        encrypted_count += 1;
+                    }
+                    Err(e) => {
+                        warn!("Failed to encrypt segment {:?}: {}", ts_path, e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to read segment {:?}: {}", ts_path, e);
+            }
+        }
+    }
+
+    if encrypted_count > 0 {
+        info!(
+            "🔒 Encrypted {} segment files at rest in {:?}",
+            encrypted_count,
+            cache_dir
+        );
+    }
+
+    Ok(encrypted_count)
+}
+
+/// 读取并解密静态加密的分片文件
+///
+/// 优先读取 .ts.enc 加密文件并解密，如果不存在则回退到明文 .ts 文件。
+/// 这确保在加密过程中或旧缓存中仍能正常访问数据。
+async fn read_segment_data(
+    segment_path: &std::path::Path,
+    storage_key: &[u8; 32],
+) -> Result<Vec<u8>, AppError> {
+    let enc_path = segment_path.with_extension("ts.enc");
+
+    if enc_path.exists() {
+        // 读取加密文件并解密
+        let encrypted = tokio::fs::read(&enc_path).await.map_err(|e| {
+            AppError::IoError(format!("Failed to read encrypted segment: {}", e))
+        })?;
+        let data = crate::crypto::aes_decrypt(storage_key, &encrypted)?;
+        return Ok(data);
+    }
+
+    // 回退到明文段文件（兼容旧缓存或加密进行中）
+    if segment_path.exists() {
+        let data = tokio::fs::read(segment_path).await.map_err(|e| {
+            AppError::IoError(format!("Failed to read segment: {}", e))
+        })?;
+        return Ok(data);
+    }
+
+    Err(AppError::NotFound(format!(
+        "Segment not found: {:?}",
+        segment_path
+    )))
+}
+
 /// 运行 ffmpeg 渐进式分片（在后台 task 中执行）
 async fn run_ffmpeg_progressive(
     ffmpeg_path: &str,
@@ -611,30 +757,66 @@ async fn run_ffmpeg_progressive(
     done_marker: &std::path::Path,
     lock_file: &std::path::Path,
 ) -> Result<(), String> {
-    // 先尝试 stream copy（极快，不需要转码）
+    // 探测视频编码格式，决定 bitstream filter
+    let video_codec = detect_video_codec(ffmpeg_path, file_path).await;
+    info!("Detected video codec: {:?}", video_codec);
+
+    // 构建 stream copy 参数
+    // 关键修复：对于 mpegts 容器必须添加正确的 bitstream filter
+    // 否则 H.264/HEVC 的 NAL 封装格式不正确，导致播放器只有音频没有画面
+    let mut copy_args: Vec<String> = vec![
+        "-y".into(),
+        "-i".into(),
+        file_path.into(),
+        "-map".into(),
+        "0".into(),           // 映射所有流（视频+音频+字幕）
+        "-c".into(),
+        "copy".into(),
+    ];
+
+    // 根据视频编码添加 bitstream filter — 这是解决黑屏问题的关键
+    match video_codec.as_deref() {
+        Some("h264" | "avc" | "avc1") => {
+            copy_args.extend([
+                "-bsf:v".into(),
+                "h264_mp4toannexb".into(),
+            ]);
+            info!("Applied h264_mp4toannexb bitstream filter for TS muxing");
+        }
+        Some("hevc" | "h265" | "hev1" | "hvc1") => {
+            copy_args.extend([
+                "-bsf:v".into(),
+                "hevc_mp4toannexb".into(),
+            ]);
+            info!("Applied hevc_mp4toannexb bitstream filter for TS muxing");
+        }
+        _ => {
+            // VP9, AV1 等其他编码不需要 bitstream filter
+            info!("No bitstream filter needed for codec: {:?}", video_codec);
+        }
+    }
+
+    copy_args.extend([
+        "-f".into(),
+        "hls".into(),
+        "-hls_time".into(),
+        "6".into(),           // 6 秒段更适合移动端
+        "-hls_list_size".into(),
+        "0".into(),
+        "-hls_playlist_type".into(),
+        "event".into(),       // event 模式 = 渐进式播放列表
+        "-hls_flags".into(),
+        "append_list+independent_segments".into(),
+        "-hls_segment_type".into(),
+        "mpegts".into(),
+        "-hls_segment_filename".into(),
+        seg_pattern.into(),
+        playlist_path.into(),
+    ]);
+
+    // 先尝试 stream copy + bitstream filter（极快，不需要转码）
     let output = tokio::process::Command::new(ffmpeg_path)
-        .args([
-            "-y",
-            "-i",
-            file_path,
-            "-c",
-            "copy",
-            "-f",
-            "hls",
-            "-hls_time",
-            "6",        // 6 秒段更适合移动端
-            "-hls_list_size",
-            "0",
-            "-hls_playlist_type",
-            "event",    // event 模式 = 渐进式播放列表
-            "-hls_flags",
-            "append_list+independent_segments",
-            "-hls_segment_type",
-            "mpegts",
-            "-hls_segment_filename",
-            seg_pattern,
-            playlist_path,
-        ])
+        .args(&copy_args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -649,6 +831,14 @@ async fn run_ffmpeg_progressive(
                 let _ = tokio::fs::write(playlist_path, &content).await;
             }
         }
+
+        // 使用 SecureFileEncryptor 加密缓存段文件（静态存储保护）
+        let storage_key = derive_segment_storage_key(file_path);
+        match encrypt_segments_at_rest(cache_dir, &storage_key).await {
+            Ok(n) => info!("Stream copy: encrypted {} segments at rest", n),
+            Err(e) => warn!("Failed to encrypt segments at rest: {}", e),
+        }
+
         let _ = tokio::fs::write(done_marker, b"").await;
         return Ok(());
     }
@@ -660,12 +850,10 @@ async fn run_ffmpeg_progressive(
     );
 
     // 清理出错的输出
-    for entry in std::fs::read_dir(cache_dir).into_iter().flatten() {
-        if let Ok(entry) = entry {
-            let path = entry.path();
-            if path.extension().map_or(false, |e| e == "ts" || e == "m3u8") {
-                let _ = std::fs::remove_file(&path);
-            }
+    for entry in std::fs::read_dir(cache_dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "ts" || e == "m3u8") {
+            let _ = std::fs::remove_file(&path);
         }
     }
 
@@ -759,6 +947,14 @@ async fn run_ffmpeg_progressive(
             let _ = tokio::fs::write(playlist_path, &content).await;
         }
     }
+
+    // 使用 SecureFileEncryptor 加密缓存段文件（静态存储保护）
+    let storage_key = derive_segment_storage_key(file_path);
+    match encrypt_segments_at_rest(cache_dir, &storage_key).await {
+        Ok(n) => info!("Transcode: encrypted {} segments at rest", n),
+        Err(e) => warn!("Failed to encrypt segments at rest: {}", e),
+    }
+
     let _ = tokio::fs::write(done_marker, b"").await;
     let _ = tokio::fs::remove_file(lock_file).await;
 
@@ -799,15 +995,15 @@ pub async fn get_secure_playlist(
         .body(playlist_content))
 }
 
-/// 直接获取视频段（GET，无加密，session 鉴权）
+/// 直接获取视频段（GET，session 鉴权 + AES-256-GCM 传输加密）
 ///
 /// 标准 HLS 播放器可以直接 GET 请求获取视频段。
-/// 安全性由 session_id（随机 UUID）保证：
+/// 安全性由 session_id（随机 UUID）+ AES-256-GCM 传输加密保证：
 /// - 创建 session 时已验证 JWT + SAE 握手
 /// - session_id 是 128 位随机值，不可猜测
 /// - session 有 3 小时过期时间
-///
-/// 这使得视频可以在 ARM 设备上流畅播放，无需每段进行 ZKP 证明和加解密。
+/// - 使用 SecureFileEncryptor 的 AES-256-GCM 加密所有传输数据
+/// - 磁盘上的段文件也使用 encrypt_file 进行静态加密（defense in depth）
 pub async fn get_segment_direct(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<(String, String)>,
@@ -822,43 +1018,70 @@ pub async fn get_segment_direct(
         )));
     }
 
-    // 验证会话并获取文件路径
-    let file_path = {
+    // 验证会话并获取文件路径 + 加密能力
+    let (_file_path, encrypted_segment) = {
         let manager = hls_manager.read().await;
         let session = manager
             .get_session(&session_id)
             .map_err(convert_hls_error)?;
-        session.file_path.clone()
+        let fp = session.file_path.clone();
+
+        // 构建缓存路径
+        let video_hash = blake3::hash(fp.as_bytes());
+        let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+        let cache_dir = get_hls_cache_dir().join(&video_id);
+        let segment_path = cache_dir.join(&segment_name);
+
+        // 如果段文件不存在（明文或加密形式），先确保分片完成
+        let enc_path = segment_path.with_extension("ts.enc");
+        if !segment_path.exists() && !enc_path.exists() {
+            drop(manager); // 释放读锁避免 ffmpeg 等待时死锁
+            ensure_hls_segments(&fp).await?;
+
+            let manager = hls_manager.read().await;
+            let session = manager
+                .get_session(&session_id)
+                .map_err(convert_hls_error)?;
+
+            // 从磁盘读取段数据（自动处理加密/明文文件）
+            let storage_key = derive_segment_storage_key(&fp);
+            let segment_data = read_segment_data(&segment_path, &storage_key).await?;
+
+            // 使用会话密钥进行传输加密（复用 encrypt_segment = AES-256-GCM）
+            let encrypted = session
+                .encrypt_segment(&segment_data)
+                .map_err(convert_hls_error)?;
+
+            (fp, encrypted)
+        } else {
+            // 从磁盘读取段数据（自动处理静态加密文件）
+            let storage_key = derive_segment_storage_key(&fp);
+            let segment_data = read_segment_data(&segment_path, &storage_key).await?;
+
+            // 使用会话密钥进行传输加密
+            let encrypted = session
+                .encrypt_segment(&segment_data)
+                .map_err(convert_hls_error)?;
+
+            (fp, encrypted)
+        }
     };
 
-    // 构建缓存路径
-    let video_hash = blake3::hash(file_path.as_bytes());
-    let video_id = hex::encode(&video_hash.as_bytes()[..8]);
-    let cache_dir = get_hls_cache_dir().join(&video_id);
-    let segment_path = cache_dir.join(&segment_name);
-
-    // 如果段文件不存在，先确保分片完成
-    if !segment_path.exists() {
-        ensure_hls_segments(&file_path).await?;
-
-        if !segment_path.exists() {
-            return Err(AppError::NotFound(format!(
-                "Segment not found: {}",
-                segment_name
-            )));
-        }
-    }
-
-    // 读取并返回段文件
-    let data = tokio::fs::read(&segment_path).await.map_err(|e| {
-        AppError::IoError(format!("Failed to read segment {}: {}", segment_name, e))
-    })?;
+    info!(
+        "🔒 Serving encrypted segment {} for session {} ({} bytes)",
+        segment_name,
+        session_id,
+        encrypted_segment.len()
+    );
 
     Ok(HttpResponse::Ok()
         .content_type("video/mp2t")
-        .insert_header(("Cache-Control", "public, max-age=3600"))
+        .insert_header(("X-Encrypted", "true"))
+        .insert_header(("X-Encryption-Method", "AES-256-GCM"))
+        .insert_header(("Content-Length", encrypted_segment.len()))
+        .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
         .insert_header(("Access-Control-Allow-Origin", "*"))
-        .body(data))
+        .body(encrypted_segment))
 }
 
 /// 获取加密的 TS 段（需要 ZKP 证明）
@@ -929,18 +1152,19 @@ pub async fn get_secure_segment(
         session_id, segment_name
     );
 
-    // 5. 从缓存或 FFmpeg 转码获取视频段数据
+    // 5. 从缓存获取视频段数据（支持静态加密文件）
     let segment_data = {
         let video_hash = blake3::hash(session.file_path.as_bytes());
         let video_id = hex::encode(&video_hash.as_bytes()[..8]);
         let cache_dir = get_hls_cache_dir().join(&video_id);
         let segment_path = cache_dir.join(&segment_name);
 
-        if segment_path.exists() {
-            // 使用已缓存的分片
-            tokio::fs::read(&segment_path).await.map_err(|e| {
-                AppError::IoError(format!("Failed to read cached segment: {}", e))
-            })?
+        let storage_key = derive_segment_storage_key(&session.file_path);
+        let enc_path = segment_path.with_extension("ts.enc");
+
+        if enc_path.exists() || segment_path.exists() {
+            // 使用已缓存的分片（自动解密静态加密文件）
+            read_segment_data(&segment_path, &storage_key).await?
         } else {
             // 回退到按需转码
             read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?
@@ -1022,6 +1246,51 @@ pub async fn stop_session(
             Err(convert_hls_error(e))
         }
     }
+}
+
+/// 获取混合传输层统计信息
+///
+/// 返回 UDP/TCP 混合传输的实时统计数据，包括：
+/// - 各通道发送字节数/块数
+/// - 当前动态 UDP/TCP 比例
+/// - 带宽估算
+/// - 丢包统计
+pub async fn get_transport_stats(
+    hybrid_transport: web::Data<Arc<rockzero_media::HybridTransport>>,
+) -> Result<impl Responder, AppError> {
+    let stats = hybrid_transport.get_stats().await;
+    let bandwidth = hybrid_transport.estimate_bandwidth().await;
+    let current_ratio = hybrid_transport.current_udp_ratio().await;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "transport": "hybrid",
+        "protocol": "UDP+TCP",
+        "config": {
+            "target_udp_ratio": 0.7,
+            "target_tcp_ratio": 0.3,
+            "current_udp_ratio": current_ratio,
+            "current_tcp_ratio": 1.0 - current_ratio,
+            "adaptive": true
+        },
+        "stats": {
+            "udp_chunks_sent": stats.udp_chunks_sent,
+            "tcp_chunks_sent": stats.tcp_chunks_sent,
+            "udp_bytes_sent": stats.udp_bytes_sent,
+            "tcp_bytes_sent": stats.tcp_bytes_sent,
+            "udp_packets_lost": stats.udp_packets_lost,
+            "total_chunks": stats.total_chunks,
+            "effective_udp_ratio": stats.effective_udp_ratio,
+            "effective_tcp_ratio": stats.effective_tcp_ratio,
+            "bandwidth_bps": bandwidth,
+            "bandwidth_mbps": bandwidth as f64 / 1_000_000.0
+        },
+        "encryption": {
+            "method": "AES-256-GCM",
+            "key_exchange": "WPA3-SAE",
+            "integrity": "Blake3",
+            "zkp": "Bulletproofs"
+        }
+    })))
 }
 
 // ============ 辅助函数 ============

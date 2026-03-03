@@ -5,6 +5,7 @@ use tokio::sync::RwLock;
 
 pub struct UdpStreamSender {
     socket: Arc<UdpSocket>,
+    #[allow(dead_code)]
     transport: Arc<SecureStreamTransport>,
     stats: Arc<RwLock<UdpStats>>,
 }
