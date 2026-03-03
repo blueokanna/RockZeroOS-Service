@@ -993,7 +993,7 @@ fn get_steam_library_folders() -> Vec<String> {
     #[cfg(target_os = "linux")]
     {
         // Linux 常见路径
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = resolve_home_dir() {
             paths.push(
                 home.join(".local/share/Steam")
                     .to_string_lossy()
@@ -1002,7 +1002,7 @@ fn get_steam_library_folders() -> Vec<String> {
             paths.push(home.join(".steam/steam").to_string_lossy().to_string());
         }
         // Flatpak
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = resolve_home_dir() {
             paths.push(
                 home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam")
                     .to_string_lossy()
@@ -1015,6 +1015,18 @@ fn get_steam_library_folders() -> Vec<String> {
     {
         paths.push("C:\\Program Files (x86)\\Steam".to_string());
         paths.push("C:\\Program Files\\Steam".to_string());
+        if let Some(home) = resolve_home_dir() {
+            paths.push(
+                home.join("AppData/Local/Steam")
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            paths.push(
+                home.join("AppData/Roaming/Steam")
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
         // D ~ G 盘也检查
         for drive in &['D', 'E', 'F', 'G'] {
             paths.push(format!("{}:\\SteamLibrary", drive));
@@ -1024,7 +1036,7 @@ fn get_steam_library_folders() -> Vec<String> {
 
     #[cfg(target_os = "macos")]
     {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = resolve_home_dir() {
             paths.push(
                 home.join("Library/Application Support/Steam")
                     .to_string_lossy()
@@ -1056,6 +1068,36 @@ fn get_steam_library_folders() -> Vec<String> {
     }
 
     paths
+}
+
+fn resolve_home_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(userprofile) = std::env::var("USERPROFILE") {
+            if !userprofile.is_empty() {
+                return Some(PathBuf::from(userprofile));
+            }
+        }
+
+        let home_drive = std::env::var("HOMEDRIVE").ok();
+        let home_path = std::env::var("HOMEPATH").ok();
+        if let (Some(drive), Some(path)) = (home_drive, home_path) {
+            let combined = format!("{}{}", drive, path);
+            if !combined.is_empty() {
+                return Some(PathBuf::from(combined));
+            }
+        }
+
+        None
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var("HOME")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    }
 }
 
 /// 从 Content-Disposition 提取文件名
