@@ -84,6 +84,7 @@ validator = { workspace = true }
 walkdir = { workspace = true }
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
+wasi-common = { workspace = true }
 which = { workspace = true }
 
 # Docker API (Unix socket)

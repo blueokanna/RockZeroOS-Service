@@ -201,3 +201,14 @@ pub async fn force_cleanup_all_cache(
         "temp_bytes_freed": report.temp_bytes_freed
     })))
 }
+
+/// 获取自动清理状态
+///
+/// 返回 2GB 阈值自动清理的实时状态，供仪表板展示。
+/// 替代手动的 Clean Cache / Clear Temp 按钮。
+pub async fn get_auto_cleanup_status(
+    storage_manager: web::Data<Arc<StorageManager>>,
+) -> Result<HttpResponse, AppError> {
+    let status = storage_manager.get_auto_cleanup_status().await;
+    Ok(HttpResponse::Ok().json(status))
+}

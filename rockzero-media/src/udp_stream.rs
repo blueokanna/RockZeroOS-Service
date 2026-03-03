@@ -4,7 +4,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
 pub struct UdpStreamSender {
-    socket: Arc<UdpSocket>,    #[allow(dead_code)]    _transport: Arc<SecureStreamTransport>,
+    socket: Arc<UdpSocket>,
+    #[allow(dead_code)]
+    transport: Arc<SecureStreamTransport>,
     stats: Arc<RwLock<UdpStats>>,
 }
 
@@ -22,8 +24,6 @@ impl UdpStreamSender {
         transport: Arc<SecureStreamTransport>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let socket = UdpSocket::bind(bind_addr).await?;
-
-        // 设置UDP socket选项以优化性能
         socket.set_broadcast(false)?;
 
         #[cfg(unix)]
@@ -44,7 +44,7 @@ impl UdpStreamSender {
 
         Ok(Self {
             socket: Arc::new(socket),
-            _transport: transport,
+            transport,
             stats: Arc::new(RwLock::new(UdpStats::default())),
         })
     }

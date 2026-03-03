@@ -65,9 +65,9 @@ impl Default for StorageConfig {
             min_free_space: 512 * 1024 * 1024,           // 512 MB
             warning_free_space: 2 * 1024 * 1024 * 1024,  // 2 GB
             critical_free_space: 1024 * 1024 * 1024,     // 1 GB
-            max_hls_cache_size: 10 * 1024 * 1024 * 1024, // 10 GB
-            max_temp_size: 5 * 1024 * 1024 * 1024,       // 5 GB
-            max_log_size: 1024 * 1024 * 1024,            // 1 GB
+            max_hls_cache_size: 2 * 1024 * 1024 * 1024,  // 2 GB — 超过自动清理
+            max_temp_size: 2 * 1024 * 1024 * 1024,       // 2 GB — 超过自动清理
+            max_log_size: 512 * 1024 * 1024,             // 512 MB
             hls_cache_retention_days: 7,
             temp_file_retention_days: 1,
             log_retention_days: 30,
@@ -307,6 +307,50 @@ impl StorageManager {
         &self.config.hls_cache_path
     }
 
+    /// 获取自动清理状态信息（替代仪表板手动按钮）
+    ///
+    /// 返回当前缓存大小、阈值、清理状态等信息，
+    /// 供前端仪表板展示自动清理状态而非手动清理按钮。
+    pub async fn get_auto_cleanup_status(&self) -> AutoCleanupStatus {
+        self.refresh_cache_sizes().await;
+
+        let hls = self.hls_cache_bytes.load(Ordering::Relaxed);
+        let temp = self.temp_bytes.load(Ordering::Relaxed);
+        let logs = self.log_bytes.load(Ordering::Relaxed);
+        let total_cache = hls + temp;
+        let threshold: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+
+        let usage_percent = if threshold > 0 {
+            (total_cache as f64 / threshold as f64 * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+
+        let status = if total_cache > threshold {
+            "cleaning".to_string()
+        } else if total_cache as f64 > threshold as f64 * 0.8 {
+            "warning".to_string()
+        } else {
+            "healthy".to_string()
+        };
+
+        let pressure = self.get_pressure_level().await;
+
+        AutoCleanupStatus {
+            enabled: true,
+            status,
+            threshold_bytes: threshold,
+            threshold_display: "2 GB".to_string(),
+            hls_cache_bytes: hls,
+            temp_bytes: temp,
+            log_bytes: logs,
+            total_cache_bytes: total_cache,
+            usage_percent,
+            pressure_level: format!("{}", pressure),
+            check_interval_secs: 30,
+        }
+    }
+
     // ─── cleanup operations ────────────────────────────────────
 
     /// Force cleanup all caches (for use after formatting or manual trigger)
@@ -428,6 +472,83 @@ impl StorageManager {
                 tick.tick().await;
                 if let Err(e) = m.enforce_cache_limits().await {
                     warn!("Cache limit enforcement failed: {}", e);
+                }
+            }
+        });
+
+        // === 2GB 自动清理守护任务 ===
+        // 每 30 秒检测 cache + temp 总大小，超过 2GB 立即触发 LRU 清理
+        // 替代仪表板的手动"Clean Cache / Clear Temp"按钮
+        let m = self.clone();
+        tokio::spawn(async move {
+            let threshold: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+            let mut tick = interval(Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+
+                let hls_size = get_directory_size(&m.config.hls_cache_path)
+                    .await
+                    .unwrap_or(0);
+                let temp_size = get_directory_size(&m.config.temp_storage_path)
+                    .await
+                    .unwrap_or(0);
+                let total = hls_size + temp_size;
+
+                m.hls_cache_bytes.store(hls_size, Ordering::Relaxed);
+                m.temp_bytes.store(temp_size, Ordering::Relaxed);
+
+                if total > threshold {
+                    let excess = total - threshold;
+                    info!(
+                        "⚠️ Cache+Temp ({}) exceeds 2GB threshold, auto-cleaning {} ...",
+                        format_bytes(total),
+                        format_bytes(excess),
+                    );
+
+                    // 优先清理 HLS 缓存（视频缓存可以重新生成）
+                    let hls_excess = hls_size.saturating_sub(threshold / 2);
+                    if hls_excess > 0 {
+                        match lru_evict_from_directory(&m.config.hls_cache_path, hls_excess).await {
+                            Ok(freed) => {
+                                m.hls_cache_bytes
+                                    .store(hls_size.saturating_sub(freed), Ordering::Relaxed);
+                                info!("🗑️ Auto-cleaned HLS cache: {}", format_bytes(freed));
+                            }
+                            Err(e) => warn!("HLS auto-cleanup failed: {}", e),
+                        }
+                    }
+
+                    // 再清理 temp（过期临时文件）
+                    let temp_excess = temp_size.saturating_sub(threshold / 2);
+                    if temp_excess > 0 {
+                        match lru_evict_from_directory(&m.config.temp_storage_path, temp_excess)
+                            .await
+                        {
+                            Ok(freed) => {
+                                m.temp_bytes
+                                    .store(temp_size.saturating_sub(freed), Ordering::Relaxed);
+                                info!("🗑️ Auto-cleaned temp storage: {}", format_bytes(freed));
+                            }
+                            Err(e) => warn!("Temp auto-cleanup failed: {}", e),
+                        }
+                    }
+
+                    // 更新最终大小
+                    let new_hls = get_directory_size(&m.config.hls_cache_path)
+                        .await
+                        .unwrap_or(0);
+                    let new_temp = get_directory_size(&m.config.temp_storage_path)
+                        .await
+                        .unwrap_or(0);
+                    m.hls_cache_bytes.store(new_hls, Ordering::Relaxed);
+                    m.temp_bytes.store(new_temp, Ordering::Relaxed);
+
+                    info!(
+                        "✅ Auto-cleanup complete — HLS: {}, Temp: {}, Total: {}",
+                        format_bytes(new_hls),
+                        format_bytes(new_temp),
+                        format_bytes(new_hls + new_temp),
+                    );
                 }
             }
         });
@@ -600,9 +721,111 @@ impl StorageManager {
         }
 
         self.refresh_cache_sizes().await;
-        let pressure = self.get_pressure_level().await;
+        let mut pressure = self.get_pressure_level().await;
+
+        // Progressive escalation: if pressure persists after standard cleanup,
+        // try increasingly aggressive retention periods
         if pressure >= CachePressureLevel::Warning {
-            warn!("Disk pressure still at {} after cleanup", pressure);
+            info!(
+                "Disk pressure at {} after standard cleanup — escalating with shorter retention",
+                pressure
+            );
+
+            // Phase 1: 1/4 of normal retention
+            let hls_short = (self.config.hls_cache_retention_days * 24 * 3600) / 4;
+            let temp_short = (self.config.temp_file_retention_days * 24 * 3600) / 4;
+            let log_short = (self.config.log_retention_days * 24 * 3600) / 4;
+
+            if dir_exists(&self.config.hls_cache_path).await {
+                let freed = cleanup_old_entries_bytes(&self.config.hls_cache_path, hls_short)
+                    .await
+                    .unwrap_or(0);
+                if freed > 0 {
+                    info!("Escalated HLS cleanup freed {}", format_bytes(freed));
+                }
+            }
+            if dir_exists(&self.config.temp_storage_path).await {
+                let freed = cleanup_old_files_bytes(&self.config.temp_storage_path, temp_short)
+                    .await
+                    .unwrap_or(0);
+                if freed > 0 {
+                    info!("Escalated temp cleanup freed {}", format_bytes(freed));
+                }
+            }
+            if dir_exists(&self.config.log_path).await {
+                let freed = cleanup_old_files_bytes(&self.config.log_path, log_short)
+                    .await
+                    .unwrap_or(0);
+                if freed > 0 {
+                    info!("Escalated log cleanup freed {}", format_bytes(freed));
+                }
+            }
+
+            self.refresh_cache_sizes().await;
+            pressure = self.get_pressure_level().await;
+        }
+
+        // Phase 2: enforce cache limits regardless of retention
+        if pressure >= CachePressureLevel::Warning {
+            info!(
+                "Disk pressure still at {} — enforcing strict cache limits",
+                pressure
+            );
+
+            // Reduce HLS cache to 50% of limit
+            let hls_cur = get_directory_size(&self.config.hls_cache_path)
+                .await
+                .unwrap_or(0);
+            let half_limit = self.config.max_hls_cache_size / 2;
+            if hls_cur > half_limit && half_limit > 0 {
+                let excess = hls_cur - half_limit;
+                let freed = lru_evict_from_directory(&self.config.hls_cache_path, excess)
+                    .await
+                    .unwrap_or(0);
+                if freed > 0 {
+                    info!(
+                        "Strict HLS LRU eviction freed {} (target: {})",
+                        format_bytes(freed),
+                        format_bytes(excess)
+                    );
+                }
+            }
+
+            // Reduce temp to 50% of limit
+            let temp_cur = get_directory_size(&self.config.temp_storage_path)
+                .await
+                .unwrap_or(0);
+            let half_temp = self.config.max_temp_size / 2;
+            if temp_cur > half_temp && half_temp > 0 {
+                let excess = temp_cur - half_temp;
+                let freed = lru_evict_from_directory(&self.config.temp_storage_path, excess)
+                    .await
+                    .unwrap_or(0);
+                if freed > 0 {
+                    info!(
+                        "Strict temp LRU eviction freed {} (target: {})",
+                        format_bytes(freed),
+                        format_bytes(excess),
+                    );
+                }
+            }
+
+            self.refresh_cache_sizes().await;
+            pressure = self.get_pressure_level().await;
+        }
+
+        if pressure >= CachePressureLevel::Warning {
+            warn!(
+                "Disk pressure remains at {} after all cleanup phases. \
+                 Consider increasing storage or reducing WARNING_FREE_SPACE threshold (current: {}).",
+                pressure,
+                format_bytes(self.config.warning_free_space),
+            );
+        } else {
+            info!(
+                "Disk pressure resolved to {} after cleanup",
+                pressure
+            );
         }
 
         info!("Cleanup completed");
@@ -764,6 +987,33 @@ pub struct AccurateDiskUsage {
     pub cache_size: u64,
     pub actual_user_data: u64,
     pub usage_percentage: f64,
+}
+
+/// 自动清理状态（替代手动 Clean Cache / Clear Temp 按钮）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoCleanupStatus {
+    /// 自动清理是否启用
+    pub enabled: bool,
+    /// 状态：healthy / warning / cleaning
+    pub status: String,
+    /// 清理阈值（字节）
+    pub threshold_bytes: u64,
+    /// 清理阈值显示文本
+    pub threshold_display: String,
+    /// HLS 缓存大小
+    pub hls_cache_bytes: u64,
+    /// 临时文件大小
+    pub temp_bytes: u64,
+    /// 日志大小
+    pub log_bytes: u64,
+    /// 缓存总大小 (HLS + temp)
+    pub total_cache_bytes: u64,
+    /// 使用百分比（相对于阈值）
+    pub usage_percent: f64,
+    /// 磁盘压力级别
+    pub pressure_level: String,
+    /// 检查间隔（秒）
+    pub check_interval_secs: u32,
 }
 
 async fn dir_exists(path: &Path) -> bool {

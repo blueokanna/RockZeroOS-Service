@@ -153,6 +153,23 @@ async fn main() -> std::io::Result<()> {
     let secure_hls_manager = Arc::new(RwLock::new(rockzero_media::HlsSessionManager::new()));
     info!("Secure HLS streaming: WPA3-SAE + ZKP + AES-256-GCM enabled");
 
+    // Initialize hybrid transport (UDP 70% + TCP 30%)
+    let stream_config = rockzero_media::secure_transport::StreamConfig::default();
+    let secure_transport = Arc::new(
+        rockzero_media::SecureStreamTransport::new(stream_config)
+            .expect("Failed to initialize secure transport"),
+    );
+    let hybrid_config = rockzero_media::HybridConfig::default();
+    let hybrid_transport = Arc::new(rockzero_media::HybridTransport::new(
+        secure_transport.clone(),
+        hybrid_config,
+    ));
+    info!(
+        "Hybrid transport initialized: UDP {:.0}% + TCP {:.0}%",
+        0.7 * 100.0,
+        0.3 * 100.0
+    );
+
     // Initialize storage manager
     let storage_config = StorageConfig::from_env();
     storage_config.init_directories().await?;
@@ -184,6 +201,11 @@ async fn main() -> std::io::Result<()> {
     handlers::disk_manager::auto_mount_all_disks();
     info!("Disk auto-mount completed");
 
+    // Auto-format and mount uninitialized disks
+    info!("Scanning for uninitialized disks...");
+    handlers::disk_manager::auto_format_and_mount_uninitialized_disks();
+    info!("Uninitialized disk scan completed");
+
     HttpServer::new(move || {
         let pool = pool.clone();
         let secure_storage = secure_storage.clone();
@@ -191,6 +213,7 @@ async fn main() -> std::io::Result<()> {
         let media_processor_data = media_processor.clone();
         let secure_hls_manager_data = secure_hls_manager.clone();
         let storage_manager_data = storage_manager.clone();
+        let hybrid_transport_data = hybrid_transport.clone();
         let app_config_data = app_config.clone();
         let cors = Cors::default()
             .allow_any_origin()
@@ -200,6 +223,8 @@ async fn main() -> std::io::Result<()> {
                 "PUT",
                 "DELETE",
                 "OPTIONS",
+                "HEAD",
+                "PATCH",
                 "PROPFIND",
                 "PROPPATCH",
                 "MKCOL",
@@ -212,9 +237,31 @@ async fn main() -> std::io::Result<()> {
                 actix_web::http::header::AUTHORIZATION,
                 actix_web::http::header::CONTENT_TYPE,
                 actix_web::http::header::ACCEPT,
+                actix_web::http::header::RANGE,
+                actix_web::http::header::IF_NONE_MATCH,
+                actix_web::http::header::IF_MODIFIED_SINCE,
+                actix_web::http::header::IF_RANGE,
+                actix_web::http::header::CACHE_CONTROL,
+                actix_web::http::header::CONTENT_LENGTH,
+                actix_web::http::header::CONTENT_RANGE,
+                actix_web::http::header::ORIGIN,
+                actix_web::http::header::HeaderName::from_static("x-requested-with"),
+                actix_web::http::header::HeaderName::from_static("x-upload-id"),
+                actix_web::http::header::HeaderName::from_static("x-chunk-index"),
+                actix_web::http::header::HeaderName::from_static("x-total-chunks"),
+                actix_web::http::header::HeaderName::from_static("x-file-name"),
+                actix_web::http::header::HeaderName::from_static("x-file-size"),
                 actix_web::http::header::HeaderName::from_static("destination"),
                 actix_web::http::header::HeaderName::from_static("overwrite"),
                 actix_web::http::header::HeaderName::from_static("depth"),
+            ])
+            .expose_headers(vec![
+                actix_web::http::header::CONTENT_RANGE,
+                actix_web::http::header::CONTENT_LENGTH,
+                actix_web::http::header::ACCEPT_RANGES,
+                actix_web::http::header::ETAG,
+                actix_web::http::header::HeaderName::from_static("x-upload-id"),
+                actix_web::http::header::HeaderName::from_static("content-duration"),
             ])
             .supports_credentials()
             .max_age(3600);
@@ -229,6 +276,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(media_processor_data))
             .app_data(web::Data::new(secure_hls_manager_data))
             .app_data(web::Data::new(storage_manager_data))
+            .app_data(web::Data::new(hybrid_transport_data))
             .app_data(web::Data::from(app_config_data))
             .app_data(web::Data::new(std::sync::Arc::new(
                 handlers::zkp_auth::ZkpAuthManager::new(),
@@ -395,6 +443,11 @@ async fn main() -> std::io::Result<()> {
                                 "/force-cleanup",
                                 web::post()
                                     .to(handlers::storage_management::force_cleanup_all_cache),
+                            )
+                            .route(
+                                "/auto-cleanup-status",
+                                web::get()
+                                    .to(handlers::storage_management::get_auto_cleanup_status),
                             ),
                     )
                     .service(
@@ -539,6 +592,14 @@ async fn main() -> std::io::Result<()> {
                                 "/steam/app/{app_id}",
                                 web::get().to(handlers::wasm_store::get_steam_app_details),
                             )
+                            .route(
+                                "/steam/library",
+                                web::get().to(handlers::wasm_store::get_steam_user_library),
+                            )
+                            .route(
+                                "/steam/player",
+                                web::get().to(handlers::wasm_store::get_steam_player_summary),
+                            )
                             // Epic 免费游戏
                             .route(
                                 "/epic/free",
@@ -548,6 +609,26 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/search",
                                 web::get().to(handlers::wasm_store::search_wasm_apps),
+                            )
+                            // 每日 Top 30 推荐
+                            .route(
+                                "/recommendations",
+                                web::get().to(handlers::wasm_store::get_daily_recommendations),
+                            )
+                            // Steam 商店搜索
+                            .route(
+                                "/steam/search",
+                                web::get().to(handlers::wasm_store::search_steam_store),
+                            )
+                            // GitHub WASM 导入
+                            .route(
+                                "/github/import",
+                                web::post().to(handlers::wasm_store::import_from_github),
+                            )
+                            // WASM 脚本执行（带输出捕获）
+                            .route(
+                                "/wasm/run-script",
+                                web::post().to(handlers::wasm_store::run_wasm_script),
                             )
                             // WASM 应用管理
                             .route(
@@ -605,6 +686,15 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/format",
                                 web::post().to(handlers::disk_manager::format_disk),
+                            )
+                            // Add routes without ID for initialize and rename
+                            .route(
+                                "/initialize",
+                                web::post().to(handlers::disk_manager::initialize_disk),
+                            )
+                            .route(
+                                "/rename",
+                                web::post().to(handlers::disk_manager::rename_disk),
                             )
                             // Keep routes with ID for backward compatibility
                             .route(
@@ -912,6 +1002,15 @@ async fn main() -> std::io::Result<()> {
                                             .to(handlers::secure_hls::complete_sae_handshake),
                                     ),
                             )
+                            // Transport stats (requires JWT)
+                            .service(
+                                web::scope("/transport")
+                                    .wrap(middleware::JwtAuth)
+                                    .route(
+                                        "/stats",
+                                        web::get().to(handlers::secure_hls::get_transport_stats),
+                                    ),
+                            )
                             // Session management (requires JWT)
                             .service(
                                 web::scope("/session")
@@ -978,6 +1077,10 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/thumbnail/{path:.*}",
                                 web::get().to(handlers::streaming::get_thumbnail),
+                            )
+                            .route(
+                                "/transcode/{path:.*}",
+                                web::get().to(handlers::streaming::transcode_audio),
                             ),
                     ),
             )
@@ -1038,6 +1141,9 @@ async fn main() -> std::io::Result<()> {
                     ),
             )
     })
+    .client_request_timeout(std::time::Duration::from_secs(600))
+    .client_disconnect_timeout(std::time::Duration::from_secs(30))
+    .max_connection_rate(512)
     .bind(&bind_addr)?
     .run()
     .await

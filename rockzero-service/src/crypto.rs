@@ -1,5 +1,3 @@
-//! Crypto bridge module - re-exports from rockzero_crypto with additional service-specific types
-
 pub use rockzero_crypto::*;
 use rockzero_common::AppError;
 use serde::{Deserialize, Serialize};
@@ -278,6 +276,7 @@ impl SecureFileEncryptor {
         self.can_encrypt_safely(&PathBuf::from(path)).unwrap_or(true)
     }
 
+    #[allow(dead_code)]
     pub async fn encrypt_file(&self, source: &PathBuf, dest: &PathBuf, key: &[u8]) -> Result<(), AppError> {
         let data = tokio::fs::read(source).await.map_err(|e| AppError::IoError(e.to_string()))?;
         let encrypted = aes_encrypt(key, &data)?;
@@ -292,16 +291,12 @@ impl SecureFileEncryptor {
         Ok(())
     }
 
-    // Convenience methods for in-memory data encryption
     pub async fn encrypt_data(&self, data: &[u8], password: &str) -> Result<EncryptedData, AppError> {
         let key = derive_key_from_password(password, b"file-encryption");
         let nonce = generate_random_bytes(12)?;
         let encrypted = aes_encrypt(&key, data)?;
 
         let _ = self.transfer_manager.list_active();
-
-        // Removed unnecessary temp file round-trip that blocked I/O and wasted disk writes
-
         Ok(EncryptedData {
             ciphertext: encrypted,
             nonce,
@@ -371,6 +366,7 @@ impl Wpa3Sae {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct EncryptedFileData {
     pub encrypted_data: Vec<u8>,
     pub nonce: Vec<u8>,

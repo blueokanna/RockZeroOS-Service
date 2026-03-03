@@ -125,6 +125,7 @@ pub struct StoreCategory {
 pub struct SearchQuery {
     pub q: Option<String>,
     pub category: Option<String>,
+    pub platform: Option<String>,
     pub page: Option<u32>,
     pub page_size: Option<u32>,
     pub sort: Option<String>,
@@ -759,6 +760,239 @@ pub async fn get_steam_app_details(path: web::Path<String>) -> Result<HttpRespon
     Ok(HttpResponse::Ok().json(data))
 }
 
+// ============================================================================
+// Steam 用户游戏库 — 获取玩家拥有的游戏及游玩时间
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct SteamLibraryQuery {
+    pub steam_id: String,
+    /// Steam Web API Key (optional, reads from env STEAM_API_KEY if unset)
+    pub api_key: Option<String>,
+}
+
+/// GET /api/v1/wasm-store/steam/library - 获取 Steam 用户的游戏库（含游玩时间）
+pub async fn get_steam_user_library(
+    query: web::Query<SteamLibraryQuery>,
+) -> Result<HttpResponse, AppError> {
+    let steam_id = &query.steam_id;
+    info!("获取 Steam 用户游戏库: {}", steam_id);
+
+    let api_key = query
+        .api_key
+        .clone()
+        .or_else(|| std::env::var("STEAM_API_KEY").ok())
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "Steam API Key 未提供。请在请求中提供 api_key 参数或设置 STEAM_API_KEY 环境变量"
+                    .to_string(),
+            )
+        })?;
+
+    // Try cache first
+    let cache_key = format!("steam_library_{}", steam_id);
+    if let Some(cached) = cache_get(&cache_key).await {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "steam_id": steam_id,
+            "games": cached,
+            "total": cached.len(),
+            "cached": true,
+        })));
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    // Call Steam IPlayerService/GetOwnedGames
+    let url = format!(
+        "https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/?key={}&steamid={}&format=json&include_appinfo=1&include_played_free_games=1",
+        api_key, steam_id
+    );
+
+    let resp = client.get(&url).send().await.map_err(|e| {
+        AppError::InternalServerError(format!("Steam API 请求失败: {}", e))
+    })?;
+
+    if !resp.status().is_success() {
+        return Err(AppError::InternalServerError(format!(
+            "Steam API 返回错误: {}",
+            resp.status()
+        )));
+    }
+
+    let json: Value = resp.json().await.map_err(|e| {
+        AppError::InternalServerError(format!("Steam JSON 解析失败: {}", e))
+    })?;
+
+    let mut games = Vec::new();
+
+    if let Some(game_list) = json
+        .pointer("/response/games")
+        .and_then(|v| v.as_array())
+    {
+        for game in game_list {
+            let appid = game.get("appid").and_then(|v| v.as_u64()).unwrap_or(0);
+            let name = game
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown");
+            let playtime_forever = game
+                .get("playtime_forever")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let playtime_2weeks = game
+                .get("playtime_2weeks")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let img_icon_url = game
+                .get("img_icon_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let playtime_linux = game
+                .get("playtime_linux_forever")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let playtime_mac = game
+                .get("playtime_mac_forever")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let playtime_windows = game
+                .get("playtime_windows_forever")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let rtime_last_played = game
+                .get("rtime_last_played")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let header_image = if appid > 0 {
+                format!(
+                    "https://cdn.akamai.steamstatic.com/steam/apps/{}/header.jpg",
+                    appid
+                )
+            } else {
+                String::new()
+            };
+
+            let icon_url = if !img_icon_url.is_empty() && appid > 0 {
+                format!(
+                    "https://media.steampowered.com/steamcommunity/public/images/apps/{}/{}",
+                    appid, img_icon_url
+                )
+            } else {
+                String::new()
+            };
+
+            // Format playtime
+            let hours = playtime_forever / 60;
+            let minutes = playtime_forever % 60;
+            let playtime_formatted = if hours > 0 {
+                format!("{}h {}m", hours, minutes)
+            } else {
+                format!("{}m", minutes)
+            };
+
+            games.push(serde_json::json!({
+                "appid": appid,
+                "name": name,
+                "playtime_forever": playtime_forever,
+                "playtime_2weeks": playtime_2weeks,
+                "playtime_formatted": playtime_formatted,
+                "playtime_hours": playtime_forever as f64 / 60.0,
+                "playtime_linux": playtime_linux,
+                "playtime_mac": playtime_mac,
+                "playtime_windows": playtime_windows,
+                "rtime_last_played": rtime_last_played,
+                "header_image": header_image,
+                "icon_url": icon_url,
+                "store_url": format!("https://store.steampowered.com/app/{}", appid),
+                "platform": "steam",
+            }));
+        }
+    }
+
+    // Sort by playtime descending
+    games.sort_by(|a, b| {
+        let a_time = a
+            .get("playtime_forever")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let b_time = b
+            .get("playtime_forever")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        b_time.cmp(&a_time)
+    });
+
+    let total = games.len();
+
+    // Cache for 10 minutes
+    cache_set(&cache_key, games.clone(), 600).await;
+
+    info!("Steam 用户游戏库: {} 款游戏", total);
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "steam_id": steam_id,
+        "games": games,
+        "total": total,
+        "cached": false,
+    })))
+}
+
+/// GET /api/v1/wasm-store/steam/player - 获取 Steam 用户资料
+pub async fn get_steam_player_summary(
+    query: web::Query<SteamLibraryQuery>,
+) -> Result<HttpResponse, AppError> {
+    let steam_id = &query.steam_id;
+    info!("获取 Steam 用户资料: {}", steam_id);
+
+    let api_key = query
+        .api_key
+        .clone()
+        .or_else(|| std::env::var("STEAM_API_KEY").ok())
+        .ok_or_else(|| {
+            AppError::BadRequest("Steam API Key 未提供".to_string())
+        })?;
+
+    let cache_key = format!("steam_player_{}", steam_id);
+    if let Some(cached) = cache_get(&cache_key).await {
+        if let Some(first) = cached.into_iter().next() {
+            return Ok(HttpResponse::Ok().json(first));
+        }
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(8))
+        .connect_timeout(Duration::from_secs(3))
+        .build()
+        .unwrap_or_default();
+
+    let url = format!(
+        "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key={}&steamids={}",
+        api_key, steam_id
+    );
+
+    let resp = client.get(&url).send().await.map_err(|e| {
+        AppError::InternalServerError(format!("Steam API 请求失败: {}", e))
+    })?;
+
+    let json: Value = resp.json().await.map_err(|e| {
+        AppError::InternalServerError(format!("JSON 解析失败: {}", e))
+    })?;
+
+    let player = json
+        .pointer("/response/players/0")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+
+    cache_set(&cache_key, vec![player.clone()], 300).await;
+
+    Ok(HttpResponse::Ok().json(player))
+}
+
 /// GET /api/v1/wasm-store/epic/free - Epic 免费游戏
 pub async fn get_epic_free_games() -> Result<HttpResponse, AppError> {
     info!("获取 Epic 免费游戏");
@@ -776,65 +1010,366 @@ pub async fn get_epic_free_games() -> Result<HttpResponse, AppError> {
     })))
 }
 
-/// GET /api/v1/wasm-store/search - 搜索游戏和应用
-pub async fn search_wasm_apps(query: web::Query<SearchQuery>) -> Result<HttpResponse, AppError> {
+/// GET /api/v1/wasm-store/search - 跨平台搜索游戏和应用
+///
+/// 支持实时搜索 Steam Store、Epic Games、本地 WASM 应用。
+/// 支持 `platform` 过滤器（steam / epic / wasm / 不传 = 搜索全部）。
+/// 返回结果包含 `owned` 字段表示用户是否拥有该游戏。
+pub async fn search_wasm_apps(
+    query: web::Query<SearchQuery>,
+    _req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
     let search_term = query.q.clone().unwrap_or_default().to_lowercase();
     let category_filter = query.category.clone();
+    let platform_filter = query.platform.clone().map(|p| p.to_lowercase());
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(20).min(100);
 
     info!(
-        "搜索游戏和应用: q={}, category={:?}",
-        search_term, category_filter
+        "跨平台搜索: q='{}', platform={:?}, category={:?}",
+        search_term, platform_filter, category_filter
     );
+
+    if search_term.is_empty() && platform_filter.is_none() {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "items": [],
+            "total": 0,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": 0,
+        })));
+    }
+
+    // 获取用户拥有的 Steam 游戏 ID 集合（用于标记 owned）
+    let owned_appids = get_owned_steam_appids_from_cache().await;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(8))
+        .connect_timeout(Duration::from_secs(3))
+        .build()
+        .unwrap_or_default();
 
     let mut results: Vec<Value> = Vec::new();
 
-    // 搜索本地 WASM 应用
-    let apps = load_wasm_registry_async().await.unwrap_or_default();
-    for app in &apps {
-        let matches_category = category_filter.as_ref().is_none_or(|cat| {
-            let app_cat = serde_json::to_string(&app.category)
-                .unwrap_or_default()
-                .trim_matches('"')
-                .to_lowercase();
-            app_cat == cat.to_lowercase()
-        });
+    // ── WASM 应用搜索 ──────────────────────────────────────────────
+    let search_wasm = platform_filter.is_none()
+        || platform_filter.as_deref() == Some("wasm");
 
-        let matches_search = search_term.is_empty()
-            || app.name.to_lowercase().contains(&search_term)
-            || app.description.to_lowercase().contains(&search_term)
-            || app.author.to_lowercase().contains(&search_term);
+    if search_wasm && !search_term.is_empty() {
+        let apps = load_wasm_registry_async().await.unwrap_or_default();
+        for app in &apps {
+            let matches_category = category_filter.as_ref().is_none_or(|cat| {
+                let app_cat = serde_json::to_string(&app.category)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_lowercase();
+                app_cat == cat.to_lowercase()
+            });
 
-        if matches_category && matches_search {
-            results.push(serde_json::json!({
-                "name": app.name,
-                "id": app.id,
-                "header_image": app.icon_url,
-                "is_free": true,
-                "platform": "wasm",
-                "short_description": app.description,
-                "store_url": "",
-                "price": { "formatted": "免费" },
-                "genres": [],
-            }));
+            let matches_search = app.name.to_lowercase().contains(&search_term)
+                || app.description.to_lowercase().contains(&search_term)
+                || app.author.to_lowercase().contains(&search_term);
+
+            if matches_category && matches_search {
+                results.push(serde_json::json!({
+                    "name": app.name,
+                    "id": app.id,
+                    "header_image": app.icon_url,
+                    "is_free": true,
+                    "platform": "wasm",
+                    "owned": app.installed,
+                    "short_description": app.description,
+                    "store_url": "",
+                    "price": { "formatted": "免费" },
+                    "genres": [],
+                }));
+            }
         }
     }
 
-    // 如果有搜索词，也搜索已缓存的 Steam 游戏（不发起新请求）
-    if !search_term.is_empty() && category_filter.is_none() {
-        if let Some(steam_games) = cache_get("steam_featured").await {
-            for game in steam_games {
-                let name = game
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                if name.contains(&search_term) {
-                    results.push(game);
+    // ── Steam Store 实时搜索 ──────────────────────────────────────
+    let search_steam = platform_filter.is_none()
+        || platform_filter.as_deref() == Some("steam");
+
+    if search_steam && !search_term.is_empty() {
+        let cache_key = format!("steam_search_{}", search_term);
+
+        let steam_results = if let Some(cached) = cache_get(&cache_key).await {
+            cached
+        } else {
+            let search_url = format!(
+                "https://store.steampowered.com/api/storesearch/?term={}&l=schinese&cc=CN",
+                urlencoding::encode(&search_term)
+            );
+
+            match client.get(&search_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<Value>().await {
+                        Ok(json) => {
+                            let mut games = Vec::new();
+                            if let Some(items) = json.get("items").and_then(|v| v.as_array()) {
+                                for item in items.iter().take(20) {
+                                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let app_id = item.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    if name.is_empty() || app_id == 0 {
+                                        continue;
+                                    }
+
+                                    let tiny_image = item
+                                        .get("tiny_image")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+
+                                    // 从 price 字段解析价格
+                                    let price_info = item.get("price");
+                                    let final_price = price_info
+                                        .and_then(|p| p.get("final"))
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let is_free = final_price == 0;
+                                    let formatted_price = if is_free {
+                                        "免费".to_string()
+                                    } else {
+                                        format!("¥{:.2}", final_price as f64 / 100.0)
+                                    };
+
+                                    // 平台支持
+                                    let platforms = item.get("platforms");
+                                    let supports_windows = platforms
+                                        .and_then(|p| p.get("windows"))
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    let supports_linux = platforms
+                                        .and_then(|p| p.get("linux"))
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    let supports_mac = platforms
+                                        .and_then(|p| p.get("mac"))
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+
+                                    let is_owned = owned_appids.contains(&app_id);
+
+                                    let header_image = format!(
+                                        "https://cdn.akamai.steamstatic.com/steam/apps/{}/header.jpg",
+                                        app_id
+                                    );
+
+                                    games.push(serde_json::json!({
+                                        "name": name,
+                                        "app_id": app_id,
+                                        "header_image": header_image,
+                                        "tiny_image": tiny_image,
+                                        "is_free": is_free,
+                                        "platform": "steam",
+                                        "owned": is_owned,
+                                        "store_url": format!("https://store.steampowered.com/app/{}", app_id),
+                                        "price": {
+                                            "final": final_price,
+                                            "formatted": formatted_price,
+                                        },
+                                        "platforms": {
+                                            "windows": supports_windows,
+                                            "linux": supports_linux,
+                                            "mac": supports_mac,
+                                        },
+                                        "short_description": "",
+                                        "genres": [],
+                                    }));
+                                }
+                            }
+
+                            // 缓存搜索结果 3 分钟
+                            cache_set(&cache_key, games.clone(), 180).await;
+                            games
+                        }
+                        Err(e) => {
+                            warn!("Steam 搜索 JSON 解析失败: {}", e);
+                            Vec::new()
+                        }
+                    }
                 }
+                _ => Vec::new(),
             }
-        }
+        };
+
+        results.extend(steam_results);
+    }
+
+    // ── Epic Games 实时搜索 ──────────────────────────────────────
+    let search_epic = platform_filter.is_none()
+        || platform_filter.as_deref() == Some("epic");
+
+    if search_epic && !search_term.is_empty() {
+        let cache_key = format!("epic_search_{}", search_term);
+
+        let epic_results = if let Some(cached) = cache_get(&cache_key).await {
+            cached
+        } else {
+            let query_body = serde_json::json!({
+                "query": r#"query searchStoreQuery($count: Int, $country: String!, $keywords: String, $locale: String, $sortBy: String, $sortDir: String, $start: Int, $withPrice: Boolean = true) {
+                    Catalog {
+                        searchStore(count: $count, country: $country, keywords: $keywords, locale: $locale, sortBy: $sortBy, sortDir: $sortDir, start: $start) {
+                            elements {
+                                title
+                                id
+                                namespace
+                                description
+                                keyImages {
+                                    type
+                                    url
+                                }
+                                seller {
+                                    name
+                                }
+                                price(country: $country) @include(if: $withPrice) {
+                                    totalPrice {
+                                        discountPrice
+                                        originalPrice
+                                        currencyCode
+                                        fmtPrice(locale: "zh-CN") {
+                                            originalPrice
+                                            discountPrice
+                                        }
+                                    }
+                                }
+                            }
+                            paging {
+                                count
+                                total
+                            }
+                        }
+                    }
+                }"#,
+                "variables": {
+                    "count": 20,
+                    "country": "CN",
+                    "keywords": search_term,
+                    "locale": "zh-CN",
+                    "sortBy": "relevancy",
+                    "sortDir": "DESC",
+                    "start": 0,
+                    "withPrice": true,
+                }
+            });
+
+            match client
+                .post("https://graphql.epicgames.com/graphql")
+                .header("Content-Type", "application/json")
+                .json(&query_body)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<Value>().await {
+                        Ok(json) => {
+                            let mut games = Vec::new();
+                            if let Some(elements) = json
+                                .pointer("/data/Catalog/searchStore/elements")
+                                .and_then(|v| v.as_array())
+                            {
+                                for elem in elements.iter().take(20) {
+                                    let title = elem
+                                        .get("title")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let id = elem
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let description = elem
+                                        .get("description")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+
+                                    if title.is_empty() {
+                                        continue;
+                                    }
+
+                                    let header_image = elem
+                                        .get("keyImages")
+                                        .and_then(|v| v.as_array())
+                                        .and_then(|images| {
+                                            images
+                                                .iter()
+                                                .find(|img| {
+                                                    img.get("type")
+                                                        .and_then(|t| t.as_str())
+                                                        .map(|t| {
+                                                            t == "OfferImageWide"
+                                                                || t == "DieselStoreFrontWide"
+                                                                || t == "Thumbnail"
+                                                        })
+                                                        .unwrap_or(false)
+                                                })
+                                                .or_else(|| images.first())
+                                                .and_then(|img| {
+                                                    img.get("url").and_then(|u| u.as_str())
+                                                })
+                                        })
+                                        .unwrap_or("");
+
+                                    let seller = elem
+                                        .pointer("/seller/name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+
+                                    let discount_price = elem
+                                        .pointer("/price/totalPrice/discountPrice")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let is_free = discount_price == 0;
+                                    let formatted_price = if is_free {
+                                        "免费".to_string()
+                                    } else {
+                                        format!("¥{:.2}", discount_price as f64 / 100.0)
+                                    };
+
+                                    let namespace = elem
+                                        .get("namespace")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let store_url = if !namespace.is_empty() {
+                                        format!(
+                                            "https://store.epicgames.com/zh-CN/p/{}",
+                                            namespace
+                                        )
+                                    } else {
+                                        "https://store.epicgames.com/zh-CN".to_string()
+                                    };
+
+                                    games.push(serde_json::json!({
+                                        "name": title,
+                                        "id": id,
+                                        "header_image": header_image,
+                                        "is_free": is_free,
+                                        "platform": "epic",
+                                        "owned": false,
+                                        "store_url": store_url,
+                                        "short_description": description,
+                                        "seller": seller,
+                                        "price": {
+                                            "formatted": formatted_price,
+                                        },
+                                        "genres": [],
+                                    }));
+                                }
+                            }
+
+                            cache_set(&cache_key, games.clone(), 180).await;
+                            games
+                        }
+                        Err(e) => {
+                            warn!("Epic 搜索 JSON 解析失败: {}", e);
+                            Vec::new()
+                        }
+                    }
+                }
+                _ => Vec::new(),
+            }
+        };
+
+        results.extend(epic_results);
     }
 
     let total = results.len() as i64;
@@ -852,6 +1387,25 @@ pub async fn search_wasm_apps(query: web::Query<SearchQuery>) -> Result<HttpResp
         "page_size": page_size,
         "total_pages": ((total as f64) / (page_size as f64)).ceil() as u32,
     })))
+}
+
+/// 从缓存获取用户拥有的 Steam 游戏 AppID 集合
+async fn get_owned_steam_appids_from_cache() -> std::collections::HashSet<u64> {
+    let cache = get_cache().read().await;
+    let mut owned = std::collections::HashSet::new();
+
+    // 扫描所有 steam_library_* 缓存条目
+    for (key, entry) in cache.iter() {
+        if key.starts_with("steam_library_") && !entry.is_expired() {
+            for game in &entry.data {
+                if let Some(appid) = game.get("appid").and_then(|v| v.as_u64()) {
+                    owned.insert(appid);
+                }
+            }
+        }
+    }
+
+    owned
 }
 
 /// GET /api/v1/wasm-store/wasm/apps - WASM 应用列表
@@ -1222,5 +1776,800 @@ pub async fn unregister_plugin(
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "status": "unregistered",
         "plugin_id": plugin_id,
+    })))
+}
+
+// ============================================================================
+// GitHub WASM 仓库导入
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct GitHubImportRequest {
+    /// GitHub 仓库 URL，如 https://github.com/user/repo
+    pub repo_url: String,
+    /// 要下载的 release tag（默认 latest）
+    pub tag: Option<String>,
+    /// 指定 WASM 文件名（从 release assets 中匹配）
+    pub asset_name: Option<String>,
+    /// 应用名称（默认使用仓库名）
+    pub name: Option<String>,
+}
+
+/// POST /api/v1/wasm-store/github/import - 从 GitHub 仓库导入 WASM 模块
+///
+/// 支持从 GitHub Releases 下载 .wasm 文件并注册到 WASM 应用商店。
+/// 1. 解析仓库 URL → owner/repo
+/// 2. 调用 GitHub API 获取 release 信息
+/// 3. 找到 .wasm 资源文件并下载
+/// 4. BLAKE3 哈希校验 + wasmtime 模块验证
+/// 5. 注册到本地 WASM 商店
+pub async fn import_from_github(
+    body: web::Json<GitHubImportRequest>,
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+
+    let repo_url = body.repo_url.trim().trim_end_matches('/');
+    info!("从 GitHub 导入 WASM: {}", repo_url);
+
+    // 解析 owner/repo
+    let (owner, repo) = parse_github_url(repo_url)?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(60))
+        .user_agent("RockZeroOS/1.0")
+        .build()
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+    // 获取 release 信息
+    let release_url = if let Some(tag) = &body.tag {
+        format!(
+            "https://api.github.com/repos/{}/{}/releases/tags/{}",
+            owner, repo, tag
+        )
+    } else {
+        format!(
+            "https://api.github.com/repos/{}/{}/releases/latest",
+            owner, repo
+        )
+    };
+
+    let release_resp = client
+        .get(&release_url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("GitHub API 请求失败: {}", e)))?;
+
+    if release_resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(AppError::NotFound(format!(
+            "仓库 {}/{} 没有找到 release",
+            owner, repo
+        )));
+    }
+
+    if !release_resp.status().is_success() {
+        return Err(AppError::InternalServerError(format!(
+            "GitHub API 返回错误: {}",
+            release_resp.status()
+        )));
+    }
+
+    let release: Value = release_resp.json().await.map_err(|e| {
+        AppError::InternalServerError(format!("解析 release JSON 失败: {}", e))
+    })?;
+
+    let tag_name = release
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let release_body = release
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // 查找 .wasm 资源
+    let assets = release
+        .get("assets")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| AppError::NotFound("Release 中没有资源文件".to_string()))?;
+
+    let wasm_asset = if let Some(asset_name) = &body.asset_name {
+        // 指定了文件名则精确匹配
+        assets
+            .iter()
+            .find(|a| {
+                a.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|n| n == asset_name.as_str())
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "Release 中未找到文件: {}",
+                    asset_name
+                ))
+            })?
+    } else {
+        // 自动寻找第一个 .wasm 文件
+        assets
+            .iter()
+            .find(|a| {
+                a.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|n| n.ends_with(".wasm"))
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                AppError::NotFound("Release 中未找到 .wasm 文件".to_string())
+            })?
+    };
+
+    let asset_name = wasm_asset
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("module.wasm");
+    let download_url = wasm_asset
+        .get("browser_download_url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::NotFound("无法获取下载地址".to_string()))?;
+    let asset_size = wasm_asset
+        .get("size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    info!(
+        "下载 WASM 资源: {} ({} bytes) from {}",
+        asset_name, asset_size, download_url
+    );
+
+    // 下载 WASM 文件
+    let wasm_resp = client
+        .get(download_url)
+        .header("Accept", "application/octet-stream")
+        .send()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("下载 WASM 失败: {}", e)))?;
+
+    if !wasm_resp.status().is_success() {
+        return Err(AppError::BadRequest(format!(
+            "下载失败: HTTP {}",
+            wasm_resp.status()
+        )));
+    }
+
+    let bytes = wasm_resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("读取 WASM 数据失败: {}", e)))?;
+
+    // BLAKE3 哈希
+    let hash = blake3::hash(&bytes);
+    let hash_hex = hash.to_hex().to_string();
+
+    // 验证 WASM 模块
+    let wasm_bytes = bytes.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let engine = wasmtime::Engine::default();
+        wasmtime::Module::new(&engine, &wasm_bytes)
+            .map_err(|e| AppError::BadRequest(format!("无效的 WASM 模块: {}", e)))
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("验证任务失败: {}", e)))??;
+
+    // 保存到磁盘
+    let app_id = format!("github-{}-{}", owner, repo);
+    let app_name = body
+        .name
+        .clone()
+        .unwrap_or_else(|| repo.to_string());
+    let store_dir = wasm_store_root().join("modules");
+    let file_bytes = bytes.to_vec();
+    let hash_hex_clone = hash_hex.clone();
+    let app_id_clone = app_id.clone();
+    let size = bytes.len() as u64;
+
+    let file_path = tokio::task::spawn_blocking(move || -> Result<PathBuf, AppError> {
+        std::fs::create_dir_all(&store_dir).map_err(|e| AppError::IoError(e.to_string()))?;
+        let filename = format!("{}_{}.wasm", app_id_clone, &hash_hex_clone[..8]);
+        let file_path = store_dir.join(&filename);
+        std::fs::write(&file_path, &file_bytes).map_err(|e| AppError::IoError(e.to_string()))?;
+        Ok(file_path)
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("I/O 任务失败: {}", e)))??;
+
+    // 更新注册表
+    let file_path_str = file_path.to_string_lossy().to_string();
+    let app_name_clone = app_name.clone();
+    let description = format!(
+        "从 GitHub 导入: {}/{}@{}\n\n{}",
+        owner, repo, tag_name, release_body
+    );
+    let app_id_for_reg = app_id.clone();
+    let repo_url_clone = repo_url.to_string();
+    let owner_for_closure = owner.clone();
+    let repo_for_closure = repo.clone();
+    let tag_name_for_closure = tag_name.clone();
+
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let mut apps = load_wasm_registry()?;
+
+        if let Some(existing) = apps.iter_mut().find(|a| a.id == app_id_for_reg) {
+            existing.installed = true;
+            existing.installed_path = Some(file_path_str);
+            existing.version = tag_name_for_closure.clone();
+            existing.description = description;
+            existing.updated_at = now_epoch();
+        } else {
+            apps.push(WasmApp {
+                id: app_id_for_reg,
+                name: app_name_clone,
+                description,
+                version: tag_name_for_closure.clone(),
+                author: owner_for_closure.to_string(),
+                icon_url: format!(
+                    "https://github.com/{}/{}/raw/main/icon.png",
+                    owner_for_closure, repo_for_closure
+                ),
+                wasm_url: repo_url_clone,
+                category: WasmAppCategory::Other,
+                size_bytes: size,
+                installed: true,
+                installed_path: Some(file_path_str),
+                permissions: Vec::new(),
+                created_at: now_epoch(),
+                updated_at: now_epoch(),
+            });
+        }
+
+        save_wasm_registry(&apps)
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("注册失败: {}", e)))??;
+
+    info!(
+        "GitHub WASM 导入完成: {}/{} → {} (hash: {})",
+        owner, repo, app_name, hash_hex
+    );
+
+    Ok(HttpResponse::Created().json(serde_json::json!({
+        "status": "imported",
+        "app_id": app_id,
+        "name": app_name,
+        "version": tag_name,
+        "hash": hash_hex,
+        "size": size,
+        "source": format!("github:{}/{}", owner, repo),
+    })))
+}
+
+/// 解析 GitHub URL → (owner, repo)
+fn parse_github_url(url: &str) -> Result<(String, String), AppError> {
+    // 支持格式：
+    //   https://github.com/owner/repo
+    //   https://github.com/owner/repo.git
+    //   github.com/owner/repo
+    //   owner/repo
+    let path = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("github.com/")
+        .trim_end_matches(".git");
+
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() < 2 {
+        return Err(AppError::BadRequest(format!(
+            "无效的 GitHub URL: {}（格式应为 owner/repo）",
+            url
+        )));
+    }
+
+    Ok((parts[0].to_string(), parts[1].to_string()))
+}
+
+// ============================================================================
+// WASM 脚本执行（支持多语言、输出捕获）
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct RunScriptRequest {
+    /// WASM 模块 URL 或已安装的 app_id
+    pub source: String,
+    /// 入口函数名（默认 _start）
+    pub function: Option<String>,
+    /// 命令行参数
+    pub args: Option<Vec<String>>,
+    /// 环境变量
+    pub env: Option<HashMap<String, String>>,
+    /// 执行超时秒数（默认 30，最大 300）
+    pub timeout_secs: Option<u64>,
+    /// 将 stdin 数据传入 WASM
+    pub stdin_data: Option<String>,
+}
+
+/// POST /api/v1/wasm-store/wasm/run-script - 执行 WASM 脚本并捕获输出
+///
+/// 与 `run_wasm_app` 不同，此端点：
+/// - 捕获 stdout 和 stderr 输出并返回给调用者
+/// - 支持可配置超时（最长 5 分钟）
+/// - 支持 stdin 数据传入
+/// - 支持直接通过 URL 执行（无需先安装）
+pub async fn run_wasm_script(
+    body: web::Json<RunScriptRequest>,
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+
+    let source = body.source.clone();
+    let func_name = body
+        .function
+        .clone()
+        .unwrap_or_else(|| "_start".to_string());
+    let args = body.args.clone().unwrap_or_default();
+    let env = body.env.clone().unwrap_or_default();
+    let timeout_secs = body.timeout_secs.unwrap_or(30).min(300);
+    let stdin_data = body.stdin_data.clone();
+
+    info!(
+        "执行 WASM 脚本: source={}, func={}, timeout={}s",
+        source, func_name, timeout_secs
+    );
+
+    // 获取 WASM 字节码
+    let wasm_bytes = if source.starts_with("http://") || source.starts_with("https://") {
+        // 从 URL 下载
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+        let resp = client
+            .get(&source)
+            .send()
+            .await
+            .map_err(|e| AppError::BadRequest(format!("下载 WASM 失败: {}", e)))?;
+
+        if !resp.status().is_success() {
+            return Err(AppError::BadRequest("下载 WASM 失败".to_string()));
+        }
+
+        resp.bytes()
+            .await
+            .map_err(|e| AppError::BadRequest(format!("读取失败: {}", e)))?
+            .to_vec()
+    } else {
+        // 从已安装的应用加载
+        let apps = load_wasm_registry_async().await?;
+        let app = apps
+            .iter()
+            .find(|a| a.id == source && a.installed)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "WASM 应用 '{}' 未找到或未安装",
+                    source
+                ))
+            })?;
+
+        let path = app
+            .installed_path
+            .as_ref()
+            .ok_or_else(|| AppError::NotFound("WASM 路径不存在".to_string()))?;
+
+        tokio::fs::read(path)
+            .await
+            .map_err(|e| AppError::IoError(format!("读取 WASM 文件失败: {}", e)))?
+    };
+
+    let func_name_clone = func_name.clone();
+    let source_clone = source.clone();
+    let start_time = Instant::now();
+
+    // 在 blocking 线程中执行 WASM，捕获 stdout/stderr
+    let exec_result = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        tokio::task::spawn_blocking(move || -> Result<(String, String), AppError> {
+            let engine = wasmtime::Engine::default();
+            let module = wasmtime::Module::new(&engine, &wasm_bytes)
+                .map_err(|e| AppError::BadRequest(format!("无效 WASM: {}", e)))?;
+
+            let mut linker = wasmtime::Linker::new(&engine);
+            #[allow(deprecated)]
+            wasmtime_wasi::add_to_linker(&mut linker, |cx| cx)
+                .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
+            #[allow(deprecated)]
+            let mut builder = wasmtime_wasi::sync::WasiCtxBuilder::new();
+
+            // 使用 wasi_common::pipe 捕获 stdout/stderr
+            let stdout_pipe = wasi_common::pipe::WritePipe::new_in_memory();
+            let stderr_pipe = wasi_common::pipe::WritePipe::new_in_memory();
+
+            builder.stdout(Box::new(stdout_pipe.clone()));
+            builder.stderr(Box::new(stderr_pipe.clone()));
+
+            // 设置 stdin
+            if let Some(ref data) = stdin_data {
+                let bytes = data.as_bytes().to_vec();
+                builder.stdin(Box::new(wasi_common::pipe::ReadPipe::from(bytes)));
+            }
+
+            for arg in &args {
+                builder.arg(arg)
+                    .map_err(|e| AppError::ValidationError(format!("无效参数: {}", e)))?;
+            }
+
+            for (key, value) in &env {
+                builder.env(key, value)
+                    .map_err(|e| AppError::ValidationError(format!("无效环境变量: {}", e)))?;
+            }
+
+            let mut store = wasmtime::Store::new(&engine, builder.build());
+            let instance = linker
+                .instantiate(&mut store, &module)
+                .map_err(|e| AppError::BadRequest(format!("实例化失败: {}", e)))?;
+
+            // 尝试调用
+            let call_result = if let Ok(entry) =
+                instance.get_typed_func::<(), ()>(&mut store, &func_name_clone)
+            {
+                entry.call(&mut store, ()).map_err(|e| {
+                    AppError::BadRequest(format!("WASM 执行失败: {}", e))
+                })
+            } else if let Some(func) = instance.get_func(&mut store, &func_name_clone) {
+                func.call(&mut store, &[], &mut []).map_err(|e| {
+                    AppError::BadRequest(format!("WASM 执行失败: {}", e))
+                })
+            } else {
+                return Err(AppError::NotFound(format!(
+                    "函数 '{}' 不存在",
+                    func_name_clone
+                )));
+            };
+
+            // 释放 store 以 flush 管道
+            drop(store);
+
+            // 提取管道输出
+            let stdout = stdout_pipe
+                .try_into_inner()
+                .map(|cursor| String::from_utf8_lossy(&cursor.into_inner()).to_string())
+                .unwrap_or_default();
+
+            let stderr = stderr_pipe
+                .try_into_inner()
+                .map(|cursor| String::from_utf8_lossy(&cursor.into_inner()).to_string())
+                .unwrap_or_default();
+
+            call_result?;
+            Ok((stdout, stderr))
+        }),
+    )
+    .await;
+
+    let elapsed_ms = start_time.elapsed().as_millis();
+
+    match exec_result {
+        Ok(Ok(Ok((stdout, stderr)))) => {
+            info!(
+                "WASM 脚本执行成功: {} ({}ms)",
+                source_clone, elapsed_ms
+            );
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "status": "completed",
+                "source": source,
+                "function": func_name,
+                "stdout": stdout,
+                "stderr": stderr,
+                "elapsed_ms": elapsed_ms,
+            })))
+        }
+        Ok(Ok(Err(app_err))) => Err(app_err),
+        Ok(Err(join_err)) => Err(AppError::InternalServerError(format!(
+            "执行线程异常: {}",
+            join_err
+        ))),
+        Err(_timeout) => {
+            warn!(
+                "WASM 脚本超时 ({}s): {}",
+                timeout_secs, source_clone
+            );
+            Err(AppError::InternalServerError(format!(
+                "WASM 执行超时 ({}s)",
+                timeout_secs
+            )))
+        }
+    }
+}
+
+// ============================================================================
+// 每日推荐 Top 30
+// ============================================================================
+
+/// GET /api/v1/wasm-store/recommendations - 每日 Top 30 游戏推荐
+///
+/// 聚合来源：
+/// 1. Steam 热门新品（New & Trending）
+/// 2. Steam 特惠游戏
+/// 3. Epic 免费 / 限免游戏
+/// 4. 本地 WASM 应用
+///
+/// 结果按以下权重排序：
+/// - 免费游戏加权 +50
+/// - 有折扣的加权 +(discount_percent)
+/// - Steam 精选加权 +20
+/// - 用户已拥有的标记但不排到前面
+pub async fn get_daily_recommendations() -> Result<HttpResponse, AppError> {
+    info!("获取每日 Top 30 推荐");
+
+    // 尝试从缓存读取（24 小时有效）
+    let cache_key = "daily_recommendations";
+    if let Some(cached) = cache_get(cache_key).await {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "items": cached,
+            "total": cached.len(),
+            "cached": true,
+            "generated_at": now_epoch(),
+        })));
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(3))
+        .build()
+        .unwrap_or_default();
+
+    let owned_appids = get_owned_steam_appids_from_cache().await;
+
+    // 并行获取 Steam 精选 + Epic 免费
+    let (steam_data, epic_data) = tokio::join!(
+        fetch_steam_featured_cached(&client),
+        fetch_epic_free_cached(&client),
+    );
+
+    let mut scored_items: Vec<(i64, Value)> = Vec::new();
+
+    // ── Steam 精选 → 加入推荐池 ──────────────────────────────────
+    if let Ok(steam_games) = steam_data {
+        for mut game in steam_games {
+            let mut score: i64 = 20; // 精选基础分
+
+            let is_free = game
+                .get("is_free")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if is_free {
+                score += 50;
+            }
+
+            let final_price = game
+                .pointer("/price/final")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let original_price = game
+                .pointer("/price/original")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            if original_price > 0 && final_price < original_price {
+                let discount = ((original_price - final_price) * 100 / original_price) as i64;
+                score += discount;
+            }
+
+            let app_id = game
+                .get("app_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let is_owned = owned_appids.contains(&app_id);
+
+            if let Some(obj) = game.as_object_mut() {
+                obj.insert("owned".to_string(), serde_json::json!(is_owned));
+                obj.insert("recommendation_score".to_string(), serde_json::json!(score));
+                obj.insert("recommendation_source".to_string(), serde_json::json!("steam_featured"));
+            }
+
+            scored_items.push((score, game));
+        }
+    }
+
+    // ── Epic 免费 → 加入推荐池 ──────────────────────────────────
+    if let Ok(epic_games) = epic_data {
+        for mut game in epic_games {
+            let mut score: i64 = 50; // 免费游戏高基础分
+
+            let has_promo = game
+                .get("has_active_promo")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if has_promo {
+                score += 30; // 限时免费额外加分
+            }
+
+            if let Some(obj) = game.as_object_mut() {
+                obj.insert("owned".to_string(), serde_json::json!(false));
+                obj.insert("recommendation_score".to_string(), serde_json::json!(score));
+                obj.insert("recommendation_source".to_string(), serde_json::json!("epic_free"));
+            }
+
+            scored_items.push((score, game));
+        }
+    }
+
+    // ── 本地 WASM 应用 → 推荐未安装的 ──────────────────────────
+    let wasm_apps = load_wasm_registry_async().await.unwrap_or_default();
+    for app in &wasm_apps {
+        if !app.installed {
+            let score: i64 = 30;
+            let item = serde_json::json!({
+                "name": app.name,
+                "id": app.id,
+                "header_image": app.icon_url,
+                "is_free": true,
+                "platform": "wasm",
+                "owned": false,
+                "short_description": app.description,
+                "store_url": "",
+                "price": { "formatted": "免费" },
+                "recommendation_score": score,
+                "recommendation_source": "wasm_store",
+                "genres": [],
+            });
+            scored_items.push((score, item));
+        }
+    }
+
+    // 按分数降序排序
+    scored_items.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // 取前 30
+    let recommendations: Vec<Value> = scored_items
+        .into_iter()
+        .take(30)
+        .map(|(_, item)| item)
+        .collect();
+
+    let total = recommendations.len();
+
+    // 缓存 1 小时
+    cache_set(cache_key, recommendations.clone(), 3600).await;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "items": recommendations,
+        "total": total,
+        "cached": false,
+        "generated_at": now_epoch(),
+    })))
+}
+
+/// GET /api/v1/wasm-store/steam/search - Steam 商店搜索（独立端点）
+pub async fn search_steam_store(
+    query: web::Query<SearchQuery>,
+) -> Result<HttpResponse, AppError> {
+    let search_term = query.q.clone().unwrap_or_default();
+    if search_term.is_empty() {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "items": [],
+            "total": 0,
+        })));
+    }
+
+    info!("Steam 商店搜索: {}", search_term);
+
+    let cache_key = format!("steam_store_search_{}", search_term.to_lowercase());
+    if let Some(cached) = cache_get(&cache_key).await {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "items": cached,
+            "total": cached.len(),
+            "cached": true,
+        })));
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(8))
+        .connect_timeout(Duration::from_secs(3))
+        .build()
+        .unwrap_or_default();
+
+    let url = format!(
+        "https://store.steampowered.com/api/storesearch/?term={}&l=schinese&cc=CN",
+        urlencoding::encode(&search_term)
+    );
+
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Steam 搜索 API 失败: {}", e);
+            return Ok(HttpResponse::Ok().json(serde_json::json!({
+                "items": [],
+                "total": 0,
+            })));
+        }
+    };
+
+    if !resp.status().is_success() {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "items": [],
+            "total": 0,
+        })));
+    }
+
+    let json: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => {
+            return Ok(HttpResponse::Ok().json(serde_json::json!({
+                "items": [],
+                "total": 0,
+            })));
+        }
+    };
+
+    let owned_appids = get_owned_steam_appids_from_cache().await;
+    let mut games = Vec::new();
+
+    if let Some(items) = json.get("items").and_then(|v| v.as_array()) {
+        for item in items {
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let app_id = item.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+            if name.is_empty() || app_id == 0 {
+                continue;
+            }
+
+            let tiny_image = item
+                .get("tiny_image")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let price_info = item.get("price");
+            let final_price = price_info
+                .and_then(|p| p.get("final"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let is_free = final_price == 0;
+            let formatted_price = if is_free {
+                "免费".to_string()
+            } else {
+                format!("¥{:.2}", final_price as f64 / 100.0)
+            };
+
+            let platforms = item.get("platforms");
+            let header_image = format!(
+                "https://cdn.akamai.steamstatic.com/steam/apps/{}/header.jpg",
+                app_id
+            );
+
+            games.push(serde_json::json!({
+                "name": name,
+                "app_id": app_id,
+                "header_image": header_image,
+                "tiny_image": tiny_image,
+                "is_free": is_free,
+                "platform": "steam",
+                "owned": owned_appids.contains(&app_id),
+                "store_url": format!("https://store.steampowered.com/app/{}", app_id),
+                "price": {
+                    "final": final_price,
+                    "formatted": formatted_price,
+                },
+                "platforms": {
+                    "windows": platforms.and_then(|p| p.get("windows")).and_then(|v| v.as_bool()).unwrap_or(false),
+                    "linux": platforms.and_then(|p| p.get("linux")).and_then(|v| v.as_bool()).unwrap_or(false),
+                    "mac": platforms.and_then(|p| p.get("mac")).and_then(|v| v.as_bool()).unwrap_or(false),
+                },
+                "short_description": "",
+                "genres": [],
+            }));
+        }
+    }
+
+    let total = games.len();
+    cache_set(&cache_key, games.clone(), 180).await;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "items": games,
+        "total": total,
+        "cached": false,
     })))
 }
