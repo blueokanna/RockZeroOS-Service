@@ -320,6 +320,10 @@ pub struct CreateSessionRequest {
     pub file_id: Option<String>,   // 文件 ID（数据库中的）
     pub file_path: Option<String>, // 文件路径（文件系统中的）
     pub zkp_registration: Option<String>,
+    /// When true, segments are served as plaintext (no AES-256-GCM transport encryption).
+    /// Suitable for ARM / low-performance devices or when libmpv cannot decrypt inline.
+    #[serde(default)]
+    pub direct_mode: bool,
 }
 
 pub async fn create_hls_session(
@@ -392,14 +396,25 @@ pub async fn create_hls_session(
         )
         .map_err(convert_hls_error)?;
 
+    // Set direct mode if requested (plaintext segments for ARM / libmpv)
+    if body.direct_mode {
+        manager
+            .set_session_direct_mode(&session_id, true)
+            .map_err(convert_hls_error)?;
+        info!(
+            "Session {} direct_mode enabled (plaintext segments)",
+            session_id
+        );
+    }
+
     let session = manager
         .get_session(&session_id)
         .map_err(convert_hls_error)?;
 
     let has_zkp = zkp_registration.is_some();
     info!(
-        "Created HLS session {} for user {} - file {} (ZKP enabled: {})",
-        session_id, user_id, file_path, has_zkp
+        "Created HLS session {} for user {} - file {} (ZKP: {}, direct: {})",
+        session_id, user_id, file_path, has_zkp, body.direct_mode
     );
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -407,7 +422,8 @@ pub async fn create_hls_session(
         "expires_at": session.expires_at.timestamp(),
         "playlist_url": format!("/api/v1/secure-hls/{}/playlist.m3u8", session_id),
         "zkp_enabled": has_zkp,
-        "encryption_method": "AES-256-GCM",
+        "direct_mode": body.direct_mode,
+        "encryption_method": if body.direct_mode { "none" } else { "AES-256-GCM" },
     })))
 }
 
@@ -995,15 +1011,17 @@ pub async fn get_secure_playlist(
         .body(playlist_content))
 }
 
-/// 直接获取视频段（GET，session 鉴权 + AES-256-GCM 传输加密）
+/// 直接获取视频段（GET，session 鉴权）
 ///
 /// 标准 HLS 播放器可以直接 GET 请求获取视频段。
-/// 安全性由 session_id（随机 UUID）+ AES-256-GCM 传输加密保证：
+/// 安全性由 session_id（随机 UUID）保证：
 /// - 创建 session 时已验证 JWT + SAE 握手
 /// - session_id 是 128 位随机值，不可猜测
 /// - session 有 3 小时过期时间
-/// - 使用 SecureFileEncryptor 的 AES-256-GCM 加密所有传输数据
 /// - 磁盘上的段文件也使用 encrypt_file 进行静态加密（defense in depth）
+///
+/// 当 session.direct_mode == true 时，返回明文视频段（适合 ARM 等低性能设备）。
+/// 当 session.direct_mode == false 时，返回 AES-256-GCM 加密的视频段。
 pub async fn get_segment_direct(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<(String, String)>,
@@ -1018,13 +1036,14 @@ pub async fn get_segment_direct(
         )));
     }
 
-    // 验证会话并获取文件路径 + 加密能力
-    let (_file_path, encrypted_segment) = {
+    // 验证会话并获取文件路径 + 段数据
+    let (is_direct_mode, response_data) = {
         let manager = hls_manager.read().await;
         let session = manager
             .get_session(&session_id)
             .map_err(convert_hls_error)?;
         let fp = session.file_path.clone();
+        let direct_mode = session.direct_mode;
 
         // 构建缓存路径
         let video_hash = blake3::hash(fp.as_bytes());
@@ -1047,41 +1066,64 @@ pub async fn get_segment_direct(
             let storage_key = derive_segment_storage_key(&fp);
             let segment_data = read_segment_data(&segment_path, &storage_key).await?;
 
-            // 使用会话密钥进行传输加密（复用 encrypt_segment = AES-256-GCM）
-            let encrypted = session
-                .encrypt_segment(&segment_data)
-                .map_err(convert_hls_error)?;
-
-            (fp, encrypted)
+            if direct_mode {
+                // 直接模式：返回明文视频段
+                (true, segment_data)
+            } else {
+                // 加密模式：使用会话密钥进行传输加密
+                let encrypted = session
+                    .encrypt_segment(&segment_data)
+                    .map_err(convert_hls_error)?;
+                (false, encrypted)
+            }
         } else {
             // 从磁盘读取段数据（自动处理静态加密文件）
             let storage_key = derive_segment_storage_key(&fp);
             let segment_data = read_segment_data(&segment_path, &storage_key).await?;
 
-            // 使用会话密钥进行传输加密
-            let encrypted = session
-                .encrypt_segment(&segment_data)
-                .map_err(convert_hls_error)?;
-
-            (fp, encrypted)
+            if direct_mode {
+                (true, segment_data)
+            } else {
+                let encrypted = session
+                    .encrypt_segment(&segment_data)
+                    .map_err(convert_hls_error)?;
+                (false, encrypted)
+            }
         }
     };
 
-    info!(
-        "🔒 Serving encrypted segment {} for session {} ({} bytes)",
-        segment_name,
-        session_id,
-        encrypted_segment.len()
-    );
+    if is_direct_mode {
+        info!(
+            "📺 Serving plaintext segment {} for session {} ({} bytes)",
+            segment_name,
+            session_id,
+            response_data.len()
+        );
 
-    Ok(HttpResponse::Ok()
-        .content_type("video/mp2t")
-        .insert_header(("X-Encrypted", "true"))
-        .insert_header(("X-Encryption-Method", "AES-256-GCM"))
-        .insert_header(("Content-Length", encrypted_segment.len()))
-        .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
-        .insert_header(("Access-Control-Allow-Origin", "*"))
-        .body(encrypted_segment))
+        Ok(HttpResponse::Ok()
+            .content_type("video/mp2t")
+            .insert_header(("X-Encrypted", "false"))
+            .insert_header(("Content-Length", response_data.len()))
+            .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
+            .insert_header(("Access-Control-Allow-Origin", "*"))
+            .body(response_data))
+    } else {
+        info!(
+            "🔒 Serving encrypted segment {} for session {} ({} bytes)",
+            segment_name,
+            session_id,
+            response_data.len()
+        );
+
+        Ok(HttpResponse::Ok()
+            .content_type("video/mp2t")
+            .insert_header(("X-Encrypted", "true"))
+            .insert_header(("X-Encryption-Method", "AES-256-GCM"))
+            .insert_header(("Content-Length", response_data.len()))
+            .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
+            .insert_header(("Access-Control-Allow-Origin", "*"))
+            .body(response_data))
+    }
 }
 
 /// 获取加密的 TS 段（需要 ZKP 证明）
