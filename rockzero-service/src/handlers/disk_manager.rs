@@ -944,26 +944,6 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
     Ok(disks)
 }
 
-#[cfg(target_os = "linux")]
-fn parse_size_string(size_str: &str) -> u64 {
-    let size_str = size_str.trim();
-    let (num_str, unit) = if size_str.ends_with('G') {
-        (&size_str[..size_str.len() - 1], 1024u64 * 1024 * 1024)
-    } else if size_str.ends_with('M') {
-        (&size_str[..size_str.len() - 1], 1024u64 * 1024)
-    } else if size_str.ends_with('K') {
-        (&size_str[..size_str.len() - 1], 1024u64)
-    } else if size_str.ends_with('T') {
-        (
-            &size_str[..size_str.len() - 1],
-            1024u64 * 1024 * 1024 * 1024,
-        )
-    } else {
-        (size_str, 1u64)
-    };
-    num_str.parse::<f64>().unwrap_or(0.0) as u64 * unit
-}
-
 #[allow(unused_variables)]
 fn get_disk_metadata(
     device_path: &str,
@@ -2035,9 +2015,11 @@ pub async fn initialize_disk(
 
         // Step 7: 初始化后自动挂载 — 用户无需手动挂载
         let mount_base = std::env::var("MOUNT_BASE").unwrap_or_else(|_| "/mnt".to_string());
-        let mount_label = body.label.as_deref().unwrap_or(&partition_device
-            .replace("/dev/", "")
-            .replace("/", "_"));
+        let default_mount_label = partition_device.replace("/dev/", "").replace("/", "_");
+        let mount_label = body
+            .label
+            .clone()
+            .unwrap_or(default_mount_label);
         let auto_mount_point = format!("{}/{}", mount_base, mount_label);
 
         let auto_mount_msg = match auto_mount_after_format(&partition_device, &auto_mount_point) {
