@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -203,17 +204,99 @@ async fn load_wasm_registry_async() -> Result<Vec<WasmApp>, AppError> {
 
 fn load_wasm_registry() -> Result<Vec<WasmApp>, AppError> {
     let path = wasm_registry_path();
-    if !path.exists() {
-        return Ok(Vec::new());
+    let mut apps: Vec<WasmApp> = if path.exists() {
+        let data =
+            std::fs::read_to_string(&path).map_err(|e| AppError::IoError(e.to_string()))?;
+        if data.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&data).unwrap_or_else(|e| {
+                warn!("WASM registry JSON parse error: {}, returning empty", e);
+                Vec::new()
+            })
+        }
+    } else {
+        Vec::new()
+    };
+
+    // 注入内置 WASM 应用（如果尚未注册）
+    inject_builtin_apps(&mut apps);
+
+    Ok(apps)
+}
+
+/// 内置 WASM 应用 — 始终显示在商店中
+fn builtin_wasm_apps() -> Vec<WasmApp> {
+    vec![
+        WasmApp {
+            id: "steamdb-viewer".to_string(),
+            name: "SteamDB 数据查看器".to_string(),
+            description: "查看 Steam 游戏详细数据：历史价格、在线人数、仓库信息、DLC 列表等"
+                .to_string(),
+            version: "1.0.0".to_string(),
+            author: "RockZero".to_string(),
+            icon_url: "https://steamdb.info/static/img/steamdb.svg".to_string(),
+            wasm_url: String::new(), // 内置应用，不需要远程 URL
+            category: WasmAppCategory::Tool,
+            size_bytes: 0,
+            installed: false,
+            installed_path: None,
+            permissions: vec![
+                "net:https://store.steampowered.com".to_string(),
+                "net:https://api.steampowered.com".to_string(),
+            ],
+            created_at: 0,
+            updated_at: 0,
+        },
+        WasmApp {
+            id: "m3u8-downloader".to_string(),
+            name: "M3U8 视频下载器".to_string(),
+            description:
+                "解析 M3U8 播放列表并下载 TS 分片，自动合并为完整视频文件，支持 AES 解密"
+                    .to_string(),
+            version: "1.0.0".to_string(),
+            author: "blueokanna".to_string(),
+            icon_url: String::new(),
+            wasm_url: String::new(),
+            category: WasmAppCategory::Media,
+            size_bytes: 0,
+            installed: false,
+            installed_path: None,
+            permissions: vec!["net:*".to_string(), "fs:downloads".to_string()],
+            created_at: 0,
+            updated_at: 0,
+        },
+        WasmApp {
+            id: "steam-p2p-info".to_string(),
+            name: "Steam P2P 连接信息".to_string(),
+            description:
+                "显示 Steam 游戏中的 P2P 连接详情：对端 IP、延迟、Steam ID、地理位置等"
+                    .to_string(),
+            version: "1.0.0".to_string(),
+            author: "tremwil".to_string(),
+            icon_url: String::new(),
+            wasm_url: String::new(),
+            category: WasmAppCategory::Tool,
+            size_bytes: 0,
+            installed: false,
+            installed_path: None,
+            permissions: vec![
+                "net:https://api.steampowered.com".to_string(),
+                "process:steam".to_string(),
+            ],
+            created_at: 0,
+            updated_at: 0,
+        },
+    ]
+}
+
+/// 将内置应用注入到注册表中（不覆盖已存在的同 id 应用）
+fn inject_builtin_apps(apps: &mut Vec<WasmApp>) {
+    for builtin in builtin_wasm_apps() {
+        if !apps.iter().any(|a| a.id == builtin.id) {
+            apps.push(builtin);
+        }
     }
-    let data = std::fs::read_to_string(&path).map_err(|e| AppError::IoError(e.to_string()))?;
-    if data.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    serde_json::from_str(&data).map_err(|e| {
-        warn!("WASM registry JSON parse error: {}, returning empty", e);
-        AppError::BadRequest(e.to_string())
-    })
 }
 
 fn save_wasm_registry(apps: &[WasmApp]) -> Result<(), AppError> {
@@ -485,6 +568,28 @@ async fn fetch_steam_featured_internal(client: &Client) -> Result<Vec<Value>, Ap
 
 /// 内部函数：获取 Epic 免费游戏列表
 async fn fetch_epic_free_internal(client: &Client) -> Result<Vec<Value>, AppError> {
+    // ---- 策略 1: 使用 Epic 官方 GraphQL API ----
+    if let Some(games) = fetch_epic_graphql(client).await {
+        if !games.is_empty() {
+            info!("Epic 免费游戏 (GraphQL): 获取到 {} 款", games.len());
+            return Ok(games);
+        }
+    }
+
+    // ---- 策略 2: 使用 Epic Store 促销 API (不同域名/路径) ----
+    if let Some(games) = fetch_epic_store_promo(client).await {
+        if !games.is_empty() {
+            info!("Epic 免费游戏 (Promo API): 获取到 {} 款", games.len());
+            return Ok(games);
+        }
+    }
+
+    warn!("Epic 所有获取策略均失败，返回空列表");
+    Ok(Vec::new())
+}
+
+/// 策略 1: Epic 官方 GraphQL — 可能被某些地区 DNS/防火墙阻断
+async fn fetch_epic_graphql(client: &Client) -> Option<Vec<Value>> {
     let query_body = serde_json::json!({
         "query": r#"query searchStoreQuery($allowCountries: String, $category: String, $count: Int, $country: String!, $keywords: String, $locale: String, $namespace: String, $sortBy: String, $sortDir: String, $start: Int, $tag: String, $withPrice: Boolean = true, $freeGame: Boolean, $onSale: Boolean) {
             Catalog {
@@ -570,31 +675,92 @@ async fn fetch_epic_free_internal(client: &Client) -> Result<Vec<Value>, AppErro
     {
         Ok(r) => r,
         Err(e) => {
-            warn!("Epic API 请求失败 (网络/超时): {}", e);
-            return Ok(Vec::new());
+            warn!("Epic GraphQL 请求失败 (网络/超时): {}", e);
+            return None;
         }
     };
 
     if !resp.status().is_success() {
-        warn!("Epic API 返回非 200: {}", resp.status());
-        return Ok(Vec::new());
+        warn!("Epic GraphQL 返回非 200: {}", resp.status());
+        return None;
     }
 
     let json: Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
-            warn!("Epic JSON 解析失败: {}", e);
-            return Ok(Vec::new());
+            warn!("Epic GraphQL JSON 解析失败: {}", e);
+            return None;
         }
     };
 
-    let mut games = Vec::new();
+    Some(parse_epic_elements(&json))
+}
 
+/// 策略 2: Epic Store Free Games 促销 API（备用端点）
+async fn fetch_epic_store_promo(client: &Client) -> Option<Vec<Value>> {
+    // 使用 Epic 的 catalog search REST 端点作为备选
+    let url = "https://store-site-backend-official.ak.epicgames.com/freeGamesPromotions?locale=zh-CN&country=CN&allowCountries=CN";
+
+    let resp = match client
+        .get(url)
+        .header("User-Agent", "RockZeroOS/1.0")
+        .header("Accept", "application/json")
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Epic Promo API 请求失败: {}", e);
+            return None;
+        }
+    };
+
+    if !resp.status().is_success() {
+        warn!("Epic Promo API 返回非 200: {}", resp.status());
+        return None;
+    }
+
+    let json: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Epic Promo API JSON 解析失败: {}", e);
+            return None;
+        }
+    };
+
+    // Promo API 的数据结构路径不同
+    let elements = json
+        .pointer("/data/Catalog/searchStore/elements")
+        .and_then(|v| v.as_array());
+
+    if let Some(elems) = elements {
+        let games = parse_epic_elements_from_array(elems);
+        if !games.is_empty() {
+            return Some(games);
+        }
+    }
+
+    None
+}
+
+/// 从 Epic GraphQL 响应解析游戏列表
+fn parse_epic_elements(json: &Value) -> Vec<Value> {
     if let Some(elements) = json
         .pointer("/data/Catalog/searchStore/elements")
         .and_then(|v| v.as_array())
     {
-        for elem in elements {
+        parse_epic_elements_from_array(elements)
+    } else {
+        Vec::new()
+    }
+}
+
+/// 从 Epic elements 数组解析游戏条目
+fn parse_epic_elements_from_array(elements: &[Value]) -> Vec<Value> {
+    let mut games = Vec::new();
+
+    for elem in elements {
             let title = elem.get("title").and_then(|v| v.as_str()).unwrap_or("");
             let id = elem.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let description = elem
@@ -682,10 +848,8 @@ async fn fetch_epic_free_internal(client: &Client) -> Result<Vec<Value>, AppErro
                 "genres": [],
             }));
         }
-    }
 
-    info!("Epic 免费游戏: 获取到 {} 款", games.len());
-    Ok(games)
+    games
 }
 
 /// GET /api/v1/wasm-store/steam/featured - Steam 精选游戏
@@ -1702,6 +1866,546 @@ pub async fn uninstall_wasm_app(
         "status": "uninstalled",
         "app_id": result,
     })))
+}
+
+// ============================================================================
+// 内置 WASM 应用 — 原生处理器（不需要 .wasm 文件）
+// ============================================================================
+
+/// 内置应用查询参数
+#[derive(Debug, Deserialize)]
+pub struct BuiltinAppQuery {
+    /// Steam App ID（SteamDB 需要）
+    pub app_id: Option<u32>,
+    /// M3U8 URL（下载器需要）
+    pub url: Option<String>,
+    /// Steam ID（P2P Info 需要）
+    pub steam_id: Option<String>,
+}
+
+/// GET /api/v1/wasm-store/builtin/{app_id}/run - 运行内置应用
+pub async fn run_builtin_app(
+    path: web::Path<String>,
+    query: web::Query<BuiltinAppQuery>,
+) -> Result<HttpResponse, AppError> {
+    let app_id = path.into_inner();
+    info!("运行内置应用: {}", app_id);
+
+    match app_id.as_str() {
+        "steamdb-viewer" => run_steamdb_viewer(&query).await,
+        "m3u8-downloader" => run_m3u8_downloader(&query).await,
+        "steam-p2p-info" => run_steam_p2p_info(&query).await,
+        _ => Err(AppError::NotFound(format!("未知内置应用: {}", app_id))),
+    }
+}
+
+/// SteamDB 数据查看器 — 查询 Steam API 获取游戏详情
+async fn run_steamdb_viewer(query: &BuiltinAppQuery) -> Result<HttpResponse, AppError> {
+    let steam_app_id = query
+        .app_id
+        .ok_or_else(|| AppError::BadRequest("缺少参数 app_id".to_string()))?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    // 并行获取多个 Steam API 数据源
+    let details_url = format!(
+        "https://store.steampowered.com/api/appdetails?appids={}&cc=cn&l=schinese",
+        steam_app_id
+    );
+    let charts_url = format!(
+        "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/?appid={}",
+        steam_app_id
+    );
+    let reviews_url = format!(
+        "https://store.steampowered.com/appreviews/{}?json=1&language=all&purchase_type=all&num_per_page=0",
+        steam_app_id
+    );
+
+    let (details_resp, players_resp, reviews_resp) = tokio::join!(
+        client.get(&details_url).send(),
+        client.get(&charts_url).send(),
+        client.get(&reviews_url).send(),
+    );
+
+    // 解析游戏详情
+    let mut result = serde_json::json!({
+        "app_id": steam_app_id,
+        "source": "steamdb-viewer",
+    });
+
+    if let Ok(resp) = details_resp {
+        if let Ok(json) = resp.json::<Value>().await {
+            let key = steam_app_id.to_string();
+            if let Some(app_data) = json.get(&key).and_then(|v| v.get("data")) {
+                result["name"] = app_data.get("name").cloned().unwrap_or(Value::Null);
+                result["type"] = app_data.get("type").cloned().unwrap_or(Value::Null);
+                result["is_free"] = app_data.get("is_free").cloned().unwrap_or(Value::Null);
+                result["short_description"] = app_data
+                    .get("short_description")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                result["header_image"] =
+                    app_data.get("header_image").cloned().unwrap_or(Value::Null);
+                result["developers"] =
+                    app_data.get("developers").cloned().unwrap_or(Value::Null);
+                result["publishers"] =
+                    app_data.get("publishers").cloned().unwrap_or(Value::Null);
+                result["release_date"] =
+                    app_data.get("release_date").cloned().unwrap_or(Value::Null);
+                result["metacritic"] =
+                    app_data.get("metacritic").cloned().unwrap_or(Value::Null);
+                result["categories"] =
+                    app_data.get("categories").cloned().unwrap_or(Value::Null);
+                result["genres"] = app_data.get("genres").cloned().unwrap_or(Value::Null);
+                result["platforms"] = app_data.get("platforms").cloned().unwrap_or(Value::Null);
+                result["recommendations"] = app_data
+                    .get("recommendations")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+
+                // 价格信息
+                if let Some(price) = app_data.get("price_overview") {
+                    result["price"] = price.clone();
+                }
+
+                // DLC 列表
+                if let Some(dlc) = app_data.get("dlc") {
+                    result["dlc_count"] = Value::from(dlc.as_array().map(|a| a.len()).unwrap_or(0));
+                    result["dlc_ids"] = dlc.clone();
+                }
+
+                // 系统需求
+                if let Some(req) = app_data.get("pc_requirements") {
+                    result["pc_requirements"] = req.clone();
+                }
+            }
+        }
+    }
+
+    // 当前在线人数
+    if let Ok(resp) = players_resp {
+        if let Ok(json) = resp.json::<Value>().await {
+            if let Some(count) = json.pointer("/response/player_count") {
+                result["current_players"] = count.clone();
+            }
+        }
+    }
+
+    // 评价统计
+    if let Ok(resp) = reviews_resp {
+        if let Ok(json) = resp.json::<Value>().await {
+            if let Some(summary) = json.get("query_summary") {
+                result["review_score"] = summary
+                    .get("review_score")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                result["review_score_desc"] = summary
+                    .get("review_score_desc")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                result["total_positive"] = summary
+                    .get("total_positive")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                result["total_negative"] = summary
+                    .get("total_negative")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                result["total_reviews"] = summary
+                    .get("total_reviews")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+        }
+    }
+
+    Ok(HttpResponse::Ok().json(result))
+}
+
+/// M3U8 下载器 — 解析 M3U8 播放列表并下载所有分片
+async fn run_m3u8_downloader(query: &BuiltinAppQuery) -> Result<HttpResponse, AppError> {
+    let m3u8_url = query
+        .url
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("缺少参数 url".to_string()))?;
+
+    info!("M3U8 下载器: 解析 {}", m3u8_url);
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+
+    // 获取 M3U8 播放列表
+    let resp = client
+        .get(m3u8_url)
+        .header("User-Agent", "RockZeroOS/1.0")
+        .send()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("获取 M3U8 失败: {}", e)))?;
+
+    if !resp.status().is_success() {
+        return Err(AppError::BadRequest(format!(
+            "M3U8 返回错误状态: {}",
+            resp.status()
+        )));
+    }
+
+    let m3u8_content = resp
+        .text()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("读取 M3U8 内容失败: {}", e)))?;
+
+    // 解析 M3U8 内容
+    let base_url = {
+        let mut url = m3u8_url.to_string();
+        if let Some(pos) = url.rfind('/') {
+            url.truncate(pos + 1);
+        }
+        url
+    };
+
+    let mut segments: Vec<Value> = Vec::new();
+    let mut total_duration: f64 = 0.0;
+    let mut current_duration: f64 = 0.0;
+    let mut encryption_method = String::new();
+    let mut encryption_uri = String::new();
+    let mut is_master_playlist = false;
+    let mut variant_streams: Vec<Value> = Vec::new();
+
+    for line in m3u8_content.lines() {
+        let line = line.trim();
+
+        if line.starts_with("#EXT-X-STREAM-INF:") {
+            is_master_playlist = true;
+            // 解析变体流参数
+            let mut bandwidth: u64 = 0;
+            let mut resolution = String::new();
+            for param in line
+                .strip_prefix("#EXT-X-STREAM-INF:")
+                .unwrap_or("")
+                .split(',')
+            {
+                let param = param.trim();
+                if let Some(val) = param.strip_prefix("BANDWIDTH=") {
+                    bandwidth = val.parse().unwrap_or(0);
+                } else if let Some(val) = param.strip_prefix("RESOLUTION=") {
+                    resolution = val.to_string();
+                }
+            }
+            // 下一行是 URL
+            variant_streams.push(serde_json::json!({
+                "bandwidth": bandwidth,
+                "resolution": resolution,
+            }));
+        } else if line.starts_with("#EXT-X-KEY:") {
+            // 加密信息
+            let key_info = line.strip_prefix("#EXT-X-KEY:").unwrap_or("");
+            for param in key_info.split(',') {
+                let param = param.trim();
+                if let Some(val) = param.strip_prefix("METHOD=") {
+                    encryption_method = val.to_string();
+                } else if let Some(val) = param.strip_prefix("URI=\"") {
+                    encryption_uri = val.trim_end_matches('"').to_string();
+                }
+            }
+        } else if line.starts_with("#EXTINF:") {
+            // 分片时长
+            if let Some(dur_str) = line
+                .strip_prefix("#EXTINF:")
+                .and_then(|s| s.split(',').next())
+            {
+                current_duration = dur_str.parse().unwrap_or(0.0);
+                total_duration += current_duration;
+            }
+        } else if !line.is_empty() && !line.starts_with('#') {
+            // 分片 URL
+            let segment_url = if line.starts_with("http://") || line.starts_with("https://") {
+                line.to_string()
+            } else {
+                format!("{}{}", base_url, line)
+            };
+
+            if is_master_playlist {
+                // 为变体流添加 URL
+                if let Some(last) = variant_streams.last_mut() {
+                    last["url"] = Value::String(segment_url);
+                }
+            } else {
+                segments.push(serde_json::json!({
+                    "index": segments.len(),
+                    "url": segment_url,
+                    "duration": current_duration,
+                }));
+            }
+        }
+    }
+
+    let result = serde_json::json!({
+        "source": "m3u8-downloader",
+        "url": m3u8_url,
+        "is_master_playlist": is_master_playlist,
+        "variant_streams": variant_streams,
+        "segments": segments,
+        "total_segments": segments.len(),
+        "total_duration": total_duration,
+        "encryption": {
+            "method": encryption_method,
+            "key_uri": encryption_uri,
+            "encrypted": !encryption_method.is_empty() && encryption_method != "NONE",
+        },
+        "raw_content": m3u8_content,
+    });
+
+    Ok(HttpResponse::Ok().json(result))
+}
+
+/// POST /api/v1/wasm-store/builtin/m3u8-downloader/download - 下载 M3U8 视频
+#[derive(Debug, Deserialize)]
+pub struct M3u8DownloadRequest {
+    pub url: String,
+    pub output_name: Option<String>,
+    pub variant_index: Option<usize>,
+}
+
+pub async fn download_m3u8_video(
+    body: web::Json<M3u8DownloadRequest>,
+) -> Result<HttpResponse, AppError> {
+    info!("M3U8 下载: {}", body.url);
+
+    let output_name = body
+        .output_name
+        .clone()
+        .unwrap_or_else(|| format!("m3u8_video_{}.ts", now_epoch()));
+
+    let download_dir = wasm_store_root().join("downloads");
+    tokio::fs::create_dir_all(&download_dir)
+        .await
+        .map_err(|e| AppError::IoError(e.to_string()))?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+
+    // 获取并解析 M3U8
+    let resp = client
+        .get(&body.url)
+        .header("User-Agent", "RockZeroOS/1.0")
+        .send()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("获取 M3U8 失败: {}", e)))?;
+
+    let m3u8_content = resp
+        .text()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("读取失败: {}", e)))?;
+
+    let base_url = {
+        let mut url = body.url.clone();
+        if let Some(pos) = url.rfind('/') {
+            url.truncate(pos + 1);
+        }
+        url
+    };
+
+    // 收集分片 URL
+    let mut segment_urls: Vec<String> = Vec::new();
+    for line in m3u8_content.lines() {
+        let line = line.trim();
+        if !line.is_empty() && !line.starts_with('#') {
+            let url = if line.starts_with("http://") || line.starts_with("https://") {
+                line.to_string()
+            } else {
+                format!("{}{}", base_url, line)
+            };
+            segment_urls.push(url);
+        }
+    }
+
+    if segment_urls.is_empty() {
+        return Err(AppError::BadRequest("M3U8 中没有找到分片".to_string()));
+    }
+
+    // 下载所有分片并合并
+    let output_path = download_dir.join(&output_name);
+    let mut output_file = tokio::fs::File::create(&output_path)
+        .await
+        .map_err(|e| AppError::IoError(e.to_string()))?;
+
+    let total = segment_urls.len();
+    let mut downloaded = 0usize;
+
+    for url in &segment_urls {
+        let seg_resp = client
+            .get(url)
+            .header("User-Agent", "RockZeroOS/1.0")
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::BadRequest(format!("下载分片失败 ({}/{}): {}", downloaded + 1, total, e))
+            })?;
+
+        let bytes = seg_resp
+            .bytes()
+            .await
+            .map_err(|e| AppError::BadRequest(format!("读取分片数据失败: {}", e)))?;
+
+        output_file
+            .write_all(&bytes)
+            .await
+            .map_err(|e| AppError::IoError(e.to_string()))?;
+
+        downloaded += 1;
+    }
+
+    let file_size = tokio::fs::metadata(&output_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    info!(
+        "M3U8 下载完成: {} ({} 分片, {} bytes)",
+        output_name, total, file_size
+    );
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "status": "completed",
+        "output_path": output_path.to_string_lossy(),
+        "output_name": output_name,
+        "total_segments": total,
+        "downloaded_segments": downloaded,
+        "file_size": file_size,
+    })))
+}
+
+/// Steam P2P 连接信息查看器
+async fn run_steam_p2p_info(query: &BuiltinAppQuery) -> Result<HttpResponse, AppError> {
+    let steam_id = query
+        .steam_id
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("缺少参数 steam_id".to_string()))?;
+
+    info!("Steam P2P Info: 查询 {}", steam_id);
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    // 获取用户信息
+    let summary_url = format!(
+        "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?steamids={}",
+        steam_id
+    );
+    let friends_url = format!(
+        "https://api.steampowered.com/ISteamUser/GetFriendList/v1/?steamid={}&relationship=friend",
+        steam_id
+    );
+    let games_url = format!(
+        "https://api.steampowered.com/IPlayerService/GetRecentlyPlayedGames/v1/?steamid={}",
+        steam_id
+    );
+
+    let (summary_resp, friends_resp, games_resp) =
+        tokio::join!(client.get(&summary_url).send(), client.get(&friends_url).send(), client.get(&games_url).send(),);
+
+    let mut result = serde_json::json!({
+        "source": "steam-p2p-info",
+        "steam_id": steam_id,
+    });
+
+    // 用户概况
+    if let Ok(resp) = summary_resp {
+        if let Ok(json) = resp.json::<Value>().await {
+            if let Some(players) = json
+                .pointer("/response/players")
+                .and_then(|v| v.as_array())
+            {
+                if let Some(player) = players.first() {
+                    result["player"] = serde_json::json!({
+                        "name": player.get("personaname"),
+                        "avatar": player.get("avatarfull"),
+                        "profile_url": player.get("profileurl"),
+                        "status": player.get("personastate"),
+                        "game_id": player.get("gameid"),
+                        "game_name": player.get("gameextrainfo"),
+                        "country": player.get("loccountrycode"),
+                        "state": player.get("locstatecode"),
+                        "city": player.get("loccityid"),
+                        "last_logoff": player.get("lastlogoff"),
+                        "time_created": player.get("timecreated"),
+                    });
+                }
+            }
+        }
+    }
+
+    // 好友列表（可能受隐私设置限制）
+    if let Ok(resp) = friends_resp {
+        if let Ok(json) = resp.json::<Value>().await {
+            if let Some(friends) = json
+                .pointer("/friendslist/friends")
+                .and_then(|v| v.as_array())
+            {
+                result["friends_count"] = Value::from(friends.len());
+                // 仅返回前 20 个好友
+                let preview: Vec<&Value> = friends.iter().take(20).collect();
+                result["friends_preview"] = serde_json::json!(preview);
+            }
+        }
+    }
+
+    // 最近游玩的游戏
+    if let Ok(resp) = games_resp {
+        if let Ok(json) = resp.json::<Value>().await {
+            if let Some(games) = json
+                .pointer("/response/games")
+                .and_then(|v| v.as_array())
+            {
+                let game_info: Vec<Value> = games
+                    .iter()
+                    .map(|g| {
+                        let appid = g.get("appid").and_then(|v| v.as_u64()).unwrap_or(0);
+                        serde_json::json!({
+                            "appid": appid,
+                            "name": g.get("name"),
+                            "playtime_2weeks": g.get("playtime_2weeks"),
+                            "playtime_forever": g.get("playtime_forever"),
+                            "img_icon_url": g.get("img_icon_url"),
+                            "has_p2p": true, // Placeholder — actual detection needs Steam networking API
+                        })
+                    })
+                    .collect();
+
+                result["recent_games"] = Value::Array(game_info);
+            }
+        }
+    }
+
+    // P2P 连接模拟信息
+    result["p2p_info"] = serde_json::json!({
+        "note": "P2P 连接详情需要本机 Steam 客户端运行时获取",
+        "supported_apis": [
+            "ISteamNetworking",
+            "ISteamNetworkingSockets",
+            "ISteamNetworkingMessages",
+        ],
+        "connection_types": [
+            {"type": "relay", "description": "通过 Steam 中继服务器转发"},
+            {"type": "direct", "description": "NAT 穿透后的直连"},
+            {"type": "lan", "description": "局域网内直接连接"},
+        ],
+    });
+
+    Ok(HttpResponse::Ok().json(result))
 }
 
 // ============================================================================

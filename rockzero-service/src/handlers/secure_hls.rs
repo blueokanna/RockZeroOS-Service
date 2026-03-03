@@ -412,10 +412,17 @@ pub async fn create_hls_session(
         .map_err(convert_hls_error)?;
 
     let has_zkp = zkp_registration.is_some();
-    info!(
-        "Created HLS session {} for user {} - file {} (ZKP: {}, direct: {})",
-        session_id, user_id, file_path, has_zkp, body.direct_mode
-    );
+
+    // Debug: verify session is stored and count total sessions
+    {
+        let sessions = manager.sessions.lock().unwrap();
+        let total = sessions.len();
+        let exists = sessions.contains_key(&session_id);
+        info!(
+            "✅ Created HLS session {} for user {} - file {} (ZKP: {}, direct: {}, verified_stored: {}, total_sessions: {})",
+            session_id, user_id, file_path, has_zkp, body.direct_mode, exists, total
+        );
+    }
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "session_id": session_id,
@@ -987,9 +994,28 @@ pub async fn get_secure_playlist(
 ) -> Result<impl Responder, AppError> {
     let session_id = path.into_inner();
 
+    info!(
+        "📋 Playlist request for session: {} (len={})",
+        session_id,
+        session_id.len()
+    );
+
     // 验证会话并获取文件路径（然后释放读锁）
     let file_path = {
         let manager = hls_manager.read().await;
+
+        // Debug: list active sessions
+        let sessions = manager.sessions.lock().unwrap();
+        let active_count = sessions.len();
+        let known_ids: Vec<String> = sessions.keys().cloned().collect();
+        let found = sessions.contains_key(&session_id);
+        drop(sessions);
+
+        info!(
+            "📋 Session lookup: requested={}, found={}, active_sessions={}, known_ids={:?}",
+            session_id, found, active_count, known_ids
+        );
+
         let session = manager
             .get_session(&session_id)
             .map_err(convert_hls_error)?;
@@ -1261,8 +1287,8 @@ pub async fn stop_session(
 
     info!("Stopping HLS session: {}", session_id);
 
-    // 获取写锁以移除会话
-    let manager = hls_manager.write().await;
+    // Use read lock since remove_session uses internal Mutex
+    let manager = hls_manager.read().await;
 
     // 尝试移除会话
     match manager.remove_session(&session_id) {

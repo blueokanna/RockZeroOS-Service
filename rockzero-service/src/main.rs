@@ -196,6 +196,12 @@ async fn main() -> std::io::Result<()> {
     let _video_access_manager = secure_video_access::init_global_video_access_manager();
     info!("Video access manager initialized");
 
+    // Initialize LAN transfer manager
+    let lan_transfer_manager = Arc::new(RwLock::new(
+        handlers::lan_transfer::LanTransferManager::new(),
+    ));
+    info!("LAN transfer manager initialized");
+
     // Auto-mount all disks
     info!("Auto-mounting disks...");
     handlers::disk_manager::auto_mount_all_disks();
@@ -215,6 +221,7 @@ async fn main() -> std::io::Result<()> {
         let storage_manager_data = storage_manager.clone();
         let hybrid_transport_data = hybrid_transport.clone();
         let app_config_data = app_config.clone();
+        let lan_transfer_data = lan_transfer_manager.clone();
         let cors = Cors::default()
             .allow_any_origin()
             .allowed_methods(vec![
@@ -278,6 +285,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(storage_manager_data))
             .app_data(web::Data::new(hybrid_transport_data))
             .app_data(web::Data::from(app_config_data))
+            .app_data(web::Data::new(lan_transfer_data))
             .app_data(web::Data::new(std::sync::Arc::new(
                 handlers::zkp_auth::ZkpAuthManager::new(),
             )))
@@ -651,6 +659,15 @@ async fn main() -> std::io::Result<()> {
                                 "/wasm/{app_id}",
                                 web::delete().to(handlers::wasm_store::uninstall_wasm_app),
                             )
+                            // 内置应用
+                            .route(
+                                "/builtin/{app_id}/run",
+                                web::get().to(handlers::wasm_store::run_builtin_app),
+                            )
+                            .route(
+                                "/builtin/m3u8-downloader/download",
+                                web::post().to(handlers::wasm_store::download_m3u8_video),
+                            )
                             // 插件系统
                             .route(
                                 "/plugins",
@@ -846,6 +863,23 @@ async fn main() -> std::io::Result<()> {
                                 "/checksum/{id}",
                                 web::get().to(file_transfer::get_file_checksum),
                             ),
+                    )
+                    .service(
+                        web::scope("/lan-transfer")
+                            // 设备信息和共享列表不需要认证（对端设备需要匿名访问）
+                            .route("/device-info", web::get().to(handlers::lan_transfer::get_device_info))
+                            .route("/shared", web::get().to(handlers::lan_transfer::list_shared_items))
+                            .route("/download/{item_id}", web::get().to(handlers::lan_transfer::download_shared_item))
+                            // 管理操作需要认证
+                            .route("/share", web::post().to(handlers::lan_transfer::add_shared_item))
+                            .route("/share/{id}", web::delete().to(handlers::lan_transfer::remove_shared_item))
+                            .route("/scan-games", web::post().to(handlers::lan_transfer::scan_local_games))
+                            .route("/receive", web::post().to(handlers::lan_transfer::receive_from_peer))
+                            .route("/sessions", web::get().to(handlers::lan_transfer::list_sessions))
+                            .route("/sessions/{id}", web::get().to(handlers::lan_transfer::get_session))
+                            .route("/sessions/{id}/cancel", web::post().to(handlers::lan_transfer::cancel_session))
+                            .route("/sessions/{id}", web::delete().to(handlers::lan_transfer::delete_session))
+                            .route("/sessions/cleanup", web::post().to(handlers::lan_transfer::cleanup_sessions)),
                     )
                     .service(
                         web::scope("/secure")
