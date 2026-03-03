@@ -724,18 +724,40 @@ use base64::Engine;
 #[derive(Debug, Deserialize)]
 pub struct GenerateProofRequest {
     #[allow(dead_code)]
-    pub username: String,
+    pub username: Option<String>,
     pub password: String,
-    pub registration: PasswordRegistration,
+    pub registration: Option<PasswordRegistration>,
     pub context: String,
 }
 
 pub async fn generate_zkp_proof(
+    pool: web::Data<SqlitePool>,
+    claims: web::ReqData<Claims>,
     body: web::Json<GenerateProofRequest>,
 ) -> Result<impl Responder, AppError> {
     let zkp_context = ZkpContext::new();
+    let user_id = claims.sub.clone();
 
-    match zkp_context.generate_enhanced_proof(&body.password, &body.registration, &body.context) {
+    let registration = if let Some(registration) = body.registration.clone() {
+        registration
+    } else {
+        let user = crate::db::find_user_by_id(&pool, &user_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+        let zkp_registration_json = user.zkp_registration.ok_or_else(|| {
+            AppError::BadRequest(
+                "User does not have ZKP registration data; please re-login or re-register"
+                    .to_string(),
+            )
+        })?;
+
+        serde_json::from_str::<PasswordRegistration>(&zkp_registration_json).map_err(|e| {
+            AppError::InternalServerError(format!("Invalid ZKP registration data in database: {}", e))
+        })?
+    };
+
+    match zkp_context.generate_enhanced_proof(&body.password, &registration, &body.context) {
         Ok(proof) => Ok(HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "proof": proof

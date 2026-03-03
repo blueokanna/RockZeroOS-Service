@@ -364,29 +364,50 @@ pub async fn create_hls_session(
         user_id, file_path
     );
 
-    let zkp_registration: Option<PasswordRegistration> =
-        if let Some(ref reg_json) = body.zkp_registration {
-            Some(serde_json::from_str(reg_json).map_err(|e| {
-                AppError::BadRequest(format!("Invalid ZKP registration format: {}", e))
-            })?)
-        } else {
-            match get_user_zkp_registration(&pool, &user_id).await {
-                Ok(Some(reg)) => Some(reg),
-                Ok(None) => {
-                    warn!(
-                        "User {} does not have ZKP registration data stored",
-                        user_id
-                    );
-                    None
-                }
-                Err(e) => {
-                    warn!("Failed to get ZKP registration for user {}: {}", user_id, e);
-                    None
-                }
+    let zkp_registration: Option<PasswordRegistration> = match get_user_zkp_registration(&pool, &user_id).await {
+        Ok(Some(reg)) => Some(reg),
+        Ok(None) => {
+            if let Some(ref reg_json) = body.zkp_registration {
+                warn!(
+                    "User {} does not have stored ZKP registration, falling back to request payload",
+                    user_id
+                );
+                Some(serde_json::from_str(reg_json).map_err(|e| {
+                    AppError::BadRequest(format!("Invalid ZKP registration format: {}", e))
+                })?)
+            } else {
+                warn!(
+                    "User {} does not have ZKP registration data stored",
+                    user_id
+                );
+                None
             }
-        };
+        }
+        Err(e) => {
+            warn!("Failed to get ZKP registration for user {}: {}", user_id, e);
+            if let Some(ref reg_json) = body.zkp_registration {
+                warn!(
+                    "Falling back to request ZKP registration for user {} due to DB lookup error",
+                    user_id
+                );
+                Some(serde_json::from_str(reg_json).map_err(|parse_err| {
+                    AppError::BadRequest(format!("Invalid ZKP registration format: {}", parse_err))
+                })?)
+            } else {
+                None
+            }
+        }
+    };
 
     let manager = hls_manager.read().await;
+    let invalidated = manager.invalidate_sessions_for_user_file(&user_id, &file_path);
+    if invalidated > 0 {
+        info!(
+            "Invalidated {} stale HLS sessions for user {} file {}",
+            invalidated, user_id, file_path
+        );
+    }
+
     let session_id = manager
         .complete_sae_handshake_with_registration(
             &body.temp_session_id,

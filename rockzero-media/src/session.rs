@@ -319,6 +319,18 @@ impl HlsSessionManager {
         Ok(())
     }
 
+    /// Invalidate existing sessions for the same user + file pair.
+    ///
+    /// This prevents stale/dirty historical sessions from affecting new playback chains.
+    pub fn invalidate_sessions_for_user_file(&self, user_id: &str, file_path: &str) -> usize {
+        let mut sessions = self.sessions.lock().unwrap();
+        let before = sessions.len();
+        sessions.retain(|_, session| {
+            !(session.user_id == user_id && session.file_path == file_path)
+        });
+        before.saturating_sub(sessions.len())
+    }
+
     pub fn get_session(&self, session_id: &str) -> Result<HlsSession> {
         let sessions = self.sessions.lock().unwrap();
         let session = sessions
