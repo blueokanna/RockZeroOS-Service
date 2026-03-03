@@ -378,6 +378,10 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/capabilities",
                                 web::get().to(handlers::system::get_hardware_capabilities),
+                            )
+                            .route(
+                                "/public-ip",
+                                web::get().to(handlers::system::get_public_ip),
                             ),
                     )
                     .service(

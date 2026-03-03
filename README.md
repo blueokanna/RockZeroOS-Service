@@ -19,7 +19,19 @@
 
 ## Overview
 
-RockZeroOS is a high-performance, secure cross-platform private cloud NAS operating system built with Rust. It features military-grade encryption including WPA3-SAE key exchange, EdDSA (Ed25519) JWT authentication, Bulletproofs zero-knowledge proofs, hardware-accelerated video transcoding, and professional storage management.
+RockZeroOS is a high-performance, secure cross-platform private cloud NAS operating system. The backend is built entirely in Rust using Actix-web with military-grade encryption including WPA3-SAE key exchange, EdDSA (Ed25519) JWT authentication, Bulletproofs zero-knowledge proofs, and AES-256-GCM encryption. The frontend is a Flutter cross-platform client supporting Android, iOS, Windows, macOS, Linux, and Web.
+
+## Features
+
+- **Dashboard** — System overview with CPU, memory, disk, network monitoring, and chronograph-style speed test
+- **File Manager** — Browse disks, navigate directories, upload/download files, LAN file transfer, WebDAV, network shares
+- **Video Playback** — Dual-strategy streaming: direct HTTP Range streaming with JWT auth (Strategy 1), or SAE-encrypted HLS with Bulletproofs ZKP per-segment authentication (Strategy 2)
+- **Game Center** — Multi-platform gaming hub with Steam, Epic Game, WeGame, Ubisoft Connect, Xbox store integration and unified game library
+- **App Store** — Docker container app management with CasaOS/iStoreOS compatible app registry
+- **WASM Runtime** — Run WebAssembly applications and scripts via Wasmtime
+- **Storage Management** — Smart formatting (ext4/XFS/Btrfs/exFAT), auto mount, partition management, SMART monitoring, secure erase
+- **Hardware Transcoding** — Auto-detected FFmpeg hardware acceleration (VAAPI, V4L2 M2M, Rockchip MPP)
+- **Security** — FIDO2/WebAuthn, wallpaper customization with glassmorphic blur, Reed-Solomon + CRC32 secure storage
 
 ## Security Architecture
 
@@ -55,12 +67,25 @@ flowchart TB
 | Hardware Auth | FIDO2/WebAuthn | Support for YubiKey, TouchID, FaceID |
 | Secure Storage | Reed-Solomon + CRC32 | Data integrity verification and error correction |
 
-## Secure HLS Video Streaming
+## Video Playback Architecture
+
+RockZeroOS uses a dual-strategy video playback system:
+
+### Strategy 1: Direct HTTP Range Streaming (Default)
+
+The client uses media_kit (mpv) with JWT auth headers to directly stream video from the server via HTTP Range requests. This supports all formats mpv can decode (MP4, MKV, AVI, WebM, FLV, etc.) with near-instant start time and full seeking support.
+
+```
+Client (media_kit/mpv) → HTTP GET with Authorization header → Server (Actix-web Range response)
+```
+
+### Strategy 2: SAE + HLS Secure Streaming (Fallback)
+
+When direct streaming fails, the client falls back to an encrypted HLS pipeline:
 
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant P as Local Proxy
     participant S as Server
     
     C->>S: 1. JWT Authentication (EdDSA)
@@ -78,46 +103,30 @@ sequenceDiagram
     C->>S: 5. Create HLS Session
     S-->>C: Session ID + Key Verification Hash
     
-    Note over C,P: Client derives encryption key via HKDF-BLAKE3(PMK)
-    C->>P: 6. Start local proxy (127.0.0.1)
-    P->>S: 7. GET playlist.m3u8
-    S-->>P: M3U8 playlist (VOD, 6s segments)
+    Note over C,S: Client derives encryption key via HKDF-BLAKE3(PMK)
+    
+    C->>S: 6. GET playlist.m3u8
+    S-->>C: M3U8 playlist
     
     loop Each Video Segment
-        P->>S: 8. POST segment_N.ts + HMAC signature
+        C->>S: 7. GET segment_N.ts (with HMAC signature)
         Note over S: Verify timestamp + nonce + BLAKE3 HMAC
-        Note over S: Transcode on-demand (stream copy ≤1080p)
-        S-->>P: AES-256-GCM encrypted segment (nonce‖ciphertext‖tag)
-        Note over P: Decrypt in background isolate
-        P-->>C: Decrypted MPEG-TS segment
+        Note over S: Progressive transcoding (stream copy ≤1080p)
+        S-->>C: AES-256-GCM encrypted segment
+        Note over C: Decrypt and play
     end
-    
-    Note over P: Prefetch next 10 segments (4 concurrent)
-    Note over P: LRU cache (100 segments max)
 ```
 
-### Video Pipeline Architecture
+### Client-side Hardware Decoding
 
-The HLS streaming system is designed for low-latency, secure playback on mobile and desktop:
+| Platform | API | Configuration |
+|----------|-----|---------------|
+| Android | MediaCodec | `hwdec=mediacodec` via libmpv |
+| iOS | VideoToolbox | `hwdec=videotoolbox` via libmpv |
+| Windows/Linux/macOS | Auto-detect | `hwdec=auto-safe` via libmpv |
 
-**Server-side (Rust)**
-- On-demand transcoding with FFmpeg: stream copy (`-c:v copy -c:a copy`) for ≤1080p sources, hardware-accelerated re-encoding for >1080p
-- Hardware acceleration auto-detection: VAAPI (Intel/AMD), V4L2 M2M (Amlogic A311D/S905/S922), Rockchip MPP (RK3588), with cached detection result
-- Atomic segment caching: writes to `.tmp` file first, then renames to prevent serving incomplete data
-- Background prefetch: pre-transcodes next 5 segments ahead with 3 concurrent tasks
-- Replay protection: timestamp validation (±30s drift), nonce uniqueness, BLAKE3 HMAC request signing
+### Key Derivation
 
-**Client-side (Flutter)**
-- Local HTTP proxy on `127.0.0.1` decrypts segments before feeding to the player
-- AES-256-GCM decryption offloaded to background isolate via `compute()` for segments >64KB
-- LRU segment cache (100 entries) with concurrent prefetch (10 ahead, 3 behind, 4 parallel)
-- media_kit (libmpv) player with platform-specific hardware decoding:
-  - Android: MediaCodec (`hwdec=mediacodec`)
-  - iOS: VideoToolbox (`hwdec=videotoolbox`)
-  - Desktop: auto-detect (`hwdec=auto-safe`)
-- Optimized buffer: 32MB buffer, 30s cache window, high-resolution seeking with frame drop
-
-**Key Derivation**
 ```
 PMK (from SAE handshake)
   → HKDF-BLAKE3(salt="hls-session-salt:{session_id}", info="hls-master-key")
@@ -128,20 +137,20 @@ Each segment is encrypted as: `nonce(12B) ‖ AES-256-GCM(plaintext, key, nonce)
 
 ## Storage Management
 
-- **Smart Formatting** - Auto-select optimal filesystem based on usage
+- **Smart Formatting** — Auto-select optimal filesystem based on usage
   - System boot: ext4
   - Media library: XFS (large file optimization)
   - Database: ext4 (journal optimization)
   - Backup: Btrfs (snapshot support)
   - Cross-platform: exFAT/NTFS
-- **Auto Mount** - Smart mount point generation with UUID/Label recognition
-- **Partition Management** - GPT/MBR partition table creation
-- **Disk Health** - SMART data monitoring, temperature detection
-- **Secure Erase** - Multi-pass overwrite for data destruction
+- **Auto Mount** — Smart mount point generation with UUID/Label recognition
+- **Partition Management** — GPT/MBR partition table creation
+- **Disk Health** — SMART data monitoring, temperature detection
+- **Secure Erase** — Multi-pass overwrite for data destruction
 
 ## Hardware Accelerated Transcoding
 
-The server auto-detects available hardware at startup (cached for the process lifetime) and selects the optimal encoding pipeline:
+The server auto-detects available hardware at startup and selects the optimal encoding pipeline:
 
 | Platform | Detection Method | Encoder | Decoder | Notes |
 |----------|-----------------|---------|---------|-------|
@@ -152,15 +161,21 @@ The server auto-detects available hardware at startup (cached for the process li
 | Generic ARM | `/dev/video10`, `/dev/video11` | h264_v4l2m2m | h264_v4l2m2m | Verified via encode test |
 | Fallback | — | libx264 (ultrafast) | software | Used when no hardware is detected |
 
-For ≤1080p content, the server uses stream copy (`-c:v copy -c:a copy`) which is near-instant regardless of hardware.
+For ≤1080p content, the server uses stream copy (`-c:v copy -c:a copy`) which is near-instant.
 
-### Client-side Hardware Decoding
+## Game Center
 
-| Platform | API | Configuration |
-|----------|-----|---------------|
-| Android | MediaCodec | `hwdec=mediacodec` via libmpv |
-| iOS | VideoToolbox | `hwdec=videotoolbox` via libmpv |
-| Windows/Linux/macOS | Auto-detect | `hwdec=auto-safe` via libmpv |
+Multi-platform gaming hub integrated into the system:
+
+| Platform | Store URL | Features |
+|----------|-----------|----------|
+| Steam | steamcommunity.com | Game library, play time stats, profile, API key binding |
+| Epic Game | store.epicgames.com | In-app browser store access |
+| WeGame | wegame.com.cn/store | In-app browser store access |
+| Ubisoft Connect | store.ubisoft.com | In-app browser store access |
+| Xbox | xbox.com/games/browse | In-app browser store access |
+
+The **My Library** tab provides a unified view of game accounts across all platforms with Steam full library integration (game count, total play time, recently played).
 
 ## Project Structure
 
@@ -188,55 +203,93 @@ graph LR
 
 ```
 RockZeroOS-Service/
-├── rockzero-common/          # Common library (error handling, config, types)
-├── rockzero-crypto/          # Cryptography library
-│   ├── jwt.rs                # EdDSA JWT (Ed25519 + BLAKE3)
-│   ├── ed25519.rs            # Ed25519 signatures
-│   ├── bulletproofs_ffi.rs   # Bulletproofs RangeProof
-│   ├── zkp.rs                # ZKP authentication
-│   ├── aes.rs                # AES-256-GCM encryption
-│   └── hash.rs               # BLAKE3, SHA3-256
-├── rockzero-sae/             # WPA3-SAE key exchange
-│   ├── client.rs             # SAE client
-│   ├── server.rs             # SAE server
-│   └── crypto.rs             # Curve25519 cryptography
-├── rockzero-media/           # Media processing
-│   ├── session.rs            # HLS session management
-│   ├── encryptor.rs          # AES-256-GCM video encryption
-│   └── bulletproof_auth.rs   # Video segment ZKP auth
-├── rockzero-db/              # Database (SQLite + Reed-Solomon)
-├── rockzero-service/         # Main service
-│   ├── storage_manager.rs    # HLS cache auto-cleanup (30min idle)
-│   └── handlers/
-│       ├── auth.rs           # EdDSA JWT authentication
-│       ├── zkp_auth.rs       # ZKP authentication
-│       ├── secure_hls.rs     # Secure HLS streaming + HW accel detection
-│       └── ...
-└── RockZeroOS-UI/            # Flutter cross-platform client
+├── rockzero-common/              # Common library (error handling, config, types)
+├── rockzero-crypto/              # Cryptography library
+│   ├── src/
+│   │   ├── jwt.rs                # EdDSA JWT (Ed25519 + BLAKE3)
+│   │   ├── ed25519.rs            # Ed25519 signature operations
+│   │   ├── bulletproofs_ffi.rs   # Bulletproofs RangeProof FFI
+│   │   ├── zkp.rs                # ZKP authentication logic
+│   │   ├── aes.rs                # AES-256-GCM encryption/decryption
+│   │   ├── hash.rs               # BLAKE3, SHA3-256 hashing
+│   │   ├── signature.rs          # Digital signatures
+│   │   ├── tls.rs                # Rustls TLS configuration
+│   │   └── utils.rs              # Crypto utilities
+├── rockzero-sae/                 # WPA3-SAE key exchange
+│   ├── src/
+│   │   ├── client.rs             # SAE client (Curve25519)
+│   │   ├── server.rs             # SAE server
+│   │   ├── crypto.rs             # Dragonfly key exchange
+│   │   ├── key_derivation.rs     # PMK derivation via HKDF
+│   │   ├── protocol.rs           # SAE protocol state machine
+│   │   └── types.rs              # SAE message types
+├── rockzero-media/               # Media processing
+│   ├── src/
+│   │   ├── session.rs            # HLS session management
+│   │   ├── encryptor.rs          # AES-256-GCM video segment encryption
+│   │   ├── bulletproof_auth.rs   # Per-segment ZKP authentication
+│   │   ├── media_processor.rs    # FFmpeg detection & HW capabilities
+│   │   ├── chunk_manager.rs      # Progressive chunk management
+│   │   ├── playlist.rs           # M3U8 playlist generation
+│   │   ├── tcp_stream.rs         # TCP streaming transport
+│   │   ├── udp_stream.rs         # UDP streaming transport
+│   │   └── secure_transport.rs   # Encrypted transport layer
+├── rockzero-db/                  # Database (SQLite + Reed-Solomon)
+│   ├── src/
+│   │   ├── secure_db.rs          # Encrypted database operations
+│   │   ├── operations.rs         # CRUD operations
+│   │   └── models.rs             # Database models
+├── rockzero-service/             # Main HTTP service (Actix-web)
+│   ├── src/
+│   │   ├── main.rs               # Server startup, route configuration
+│   │   ├── middleware.rs          # JWT auth middleware
+│   │   ├── storage_manager.rs    # Disk & mount management
+│   │   ├── docker_api.rs         # Docker container API
+│   │   ├── fido.rs               # FIDO2/WebAuthn handler
+│   │   ├── handlers/
+│   │   │   ├── auth.rs           # User registration & login (EdDSA JWT)
+│   │   │   ├── zkp_auth.rs       # Bulletproofs ZKP authentication
+│   │   │   ├── secure_hls.rs     # SAE handshake + encrypted HLS streaming
+│   │   │   ├── streaming.rs      # Direct HTTP Range video streaming
+│   │   │   ├── filemanager.rs    # File CRUD, upload, download, stream_media
+│   │   │   ├── storage.rs        # Storage overview & disk info
+│   │   │   ├── storage_management.rs  # Format, mount, unmount, erase
+│   │   │   ├── disk_manager.rs   # Disk detail & SMART
+│   │   │   ├── docker.rs         # Docker container management
+│   │   │   ├── appstore.rs       # CasaOS/iStoreOS app registry
+│   │   │   ├── wasm_store.rs     # WASM app store & game APIs
+│   │   │   ├── system.rs         # System info (CPU, mem, temp)
+│   │   │   ├── speedtest.rs      # Network speed test
+│   │   │   ├── lan_transfer.rs   # LAN file transfer
+│   │   │   ├── webdav.rs         # WebDAV server
+│   │   │   ├── widgets.rs        # Dashboard widgets
+│   │   │   └── health.rs         # Health check endpoint
+└── RockZeroOS-UI/                # Flutter cross-platform client
     └── lib/
-        ├── services/
-        │   ├── bulletproofs_ffi.dart
-        │   ├── sae_client_curve25519.dart
-        │   ├── secure_hls_proxy.dart   # Local decrypt proxy + isolate decryption
-        │   └── sae_handshake_service.dart
         ├── core/
-        │   ├── services/
-        │   │   ├── wallpaper_service.dart  # Wallpaper + blur amount provider
-        │   │   └── media_kit_initializer.dart
-        │   └── widgets/
-        │       └── shell_scaffold.dart     # Glassmorphic wallpaper background
-        └── features/
-            ├── auth/
-            ├── files/
-            │   └── presentation/pages/
-            │       └── secure_hls_video_player.dart  # HW-accelerated player
-            ├── dashboard/
-            │   └── presentation/pages/
-            │       └── speed_test_page.dart  # Chronograph-style speed test
-            ├── settings/
-            │   └── presentation/pages/
-            │       └── settings_page.dart    # Blur intensity slider
-            └── ...
+        │   ├── models/           # API models (DiskInfo, etc.)
+        │   ├── network/          # API service, Dio HTTP client
+        │   ├── services/         # Wallpaper, media_kit init, etc.
+        │   └── widgets/          # ShellScaffold (glassmorphic nav)
+        ├── features/
+        │   ├── auth/             # Login, register pages
+        │   ├── dashboard/        # Dashboard, speed test
+        │   ├── files/            # File browser, video player
+        │   │   └── presentation/pages/
+        │   │       ├── files_page.dart             # Disk grid + file listing
+        │   │       └── secure_hls_video_player.dart # Dual-strategy video player
+        │   ├── appstore/         # Game center, in-app browser
+        │   │   └── presentation/pages/
+        │   │       ├── wasm_store_page.dart         # Multi-platform game hub
+        │   │       └── in_app_browser_page.dart     # Embedded WebView
+        │   ├── device_discovery/ # mDNS device discovery
+        │   ├── disk/             # Disk formatting & management
+        │   ├── storage/          # Storage overview
+        │   ├── system/           # System monitoring
+        │   └── settings/         # App settings, wallpaper, blur
+        └── services/
+            ├── sae_client_curve25519.dart    # SAE Dragonfly client
+            └── sae_handshake_service.dart    # SAE handshake orchestration
 ```
 
 ## Quick Start
@@ -317,7 +370,18 @@ POST /api/v1/secure-hls/sae/init
 POST /api/v1/secure-hls/sae/commit
 POST /api/v1/secure-hls/sae/confirm
 POST /api/v1/secure-hls/session/create
-POST /api/v1/secure-hls/{session_id}/segment_{n}.ts
+GET  /api/v1/secure-hls/{session_id}/playlist.m3u8
+GET  /api/v1/secure-hls/{session_id}/segment_{n}.ts
+```
+
+### File Manager & Streaming
+
+```http
+GET    /api/v1/filemanager/list?path=...
+POST   /api/v1/filemanager/upload
+GET    /api/v1/filemanager/download?path=...
+GET    /api/v1/filemanager/media/stream?path=...    # Direct HTTP Range streaming
+DELETE /api/v1/filemanager/delete
 ```
 
 ### ZKP
@@ -327,6 +391,16 @@ POST /api/v1/zkp/range-proof/create
 POST /api/v1/zkp/range-proof/verify
 POST /api/v1/zkp/video/proof
 POST /api/v1/zkp/video/verify
+```
+
+### Storage
+
+```http
+GET  /api/v1/storage/disks
+GET  /api/v1/storage/disk/{name}
+POST /api/v1/storage/format
+POST /api/v1/storage/mount
+POST /api/v1/storage/unmount
 ```
 
 ## Performance
@@ -342,8 +416,6 @@ POST /api/v1/zkp/video/verify
 | HLS Segment (stream copy) | <100ms | ≤1080p, no re-encoding |
 | HLS Segment (hw transcode) | ~200-500ms | >1080p, VAAPI/V4L2 |
 | HLS Segment (sw transcode) | ~1-3s | >1080p, libx264 ultrafast |
-| Client Decrypt (isolate) | ~5-15ms | Per 6s segment, background isolate |
-| Prefetch Pipeline | 10 segments ahead | 4 concurrent, ~60s buffer |
 
 ## Docker Deployment
 
@@ -357,18 +429,28 @@ docker run -d \
   rockzero-service
 ```
 
+Multi-architecture build (ARM64 + AMD64):
+
+```bash
+docker compose -f docker-compose.multiarch.yml build
+```
+
 ## Roadmap
 
 - [x] EdDSA (Ed25519) JWT authentication
-- [x] WPA3-SAE key exchange
+- [x] WPA3-SAE key exchange (Curve25519 Dragonfly)
 - [x] Bulletproofs RangeProof ZKP
-- [x] AES-256-GCM encrypted HLS streaming
+- [x] Dual-strategy video streaming (direct + encrypted HLS)
 - [x] FIDO2/WebAuthn hardware authentication
 - [x] Professional storage management
 - [x] Hardware accelerated video transcoding
-- [x] CasaOS/iStoreOS app store
+- [x] CasaOS/iStoreOS app store compatibility
 - [x] Docker container management
 - [x] Flutter cross-platform client
+- [x] Multi-platform game center (Steam/Epic/WeGame/Ubisoft/Xbox)
+- [x] LAN file transfer
+- [x] WebDAV server
+- [x] WASM application runtime
 - [ ] RAID support
 - [ ] Snapshot and backup
 - [ ] Multi-user permission management
@@ -376,20 +458,36 @@ docker run -d \
 - [ ] Remote access (DDNS, VPN)
 - [ ] AI smart album
 
-## License
-
-This project is licensed under AGPL-3.0 - see [LICENSE](LICENSE) for details.
-
 ## Dependencies
 
-- [Actix Web](https://actix.rs/) - High-performance web framework
-- [Tokio](https://tokio.rs/) - Async runtime
-- [ed25519-dalek](https://github.com/dalek-cryptography/ed25519-dalek) - Ed25519 signatures
-- [curve25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) - Curve25519
-- [bulletproofs](https://github.com/dalek-cryptography/bulletproofs) - Zero-knowledge proofs
-- [blake3](https://github.com/BLAKE3-team/BLAKE3) - Fast hashing
-- [FFmpeg](https://ffmpeg.org/) - Media processing
-- [Flutter](https://flutter.dev/) - Cross-platform UI
+### Rust Backend
+
+- [Actix Web](https://actix.rs/) — High-performance async web framework
+- [Tokio](https://tokio.rs/) — Async runtime
+- [SQLx](https://github.com/launchbadge/sqlx) — Async SQLite driver
+- [ed25519-dalek](https://github.com/dalek-cryptography/ed25519-dalek) — Ed25519 signatures
+- [curve25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) — Curve25519 operations
+- [bulletproofs](https://github.com/dalek-cryptography/bulletproofs) — Zero-knowledge proofs
+- [blake3](https://github.com/BLAKE3-team/BLAKE3) — Fast cryptographic hashing
+- [aes-gcm](https://github.com/RustCrypto/AEADs) — AES-256-GCM encryption
+- [Wasmtime](https://wasmtime.dev/) — WebAssembly runtime
+- [Rustls](https://github.com/rustls/rustls) — TLS implementation
+- [FFmpeg](https://ffmpeg.org/) — Media transcoding (external binary)
+
+### Flutter Frontend
+
+- [Riverpod](https://riverpod.dev/) — State management
+- [go_router](https://pub.dev/packages/go_router) — Navigation
+- [media_kit](https://github.com/media-kit/media-kit) — Video playback (mpv)
+- [webview_flutter](https://pub.dev/packages/webview_flutter) — In-app browser
+- [flutter_animate](https://pub.dev/packages/flutter_animate) — Animations
+- [flutter_secure_storage](https://pub.dev/packages/flutter_secure_storage) — Secure credential storage
+
+## License
+
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
+
+See [LICENSE](LICENSE) for the full license text.
 
 ## Contact
 

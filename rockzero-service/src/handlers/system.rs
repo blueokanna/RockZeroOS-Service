@@ -864,3 +864,79 @@ pub async fn get_hardware_capabilities() -> Result<impl Responder, AppError> {
     let capabilities = crate::hardware::detect_hardware();
     Ok(HttpResponse::Ok().json(capabilities))
 }
+
+/// 获取服务器的公网 IP 地址
+///
+/// 优先使用 ip.sb（纯文本 API），备用 api.ipify.org 和 ifconfig.me。
+/// 结果缓存 5 分钟以避免频繁请求。
+pub async fn get_public_ip() -> Result<impl Responder, AppError> {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    use tokio::sync::Mutex;
+
+    // 简单缓存：(IP, 获取时间)
+    static CACHE: OnceLock<Mutex<Option<(String, Instant)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+
+    {
+        let guard = cache.lock().await;
+        if let Some((ref ip, ref when)) = *guard {
+            if when.elapsed().as_secs() < 300 {
+                return Ok(HttpResponse::Ok().json(serde_json::json!({
+                    "public_ip": ip,
+                    "cached": true,
+                })));
+            }
+        }
+    }
+
+    // 按优先级尝试多个 IP 检测服务
+    let services: &[&str] = &[
+        "https://api.ip.sb/ip",
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
+    ];
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| AppError::InternalServerError(format!("HTTP client error: {}", e)))?;
+
+    for service_url in services {
+        match client.get(*service_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.text().await {
+                    let ip = body.trim().to_string();
+                    // 简单验证 IP 格式（IPv4 或 IPv6）
+                    if !ip.is_empty()
+                        && ip.len() < 50
+                        && (ip.contains('.') || ip.contains(':'))
+                    {
+                        tracing::info!("Public IP detected: {} (via {})", ip, service_url);
+
+                        // 更新缓存
+                        let mut guard = cache.lock().await;
+                        *guard = Some((ip.clone(), Instant::now()));
+
+                        return Ok(HttpResponse::Ok().json(serde_json::json!({
+                            "public_ip": ip,
+                            "cached": false,
+                            "source": service_url,
+                        })));
+                    }
+                }
+            }
+            Ok(resp) => {
+                tracing::warn!("IP service {} returned status {}", service_url, resp.status());
+            }
+            Err(e) => {
+                tracing::warn!("IP service {} failed: {}", service_url, e);
+            }
+        }
+    }
+
+    Err(AppError::InternalServerError(
+        "无法获取公网 IP 地址，所有检测服务均不可用".to_string(),
+    ))
+}
