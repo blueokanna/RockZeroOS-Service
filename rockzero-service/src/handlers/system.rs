@@ -291,14 +291,15 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                     continue;
                 }
 
-                let (used_space, available_space, actual_total) = if partition.mount_point.is_some() {
+                let (used_space, available_space, actual_total) = if partition.mount_point.is_some()
+                {
                     let mount_pt = partition.mount_point.as_deref().unwrap_or("");
-                    
+
                     #[cfg(target_os = "linux")]
                     let result = {
                         use std::mem::MaybeUninit;
                         let mut stat_result: Option<(u64, u64, u64)> = None;
-                        
+
                         if !mount_pt.is_empty() {
                             if let Ok(path_cstr) = std::ffi::CString::new(mount_pt) {
                                 let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
@@ -309,29 +310,29 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                                         let total_blocks = stat.f_blocks as u64;
                                         let free_blocks = stat.f_bfree as u64;
                                         let avail_blocks = stat.f_bavail as u64;
-                                        
+
                                         let total = total_blocks * block_size;
                                         let free = free_blocks * block_size;
                                         let avail = avail_blocks * block_size;
-                                        
+
                                         // 真实已用空间 = 总空间 - 空闲空间（包含保留块）
                                         // 但对用户来说，"已用" 应该是 总空间 - 用户可用空间 - 保留块
                                         // 即：used = total - free (实际占用)
                                         // 保留块 = free - avail
                                         // 用户数据 = total - free = used (不含保留块)
                                         let used = total.saturating_sub(free);
-                                        
+
                                         // 对于用户显示，总空间应该减去保留块
                                         // 这样 used/total 的比例才是用户真正关心的
                                         let reserved = free.saturating_sub(avail);
                                         let user_total = total.saturating_sub(reserved);
-                                        
+
                                         stat_result = Some((used, avail, user_total));
                                     }
                                 }
                             }
                         }
-                        
+
                         if let Some((used, avail, total)) = stat_result {
                             (used, avail, total)
                         } else {
@@ -341,14 +342,15 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                             let mut total = partition.size;
                             let mut avail = partition.size;
                             let mut used = 0u64;
-                            
+
                             for disk in disks_info.list() {
                                 let disk_mount = disk.mount_point().to_string_lossy().to_string();
                                 let disk_name = disk.name().to_string_lossy().to_string();
-                                
-                                if disk_mount == mount_pt || 
-                                   disk_name == partition.device_path ||
-                                   disk_name.ends_with(&partition.name) {
+
+                                if disk_mount == mount_pt
+                                    || disk_name == partition.device_path
+                                    || disk_name.ends_with(&partition.name)
+                                {
                                     total = disk.total_space();
                                     avail = disk.available_space();
                                     used = total.saturating_sub(avail);
@@ -356,18 +358,20 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                                     break;
                                 }
                             }
-                            
+
                             if !found {
-                                if let Some(avail_space) = get_available_space(&partition.device_path) {
+                                if let Some(avail_space) =
+                                    get_available_space(&partition.device_path)
+                                {
                                     avail = avail_space;
                                     used = partition.size.saturating_sub(avail_space);
                                 }
                             }
-                            
+
                             (used, avail, total)
                         }
                     };
-                    
+
                     #[cfg(not(target_os = "linux"))]
                     let result = {
                         let disks_info = Disks::new_with_refreshed_list();
@@ -375,14 +379,15 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                         let mut total = partition.size;
                         let mut avail = partition.size;
                         let mut used = 0u64;
-                        
+
                         for disk in disks_info.list() {
                             let disk_mount = disk.mount_point().to_string_lossy().to_string();
                             let disk_name = disk.name().to_string_lossy().to_string();
-                            
-                            if disk_mount == mount_pt || 
-                               disk_name == partition.device_path ||
-                               disk_name.ends_with(&partition.name) {
+
+                            if disk_mount == mount_pt
+                                || disk_name == partition.device_path
+                                || disk_name.ends_with(&partition.name)
+                            {
                                 total = disk.total_space();
                                 avail = disk.available_space();
                                 used = total.saturating_sub(avail);
@@ -390,17 +395,17 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                                 break;
                             }
                         }
-                        
+
                         if !found {
                             if let Some(avail_space) = get_available_space(&partition.device_path) {
                                 avail = avail_space;
                                 used = partition.size.saturating_sub(avail_space);
                             }
                         }
-                        
+
                         (used, avail, total)
                     };
-                    
+
                     result
                 } else {
                     (0, partition.size, partition.size)
@@ -865,16 +870,11 @@ pub async fn get_hardware_capabilities() -> Result<impl Responder, AppError> {
     Ok(HttpResponse::Ok().json(capabilities))
 }
 
-/// 获取服务器的公网 IP 地址
-///
-/// 优先使用 ip.sb（纯文本 API），备用 api.ipify.org 和 ifconfig.me。
-/// 结果缓存 5 分钟以避免频繁请求。
 pub async fn get_public_ip() -> Result<impl Responder, AppError> {
     use std::sync::OnceLock;
     use std::time::Instant;
     use tokio::sync::Mutex;
 
-    // 简单缓存：(IP, 获取时间)
     static CACHE: OnceLock<Mutex<Option<(String, Instant)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
 
@@ -890,10 +890,11 @@ pub async fn get_public_ip() -> Result<impl Responder, AppError> {
         }
     }
 
-    // 按优先级尝试多个 IP 检测服务
     let services: &[&str] = &[
-        "https://api.ip.sb/ip",
+        "https://api4.ipify.org",
+        "https://api4.ip.sb/ip",
         "https://api.ipify.org",
+        "https://api.ip.sb/ip",
         "https://ifconfig.me/ip",
         "https://icanhazip.com",
     ];
@@ -908,14 +909,9 @@ pub async fn get_public_ip() -> Result<impl Responder, AppError> {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(body) = resp.text().await {
                     let ip = body.trim().to_string();
-                    // 简单验证 IP 格式（IPv4 或 IPv6）
-                    if !ip.is_empty()
-                        && ip.len() < 50
-                        && (ip.contains('.') || ip.contains(':'))
-                    {
+                    if !ip.is_empty() && ip.len() < 50 && (ip.contains('.') || ip.contains(':')) {
                         tracing::info!("Public IP detected: {} (via {})", ip, service_url);
 
-                        // 更新缓存
                         let mut guard = cache.lock().await;
                         *guard = Some((ip.clone(), Instant::now()));
 
@@ -928,7 +924,11 @@ pub async fn get_public_ip() -> Result<impl Responder, AppError> {
                 }
             }
             Ok(resp) => {
-                tracing::warn!("IP service {} returned status {}", service_url, resp.status());
+                tracing::warn!(
+                    "IP service {} returned status {}",
+                    service_url,
+                    resp.status()
+                );
             }
             Err(e) => {
                 tracing::warn!("IP service {} failed: {}", service_url, e);

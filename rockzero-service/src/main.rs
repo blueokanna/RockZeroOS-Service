@@ -672,6 +672,14 @@ async fn main() -> std::io::Result<()> {
                                 "/builtin/m3u8-downloader/download",
                                 web::post().to(handlers::wasm_store::download_m3u8_video),
                             )
+                            .route(
+                                "/builtin/downloads",
+                                web::get().to(handlers::wasm_store::list_downloads),
+                            )
+                            .route(
+                                "/builtin/downloads/{filename}",
+                                web::get().to(handlers::wasm_store::serve_download_file),
+                            )
                             // 插件系统
                             .route(
                                 "/plugins",

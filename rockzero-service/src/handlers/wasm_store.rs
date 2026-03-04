@@ -2285,6 +2285,80 @@ pub async fn download_m3u8_video(
     })))
 }
 
+/// GET /api/v1/wasm-store/builtin/downloads - 列出已下载的文件
+pub async fn list_downloads() -> Result<HttpResponse, AppError> {
+    let download_dir = wasm_store_root().join("downloads");
+    if !download_dir.exists() {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "files": [],
+            "total": 0,
+        })));
+    }
+
+    let mut files = Vec::new();
+    let mut entries = tokio::fs::read_dir(&download_dir)
+        .await
+        .map_err(|e| AppError::IoError(e.to_string()))?;
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| AppError::IoError(e.to_string()))?
+    {
+        let meta = entry.metadata().await.ok();
+        let name = entry.file_name().to_string_lossy().to_string();
+        files.push(serde_json::json!({
+            "name": name,
+            "size": meta.as_ref().map(|m| m.len()).unwrap_or(0),
+            "is_file": meta.as_ref().map(|m| m.is_file()).unwrap_or(false),
+        }));
+    }
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "files": files,
+        "total": files.len(),
+    })))
+}
+
+/// GET /api/v1/wasm-store/builtin/downloads/{filename} - 下载指定文件
+pub async fn serve_download_file(
+    path: web::Path<String>,
+) -> Result<HttpResponse, AppError> {
+    let filename = path.into_inner();
+
+    // 安全检查：防止路径遍历
+    if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+        return Err(AppError::BadRequest("非法文件名".to_string()));
+    }
+
+    let file_path = wasm_store_root().join("downloads").join(&filename);
+    if !file_path.exists() || !file_path.is_file() {
+        return Err(AppError::NotFound(format!("文件不存在: {}", filename)));
+    }
+
+    let data = tokio::fs::read(&file_path)
+        .await
+        .map_err(|e| AppError::IoError(e.to_string()))?;
+
+    let content_type = if filename.ends_with(".ts") {
+        "video/mp2t"
+    } else if filename.ends_with(".mp4") {
+        "video/mp4"
+    } else if filename.ends_with(".mkv") {
+        "video/x-matroska"
+    } else {
+        "application/octet-stream"
+    };
+
+    Ok(HttpResponse::Ok()
+        .insert_header(("Content-Type", content_type))
+        .insert_header((
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        ))
+        .body(data))
+}
+
 /// Steam P2P 连接信息查看器
 async fn run_steam_p2p_info(query: &BuiltinAppQuery) -> Result<HttpResponse, AppError> {
     let steam_id = query
@@ -3128,21 +3202,55 @@ pub async fn get_daily_recommendations() -> Result<HttpResponse, AppError> {
     // 按分数降序排序
     scored_items.sort_by(|a, b| b.0.cmp(&a.0));
 
-    // 取前 30
-    let recommendations: Vec<Value> = scored_items
-        .into_iter()
-        .take(30)
-        .map(|(_, item)| item)
-        .collect();
+    // 每个平台取前 30（而非总共 30）
+    let mut steam_items: Vec<Value> = Vec::new();
+    let mut epic_items: Vec<Value> = Vec::new();
+    let mut wasm_items: Vec<Value> = Vec::new();
+    let mut other_items: Vec<Value> = Vec::new();
+
+    for (_, item) in scored_items {
+        let platform = item
+            .get("platform")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        match platform {
+            "steam" if steam_items.len() < 30 => steam_items.push(item),
+            "epic" if epic_items.len() < 30 => epic_items.push(item),
+            "wasm" if wasm_items.len() < 30 => wasm_items.push(item),
+            _ if other_items.len() < 30 => other_items.push(item),
+            _ => {}
+        }
+    }
+
+    // Combine all — frontend can filter by platform
+    let mut recommendations: Vec<Value> = Vec::new();
+    recommendations.extend(steam_items.iter().cloned());
+    recommendations.extend(epic_items.iter().cloned());
+    recommendations.extend(wasm_items.iter().cloned());
+    recommendations.extend(other_items.iter().cloned());
 
     let total = recommendations.len();
 
     // 缓存 1 小时
     cache_set(cache_key, recommendations.clone(), 3600).await;
 
+    info!(
+        "每日推荐: Steam {} / Epic {} / WASM {} / 其他 {} = 总计 {}",
+        steam_items.len(),
+        epic_items.len(),
+        wasm_items.len(),
+        other_items.len(),
+        total,
+    );
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "items": recommendations,
         "total": total,
+        "per_platform": {
+            "steam": steam_items.len(),
+            "epic": epic_items.len(),
+            "wasm": wasm_items.len(),
+        },
         "cached": false,
         "generated_at": now_epoch(),
     })))

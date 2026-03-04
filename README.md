@@ -19,19 +19,19 @@
 
 ## Overview
 
-RockZeroOS is a high-performance, secure cross-platform private cloud NAS operating system. The backend is built entirely in Rust using Actix-web with military-grade encryption including WPA3-SAE key exchange, EdDSA (Ed25519) JWT authentication, Bulletproofs zero-knowledge proofs, and AES-256-GCM encryption. The frontend is a Flutter cross-platform client supporting Android, iOS, Windows, macOS, Linux, and Web.
+RockZeroOS is a high-performance, secure cross-platform private cloud NAS operating system. The backend is built entirely in Rust using Actix-web with military-grade encryption including WPA3-SAE key exchange, EdDSA (Ed25519) JWT authentication, AES-256-GCM encryption, and BLAKE3 integrity verification. The frontend is a Flutter cross-platform client supporting Android, iOS, Windows, macOS, Linux, and Web, with Material Design 3 UI optimized for low-power ARM SoCs (Snapdragon 835 class).
 
 ## Features
 
 - **Dashboard** — System overview with CPU, memory, disk, network monitoring, and chronograph-style speed test
 - **File Manager** — Browse disks, navigate directories, upload/download files, LAN file transfer, WebDAV, network shares
-- **Video Playback** — Dual-strategy streaming: direct HTTP Range streaming with JWT auth (Strategy 1), or SAE-encrypted HLS with Bulletproofs ZKP per-segment authentication (Strategy 2)
-- **Game Center** — Multi-platform gaming hub with Steam, Epic Game, WeGame, Ubisoft Connect, Xbox store integration and unified game library
+- **Video Playback** — Dual-strategy streaming: direct HTTP Range streaming with JWT auth (Strategy 1), or SAE-encrypted HLS with session-based authentication and AES-256-GCM encryption (Strategy 2, direct mode)
+- **Game Center** — Multi-platform gaming hub with Steam, Epic Game, WeGame, Ubisoft Connect, Xbox store integration, unified game library, daily Top 30 recommendations (30 per platform), and built-in SteamDB viewer
 - **App Store** — Docker container app management with CasaOS/iStoreOS compatible app registry
-- **WASM Runtime** — Run WebAssembly applications and scripts via Wasmtime
+- **WASM Runtime** — Run WebAssembly applications and scripts via Wasmtime, including built-in SteamDB viewer, M3U8 video downloader, and Steam P2P connection analyzer
 - **Storage Management** — Smart formatting (ext4/XFS/Btrfs/exFAT), auto mount, partition management, SMART monitoring, secure erase
 - **Hardware Transcoding** — Auto-detected FFmpeg hardware acceleration (VAAPI, V4L2 M2M, Rockchip MPP)
-- **Security** — FIDO2/WebAuthn, wallpaper customization with glassmorphic blur, Reed-Solomon + CRC32 secure storage
+- **Security** — FIDO2/WebAuthn, wallpaper customization with glassmorphic blur, Reed-Solomon + CRC32 secure storage, Bulletproofs ZKP for authentication
 
 ## Security Architecture
 
@@ -40,7 +40,7 @@ flowchart TB
     subgraph Client["Flutter Client"]
         A[User Login] --> B[EdDSA JWT Auth]
         B --> C[SAE Handshake]
-        C --> D[Bulletproofs ZKP]
+        C --> D[Session Auth]
     end
     
     subgraph Server["Rust Backend"]
@@ -61,9 +61,10 @@ flowchart TB
 |---------|------------|-------------|
 | JWT Authentication | EdDSA (Ed25519) | Private key derived from BLAKE3 hash of password |
 | Key Exchange | WPA3-SAE (Dragonfly) | Secure key negotiation based on Curve25519 |
-| Zero-Knowledge Proof | Bulletproofs RangeProof | Prove password knowledge without revealing it |
-| Video Encryption | AES-256-GCM | Each HLS segment independently encrypted |
+| Video Encryption | AES-256-GCM | HLS segments encrypted at rest, session-authenticated playback |
+| Session Auth | 128-bit UUID + BLAKE3 HMAC | Direct mode session token per HLS stream |
 | Replay Protection | Timestamp + Nonce + HMAC | Multi-layer protection mechanism |
+| Zero-Knowledge Proof | Bulletproofs RangeProof | Prove password knowledge without revealing it (auth only) |
 | Hardware Auth | FIDO2/WebAuthn | Support for YubiKey, TouchID, FaceID |
 | Secure Storage | Reed-Solomon + CRC32 | Data integrity verification and error correction |
 
@@ -81,7 +82,7 @@ Client (media_kit/mpv) → HTTP GET with Authorization header → Server (Actix-
 
 ### Strategy 2: SAE + HLS Secure Streaming (Fallback)
 
-When direct streaming fails, the client falls back to an encrypted HLS pipeline:
+When direct streaming fails, the client falls back to an encrypted HLS pipeline using **direct mode** — the client performs an SAE handshake, creates a session with `direct_mode: true`, and accesses the playlist URL directly via media_kit without an intermediate proxy. Bulletproofs ZKP is **not** used for video playback; authentication is handled by session tokens.
 
 ```mermaid
 sequenceDiagram
@@ -100,20 +101,20 @@ sequenceDiagram
     C->>S: 4. SAE Confirm
     S-->>C: Server Confirm + PMK
     
-    C->>S: 5. Create HLS Session
-    S-->>C: Session ID + Key Verification Hash
+    C->>S: 5. Create HLS Session (direct_mode=true)
+    S-->>C: Session ID + Playlist URL
     
-    Note over C,S: Client derives encryption key via HKDF-BLAKE3(PMK)
+    Note over C,S: No per-segment ZKP — session token authenticates all requests
     
-    C->>S: 6. GET playlist.m3u8
+    C->>S: 6. GET playlist.m3u8 (via media_kit)
     S-->>C: M3U8 playlist
     
     loop Each Video Segment
-        C->>S: 7. GET segment_N.ts (with HMAC signature)
-        Note over S: Verify timestamp + nonce + BLAKE3 HMAC
-        Note over S: Progressive transcoding (stream copy ≤1080p)
-        S-->>C: AES-256-GCM encrypted segment
-        Note over C: Decrypt and play
+        C->>S: 7. GET segment_N.ts (session token in URL)
+        Note over S: Verify session token
+        Note over S: Stream copy ≤1080p / HW transcode >1080p
+        S-->>C: AES-256-GCM encrypted segment (at-rest)
+        Note over C: Decrypt and play via hardware decoder
     end
 ```
 
@@ -169,13 +170,23 @@ Multi-platform gaming hub integrated into the system:
 
 | Platform | Store URL | Features |
 |----------|-----------|----------|
-| Steam | steamcommunity.com | Game library, play time stats, profile, API key binding |
-| Epic Game | store.epicgames.com | In-app browser store access |
+| Steam | steamcommunity.com | Game library, play time stats, profile, API key binding, SteamDB viewer |
+| Epic Game | store.epicgames.com | In-app browser store access, free game notifications |
 | WeGame | wegame.com.cn/store | In-app browser store access |
 | Ubisoft Connect | store.ubisoft.com | In-app browser store access |
 | Xbox | xbox.com/games/browse | In-app browser store access |
 
 The **My Library** tab provides a unified view of game accounts across all platforms with Steam full library integration (game count, total play time, recently played).
+
+The **Daily Top 30** tab shows curated recommendations with 30 games per platform (Steam, Epic, WASM) scored by recency, price, and availability.
+
+### Built-in WASM Applications
+
+| App | Description |
+|-----|-------------|
+| SteamDB Viewer | Query Steam API for game details: price, online players, reviews, DLC, system requirements |
+| M3U8 Downloader | Parse M3U8 playlists, download TS segments, auto-merge with AES decryption support |
+| Steam P2P Info | View Steam player profiles, friends list, recent games, and P2P connection details |
 
 ## Project Structure
 
@@ -410,7 +421,7 @@ POST /api/v1/storage/unmount
 | EdDSA JWT Sign | ~0.1ms | Ed25519 via dalek |
 | EdDSA JWT Verify | ~0.2ms | Ed25519 via dalek |
 | SAE Handshake (full) | ~5-10ms | Curve25519 Dragonfly |
-| Bulletproofs RangeProof | ~50ms | 64-bit range proof |
+| Bulletproofs RangeProof | ~50ms | 64-bit range proof (auth only, not video playback) |
 | AES-256-GCM Encrypt/Decrypt | ~500 MB/s | Per-segment encryption |
 | BLAKE3 Hash | ~1 GB/s | Used for HKDF, HMAC, signatures |
 | HLS Segment (stream copy) | <100ms | ≤1080p, no re-encoding |
@@ -439,8 +450,8 @@ docker compose -f docker-compose.multiarch.yml build
 
 - [x] EdDSA (Ed25519) JWT authentication
 - [x] WPA3-SAE key exchange (Curve25519 Dragonfly)
-- [x] Bulletproofs RangeProof ZKP
-- [x] Dual-strategy video streaming (direct + encrypted HLS)
+- [x] Bulletproofs RangeProof ZKP (authentication only)
+- [x] Dual-strategy video streaming (direct + SAE session-authenticated HLS)
 - [x] FIDO2/WebAuthn hardware authentication
 - [x] Professional storage management
 - [x] Hardware accelerated video transcoding
@@ -450,7 +461,7 @@ docker compose -f docker-compose.multiarch.yml build
 - [x] Multi-platform game center (Steam/Epic/WeGame/Ubisoft/Xbox)
 - [x] LAN file transfer
 - [x] WebDAV server
-- [x] WASM application runtime
+- [x] WASM application runtime (with built-in SteamDB viewer, M3U8 downloader, Steam P2P info)
 - [ ] RAID support
 - [ ] Snapshot and backup
 - [ ] Multi-user permission management
@@ -502,5 +513,5 @@ See [LICENSE](LICENSE) for the full license text.
 </p>
 
 <p align="center">
-  Powered by Rust 🦀 | Secured by EdDSA + Bulletproofs 🔐 | Accelerated by Hardware 🚀
+  Powered by Rust 🦀 | Secured by EdDSA + SAE + AES-256-GCM 🔐 | Accelerated by Hardware 🚀
 </p>

@@ -1371,8 +1371,9 @@ mod tests {
         let config = StorageConfig::default();
         assert_eq!(config.hls_cache_retention_days, 7);
         assert_eq!(config.temp_file_retention_days, 1);
-        assert_eq!(config.max_hls_cache_size, 10 * 1024 * 1024 * 1024);
-        assert_eq!(config.max_log_size, 1024 * 1024 * 1024);
+        assert_eq!(config.max_hls_cache_size, 2 * 1024 * 1024 * 1024);
+        assert_eq!(config.max_temp_size, 2 * 1024 * 1024 * 1024);
+        assert_eq!(config.max_log_size, 512 * 1024 * 1024);
     }
 
     #[tokio::test]
