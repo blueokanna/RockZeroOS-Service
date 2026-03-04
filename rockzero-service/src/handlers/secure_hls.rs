@@ -495,12 +495,21 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
     // 锁文件防止并发 ffmpeg 进程
     let lock_file = cache_dir.join(".lock");
 
-    // 如果已完成分片，直接返回缓存的 playlist
+    // 如果已完成分片，优先复用缓存；但要校验 playlist 引用的分片是否都存在
     if done_marker.exists() && playlist_path.exists() {
         let content = tokio::fs::read_to_string(&playlist_path)
             .await
             .map_err(|e| AppError::IoError(format!("Failed to read cached playlist: {}", e)))?;
-        return Ok((cache_dir, content));
+
+        if playlist_segments_exist_on_disk(&cache_dir, &content) {
+            return Ok((cache_dir, content));
+        }
+
+        warn!(
+            "Detected stale HLS cache for {}, playlist references missing segments; regenerating",
+            video_id
+        );
+        let _ = tokio::fs::remove_file(&done_marker).await;
     }
 
     // 如果有播放列表且至少有一个 segment，说明上一次分片正在进行中或中断
@@ -508,7 +517,8 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
     if playlist_path.exists() && lock_file.exists() {
         let content = tokio::fs::read_to_string(&playlist_path).await.ok();
         if let Some(content) = content {
-            if content.contains("#EXTINF") {
+            if content.contains("#EXTINF") && playlist_segments_exist_on_disk(&cache_dir, &content)
+            {
                 info!(
                     "FFmpeg still running for {}, returning progressive playlist",
                     video_id
@@ -599,9 +609,13 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
 
     while waited < max_wait_ms {
         if first_segment.exists() && playlist_path.exists() {
-            // 等待 playlist 至少包含一个 EXTINF
+            // 等待 playlist 至少包含一个可播放段；对于长视频尽量等待 2 段，降低 segment_1 早到 404
             if let Ok(content) = tokio::fs::read_to_string(&playlist_path).await {
-                if content.contains("#EXTINF") {
+                let is_done = done_marker.exists();
+                let min_segments = if is_done { 1 } else { 2 };
+                if playlist_has_min_segments(&content, min_segments)
+                    && playlist_segments_exist_on_disk(&cache_dir, &content)
+                {
                     info!("First segment ready after {}ms, returning playlist", waited);
                     return Ok((cache_dir, content));
                 }
@@ -617,7 +631,9 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
         let content = tokio::fs::read_to_string(&playlist_path)
             .await
             .map_err(|e| AppError::IoError(format!("Failed to read playlist: {}", e)))?;
-        if content.contains("#EXTINF") {
+        if playlist_has_min_segments(&content, 1)
+            && playlist_segments_exist_on_disk(&cache_dir, &content)
+        {
             return Ok((cache_dir, content));
         }
     }
@@ -625,6 +641,40 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
     Err(AppError::InternalServerError(
         "视频分片超时，请检查 ffmpeg 是否正确安装".to_string(),
     ))
+}
+
+fn extract_playlist_segment_names(playlist_content: &str) -> Vec<String> {
+    playlist_content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let no_query = line.split('?').next().unwrap_or(line);
+            let file_name = no_query.rsplit('/').next().unwrap_or(no_query);
+            if file_name.starts_with("segment_") && file_name.ends_with(".ts") {
+                Some(file_name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn playlist_has_min_segments(playlist_content: &str, min_segments: usize) -> bool {
+    extract_playlist_segment_names(playlist_content).len() >= min_segments
+}
+
+fn playlist_segments_exist_on_disk(cache_dir: &std::path::Path, playlist_content: &str) -> bool {
+    let segments = extract_playlist_segment_names(playlist_content);
+    if segments.is_empty() {
+        return false;
+    }
+
+    segments.into_iter().all(|segment| {
+        let ts_path = cache_dir.join(&segment);
+        let enc_path = ts_path.with_extension("ts.enc");
+        ts_path.exists() || enc_path.exists()
+    })
 }
 
 /// 探测视频文件的视频编码格式
@@ -784,6 +834,11 @@ async fn run_ffmpeg_progressive(
     let video_codec = detect_video_codec(ffmpeg_path, file_path).await;
     info!("Detected video codec: {:?}", video_codec);
 
+    let allow_stream_copy = matches!(
+        video_codec.as_deref(),
+        Some("h264" | "avc" | "avc1" | "hevc" | "h265" | "hev1" | "hvc1")
+    );
+
     // 构建 stream copy 参数
     // 关键修复：对于 mpegts 容器必须添加正确的 bitstream filter
     // 否则 H.264/HEVC 的 NAL 封装格式不正确，导致播放器只有音频没有画面
@@ -833,40 +888,51 @@ async fn run_ffmpeg_progressive(
         playlist_path.into(),
     ]);
 
-    // 先尝试 stream copy + bitstream filter（极快，不需要转码）
-    let output = tokio::process::Command::new(ffmpeg_path)
-        .args(&copy_args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+    if allow_stream_copy {
+        // 先尝试 stream copy + bitstream filter（极快，不需要转码）
+        let output = tokio::process::Command::new(ffmpeg_path)
+            .args(&copy_args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| {
+                let _ = std::fs::remove_file(lock_file);
+                format!("Failed to run ffmpeg: {}", e)
+            })?;
 
-    if output.status.success() {
-        // stream copy 成功 — 添加 #EXT-X-ENDLIST 标记完成
-        if let Ok(mut content) = tokio::fs::read_to_string(playlist_path).await {
-            if !content.contains("#EXT-X-ENDLIST") {
-                content.push_str("\n#EXT-X-ENDLIST\n");
-                let _ = tokio::fs::write(playlist_path, &content).await;
+        if output.status.success() {
+            // stream copy 成功 — 添加 #EXT-X-ENDLIST 标记完成
+            if let Ok(mut content) = tokio::fs::read_to_string(playlist_path).await {
+                if !content.contains("#EXT-X-ENDLIST") {
+                    content.push_str("\n#EXT-X-ENDLIST\n");
+                    let _ = tokio::fs::write(playlist_path, &content).await;
+                }
             }
+
+            // 使用 SecureFileEncryptor 加密缓存段文件（静态存储保护）
+            let storage_key = derive_segment_storage_key(file_path);
+            match encrypt_segments_at_rest(cache_dir, &storage_key).await {
+                Ok(n) => info!("Stream copy: encrypted {} segments at rest", n),
+                Err(e) => warn!("Failed to encrypt segments at rest: {}", e),
+            }
+
+            let _ = tokio::fs::write(done_marker, b"").await;
+            let _ = tokio::fs::remove_file(lock_file).await;
+            return Ok(());
         }
 
-        // 使用 SecureFileEncryptor 加密缓存段文件（静态存储保护）
-        let storage_key = derive_segment_storage_key(file_path);
-        match encrypt_segments_at_rest(cache_dir, &storage_key).await {
-            Ok(n) => info!("Stream copy: encrypted {} segments at rest", n),
-            Err(e) => warn!("Failed to encrypt segments at rest: {}", e),
-        }
-
-        let _ = tokio::fs::write(done_marker, b"").await;
-        return Ok(());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(
+            "Stream copy failed, trying transcode: {}",
+            &stderr[..stderr.len().min(500)]
+        );
+    } else {
+        info!(
+            "Skipping stream copy for codec {:?}, using H.264/AAC transcode for compatibility",
+            video_codec
+        );
     }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    warn!(
-        "Stream copy failed, trying transcode: {}",
-        &stderr[..stderr.len().min(500)]
-    );
 
     // 清理出错的输出
     for entry in std::fs::read_dir(cache_dir).into_iter().flatten().flatten() {
@@ -964,6 +1030,7 @@ async fn run_ffmpeg_progressive(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = tokio::fs::remove_file(lock_file).await;
         return Err(format!(
             "FFmpeg segmentation failed: {}",
             &stderr[..stderr.len().min(500)]
@@ -1173,15 +1240,29 @@ pub async fn get_segment_direct(
     if !segment_path.exists() && !enc_path.exists() {
         ensure_hls_segments(&file_path).await?;
 
-        let ready = wait_for_segment_ready(&cache_dir, &segment_name, 15_000).await?;
+        let ready = wait_for_segment_ready(&cache_dir, &segment_name, 45_000).await?;
         if !ready {
-            let max_idx = get_max_existing_segment_index(&cache_dir)
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            return Err(AppError::NotFound(format!(
-                "Segment '{}' not available (video_id={}, max_generated={})",
-                segment_name, video_id, max_idx
-            )));
+            let done_marker = cache_dir.join(".done");
+            let max_idx = get_max_existing_segment_index(&cache_dir);
+
+            if done_marker.exists() {
+                let max_str = max_idx
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                return Err(AppError::NotFound(format!(
+                    "Segment '{}' not available (video_id={}, max_generated={})",
+                    segment_name, video_id, max_str
+                )));
+            }
+
+            return Ok(HttpResponse::ServiceUnavailable()
+                .insert_header(("Retry-After", "2"))
+                .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
+                .insert_header(("Access-Control-Allow-Origin", "*"))
+                .body(format!(
+                    "Segment '{}' is still being generated, please retry",
+                    segment_name
+                )));
         }
     }
 

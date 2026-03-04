@@ -168,6 +168,31 @@ The server auto-detects available hardware at startup and selects the optimal en
 
 For ≤1080p content, the server uses stream copy (`-c:v copy -c:a copy -map 0:v? -map 0:a?`) which is near-instant. The `-map 0:v? -map 0:a?` flags ensure only video and audio streams are selected, avoiding mpegts muxer failures from subtitle or data tracks.
 
+### Adaptive Hybrid Transport (UDP/TCP)
+
+RockZeroOS uses an adaptive hybrid transport layer for secure media delivery. The runtime policy is now constrained to the following production bounds:
+
+- **Default ratio**: UDP 70% + TCP 30%
+- **Maximum UDP ratio**: 70% (therefore TCP minimum is 30%)
+- **Maximum TCP ratio**: 90% (therefore UDP minimum is 10%)
+- **Adaptive trigger**: UDP loss rate above threshold reduces UDP share and increases TCP reliability
+
+The transport startup profile is tuned for high-throughput devices (including ARM NAS boards):
+
+- `chunk_size`: 128 KiB
+- `udp_window_size`: 96
+- `send_buffer_size`: 16 MiB
+- `tcp_max_retries`: 5
+- `udp_loss_threshold`: 3%
+
+On Amlogic A311D class devices, hardware path preference remains:
+
+1. Stream copy when source codec/container is directly playable (fastest path, no quality loss)
+2. Hardware encode/transcode via `h264_v4l2m2m` when re-encode is required
+3. Software fallback (`libx264`) only when hardware encoder validation fails
+
+This design keeps startup latency low while retaining playback continuity under packet loss.
+
 ## Game Center
 
 Multi-platform gaming hub with **fully native** UI integration (no WebView). Each platform tab fetches **real-time data from official APIs** with built-in catalog fallback:

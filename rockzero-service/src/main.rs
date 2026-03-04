@@ -157,7 +157,18 @@ async fn main() -> std::io::Result<()> {
         rockzero_media::SecureStreamTransport::new(stream_config)
             .expect("Failed to initialize secure transport"),
     );
-    let hybrid_config = rockzero_media::HybridConfig::default();
+    let hybrid_config = rockzero_media::HybridConfig {
+        udp_ratio: 0.70,
+        tcp_ratio: 0.30,
+        udp_min_ratio: 0.10,
+        udp_max_ratio: 0.70,
+        chunk_size: 128 * 1024,
+        udp_window_size: 96,
+        send_buffer_size: 16 * 1024 * 1024,
+        udp_loss_threshold: 0.03,
+        tcp_max_retries: 5,
+        ..rockzero_media::HybridConfig::default()
+    };
     let hybrid_transport = Arc::new(rockzero_media::HybridTransport::new(
         secure_transport.clone(),
         hybrid_config,
