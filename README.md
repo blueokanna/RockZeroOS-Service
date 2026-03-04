@@ -25,13 +25,13 @@ RockZeroOS is a high-performance, secure cross-platform private cloud NAS operat
 
 - **Dashboard** — System overview with CPU, memory, disk, network monitoring, and chronograph-style speed test
 - **File Manager** — Browse disks, navigate directories, upload/download files, LAN file transfer, WebDAV, network shares
-- **Video Playback** — Dual-strategy streaming: direct HTTP Range streaming with JWT auth (Strategy 1), or SAE-encrypted HLS with session-based authentication and AES-256-GCM encryption (Strategy 2, direct mode)
-- **Game Center** — Multi-platform gaming hub with Steam, Epic Game, WeGame, Ubisoft Connect, Xbox store integration, unified game library, daily Top 30 recommendations (30 per platform), and built-in SteamDB viewer
-- **App Store** — Docker container app management with CasaOS/iStoreOS compatible app registry
+- **Video Playback** — SAE-encrypted HLS streaming with session-based authentication and AES-256-GCM segment encryption (PMK → HKDF-BLAKE3 → AES-GCM)
+- **Game Center** — Multi-platform gaming hub with Steam, Epic Games, WeGame, Ubisoft Connect, Xbox native store integration (no WebView), unified game library, daily Top 30 recommendations, and built-in SteamDB viewer
 - **WASM Runtime** — Run WebAssembly applications and scripts via Wasmtime, including built-in SteamDB viewer, M3U8 video downloader, and Steam P2P connection analyzer
 - **Storage Management** — Smart formatting (ext4/XFS/Btrfs/exFAT), auto mount, partition management, SMART monitoring, secure erase
 - **Hardware Transcoding** — Auto-detected FFmpeg hardware acceleration (VAAPI, V4L2 M2M, Rockchip MPP)
-- **Security** — FIDO2/WebAuthn, wallpaper customization with glassmorphic blur, Reed-Solomon + CRC32 secure storage, Bulletproofs ZKP for authentication
+- **Security** — FIDO2/WebAuthn, wallpaper customization with glassmorphic blur (BackdropFilter high-contrast frost), dynamic color (80% wallpaper + 20% system), Reed-Solomon + CRC32 secure storage, Bulletproofs ZKP for authentication
+- **Edge-to-Edge UI** — Full-screen gesture navigation support on Android, transparent system bars, predictive back gestures
 
 ## Security Architecture
 
@@ -70,19 +70,7 @@ flowchart TB
 
 ## Video Playback Architecture
 
-RockZeroOS uses a dual-strategy video playback system:
-
-### Strategy 1: Direct HTTP Range Streaming (Default)
-
-The client uses media_kit (mpv) with JWT auth headers to directly stream video from the server via HTTP Range requests. This supports all formats mpv can decode (MP4, MKV, AVI, WebM, FLV, etc.) with near-instant start time and full seeking support.
-
-```
-Client (media_kit/mpv) → HTTP GET with Authorization header → Server (Actix-web Range response)
-```
-
-### Strategy 2: SAE + HLS Secure Streaming (Fallback)
-
-When direct streaming fails, the client falls back to an encrypted HLS pipeline using **direct mode** — the client performs an SAE handshake, creates a session with `direct_mode: true`, and accesses the playlist URL directly via media_kit without an intermediate proxy. Bulletproofs ZKP is **not** used for video playback; authentication is handled by session tokens.
+RockZeroOS uses SAE-encrypted HLS streaming for all video playback. The client performs an SAE handshake, creates a session with `direct_mode: true`, and accesses the playlist URL directly via media_kit without an intermediate proxy. Bulletproofs ZKP is **not** used for video playback; authentication is handled by session tokens.
 
 ```mermaid
 sequenceDiagram
@@ -166,15 +154,15 @@ For ≤1080p content, the server uses stream copy (`-c:v copy -c:a copy`) which 
 
 ## Game Center
 
-Multi-platform gaming hub integrated into the system:
+Multi-platform gaming hub with **fully native** UI integration (no WebView):
 
-| Platform | Store URL | Features |
-|----------|-----------|----------|
-| Steam | steamcommunity.com | Game library, play time stats, profile, API key binding, SteamDB viewer |
-| Epic Game | store.epicgames.com | In-app browser store access, free game notifications |
-| WeGame | wegame.com.cn/store | In-app browser store access |
-| Ubisoft Connect | store.ubisoft.com | In-app browser store access |
-| Xbox | xbox.com/games/browse | In-app browser store access |
+| Platform | Integration | Features |
+|----------|-------------|----------|
+| Steam | API + SteamDB | Game library, play time stats, profile, API key binding, SteamDB viewer |
+| Epic Games | Native catalog (12 games) | Featured carousel, free game highlights, category browsing, search, save to library |
+| WeGame | Native catalog (12 games) | Featured carousel, category browsing, search, save to library |
+| Ubisoft Connect | Native catalog (11 games) | Featured carousel, category browsing, search, save to library |
+| Xbox | Native catalog (11 games) | Featured carousel, Game Pass highlights, category browsing, search, save to library |
 
 The **My Library** tab provides a unified view of game accounts across all platforms with Steam full library integration (game count, total play time, recently played).
 
@@ -187,6 +175,16 @@ The **Daily Top 30** tab shows curated recommendations with 30 games per platfor
 | SteamDB Viewer | Query Steam API for game details: price, online players, reviews, DLC, system requirements |
 | M3U8 Downloader | Parse M3U8 playlists, download TS segments, auto-merge with AES decryption support |
 | Steam P2P Info | View Steam player profiles, friends list, recent games, and P2P connection details |
+
+## Dynamic Theming & Wallpaper
+
+RockZeroOS supports advanced dynamic theming:
+
+- **Material You** — Seed color from user preference or system accent color
+- **Custom Wallpaper** — Set custom wallpaper from gallery; dominant color extracted for theme blending
+- **Dynamic Color Blending** — 80% custom wallpaper color + 20% system accent color
+- **Glassmorphic Cards** — When wallpaper is active, all cards use frosted glass effect with `BackdropFilter` blur (sigma 20), semi-transparent backgrounds, and subtle border highlighting
+- **Edge-to-Edge** — Transparent status bar and navigation bar on Android with predictive back gesture support
 
 ## Project Structure
 
@@ -238,7 +236,7 @@ RockZeroOS-Service/
 │   ├── src/
 │   │   ├── session.rs            # HLS session management
 │   │   ├── encryptor.rs          # AES-256-GCM video segment encryption
-│   │   ├── bulletproof_auth.rs   # Per-segment ZKP authentication
+│   │   ├── bulletproof_auth.rs   # Per-segment authentication
 │   │   ├── media_processor.rs    # FFmpeg detection & HW capabilities
 │   │   ├── chunk_manager.rs      # Progressive chunk management
 │   │   ├── playlist.rs           # M3U8 playlist generation
@@ -255,19 +253,17 @@ RockZeroOS-Service/
 │   │   ├── main.rs               # Server startup, route configuration
 │   │   ├── middleware.rs          # JWT auth middleware
 │   │   ├── storage_manager.rs    # Disk & mount management
-│   │   ├── docker_api.rs         # Docker container API
 │   │   ├── fido.rs               # FIDO2/WebAuthn handler
 │   │   ├── handlers/
 │   │   │   ├── auth.rs           # User registration & login (EdDSA JWT)
 │   │   │   ├── zkp_auth.rs       # Bulletproofs ZKP authentication
 │   │   │   ├── secure_hls.rs     # SAE handshake + encrypted HLS streaming
-│   │   │   ├── streaming.rs      # Direct HTTP Range video streaming
-│   │   │   ├── filemanager.rs    # File CRUD, upload, download, stream_media
+│   │   │   ├── streaming.rs      # Media info, thumbnails, HLS playlist, audio transcode
+│   │   │   ├── filemanager.rs    # File CRUD, upload, download
 │   │   │   ├── storage.rs        # Storage overview & disk info
 │   │   │   ├── storage_management.rs  # Format, mount, unmount, erase
 │   │   │   ├── disk_manager.rs   # Disk detail & SMART
-│   │   │   ├── docker.rs         # Docker container management
-│   │   │   ├── appstore.rs       # CasaOS/iStoreOS app registry
+│   │   │   ├── appstore.rs       # WASM app registry
 │   │   │   ├── wasm_store.rs     # WASM app store & game APIs
 │   │   │   ├── system.rs         # System info (CPU, mem, temp)
 │   │   │   ├── speedtest.rs      # Network speed test
@@ -280,19 +276,22 @@ RockZeroOS-Service/
         ├── core/
         │   ├── models/           # API models (DiskInfo, etc.)
         │   ├── network/          # API service, Dio HTTP client
-        │   ├── services/         # Wallpaper, media_kit init, etc.
-        │   └── widgets/          # ShellScaffold (glassmorphic nav)
+        │   ├── services/         # Wallpaper, media_kit init, dynamic color
+        │   ├── theme/            # M3 theme, dynamic color, animation curves
+        │   └── widgets/          # ShellScaffold, WallpaperBackground, GlassmorphicBackground, DynamicColorCard
         ├── features/
-        │   ├── auth/             # Login, register pages
+        │   ├── auth/             # Login, register pages (glassmorphic cards)
         │   ├── dashboard/        # Dashboard, speed test
         │   ├── files/            # File browser, video player
         │   │   └── presentation/pages/
         │   │       ├── files_page.dart             # Disk grid + file listing
-        │   │       └── secure_hls_video_player.dart # Dual-strategy video player
-        │   ├── appstore/         # Game center, in-app browser
-        │   │   └── presentation/pages/
-        │   │       ├── wasm_store_page.dart         # Multi-platform game hub
-        │   │       └── in_app_browser_page.dart     # Embedded WebView
+        │   │       └── secure_hls_video_player.dart # SAE+HLS video player
+        │   ├── appstore/         # Game center
+        │   │   └── presentation/
+        │   │       ├── pages/
+        │   │       │   └── wasm_store_page.dart     # Multi-platform game hub
+        │   │       └── widgets/
+        │   │           └── platform_game_tab.dart   # Native game tabs (Epic/WeGame/Ubisoft/Xbox)
         │   ├── device_discovery/ # mDNS device discovery
         │   ├── disk/             # Disk formatting & management
         │   ├── storage/          # Storage overview
@@ -374,7 +373,7 @@ sequenceDiagram
     S-->>C: {tokens, user}
 ```
 
-### Secure HLS
+### Secure HLS (SAE + AES-256-GCM)
 
 ```http
 POST /api/v1/secure-hls/sae/init
@@ -385,23 +384,38 @@ GET  /api/v1/secure-hls/{session_id}/playlist.m3u8
 GET  /api/v1/secure-hls/{session_id}/segment_{n}.ts
 ```
 
-### File Manager & Streaming
+### Media Info & Streaming Utilities
+
+```http
+GET  /api/v1/streaming/formats             # Supported media formats
+GET  /api/v1/streaming/library             # List media library
+GET  /api/v1/streaming/info/{path}         # Get media info (codecs, duration, resolution)
+GET  /api/v1/streaming/extended-info/{path} # Extended media info (EXIF, tracks)
+GET  /api/v1/streaming/hls/{path}          # Generate HLS playlist
+GET  /api/v1/streaming/thumbnail/{path}    # Get video thumbnail
+GET  /api/v1/streaming/transcode/{path}    # Audio transcoding
+```
+
+### File Manager
 
 ```http
 GET    /api/v1/filemanager/list?path=...
 POST   /api/v1/filemanager/upload
 GET    /api/v1/filemanager/download?path=...
-GET    /api/v1/filemanager/media/stream?path=...    # Direct HTTP Range streaming
+GET    /api/v1/filemanager/media/info?path=...
+GET    /api/v1/filemanager/media/image?path=...
+GET    /api/v1/filemanager/media/thumbnail?path=...
 DELETE /api/v1/filemanager/delete
 ```
 
-### ZKP
+### ZKP (Auth only)
 
 ```http
-POST /api/v1/zkp/range-proof/create
-POST /api/v1/zkp/range-proof/verify
-POST /api/v1/zkp/video/proof
-POST /api/v1/zkp/video/verify
+POST /api/v1/zkp/search/token
+POST /api/v1/zkp/search/execute
+POST /api/v1/zkp/share/proof
+POST /api/v1/zkp/share/verify
+POST /api/v1/zkp/proof/generate
 ```
 
 ### Storage
@@ -428,40 +442,22 @@ POST /api/v1/storage/unmount
 | HLS Segment (hw transcode) | ~200-500ms | >1080p, VAAPI/V4L2 |
 | HLS Segment (sw transcode) | ~1-3s | >1080p, libx264 ultrafast |
 
-## Docker Deployment
-
-```bash
-docker build -t rockzero-service .
-docker run -d \
-  -p 8080:8080 \
-  -v /mnt/storage:/mnt/storage \
-  -v ./data:/app/data \
-  --name rockzero \
-  rockzero-service
-```
-
-Multi-architecture build (ARM64 + AMD64):
-
-```bash
-docker compose -f docker-compose.multiarch.yml build
-```
-
 ## Roadmap
 
 - [x] EdDSA (Ed25519) JWT authentication
 - [x] WPA3-SAE key exchange (Curve25519 Dragonfly)
 - [x] Bulletproofs RangeProof ZKP (authentication only)
-- [x] Dual-strategy video streaming (direct + SAE session-authenticated HLS)
+- [x] SAE session-authenticated HLS streaming with AES-256-GCM
 - [x] FIDO2/WebAuthn hardware authentication
 - [x] Professional storage management
 - [x] Hardware accelerated video transcoding
-- [x] CasaOS/iStoreOS app store compatibility
-- [x] Docker container management
 - [x] Flutter cross-platform client
-- [x] Multi-platform game center (Steam/Epic/WeGame/Ubisoft/Xbox)
+- [x] Multi-platform native game center (Steam/Epic/WeGame/Ubisoft/Xbox)
 - [x] LAN file transfer
 - [x] WebDAV server
 - [x] WASM application runtime (with built-in SteamDB viewer, M3U8 downloader, Steam P2P info)
+- [x] Dynamic theming with wallpaper color extraction & glassmorphic UI
+- [x] Edge-to-edge UI with gesture navigation
 - [ ] RAID support
 - [ ] Snapshot and backup
 - [ ] Multi-user permission management
@@ -490,7 +486,6 @@ docker compose -f docker-compose.multiarch.yml build
 - [Riverpod](https://riverpod.dev/) — State management
 - [go_router](https://pub.dev/packages/go_router) — Navigation
 - [media_kit](https://github.com/media-kit/media-kit) — Video playback (mpv)
-- [webview_flutter](https://pub.dev/packages/webview_flutter) — In-app browser
 - [flutter_animate](https://pub.dev/packages/flutter_animate) — Animations
 - [flutter_secure_storage](https://pub.dev/packages/flutter_secure_storage) — Secure credential storage
 

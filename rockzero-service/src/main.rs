@@ -1,6 +1,5 @@
 mod crypto;
 mod db;
-mod docker_api;
 mod event_notifier;
 mod ffmpeg_manager;
 mod fido;
@@ -11,7 +10,6 @@ mod invite;
 mod media_processor;
 mod middleware;
 mod secure_db;
-mod secure_video_access;
 mod storage_manager;
 
 use rockzero_common::{self as _, AppConfig};
@@ -192,10 +190,6 @@ async fn main() -> std::io::Result<()> {
 
     info!("WASM store initialized");
 
-    // Initialize video access manager
-    let _video_access_manager = secure_video_access::init_global_video_access_manager();
-    info!("Video access manager initialized");
-
     // Initialize LAN transfer manager
     let lan_transfer_manager = Arc::new(RwLock::new(
         handlers::lan_transfer::LanTransferManager::new(),
@@ -335,22 +329,6 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/share/verify",
                                 web::post().to(handlers::zkp_auth::verify_share_proof),
-                            )
-                            .route(
-                                "/range-proof/create",
-                                web::post().to(handlers::zkp_auth::create_range_proof),
-                            )
-                            .route(
-                                "/range-proof/verify",
-                                web::post().to(handlers::zkp_auth::verify_range_proof),
-                            )
-                            .route(
-                                "/video/proof",
-                                web::post().to(handlers::zkp_auth::create_video_stream_proof),
-                            )
-                            .route(
-                                "/video/verify",
-                                web::post().to(handlers::zkp_auth::verify_video_stream_proof),
                             )
                             .route(
                                 "/proof/generate",
@@ -551,10 +529,6 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/media/info",
                                 web::get().to(handlers::filemanager::get_media_info),
-                            )
-                            .route(
-                                "/media/stream",
-                                web::get().to(handlers::filemanager::stream_media),
                             )
                             .route(
                                 "/media/image",
@@ -1111,10 +1085,6 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/extended-info/{path:.*}",
                                 web::get().to(handlers::streaming::get_extended_media_info),
-                            )
-                            .route(
-                                "/play/{path:.*}",
-                                web::get().to(handlers::streaming::stream_media),
                             )
                             .route(
                                 "/hls/{path:.*}",

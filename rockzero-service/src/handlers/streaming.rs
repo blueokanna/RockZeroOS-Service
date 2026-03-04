@@ -14,8 +14,11 @@ use crate::media_processor::needs_audio_transcode;
 const MEDIA_BASE: &str = "./media";
 
 /// Chunk sizes for different streaming scenarios
+#[allow(dead_code)]
 const INITIAL_CHUNK_SIZE: usize = 256 * 1024; // 256KB for initial probe
+#[allow(dead_code)]
 const STREAMING_CHUNK_SIZE: usize = 2 * 1024 * 1024; // 2MB for sequential streaming
+#[allow(dead_code)]
 const SEEK_CHUNK_SIZE: usize = 512 * 1024; // 512KB for seek (smaller = faster first-byte)
 
 #[derive(Debug, Serialize)]
@@ -222,6 +225,7 @@ pub async fn get_extended_media_info(path: web::Path<String>) -> Result<HttpResp
 /// Async file stream that uses tokio::fs for non-blocking I/O.
 /// This prevents blocking the async runtime when reading large files,
 /// which was the root cause of seek hangs and slow loading for big videos.
+#[allow(dead_code)]
 struct AsyncFileStream {
     file: tokio::fs::File,
     remaining: u64,
@@ -291,6 +295,7 @@ impl futures::Stream for AsyncFileStream {
 }
 
 /// Generate an ETag from file metadata for caching and conditional requests.
+#[allow(dead_code)]
 fn generate_etag(metadata: &std::fs::Metadata) -> String {
     let modified = metadata
         .modified()
@@ -303,6 +308,7 @@ fn generate_etag(metadata: &std::fs::Metadata) -> String {
 }
 
 /// Format a SystemTime as an HTTP date string for Last-Modified header.
+#[allow(dead_code)]
 fn format_http_date(time: std::time::SystemTime) -> String {
     let duration = time
         .duration_since(std::time::UNIX_EPOCH)
@@ -312,6 +318,7 @@ fn format_http_date(time: std::time::SystemTime) -> String {
     dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
+#[allow(dead_code)]
 pub async fn stream_media(
     req: HttpRequest,
     path: web::Path<String>,
@@ -698,6 +705,7 @@ fn get_media_path(path: &str) -> Result<std::path::PathBuf, AppError> {
     Ok(full_path)
 }
 
+#[allow(dead_code)]
 fn parse_range(range: &str, file_size: u64) -> Result<(u64, u64), AppError> {
     let range = range
         .strip_prefix("bytes=")
