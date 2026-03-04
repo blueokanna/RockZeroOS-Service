@@ -945,88 +945,118 @@ async fn run_ffmpeg_progressive(
     // 检测硬件加速
     let hw_accel = detect_hardware_acceleration().await;
 
-    let mut args: Vec<String> = vec!["-y".into(), "-i".into(), file_path.into()];
+    let build_transcode_args = |accel: HardwareAccel| {
+        let mut args: Vec<String> = vec!["-y".into(), "-i".into(), file_path.into()];
 
-    match hw_accel {
-        HardwareAccel::Rkmpp => {
-            info!("Using Rockchip MPP hardware encoding for HLS segmentation");
-            args.extend([
-                "-c:v".into(),
-                "h264_rkmpp".into(),
-                "-b:v".into(),
-                "3M".into(),
-                "-rc_mode".into(),
-                "VBR".into(),
-            ]);
+        match accel {
+            HardwareAccel::Rkmpp => {
+                info!("Using Rockchip MPP hardware encoding for HLS segmentation");
+                args.extend([
+                    "-c:v".into(),
+                    "h264_rkmpp".into(),
+                    "-b:v".into(),
+                    "3M".into(),
+                    "-rc_mode".into(),
+                    "VBR".into(),
+                ]);
+            }
+            HardwareAccel::V4l2 => {
+                info!("Using V4L2 hardware encoding for HLS segmentation");
+                args.extend([
+                    "-c:v".into(),
+                    "h264_v4l2m2m".into(),
+                    "-b:v".into(),
+                    "2M".into(),
+                ]);
+            }
+            HardwareAccel::Vaapi => {
+                info!("Using VAAPI hardware encoding for HLS segmentation");
+                args.extend([
+                    "-hwaccel".into(),
+                    "vaapi".into(),
+                    "-hwaccel_device".into(),
+                    "/dev/dri/renderD128".into(),
+                    "-hwaccel_output_format".into(),
+                    "vaapi".into(),
+                    "-c:v".into(),
+                    "h264_vaapi".into(),
+                    "-qp".into(),
+                    "23".into(),
+                ]);
+            }
+            HardwareAccel::None => {
+                info!("Using software encoding (libx264) for HLS segmentation");
+                args.extend([
+                    "-c:v".into(),
+                    "libx264".into(),
+                    "-preset".into(),
+                    "ultrafast".into(), // ultrafast 更快输出首个 segment
+                    "-crf".into(),
+                    "23".into(),
+                    "-pix_fmt".into(),
+                    "yuv420p".into(),
+                ]);
+            }
         }
-        HardwareAccel::V4l2 => {
-            info!("Using V4L2 hardware encoding for HLS segmentation");
-            args.extend([
-                "-c:v".into(),
-                "h264_v4l2m2m".into(),
-                "-b:v".into(),
-                "2M".into(),
-            ]);
-        }
-        HardwareAccel::Vaapi => {
-            info!("Using VAAPI hardware encoding for HLS segmentation");
-            args.extend([
-                "-hwaccel".into(),
-                "vaapi".into(),
-                "-hwaccel_device".into(),
-                "/dev/dri/renderD128".into(),
-                "-hwaccel_output_format".into(),
-                "vaapi".into(),
-                "-c:v".into(),
-                "h264_vaapi".into(),
-                "-qp".into(),
-                "23".into(),
-            ]);
-        }
-        HardwareAccel::None => {
-            info!("Using software encoding (libx264) for HLS segmentation");
-            args.extend([
-                "-c:v".into(),
-                "libx264".into(),
-                "-preset".into(),
-                "ultrafast".into(), // ultrafast 更快输出首个 segment
-                "-crf".into(),
-                "23".into(),
-            ]);
-        }
-    }
 
-    args.extend([
-        "-c:a".into(),
-        "aac".into(),
-        "-b:a".into(),
-        "128k".into(),
-        "-ac".into(),
-        "2".into(),
-        "-f".into(),
-        "hls".into(),
-        "-hls_time".into(),
-        "2".into(),
-        "-hls_list_size".into(),
-        "0".into(),
-        "-hls_playlist_type".into(),
-        "event".into(),
-        "-hls_flags".into(),
-        "append_list+independent_segments".into(),
-        "-hls_segment_type".into(),
-        "mpegts".into(),
-        "-hls_segment_filename".into(),
-        seg_pattern.into(),
-        playlist_path.into(),
-    ]);
+        args.extend([
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "128k".into(),
+            "-ac".into(),
+            "2".into(),
+            "-f".into(),
+            "hls".into(),
+            "-hls_time".into(),
+            "2".into(),
+            "-hls_list_size".into(),
+            "0".into(),
+            "-hls_playlist_type".into(),
+            "event".into(),
+            "-hls_flags".into(),
+            "append_list+independent_segments".into(),
+            "-hls_segment_type".into(),
+            "mpegts".into(),
+            "-hls_segment_filename".into(),
+            seg_pattern.into(),
+            playlist_path.into(),
+        ]);
 
-    let output = tokio::process::Command::new(ffmpeg_path)
-        .args(&args)
+        args
+    };
+
+    let mut output = tokio::process::Command::new(ffmpeg_path)
+        .args(build_transcode_args(hw_accel))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .output()
         .await
         .map_err(|e| format!("FFmpeg transcode failed: {}", e))?;
+
+    if !output.status.success() && hw_accel != HardwareAccel::None {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(
+            "Hardware transcode failed ({:?}), retrying with software libx264: {}",
+            hw_accel,
+            &stderr[..stderr.len().min(500)]
+        );
+
+        for entry in std::fs::read_dir(cache_dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "ts" || e == "m3u8") {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+
+        output = tokio::process::Command::new(ffmpeg_path)
+            .args(build_transcode_args(HardwareAccel::None))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| format!("FFmpeg software fallback failed: {}", e))?;
+    }
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
