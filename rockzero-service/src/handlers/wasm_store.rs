@@ -3064,6 +3064,900 @@ pub async fn run_wasm_script(
 }
 
 // ============================================================================
+// 平台游戏数据 — 从官方 API 获取 (Epic / WeGame / Ubisoft / Xbox)
+// ============================================================================
+
+/// 平台游戏查询参数
+#[derive(Debug, Deserialize)]
+pub struct PlatformGamesQuery {
+    pub platform: String,
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+}
+
+/// GET /api/v1/wasm-store/platform/games - 获取指定平台的游戏列表
+///
+/// 支持平台: epic, wegame, ubisoft, xbox
+/// 优先从官方 API 获取实时数据，缓存 30 分钟；API 不可用时返回空
+pub async fn get_platform_games(
+    query: web::Query<PlatformGamesQuery>,
+) -> Result<HttpResponse, AppError> {
+    let platform = query.platform.to_lowercase();
+    let page_size = query.page_size.unwrap_or(30).min(100);
+
+    info!("获取平台游戏数据: platform={}, page_size={}", platform, page_size);
+
+    let cache_key = format!("platform_games_{}", platform);
+    if let Some(cached) = cache_get(&cache_key).await {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "platform": platform,
+            "items": cached,
+            "total": cached.len(),
+            "cached": true,
+            "source": "cache",
+        })));
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    let games = match platform.as_str() {
+        "epic" => fetch_epic_platform_games(&client, page_size).await,
+        "wegame" => fetch_wegame_platform_games(&client, page_size).await,
+        "ubisoft" => fetch_ubisoft_platform_games(&client, page_size).await,
+        "xbox" => fetch_xbox_platform_games(&client, page_size).await,
+        _ => {
+            return Err(AppError::BadRequest(format!(
+                "不支持的平台: {}。支持: epic, wegame, ubisoft, xbox",
+                platform
+            )));
+        }
+    };
+
+    let items = games.unwrap_or_default();
+    let total = items.len();
+
+    if !items.is_empty() {
+        cache_set(&cache_key, items.clone(), 1800).await; // 缓存 30 分钟
+    }
+
+    info!("平台 {} 游戏数据: {} 款 (live)", platform, total);
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "platform": platform,
+        "items": items,
+        "total": total,
+        "cached": false,
+        "source": "api",
+    })))
+}
+
+/// Epic Games — 使用 GraphQL API 获取全品类游戏
+async fn fetch_epic_platform_games(client: &Client, count: u32) -> Result<Vec<Value>, AppError> {
+    let query_body = serde_json::json!({
+        "query": r#"query searchStoreQuery($count: Int, $country: String!, $locale: String, $sortBy: String, $sortDir: String, $start: Int, $withPrice: Boolean = true) {
+            Catalog {
+                searchStore(count: $count, country: $country, locale: $locale, sortBy: $sortBy, sortDir: $sortDir, start: $start) {
+                    elements {
+                        title
+                        id
+                        namespace
+                        description
+                        keyImages { type url }
+                        seller { name }
+                        categories { path }
+                        tags { id name }
+                        price(country: $country) @include(if: $withPrice) {
+                            totalPrice {
+                                discountPrice
+                                originalPrice
+                                currencyCode
+                                fmtPrice(locale: "zh-CN") { originalPrice discountPrice }
+                            }
+                        }
+                    }
+                    paging { count total }
+                }
+            }
+        }"#,
+        "variables": {
+            "count": count,
+            "country": "CN",
+            "locale": "zh-CN",
+            "sortBy": "releaseDate",
+            "sortDir": "DESC",
+            "start": 0,
+            "withPrice": true,
+        }
+    });
+
+    let resp = client
+        .post("https://graphql.epicgames.com/graphql")
+        .header("Content-Type", "application/json")
+        .json(&query_body)
+        .send()
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("Epic API 请求失败: {}", e)))?;
+
+    if !resp.status().is_success() {
+        warn!("Epic API 返回非 200: {}", resp.status());
+        return Ok(Vec::new());
+    }
+
+    let json: Value = resp.json().await.unwrap_or(Value::Null);
+
+    let elements = json
+        .pointer("/data/Catalog/searchStore/elements")
+        .and_then(|v| v.as_array());
+
+    let mut games = Vec::new();
+    if let Some(elems) = elements {
+        for elem in elems {
+            let title = elem.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            if title.is_empty() {
+                continue;
+            }
+
+            let id = elem.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let desc = elem.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let seller = elem.pointer("/seller/name").and_then(|v| v.as_str()).unwrap_or("");
+
+            let header_image = elem
+                .get("keyImages")
+                .and_then(|v| v.as_array())
+                .and_then(|imgs| {
+                    imgs.iter()
+                        .find(|img| {
+                            matches!(
+                                img.get("type").and_then(|t| t.as_str()),
+                                Some("OfferImageWide" | "DieselStoreFrontWide" | "Thumbnail")
+                            )
+                        })
+                        .or_else(|| imgs.first())
+                        .and_then(|img| img.get("url").and_then(|u| u.as_str()))
+                })
+                .unwrap_or("");
+
+            let discount_price = elem
+                .pointer("/price/totalPrice/discountPrice")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let original_price = elem
+                .pointer("/price/totalPrice/originalPrice")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let is_free = discount_price == 0;
+            let formatted_price = if is_free {
+                "免费".to_string()
+            } else {
+                elem.pointer("/price/totalPrice/fmtPrice/discountPrice")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+
+            let namespace = elem.get("namespace").and_then(|v| v.as_str()).unwrap_or("");
+
+            let tags: Vec<String> = elem
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+                        .take(5)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let genre = elem
+                .get("categories")
+                .and_then(|v| v.as_array())
+                .and_then(|cats| {
+                    cats.first()
+                        .and_then(|c| c.get("path").and_then(|p| p.as_str()))
+                })
+                .unwrap_or("games")
+                .to_string();
+
+            let store_url = if !namespace.is_empty() {
+                format!("https://store.epicgames.com/zh-CN/p/{}", namespace)
+            } else {
+                "https://store.epicgames.com/zh-CN".to_string()
+            };
+
+            games.push(serde_json::json!({
+                "id": id,
+                "name": title,
+                "developer": seller,
+                "genre": genre,
+                "description": desc,
+                "header_image": header_image,
+                "is_free": is_free,
+                "platform": "epic",
+                "store_url": store_url,
+                "tags": tags,
+                "price": {
+                    "original": original_price,
+                    "final": discount_price,
+                    "formatted": formatted_price,
+                },
+            }));
+        }
+    }
+
+    Ok(games)
+}
+
+/// WeGame — 使用腾讯 WeGame 内部 API 获取游戏列表
+async fn fetch_wegame_platform_games(client: &Client, count: u32) -> Result<Vec<Value>, AppError> {
+    // WeGame 商店推荐 API (公开可访问)
+    let body = serde_json::json!({
+        "search_text": "",
+        "limit": count.min(50),
+        "platform_id": 0,
+        "sort_field": 1,
+        "sort_type": 1,
+        "scene": "wegame-store-pc"
+    });
+
+    let resp = match client
+        .post("https://www.wegame.com.cn/api/v1/wegame.product.search/")
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .header("Accept", "application/json")
+        .header("Accept-Language", "zh-CN,zh;q=0.9")
+        .header("Referer", "https://www.wegame.com.cn/store")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("WeGame API 请求失败: {}", e);
+            // 尝试备用 API: 热门游戏列表
+            return fetch_wegame_hot_games(client, count).await;
+        }
+    };
+
+    if !resp.status().is_success() {
+        warn!("WeGame API 非 200: {}", resp.status());
+        return fetch_wegame_hot_games(client, count).await;
+    }
+
+    let json: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("WeGame JSON 解析失败: {}", e);
+            return fetch_wegame_hot_games(client, count).await;
+        }
+    };
+
+    let mut games = Vec::new();
+
+    if let Some(items) = json
+        .pointer("/data/items")
+        .or_else(|| json.pointer("/result/items"))
+        .and_then(|v| v.as_array())
+    {
+        for item in items {
+            let name = item
+                .get("name")
+                .or_else(|| item.get("product_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+
+            let id = item
+                .get("product_id")
+                .or_else(|| item.get("id"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let desc = item
+                .get("description")
+                .or_else(|| item.get("short_desc"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let developer = item
+                .get("developer")
+                .or_else(|| item.get("developer_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let header_image = item
+                .get("icon_url")
+                .or_else(|| item.get("cover_url"))
+                .or_else(|| item.get("image_url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let is_free = item
+                .get("is_free")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let price_val = item
+                .get("price")
+                .or_else(|| item.get("current_price"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let formatted_price = if is_free || price_val == 0.0 {
+                "免费".to_string()
+            } else {
+                format!("¥{:.0}", price_val / 100.0)
+            };
+
+            let genre = item
+                .get("category")
+                .or_else(|| item.get("genre"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("游戏")
+                .to_string();
+
+            let tags: Vec<String> = item
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| {
+                            t.as_str()
+                                .map(String::from)
+                                .or_else(|| t.get("name").and_then(|n| n.as_str()).map(String::from))
+                        })
+                        .take(5)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            games.push(serde_json::json!({
+                "id": format!("wg_{}", id),
+                "name": name,
+                "developer": developer,
+                "genre": genre,
+                "description": desc,
+                "header_image": header_image,
+                "is_free": is_free,
+                "platform": "wegame",
+                "store_url": format!("https://www.wegame.com.cn/store/detail?productid={}", id),
+                "tags": tags,
+                "price": {
+                    "final": price_val as u64,
+                    "formatted": formatted_price,
+                },
+            }));
+        }
+    }
+
+    info!("WeGame 搜索 API: {} 款游戏", games.len());
+    Ok(games)
+}
+
+/// WeGame 备用: 热门游戏排行列表
+async fn fetch_wegame_hot_games(client: &Client, count: u32) -> Result<Vec<Value>, AppError> {
+    // 使用 WeGame 热门排行 API
+    let url = format!(
+        "https://www.wegame.com.cn/api/v1/wegame.pcsale.recommend/GetRankList?limit={}&offset=0",
+        count.min(50)
+    );
+
+    let resp = match client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .header("Referer", "https://www.wegame.com.cn/store")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("WeGame 热门排行 API 也失败: {}", e);
+            return Ok(Vec::new());
+        }
+    };
+
+    if !resp.status().is_success() {
+        return Ok(Vec::new());
+    }
+
+    let json: Value = resp.json().await.unwrap_or(Value::Null);
+    let mut games = Vec::new();
+
+    if let Some(items) = json
+        .pointer("/data/rank_list")
+        .or_else(|| json.pointer("/result/items"))
+        .and_then(|v| v.as_array())
+    {
+        for item in items {
+            let name = item
+                .get("product_name")
+                .or_else(|| item.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let id = item
+                .get("product_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let icon = item
+                .get("icon_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            games.push(serde_json::json!({
+                "id": format!("wg_{}", id),
+                "name": name,
+                "developer": "",
+                "genre": "游戏",
+                "description": "",
+                "header_image": icon,
+                "is_free": false,
+                "platform": "wegame",
+                "store_url": format!("https://www.wegame.com.cn/store/detail?productid={}", id),
+                "tags": [],
+                "price": { "formatted": "" },
+            }));
+        }
+    }
+
+    info!("WeGame 热门排行: {} 款", games.len());
+    Ok(games)
+}
+
+/// Ubisoft — 使用 Ubisoft Store API 获取游戏列表
+async fn fetch_ubisoft_platform_games(client: &Client, count: u32) -> Result<Vec<Value>, AppError> {
+    // Ubisoft Store REST API（公开可访问）
+    let url = format!(
+        "https://store.ubisoft.com/on/demandware.store/Sites-us-ubisoft-Site/zh_TW/Search-Show?cgid=games&format=ajax&start=0&sz={}",
+        count.min(60)
+    );
+
+    let resp = match client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .header("Accept", "application/json, text/html")
+        .header("Accept-Language", "zh-TW,zh;q=0.9,en;q=0.8")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Ubisoft Store API 请求失败: {}", e);
+            return fetch_ubisoft_from_api_v2(client, count).await;
+        }
+    };
+
+    if !resp.status().is_success() {
+        warn!("Ubisoft Store API 非 200: {}", resp.status());
+        return fetch_ubisoft_from_api_v2(client, count).await;
+    }
+
+    let body = resp.text().await.unwrap_or_default();
+
+    // 尝试 JSON 解析
+    if let Ok(json) = serde_json::from_str::<Value>(&body) {
+        let mut games = Vec::new();
+
+        if let Some(hits) = json
+            .pointer("/hits")
+            .or_else(|| json.pointer("/products"))
+            .or_else(|| json.pointer("/data/products"))
+            .and_then(|v| v.as_array())
+        {
+            for hit in hits.iter().take(count as usize) {
+                let name = hit
+                    .get("productName")
+                    .or_else(|| hit.get("name"))
+                    .or_else(|| hit.get("title"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+
+                let id = hit
+                    .get("productID")
+                    .or_else(|| hit.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let desc = hit
+                    .get("shortDescription")
+                    .or_else(|| hit.get("description"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let image = hit
+                    .get("image")
+                    .or_else(|| hit.pointer("/images/0/url"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let brand = hit
+                    .get("brand")
+                    .or_else(|| hit.get("developer"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Ubisoft");
+                let category = hit
+                    .get("primaryCategory")
+                    .or_else(|| hit.get("genre"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("游戏");
+
+                let price_str = hit
+                    .pointer("/price/sales/value")
+                    .or_else(|| hit.get("price"))
+                    .and_then(|v| v.as_f64())
+                    .map(|p| format!("¥{:.0}", p))
+                    .unwrap_or_default();
+
+                let is_free = hit
+                    .get("isFree")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let url = hit
+                    .get("url")
+                    .or_else(|| hit.get("pdpUrl"))
+                    .and_then(|v| v.as_str())
+                    .map(|u| {
+                        if u.starts_with("http") {
+                            u.to_string()
+                        } else {
+                            format!("https://store.ubisoft.com{}", u)
+                        }
+                    })
+                    .unwrap_or_else(|| "https://store.ubisoft.com".to_string());
+
+                games.push(serde_json::json!({
+                    "id": format!("ubi_{}", id),
+                    "name": name,
+                    "developer": brand,
+                    "genre": category,
+                    "description": desc,
+                    "header_image": image,
+                    "is_free": is_free,
+                    "platform": "ubisoft",
+                    "store_url": url,
+                    "tags": [],
+                    "price": { "formatted": if is_free { "免费".to_string() } else { price_str } },
+                }));
+            }
+        }
+
+        if !games.is_empty() {
+            info!("Ubisoft Store API: {} 款游戏", games.len());
+            return Ok(games);
+        }
+    }
+
+    // JSON 解析失败 → 尝试 v2 API
+    fetch_ubisoft_from_api_v2(client, count).await
+}
+
+/// Ubisoft 备用 API — 使用不同端点
+async fn fetch_ubisoft_from_api_v2(client: &Client, count: u32) -> Result<Vec<Value>, AppError> {
+    // 尝试 Ubisoft Connect API
+    let url = "https://public-ubiservices.ubi.com/v1/spaces/4ce775e2-fdd5-4a1a-b78a-a0d7846e498f/sandboxes/UPLAY_PC_NA/catalog/products?limit=30&offset=0";
+
+    let resp = match client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        .header("Ubi-AppId", "e3d5ea9e-50bd-43b7-88bf-39794f4e3d40")
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => {
+            warn!("Ubisoft 所有 API 均失败");
+            return Ok(Vec::new());
+        }
+    };
+
+    let json: Value = resp.json().await.unwrap_or(Value::Null);
+    let mut games = Vec::new();
+
+    if let Some(items) = json.get("products").and_then(|v| v.as_array()) {
+        for item in items.iter().take(count as usize) {
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let id = item.get("productId").and_then(|v| v.as_str()).unwrap_or("");
+            let desc = item
+                .get("shortDescription")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let image = item
+                .pointer("/images/0")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            games.push(serde_json::json!({
+                "id": format!("ubi_{}", id),
+                "name": name,
+                "developer": "Ubisoft",
+                "genre": "游戏",
+                "description": desc,
+                "header_image": image,
+                "is_free": false,
+                "platform": "ubisoft",
+                "store_url": format!("https://www.ubisoft.com/zh-tw/game/{}", id),
+                "tags": [],
+                "price": { "formatted": "" },
+            }));
+        }
+    }
+
+    info!("Ubisoft v2 API: {} 款", games.len());
+    Ok(games)
+}
+
+/// Xbox / Microsoft — 使用 Xbox Game Pass 目录 API + Microsoft Display Catalog
+async fn fetch_xbox_platform_games(client: &Client, count: u32) -> Result<Vec<Value>, AppError> {
+    // Xbox Game Pass PC 目录 (公开 API, 无需密钥)
+    // sigls ID 对照: fdd9e2a7-... = Game Pass PC
+    let gp_url = "https://catalog.gamepass.com/sigls/v2?id=fdd9e2a7-0fee-49f6-ad69-4354098401ff&language=zh-cn&market=CN";
+
+    let resp = match client
+        .get(gp_url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        .header("Accept", "application/json")
+        .header("ms-cv", "RockZeroOS")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Xbox Game Pass API 请求失败: {}", e);
+            return fetch_xbox_from_catalog(client, count).await;
+        }
+    };
+
+    if !resp.status().is_success() {
+        warn!("Xbox Game Pass API 非 200: {}", resp.status());
+        return fetch_xbox_from_catalog(client, count).await;
+    }
+
+    let json: Value = resp.json().await.unwrap_or(Value::Null);
+    let items = json.as_array();
+
+    if let Some(items) = items {
+        // Game Pass API 返回产品 ID 列表,需要批量查询详情
+        let mut product_ids: Vec<String> = Vec::new();
+        for item in items.iter().take(count as usize) {
+            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                product_ids.push(id.to_string());
+            }
+        }
+
+        if !product_ids.is_empty() {
+            return fetch_xbox_product_details(client, &product_ids).await;
+        }
+    }
+
+    // 直接从 DisplayCatalog 获取
+    fetch_xbox_from_catalog(client, count).await
+}
+
+/// 批量获取 Xbox 产品详情 (Microsoft DisplayCatalog API)
+async fn fetch_xbox_product_details(
+    client: &Client,
+    product_ids: &[String],
+) -> Result<Vec<Value>, AppError> {
+    // DisplayCatalog API 每次最多查 20 个
+    let mut all_games = Vec::new();
+
+    for chunk in product_ids.chunks(20) {
+        let big_ids = chunk.join(",");
+        let url = format!(
+            "https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds={}&market=CN&languages=zh-cn,en-us&MS-CV=RockZeroOS",
+            big_ids
+        );
+
+        let resp = match client.get(&url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+
+        let json: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if let Some(products) = json.get("Products").and_then(|v| v.as_array()) {
+            for product in products {
+                let props = match product.get("LocalizedProperties").and_then(|v| v.as_array()).and_then(|a| a.first()) {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                let name = props
+                    .get("ProductTitle")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+
+                let id = product
+                    .get("ProductId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let desc = props
+                    .get("ShortDescription")
+                    .or_else(|| props.get("ShortTitle"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let developer = props
+                    .get("DeveloperName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let publisher = props
+                    .get("PublisherName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                // 获取封面图
+                let header_image = props
+                    .get("Images")
+                    .and_then(|v| v.as_array())
+                    .and_then(|imgs| {
+                        imgs.iter()
+                            .find(|img| {
+                                img.get("ImagePurpose")
+                                    .and_then(|v| v.as_str())
+                                    .map(|p| p == "SuperHeroArt" || p == "Poster" || p == "BoxArt")
+                                    .unwrap_or(false)
+                            })
+                            .or_else(|| imgs.first())
+                            .and_then(|img| img.get("Uri").and_then(|u| u.as_str()))
+                    })
+                    .map(|u| {
+                        if u.starts_with("//") {
+                            format!("https:{}", u)
+                        } else {
+                            u.to_string()
+                        }
+                    })
+                    .unwrap_or_default();
+
+                // 解析价格
+                let (is_free, formatted_price) = product
+                    .get("DisplaySkuAvailabilities")
+                    .and_then(|v| v.as_array())
+                    .and_then(|skus| skus.first())
+                    .and_then(|sku| {
+                        sku.get("Availabilities")
+                            .and_then(|v| v.as_array())
+                            .and_then(|a| a.first())
+                    })
+                    .map(|avail| {
+                        let list_price = avail
+                            .pointer("/OrderManagementData/Price/ListPrice")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let ms_price = avail
+                            .pointer("/OrderManagementData/Price/MSRP")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let price = if list_price > 0.0 { list_price } else { ms_price };
+                        let free = price == 0.0;
+                        let fmt = if free {
+                            "免费".to_string()
+                        } else {
+                            format!("¥{:.0}", price)
+                        };
+                        (free, fmt)
+                    })
+                    .unwrap_or((false, String::new()));
+
+                let store_url = format!(
+                    "https://www.xbox.com/zh-CN/games/store/{}",
+                    id.to_lowercase()
+                );
+
+                let category = product
+                    .get("Properties")
+                    .and_then(|v| v.get("Category"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("游戏");
+
+                all_games.push(serde_json::json!({
+                    "id": format!("xb_{}", id),
+                    "name": name,
+                    "developer": if !developer.is_empty() { developer } else { publisher },
+                    "genre": category,
+                    "description": desc,
+                    "header_image": header_image,
+                    "is_free": is_free,
+                    "platform": "xbox",
+                    "store_url": store_url,
+                    "tags": ["Game Pass"],
+                    "price": { "formatted": formatted_price },
+                }));
+            }
+        }
+    }
+
+    info!("Xbox DisplayCatalog: {} 款游戏", all_games.len());
+    Ok(all_games)
+}
+
+/// Xbox 备用: 使用 Microsoft Store 搜索 API
+async fn fetch_xbox_from_catalog(client: &Client, count: u32) -> Result<Vec<Value>, AppError> {
+    // Microsoft Store 搜索接口
+    let url = format!(
+        "https://storeedgefd.dsx.mp.microsoft.com/v9.0/pages/pdp?market=CN&locale=zh-cn&deviceFamily=Windows.Xbox&appVersion=0&catalogIds=&productIds=&mediaGroup=Games&top={}",
+        count.min(50)
+    );
+
+    let resp = match client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => {
+            warn!("Xbox 所有 API 均失败");
+            return Ok(Vec::new());
+        }
+    };
+
+    let json: Value = resp.json().await.unwrap_or(Value::Null);
+    let mut games = Vec::new();
+
+    // storeedge API 结构
+    if let Some(cards) = json
+        .pointer("/Payload/Cards")
+        .and_then(|v| v.as_array())
+    {
+        for card in cards {
+            if let Some(items) = card.get("Items").and_then(|v| v.as_array()) {
+                for item in items.iter().take(count as usize) {
+                    let title = item
+                        .get("Title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if title.is_empty() {
+                        continue;
+                    }
+                    let id = item
+                        .get("ProductId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let image = item
+                        .get("ImageUrl")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    games.push(serde_json::json!({
+                        "id": format!("xb_{}", id),
+                        "name": title,
+                        "developer": "",
+                        "genre": "游戏",
+                        "description": "",
+                        "header_image": image,
+                        "is_free": false,
+                        "platform": "xbox",
+                        "store_url": format!("https://www.xbox.com/zh-CN/games/store/{}", id.to_lowercase()),
+                        "tags": [],
+                        "price": { "formatted": "" },
+                    }));
+                }
+            }
+        }
+    }
+
+    info!("Xbox Store Edge: {} 款", games.len());
+    Ok(games)
+}
+
+// ============================================================================
 // 每日推荐 Top 30
 // ============================================================================
 

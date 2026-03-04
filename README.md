@@ -108,11 +108,27 @@ sequenceDiagram
 
 ### Client-side Hardware Decoding
 
+The Flutter client uses media_kit (libmpv) with hardware decoding enabled by default. The `Video()` widget is wrapped in `SizedBox.expand()` to ensure proper sizing on all platforms. mpv is configured with:
+
+- `hwdec=auto-safe` — Automatically selects the best available hardware decoder
+- `cache=yes` with `demuxer-max-bytes=50MiB` / `demuxer-max-back-bytes=25MiB` — Reduces stalls
+- `stream-buffer-size=2MiB` — Optimized for network streaming
+
 | Platform | API | Configuration |
 |----------|-----|---------------|
 | Android | MediaCodec | `hwdec=mediacodec` via libmpv |
 | iOS | VideoToolbox | `hwdec=videotoolbox` via libmpv |
 | Windows/Linux/macOS | Auto-detect | `hwdec=auto-safe` via libmpv |
+
+### Audio Playback
+
+Audio uses `just_audio` with a **triple-fallback source strategy**:
+
+1. `LockCachingAudioSource` — Progressive download with caching (20s timeout)
+2. `AudioSource.uri` with Auth headers — Direct streaming (20s timeout)
+3. `setUrl` — Simple URL playback (20s timeout)
+
+Unsupported audio codecs (wmav1/2, wmapro, wmalossless, pcm_bluray/dvd, cook, ra_288, atrac3/3p, ape, etc.) are automatically transcoded to AAC/MP3 on the server side before streaming.
 
 ### Key Derivation
 
@@ -139,30 +155,35 @@ Each segment is encrypted as: `nonce(12B) ‖ AES-256-GCM(plaintext, key, nonce)
 
 ## Hardware Accelerated Transcoding
 
-The server auto-detects available hardware at startup and selects the optimal encoding pipeline:
+The server auto-detects available hardware at startup and selects the optimal encoding pipeline. On ARM architectures, VAAPI is **explicitly skipped** (Mali/Panfrost GPUs expose `/dev/dri/renderD128` but do not support video encoding), and the detection order is: **Rockchip MPP → V4L2 M2M → Software fallback**. A test encode is performed to verify each candidate actually works before committing to it.
 
 | Platform | Detection Method | Encoder | Decoder | Notes |
 |----------|-----------------|---------|---------|-------|
-| Intel | VAAPI device + vendor ID `0x8086` | h264_vaapi | hwaccel vaapi | Verified via FFmpeg init test |
-| AMD | VAAPI device + vendor ID `0x1002` | h264_vaapi | hwaccel vaapi | Verified via FFmpeg init test |
-| Amlogic (A311D/S905/S922) | `/proc/cpuinfo`, device tree, `/dev/amvideo` | h264_v4l2m2m | meson_vdec | Falls back to software encode if V4L2 M2M fails |
-| Rockchip (RK3588/RK3399) | `/proc/cpuinfo`, device tree | h264_rkmpp | rkmpp | Requires MPP libraries |
-| Generic ARM | `/dev/video10`, `/dev/video11` | h264_v4l2m2m | h264_v4l2m2m | Verified via encode test |
+| Intel | VAAPI device + vendor ID `0x8086` | h264_vaapi | hwaccel vaapi | Verified via FFmpeg test encode |
+| AMD | VAAPI device + vendor ID `0x1002` | h264_vaapi | hwaccel vaapi | Verified via FFmpeg test encode |
+| Rockchip (RK3588/RK3399) | `/proc/cpuinfo`, device tree | h264_rkmpp | rkmpp | Requires MPP libraries; priority 1 on ARM |
+| Amlogic (A311D/S905/S922) | `/proc/cpuinfo`, device tree, `/dev/amvideo` | h264_v4l2m2m | meson_vdec | Falls back to software if V4L2 M2M fails |
+| Generic ARM | `/dev/video10`, `/dev/video11` | h264_v4l2m2m | h264_v4l2m2m | Verified via encode test; priority 2 on ARM |
 | Fallback | — | libx264 (ultrafast) | software | Used when no hardware is detected |
 
-For ≤1080p content, the server uses stream copy (`-c:v copy -c:a copy`) which is near-instant.
+For ≤1080p content, the server uses stream copy (`-c:v copy -c:a copy -map 0:v? -map 0:a?`) which is near-instant. The `-map 0:v? -map 0:a?` flags ensure only video and audio streams are selected, avoiding mpegts muxer failures from subtitle or data tracks.
 
 ## Game Center
 
-Multi-platform gaming hub with **fully native** UI integration (no WebView):
+Multi-platform gaming hub with **fully native** UI integration (no WebView). Each platform tab fetches **real-time data from official APIs** with built-in catalog fallback:
 
-| Platform | Integration | Features |
-|----------|-------------|----------|
-| Steam | API + SteamDB | Game library, play time stats, profile, API key binding, SteamDB viewer |
-| Epic Games | Native catalog (12 games) | Featured carousel, free game highlights, category browsing, search, save to library |
-| WeGame | Native catalog (12 games) | Featured carousel, category browsing, search, save to library |
-| Ubisoft Connect | Native catalog (11 games) | Featured carousel, category browsing, search, save to library |
-| Xbox | Native catalog (11 games) | Featured carousel, Game Pass highlights, category browsing, search, save to library |
+| Platform | Official API Source | Features |
+|----------|---------------------|----------|
+| Steam | Steam Web API (`store.steampowered.com`) | Game library, play time stats, profile, API key binding, SteamDB viewer |
+| Epic Games | Epic GraphQL API (`graphql.epicgames.com`) | Live catalog, free game highlights, featured carousel, category browsing, search |
+| WeGame | WeGame Internal API (`wegame.com.cn/api/v1/`) | Live catalog, hot games ranking, featured carousel, search, save to library |
+| Ubisoft Connect | Ubisoft Store API (`store.ubisoft.com`) + Ubisoft Services API | Live catalog, featured carousel, category browsing, search, save to library |
+| Xbox | Game Pass Catalog (`catalog.gamepass.com`) + Microsoft DisplayCatalog API | Live catalog, Game Pass highlights, featured carousel, search, save to library |
+
+- All platform tabs show a **live data indicator** (🔴 实时) when displaying API-fetched data
+- Game cover images are loaded directly from official CDN URLs (Epic `cdn1.epicgames.com`, Ubisoft `staticctf.ubisoft.com`, Xbox `store-images.s-microsoft.com`)
+- 30-minute server-side cache with automatic refresh on pull-to-refresh
+- Graceful degradation: if any API is unreachable, the tab seamlessly falls back to curated catalog data
 
 The **My Library** tab provides a unified view of game accounts across all platforms with Steam full library integration (game count, total play time, recently played).
 
@@ -418,6 +439,32 @@ POST /api/v1/zkp/share/verify
 POST /api/v1/zkp/proof/generate
 ```
 
+### WASM Store & Game Center
+
+```http
+GET  /api/v1/wasm-store/overview                     # Store overview (stats, categories)
+GET  /api/v1/wasm-store/steam/featured               # Steam featured games
+GET  /api/v1/wasm-store/steam/app/{app_id}            # Steam app details
+GET  /api/v1/wasm-store/steam/library                 # User's Steam library
+GET  /api/v1/wasm-store/steam/player                  # Steam player summary
+GET  /api/v1/wasm-store/steam/search?q=...            # Search Steam store
+GET  /api/v1/wasm-store/epic/free                     # Epic free games (GraphQL)
+GET  /api/v1/wasm-store/platform/games?platform=epic|wegame|ubisoft|xbox  # Official platform API data
+GET  /api/v1/wasm-store/search?q=...                  # Search WASM apps
+GET  /api/v1/wasm-store/recommendations               # Daily Top 30 recommendations
+POST /api/v1/wasm-store/github/import                 # Import WASM from GitHub
+POST /api/v1/wasm-store/wasm/run-script               # Execute WASM script
+GET  /api/v1/wasm-store/wasm/apps                     # List installed WASM apps
+GET  /api/v1/wasm-store/wasm/apps/{app_id}            # WASM app details
+POST /api/v1/wasm-store/wasm/install                  # Install WASM app
+POST /api/v1/wasm-store/wasm/{app_id}/run             # Run installed WASM app
+DELETE /api/v1/wasm-store/wasm/{app_id}               # Uninstall WASM app
+GET  /api/v1/wasm-store/builtin/{app_id}/run          # Run built-in app (SteamDB/M3U8/P2P)
+POST /api/v1/wasm-store/builtin/m3u8-downloader/download  # Download M3U8 video
+GET  /api/v1/wasm-store/builtin/downloads             # List downloaded files
+GET  /api/v1/wasm-store/builtin/downloads/{filename}  # Serve downloaded file
+```
+
 ### Storage
 
 ```http
@@ -426,6 +473,49 @@ GET  /api/v1/storage/disk/{name}
 POST /api/v1/storage/format
 POST /api/v1/storage/mount
 POST /api/v1/storage/unmount
+POST /api/v1/storage/file                            # Write file to storage
+```
+
+### Storage Management
+
+```http
+GET  /api/v1/storage-management/overview             # Storage overview
+POST /api/v1/storage-management/format               # Format disk
+POST /api/v1/storage-management/mount                 # Mount filesystem
+POST /api/v1/storage-management/unmount               # Unmount filesystem
+POST /api/v1/storage-management/secure-erase          # Secure erase disk
+GET  /api/v1/storage-management/smart/{device}        # SMART health data
+POST /api/v1/storage-management/partition              # Create partition
+POST /api/v1/storage-management/scan                  # Scan for new devices
+```
+
+### System
+
+```http
+GET  /api/v1/system/info                             # System overview
+GET  /api/v1/system/cpu                              # CPU details
+GET  /api/v1/system/memory                           # Memory usage
+GET  /api/v1/system/disks                            # Disk info
+GET  /api/v1/system/usb                              # USB devices
+GET  /api/v1/system/hardware                         # Hardware info
+GET  /api/v1/system/all                              # All system info combined
+```
+
+### Speed Test
+
+```http
+GET  /api/v1/speedtest/download                      # Download speed test
+POST /api/v1/speedtest/upload                        # Upload speed test
+GET  /api/v1/speedtest/ping                          # Latency test
+GET  /api/v1/speedtest/info                          # Server info
+```
+
+### Invite System
+
+```http
+POST /api/v1/invite/create                           # Create invite code
+GET  /api/v1/invite/validate/{code}                  # Validate invite
+POST /api/v1/invite/remaining                        # Check remaining time
 ```
 
 ## Performance
@@ -450,14 +540,18 @@ POST /api/v1/storage/unmount
 - [x] SAE session-authenticated HLS streaming with AES-256-GCM
 - [x] FIDO2/WebAuthn hardware authentication
 - [x] Professional storage management
-- [x] Hardware accelerated video transcoding
-- [x] Flutter cross-platform client
-- [x] Multi-platform native game center (Steam/Epic/WeGame/Ubisoft/Xbox)
+- [x] Hardware accelerated video transcoding (VAAPI / Rockchip MPP / V4L2 M2M)
+- [x] ARM architecture-aware encoder detection (skip VAAPI on Mali/Panfrost)
+- [x] Flutter cross-platform client with hardware-accelerated playback
+- [x] Multi-platform native game center with official API integration (Steam/Epic/WeGame/Ubisoft/Xbox)
+- [x] Triple-fallback audio playback with automatic server-side codec transcoding
 - [x] LAN file transfer
 - [x] WebDAV server
 - [x] WASM application runtime (with built-in SteamDB viewer, M3U8 downloader, Steam P2P info)
 - [x] Dynamic theming with wallpaper color extraction & glassmorphic UI
 - [x] Edge-to-edge UI with gesture navigation
+- [x] Network speed test (download/upload/ping with chronograph UI)
+- [x] Invite system with expiring codes
 - [ ] RAID support
 - [ ] Snapshot and backup
 - [ ] Multi-user permission management

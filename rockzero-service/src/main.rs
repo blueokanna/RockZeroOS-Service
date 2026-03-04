@@ -591,6 +591,11 @@ async fn main() -> std::io::Result<()> {
                                 "/epic/free",
                                 web::get().to(handlers::wasm_store::get_epic_free_games),
                             )
+                            // 平台游戏数据 (Epic/WeGame/Ubisoft/Xbox 官方 API)
+                            .route(
+                                "/platform/games",
+                                web::get().to(handlers::wasm_store::get_platform_games),
+                            )
                             // WASM 应用搜索
                             .route(
                                 "/search",

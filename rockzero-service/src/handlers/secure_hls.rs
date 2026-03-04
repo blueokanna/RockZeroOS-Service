@@ -25,32 +25,25 @@ fn convert_hls_error(err: rockzero_media::HlsError) -> AppError {
 fn sanitize_file_path(path: &str) -> Result<std::path::PathBuf, AppError> {
     use std::path::PathBuf;
 
-    // URL 解码
     let decoded_path = urlencoding::decode(path)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| path.to_string());
 
     let path_buf = PathBuf::from(&decoded_path);
 
-    // 如果是绝对路径，直接验证
     if path_buf.is_absolute() {
-        // 尝试规范化路径
         let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
 
-        // 验证路径是否在允许的目录中
         const ALLOWED_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
         let path_str = canonical.to_string_lossy();
-
         for allowed_dir in ALLOWED_DIRS {
             if path_str.starts_with(allowed_dir) {
                 return Ok(canonical);
             }
         }
 
-        // Windows 路径
         #[cfg(target_os = "windows")]
         {
-            // 允许所有盘符
             if path_str.len() >= 2 && path_str.chars().nth(1) == Some(':') {
                 return Ok(canonical);
             }
@@ -61,10 +54,8 @@ fn sanitize_file_path(path: &str) -> Result<std::path::PathBuf, AppError> {
         ));
     }
 
-    // 相对路径：相对于基础目录
     let base_dir = get_base_directory()?;
     let full_path = base_dir.join(&decoded_path);
-
     let canonical = full_path
         .canonicalize()
         .unwrap_or_else(|_| full_path.clone());
@@ -108,8 +99,8 @@ fn get_base_directory() -> Result<std::path::PathBuf, AppError> {
 
 #[derive(Debug, Deserialize)]
 pub struct InitSaeRequest {
-    pub file_id: Option<String>,   // 文件 ID（数据库中的）
-    pub file_path: Option<String>, // 文件路径（文件系统中的）
+    pub file_id: Option<String>,
+    pub file_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,7 +112,7 @@ pub struct CompleteSaeRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct SecureSegmentRequest {
-    pub zkp_proof: String, // Base64 编码的 ZKP 证明
+    pub zkp_proof: String,
 }
 
 pub async fn init_sae_handshake(
@@ -132,15 +123,12 @@ pub async fn init_sae_handshake(
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
 
-    // 验证文件访问权限（支持文件 ID 或文件路径）
     let file_path = if let Some(ref file_id) = body.file_id {
-        // 通过文件 ID 查找
         let file = crate::db::find_file_by_id(&pool, file_id, &user_id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("File not found: {}", file_id)))?;
         file.file_path
     } else if let Some(ref path) = body.file_path {
-        // 直接使用文件路径（验证路径是否存在）
         let sanitized_path = sanitize_file_path(path)?;
         if !sanitized_path.exists() {
             return Err(AppError::NotFound(format!("File not found: {}", path)));
@@ -163,7 +151,6 @@ pub async fn init_sae_handshake(
         user_id, file_path
     );
 
-    // 从数据库获取用户的 SAE 密钥（SHA-256 hash of password）
     let user = crate::db::find_user_by_id(&pool, &user_id)
         .await?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
@@ -364,7 +351,11 @@ pub async fn create_hls_session(
         user_id, file_path
     );
 
-    let zkp_registration: Option<PasswordRegistration> = match get_user_zkp_registration(&pool, &user_id).await {
+    let zkp_registration: Option<PasswordRegistration> = match get_user_zkp_registration(
+        &pool, &user_id,
+    )
+    .await
+    {
         Ok(Some(reg)) => Some(reg),
         Ok(None) => {
             if let Some(ref reg_json) = body.zkp_registration {
@@ -546,14 +537,8 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
         .unwrap_or_else(|_| "ffmpeg".to_string());
 
     let segment_pattern = cache_dir.join("segment_%d.ts");
-    let seg_pattern_str = segment_pattern
-        .to_str()
-        .unwrap_or("")
-        .to_string();
-    let playlist_str = playlist_path
-        .to_str()
-        .unwrap_or("")
-        .to_string();
+    let seg_pattern_str = segment_pattern.to_str().unwrap_or("").to_string();
+    let playlist_str = playlist_path.to_str().unwrap_or("").to_string();
 
     info!(
         "🎬 Starting progressive segmentation: {} → {}",
@@ -563,7 +548,11 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
 
     // 清理之前的部分输出（如果有）
     if !lock_file.exists() {
-        for entry in std::fs::read_dir(&cache_dir).into_iter().flatten().flatten() {
+        for entry in std::fs::read_dir(&cache_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "ts" || e == "m3u8") {
                 let _ = std::fs::remove_file(&path);
@@ -613,10 +602,7 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
             // 等待 playlist 至少包含一个 EXTINF
             if let Ok(content) = tokio::fs::read_to_string(&playlist_path).await {
                 if content.contains("#EXTINF") {
-                    info!(
-                        "First segment ready after {}ms, returning playlist",
-                        waited
-                    );
+                    info!("First segment ready after {}ms, returning playlist", waited);
                     return Ok((cache_dir, content));
                 }
             }
@@ -630,9 +616,7 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
     if playlist_path.exists() {
         let content = tokio::fs::read_to_string(&playlist_path)
             .await
-            .map_err(|e| {
-                AppError::IoError(format!("Failed to read playlist: {}", e))
-            })?;
+            .map_err(|e| AppError::IoError(format!("Failed to read playlist: {}", e)))?;
         if content.contains("#EXTINF") {
             return Ok((cache_dir, content));
         }
@@ -663,10 +647,14 @@ async fn detect_video_codec(ffmpeg_path: &str, file_path: &str) -> Option<String
 
     let output = tokio::process::Command::new(&ffprobe_path)
         .args([
-            "-v", "quiet",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=codec_name",
-            "-of", "csv=p=0",
+            "-v",
+            "quiet",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "csv=p=0",
             file_path,
         ])
         .output()
@@ -714,9 +702,7 @@ async fn encrypt_segments_at_rest(
     let mut ts_files = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "ts")
-            && !path.with_extension("ts.enc").exists()
-        {
+        if path.extension().is_some_and(|e| e == "ts") && !path.with_extension("ts.enc").exists() {
             ts_files.push(path);
         }
     }
@@ -750,18 +736,13 @@ async fn encrypt_segments_at_rest(
     if encrypted_count > 0 {
         info!(
             "🔒 Encrypted {} segment files at rest in {:?}",
-            encrypted_count,
-            cache_dir
+            encrypted_count, cache_dir
         );
     }
 
     Ok(encrypted_count)
 }
 
-/// 读取并解密静态加密的分片文件
-///
-/// 优先读取 .ts.enc 加密文件并解密，如果不存在则回退到明文 .ts 文件。
-/// 这确保在加密过程中或旧缓存中仍能正常访问数据。
 async fn read_segment_data(
     segment_path: &std::path::Path,
     storage_key: &[u8; 32],
@@ -769,19 +750,17 @@ async fn read_segment_data(
     let enc_path = segment_path.with_extension("ts.enc");
 
     if enc_path.exists() {
-        // 读取加密文件并解密
-        let encrypted = tokio::fs::read(&enc_path).await.map_err(|e| {
-            AppError::IoError(format!("Failed to read encrypted segment: {}", e))
-        })?;
+        let encrypted = tokio::fs::read(&enc_path)
+            .await
+            .map_err(|e| AppError::IoError(format!("Failed to read encrypted segment: {}", e)))?;
         let data = crate::crypto::aes_decrypt(storage_key, &encrypted)?;
         return Ok(data);
     }
 
-    // 回退到明文段文件（兼容旧缓存或加密进行中）
     if segment_path.exists() {
-        let data = tokio::fs::read(segment_path).await.map_err(|e| {
-            AppError::IoError(format!("Failed to read segment: {}", e))
-        })?;
+        let data = tokio::fs::read(segment_path)
+            .await
+            .map_err(|e| AppError::IoError(format!("Failed to read segment: {}", e)))?;
         return Ok(data);
     }
 
@@ -813,7 +792,9 @@ async fn run_ffmpeg_progressive(
         "-i".into(),
         file_path.into(),
         "-map".into(),
-        "0".into(),           // 映射所有流（视频+音频+字幕）
+        "0:v?".into(), // 视频流（如果有）
+        "-map".into(),
+        "0:a?".into(), // 音频流（如果有）
         "-c".into(),
         "copy".into(),
     ];
@@ -821,17 +802,11 @@ async fn run_ffmpeg_progressive(
     // 根据视频编码添加 bitstream filter — 这是解决黑屏问题的关键
     match video_codec.as_deref() {
         Some("h264" | "avc" | "avc1") => {
-            copy_args.extend([
-                "-bsf:v".into(),
-                "h264_mp4toannexb".into(),
-            ]);
+            copy_args.extend(["-bsf:v".into(), "h264_mp4toannexb".into()]);
             info!("Applied h264_mp4toannexb bitstream filter for TS muxing");
         }
         Some("hevc" | "h265" | "hev1" | "hvc1") => {
-            copy_args.extend([
-                "-bsf:v".into(),
-                "hevc_mp4toannexb".into(),
-            ]);
+            copy_args.extend(["-bsf:v".into(), "hevc_mp4toannexb".into()]);
             info!("Applied hevc_mp4toannexb bitstream filter for TS muxing");
         }
         _ => {
@@ -844,11 +819,11 @@ async fn run_ffmpeg_progressive(
         "-f".into(),
         "hls".into(),
         "-hls_time".into(),
-        "6".into(),           // 6 秒段更适合移动端
+        "6".into(), // 6 秒段更适合移动端
         "-hls_list_size".into(),
         "0".into(),
         "-hls_playlist_type".into(),
-        "event".into(),       // event 模式 = 渐进式播放列表
+        "event".into(), // event 模式 = 渐进式播放列表
         "-hls_flags".into(),
         "append_list+independent_segments".into(),
         "-hls_segment_type".into(),
@@ -907,6 +882,17 @@ async fn run_ffmpeg_progressive(
     let mut args: Vec<String> = vec!["-y".into(), "-i".into(), file_path.into()];
 
     match hw_accel {
+        HardwareAccel::Rkmpp => {
+            info!("Using Rockchip MPP hardware encoding for HLS segmentation");
+            args.extend([
+                "-c:v".into(),
+                "h264_rkmpp".into(),
+                "-b:v".into(),
+                "3M".into(),
+                "-rc_mode".into(),
+                "VBR".into(),
+            ]);
+        }
         HardwareAccel::V4l2 => {
             info!("Using V4L2 hardware encoding for HLS segmentation");
             args.extend([
@@ -1703,6 +1689,20 @@ async fn transcode_segment_async(
 
     // 根据硬件加速能力选择编码器
     match hw_accel {
+        HardwareAccel::Rkmpp => {
+            info!(
+                "Using Rockchip MPP hardware acceleration for segment {}",
+                segment_index
+            );
+            args.extend(vec![
+                "-c:v".to_string(),
+                "h264_rkmpp".to_string(),
+                "-b:v".to_string(),
+                "3M".to_string(),
+                "-rc_mode".to_string(),
+                "VBR".to_string(),
+            ]);
+        }
         HardwareAccel::Vaapi => {
             // Intel/AMD GPU 硬件加速
             info!(
@@ -1802,21 +1802,81 @@ async fn transcode_segment_async(
 /// 硬件加速类型
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HardwareAccel {
+    Rkmpp, // Rockchip MPP (RK3588 等)
     Vaapi, // Intel/AMD GPU (VA-API)
     V4l2,  // V4L2 M2M (ARM SoC)
     None,  // 软件编码
 }
 
 /// 检测可用的硬件加速
+///
+/// 检测顺序（优先ARM场景）：
+/// 1. 检查 CPU 架构 — aarch64 优先使用 ARM 编码器
+/// 2. Rockchip MPP (`h264_rkmpp`) — RK3588/RK3399 等 SoC
+/// 3. V4L2 M2M (`h264_v4l2m2m`) — 通用 ARM 硬件编码
+/// 4. VAAPI (`h264_vaapi`) — Intel/AMD GPU（仅 x86_64）
+/// 5. 软件编码 (`libx264`) — 最终回退
 async fn detect_hardware_acceleration() -> HardwareAccel {
     use tokio::fs;
 
-    if fs::metadata("/dev/dri/renderD128").await.is_ok() && check_ffmpeg_encoder("h264_vaapi").await
-    {
-        return HardwareAccel::Vaapi;
+    let is_arm = cfg!(target_arch = "aarch64") || cfg!(target_arch = "arm") || {
+        // 运行时检测（交叉编译场景）
+        if let Ok(machine) = tokio::process::Command::new("uname")
+            .arg("-m")
+            .output()
+            .await
+        {
+            let arch = String::from_utf8_lossy(&machine.stdout)
+                .trim()
+                .to_lowercase();
+            arch.contains("aarch64") || arch.contains("arm")
+        } else {
+            false
+        }
+    };
+
+    if is_arm {
+        // ARM 平台：优先 Rockchip MPP → V4L2 → 软件编码
+        // 不使用 VAAPI（即使 /dev/dri/renderD128 存在也可能是 Mali 显示驱动）
+
+        // Rockchip MPP
+        if check_ffmpeg_encoder("h264_rkmpp").await {
+            info!("Detected Rockchip MPP hardware encoder on ARM");
+            return HardwareAccel::Rkmpp;
+        }
+
+        // V4L2 M2M — 检测设备节点和编码器支持
+        let has_v4l2_device = fs::metadata("/dev/video10").await.is_ok()
+            || fs::metadata("/dev/video11").await.is_ok()
+            || fs::metadata("/dev/video0").await.is_ok();
+
+        if has_v4l2_device && check_ffmpeg_encoder("h264_v4l2m2m").await {
+            // 验证 V4L2 编码器真正可用（某些设备列出但无法使用）
+            if verify_encoder_works("h264_v4l2m2m").await {
+                info!("Detected V4L2 M2M hardware encoder on ARM");
+                return HardwareAccel::V4l2;
+            } else {
+                warn!("V4L2 encoder listed but failed test encode, falling back to software");
+            }
+        }
+
+        info!("No hardware encoder available on ARM, using software encoding");
+        return HardwareAccel::None;
     }
 
-    // 检测 V4L2 设备（ARM SoC）
+    // x86_64 平台：VAAPI → V4L2 → 软件编码
+    if fs::metadata("/dev/dri/renderD128").await.is_ok() && check_ffmpeg_encoder("h264_vaapi").await
+    {
+        // 验证 VAAPI 真正可用
+        if verify_vaapi_works().await {
+            info!("Detected VAAPI hardware encoder on x86_64");
+            return HardwareAccel::Vaapi;
+        } else {
+            warn!("VAAPI encoder detected but test failed, falling back");
+        }
+    }
+
+    // V4L2 回退
     if (fs::metadata("/dev/video10").await.is_ok() || fs::metadata("/dev/video11").await.is_ok())
         && check_ffmpeg_encoder("h264_v4l2m2m").await
     {
@@ -1845,6 +1905,78 @@ async fn check_ffmpeg_encoder(encoder: &str) -> bool {
     }
 
     false
+}
+
+/// 验证硬件编码器真正可用（而非仅列出）
+///
+/// 通过生成一帧测试视频来验证编码器是否真正工作。
+/// 某些设备（如 Mali GPU）虽然有 /dev/dri/renderD128 但不支持编码。
+async fn verify_encoder_works(encoder: &str) -> bool {
+    use tokio::process::Command;
+
+    let ffmpeg_path = std::env::var("FFMPEG_PATH")
+        .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
+        .unwrap_or_else(|_| "ffmpeg".to_string());
+
+    // 生成 1 帧黑色视频并尝试用指定编码器编码
+    let result = Command::new(&ffmpeg_path)
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:s=64x64:d=0.04:r=25",
+            "-c:v",
+            encoder,
+            "-frames:v",
+            "1",
+            "-f",
+            "null",
+            "-y",
+            "/dev/null",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+
+    matches!(result, Ok(status) if status.success())
+}
+
+/// 验证 VAAPI 编码器真正可用
+async fn verify_vaapi_works() -> bool {
+    use tokio::process::Command;
+
+    let ffmpeg_path = std::env::var("FFMPEG_PATH")
+        .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
+        .unwrap_or_else(|_| "ffmpeg".to_string());
+
+    let result = Command::new(&ffmpeg_path)
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:s=64x64:d=0.04:r=25",
+            "-hwaccel",
+            "vaapi",
+            "-hwaccel_device",
+            "/dev/dri/renderD128",
+            "-hwaccel_output_format",
+            "vaapi",
+            "-c:v",
+            "h264_vaapi",
+            "-frames:v",
+            "1",
+            "-f",
+            "null",
+            "-y",
+            "/dev/null",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+
+    matches!(result, Ok(status) if status.success())
 }
 
 #[cfg(test)]
