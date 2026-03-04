@@ -819,7 +819,7 @@ async fn run_ffmpeg_progressive(
         "-f".into(),
         "hls".into(),
         "-hls_time".into(),
-        "6".into(), // 6 秒段更适合移动端
+        "2".into(), // 2 秒段提升首帧速度与seek响应
         "-hls_list_size".into(),
         "0".into(),
         "-hls_playlist_type".into(),
@@ -940,7 +940,7 @@ async fn run_ffmpeg_progressive(
         "-f".into(),
         "hls".into(),
         "-hls_time".into(),
-        "6".into(),
+        "2".into(),
         "-hls_list_size".into(),
         "0".into(),
         "-hls_playlist_type".into(),

@@ -531,6 +531,10 @@ async fn main() -> std::io::Result<()> {
                                 web::get().to(handlers::filemanager::get_media_info),
                             )
                             .route(
+                                "/media/stream",
+                                web::get().to(handlers::filemanager::stream_media),
+                            )
+                            .route(
                                 "/media/image",
                                 web::get().to(handlers::filemanager::serve_image),
                             )
