@@ -1044,6 +1044,89 @@ pub async fn get_secure_playlist(
         .body(playlist_content))
 }
 
+fn parse_segment_index(segment_name: &str) -> Option<usize> {
+    if !segment_name.starts_with("segment_") || !segment_name.ends_with(".ts") {
+        return None;
+    }
+
+    segment_name
+        .trim_start_matches("segment_")
+        .trim_end_matches(".ts")
+        .parse::<usize>()
+        .ok()
+}
+
+fn get_max_existing_segment_index(cache_dir: &std::path::Path) -> Option<usize> {
+    let mut max_idx: Option<usize> = None;
+
+    let entries = match std::fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        Err(_) => return None,
+    };
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+
+        let idx = if file_name.starts_with("segment_") && file_name.ends_with(".ts") {
+            file_name
+                .trim_start_matches("segment_")
+                .trim_end_matches(".ts")
+                .parse::<usize>()
+                .ok()
+        } else if file_name.starts_with("segment_") && file_name.ends_with(".ts.enc") {
+            file_name
+                .trim_start_matches("segment_")
+                .trim_end_matches(".ts.enc")
+                .parse::<usize>()
+                .ok()
+        } else {
+            None
+        };
+
+        if let Some(idx) = idx {
+            max_idx = Some(max_idx.map_or(idx, |current| current.max(idx)));
+        }
+    }
+
+    max_idx
+}
+
+async fn wait_for_segment_ready(
+    cache_dir: &std::path::Path,
+    segment_name: &str,
+    max_wait_ms: u64,
+) -> Result<bool, AppError> {
+    let segment_path = cache_dir.join(segment_name);
+    let enc_path = segment_path.with_extension("ts.enc");
+    let done_marker = cache_dir.join(".done");
+    let target_idx = parse_segment_index(segment_name);
+
+    let mut waited_ms = 0u64;
+    let poll_interval_ms = 120u64;
+
+    while waited_ms <= max_wait_ms {
+        if segment_path.exists() || enc_path.exists() {
+            return Ok(true);
+        }
+
+        if done_marker.exists() {
+            if let Some(target_idx) = target_idx {
+                if let Some(max_idx) = get_max_existing_segment_index(cache_dir) {
+                    if target_idx > max_idx {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
+        waited_ms += poll_interval_ms;
+    }
+
+    Ok(segment_path.exists() || enc_path.exists())
+}
+
 /// 直接获取视频段（GET，session 鉴权）
 ///
 /// 标准 HLS 播放器可以直接 GET 请求获取视频段。
@@ -1069,60 +1152,50 @@ pub async fn get_segment_direct(
         )));
     }
 
-    // 验证会话并获取文件路径 + 段数据
-    let (is_direct_mode, response_data) = {
+    // 先读取会话必要数据，避免在 await 期间持有 RwLock 读锁
+    let (file_path, is_direct_mode) = {
         let manager = hls_manager.read().await;
         let session = manager
             .get_session(&session_id)
             .map_err(convert_hls_error)?;
-        let fp = session.file_path.clone();
-        let direct_mode = session.direct_mode;
+        (session.file_path.clone(), session.direct_mode)
+    };
 
-        // 构建缓存路径
-        let video_hash = blake3::hash(fp.as_bytes());
-        let video_id = hex::encode(&video_hash.as_bytes()[..8]);
-        let cache_dir = get_hls_cache_dir().join(&video_id);
-        let segment_path = cache_dir.join(&segment_name);
+    // 构建缓存路径
+    let video_hash = blake3::hash(file_path.as_bytes());
+    let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+    let cache_dir = get_hls_cache_dir().join(&video_id);
+    let segment_path = cache_dir.join(&segment_name);
+    let enc_path = segment_path.with_extension("ts.enc");
 
-        // 如果段文件不存在（明文或加密形式），先确保分片完成
-        let enc_path = segment_path.with_extension("ts.enc");
-        if !segment_path.exists() && !enc_path.exists() {
-            drop(manager); // 释放读锁避免 ffmpeg 等待时死锁
-            ensure_hls_segments(&fp).await?;
+    // 渐进式模式下，段文件可能在 playlist 暴露后短时间内尚未落盘。
+    // 这里进行有限等待，避免播放器被 404 打断。
+    if !segment_path.exists() && !enc_path.exists() {
+        ensure_hls_segments(&file_path).await?;
 
-            let manager = hls_manager.read().await;
-            let session = manager
-                .get_session(&session_id)
-                .map_err(convert_hls_error)?;
-
-            // 从磁盘读取段数据（自动处理加密/明文文件）
-            let storage_key = derive_segment_storage_key(&fp);
-            let segment_data = read_segment_data(&segment_path, &storage_key).await?;
-
-            if direct_mode {
-                // 直接模式：返回明文视频段
-                (true, segment_data)
-            } else {
-                // 加密模式：使用会话密钥进行传输加密
-                let encrypted = session
-                    .encrypt_segment(&segment_data)
-                    .map_err(convert_hls_error)?;
-                (false, encrypted)
-            }
-        } else {
-            // 从磁盘读取段数据（自动处理静态加密文件）
-            let storage_key = derive_segment_storage_key(&fp);
-            let segment_data = read_segment_data(&segment_path, &storage_key).await?;
-
-            if direct_mode {
-                (true, segment_data)
-            } else {
-                let encrypted = session
-                    .encrypt_segment(&segment_data)
-                    .map_err(convert_hls_error)?;
-                (false, encrypted)
-            }
+        let ready = wait_for_segment_ready(&cache_dir, &segment_name, 15_000).await?;
+        if !ready {
+            let max_idx = get_max_existing_segment_index(&cache_dir)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            return Err(AppError::NotFound(format!(
+                "Segment '{}' not available (video_id={}, max_generated={})",
+                segment_name, video_id, max_idx
+            )));
         }
+    }
+
+    let storage_key = derive_segment_storage_key(&file_path);
+    let segment_data = read_segment_data(&segment_path, &storage_key).await?;
+
+    let response_data = if is_direct_mode {
+        segment_data
+    } else {
+        let manager = hls_manager.read().await;
+        let session = manager
+            .get_session(&session_id)
+            .map_err(convert_hls_error)?;
+        session.encrypt_segment(&segment_data).map_err(convert_hls_error)?
     };
 
     if is_direct_mode {
