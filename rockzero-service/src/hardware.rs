@@ -1104,8 +1104,8 @@ fn detect_usb_device_class(device_path: &Path) -> String {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn find_usb_device_mount(vendor_id: &str, product_id: &str) -> Option<String> {
-    // 首先尝试通过 /proc/mounts 查找
     if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
         for line in mounts.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -1113,16 +1113,13 @@ fn find_usb_device_mount(vendor_id: &str, product_id: &str) -> Option<String> {
                 let device = parts[0];
                 let mount_point = parts[1];
 
-                // 检查是否是 USB 存储设备
                 if device.starts_with("/dev/sd") {
-                    // 尝试匹配设备
                     let dev_name = device.trim_start_matches("/dev/");
                     let base_dev = dev_name
                         .chars()
                         .take_while(|c| !c.is_ascii_digit())
                         .collect::<String>();
 
-                    // 检查设备的 vendor/product ID
                     let usb_device_path = format!("/sys/block/{}/device/../../../", base_dev);
                     if let Ok(vid) = fs::read_to_string(format!("{}idVendor", usb_device_path)) {
                         if let Ok(pid) = fs::read_to_string(format!("{}idProduct", usb_device_path))
@@ -1137,7 +1134,6 @@ fn find_usb_device_mount(vendor_id: &str, product_id: &str) -> Option<String> {
         }
     }
 
-    // 备用方案：检查 /media 和 /mnt 目录
     for base in &["/media", "/mnt"] {
         if let Ok(entries) = fs::read_dir(base) {
             for entry in entries.flatten() {

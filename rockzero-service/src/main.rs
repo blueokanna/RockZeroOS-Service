@@ -1,6 +1,5 @@
 mod crypto;
 mod db;
-mod docker_api;
 mod event_notifier;
 mod ffmpeg_manager;
 mod fido;
@@ -11,7 +10,6 @@ mod invite;
 mod media_processor;
 mod middleware;
 mod secure_db;
-mod secure_video_access;
 mod storage_manager;
 
 use rockzero_common::{self as _, AppConfig};
@@ -159,7 +157,18 @@ async fn main() -> std::io::Result<()> {
         rockzero_media::SecureStreamTransport::new(stream_config)
             .expect("Failed to initialize secure transport"),
     );
-    let hybrid_config = rockzero_media::HybridConfig::default();
+    let hybrid_config = rockzero_media::HybridConfig {
+        udp_ratio: 0.70,
+        tcp_ratio: 0.30,
+        udp_min_ratio: 0.10,
+        udp_max_ratio: 0.70,
+        chunk_size: 128 * 1024,
+        udp_window_size: 96,
+        send_buffer_size: 16 * 1024 * 1024,
+        udp_loss_threshold: 0.03,
+        tcp_max_retries: 5,
+        ..rockzero_media::HybridConfig::default()
+    };
     let hybrid_transport = Arc::new(rockzero_media::HybridTransport::new(
         secure_transport.clone(),
         hybrid_config,
@@ -192,9 +201,11 @@ async fn main() -> std::io::Result<()> {
 
     info!("WASM store initialized");
 
-    // Initialize video access manager
-    let _video_access_manager = secure_video_access::init_global_video_access_manager();
-    info!("Video access manager initialized");
+    // Initialize LAN transfer manager
+    let lan_transfer_manager = Arc::new(RwLock::new(
+        handlers::lan_transfer::LanTransferManager::new(),
+    ));
+    info!("LAN transfer manager initialized");
 
     // Auto-mount all disks
     info!("Auto-mounting disks...");
@@ -215,6 +226,7 @@ async fn main() -> std::io::Result<()> {
         let storage_manager_data = storage_manager.clone();
         let hybrid_transport_data = hybrid_transport.clone();
         let app_config_data = app_config.clone();
+        let lan_transfer_data = lan_transfer_manager.clone();
         let cors = Cors::default()
             .allow_any_origin()
             .allowed_methods(vec![
@@ -278,6 +290,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(storage_manager_data))
             .app_data(web::Data::new(hybrid_transport_data))
             .app_data(web::Data::from(app_config_data))
+            .app_data(web::Data::new(lan_transfer_data))
             .app_data(web::Data::new(std::sync::Arc::new(
                 handlers::zkp_auth::ZkpAuthManager::new(),
             )))
@@ -329,22 +342,6 @@ async fn main() -> std::io::Result<()> {
                                 web::post().to(handlers::zkp_auth::verify_share_proof),
                             )
                             .route(
-                                "/range-proof/create",
-                                web::post().to(handlers::zkp_auth::create_range_proof),
-                            )
-                            .route(
-                                "/range-proof/verify",
-                                web::post().to(handlers::zkp_auth::verify_range_proof),
-                            )
-                            .route(
-                                "/video/proof",
-                                web::post().to(handlers::zkp_auth::create_video_stream_proof),
-                            )
-                            .route(
-                                "/video/verify",
-                                web::post().to(handlers::zkp_auth::verify_video_stream_proof),
-                            )
-                            .route(
                                 "/proof/generate",
                                 web::post().to(handlers::zkp_auth::generate_zkp_proof),
                             ),
@@ -370,6 +367,10 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/capabilities",
                                 web::get().to(handlers::system::get_hardware_capabilities),
+                            )
+                            .route(
+                                "/public-ip",
+                                web::get().to(handlers::system::get_public_ip),
                             ),
                     )
                     .service(
@@ -605,6 +606,11 @@ async fn main() -> std::io::Result<()> {
                                 "/epic/free",
                                 web::get().to(handlers::wasm_store::get_epic_free_games),
                             )
+                            // 平台游戏数据 (Epic/WeGame/Ubisoft/Xbox 官方 API)
+                            .route(
+                                "/platform/games",
+                                web::get().to(handlers::wasm_store::get_platform_games),
+                            )
                             // WASM 应用搜索
                             .route(
                                 "/search",
@@ -650,6 +656,23 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/wasm/{app_id}",
                                 web::delete().to(handlers::wasm_store::uninstall_wasm_app),
+                            )
+                            // 内置应用
+                            .route(
+                                "/builtin/{app_id}/run",
+                                web::get().to(handlers::wasm_store::run_builtin_app),
+                            )
+                            .route(
+                                "/builtin/m3u8-downloader/download",
+                                web::post().to(handlers::wasm_store::download_m3u8_video),
+                            )
+                            .route(
+                                "/builtin/downloads",
+                                web::get().to(handlers::wasm_store::list_downloads),
+                            )
+                            .route(
+                                "/builtin/downloads/{filename}",
+                                web::get().to(handlers::wasm_store::serve_download_file),
                             )
                             // 插件系统
                             .route(
@@ -846,6 +869,23 @@ async fn main() -> std::io::Result<()> {
                                 "/checksum/{id}",
                                 web::get().to(file_transfer::get_file_checksum),
                             ),
+                    )
+                    .service(
+                        web::scope("/lan-transfer")
+                            // 设备信息和共享列表不需要认证（对端设备需要匿名访问）
+                            .route("/device-info", web::get().to(handlers::lan_transfer::get_device_info))
+                            .route("/shared", web::get().to(handlers::lan_transfer::list_shared_items))
+                            .route("/download/{item_id}", web::get().to(handlers::lan_transfer::download_shared_item))
+                            // 管理操作需要认证
+                            .route("/share", web::post().to(handlers::lan_transfer::add_shared_item))
+                            .route("/share/{id}", web::delete().to(handlers::lan_transfer::remove_shared_item))
+                            .route("/scan-games", web::post().to(handlers::lan_transfer::scan_local_games))
+                            .route("/receive", web::post().to(handlers::lan_transfer::receive_from_peer))
+                            .route("/sessions", web::get().to(handlers::lan_transfer::list_sessions))
+                            .route("/sessions/{id}", web::get().to(handlers::lan_transfer::get_session))
+                            .route("/sessions/{id}/cancel", web::post().to(handlers::lan_transfer::cancel_session))
+                            .route("/sessions/{id}", web::delete().to(handlers::lan_transfer::delete_session))
+                            .route("/sessions/cleanup", web::post().to(handlers::lan_transfer::cleanup_sessions)),
                     )
                     .service(
                         web::scope("/secure")
@@ -1065,10 +1105,6 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/extended-info/{path:.*}",
                                 web::get().to(handlers::streaming::get_extended_media_info),
-                            )
-                            .route(
-                                "/play/{path:.*}",
-                                web::get().to(handlers::streaming::stream_media),
                             )
                             .route(
                                 "/hls/{path:.*}",

@@ -24,6 +24,11 @@ pub struct HlsSession {
     /// HKDF instance for lazy key derivation
     hkdf: HkdfBlake3,
     pub zkp_registration: Option<PasswordRegistration>,
+    /// When true, GET segment requests return plaintext (no AES-256-GCM transport encryption).
+    /// Security is still guaranteed by session UUID + SAE handshake requirement.
+    /// Designed for ARM / low-performance devices where per-segment
+    /// encryption/decryption overhead is prohibitive.
+    pub direct_mode: bool,
 }
 
 /// HKDF-Blake3 key derivation
@@ -166,6 +171,7 @@ impl HlsSession {
             max_segments,
             hkdf: hk,
             zkp_registration,
+            direct_mode: false,
         })
     }
 
@@ -175,6 +181,13 @@ impl HlsSession {
 
     pub fn get_zkp_registration(&self) -> Option<&PasswordRegistration> {
         self.zkp_registration.as_ref()
+    }
+
+    /// Enable direct (plaintext) segment delivery mode.
+    /// When enabled, `get_segment_direct` returns raw TS data instead of
+    /// AES-256-GCM encrypted data. Session UUID + SAE handshake still guard access.
+    pub fn set_direct_mode(&mut self, enabled: bool) {
+        self.direct_mode = enabled;
     }
 
     pub fn is_expired(&self) -> bool {
@@ -295,6 +308,29 @@ impl HlsSessionManager {
         Ok(())
     }
 
+    /// Enable or disable direct (plaintext) segment delivery for a session.
+    pub fn set_session_direct_mode(&self, session_id: &str, enabled: bool) -> Result<()> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| HlsError::SessionNotFound(session_id.to_string()))?;
+
+        session.set_direct_mode(enabled);
+        Ok(())
+    }
+
+    /// Invalidate existing sessions for the same user + file pair.
+    ///
+    /// This prevents stale/dirty historical sessions from affecting new playback chains.
+    pub fn invalidate_sessions_for_user_file(&self, user_id: &str, file_path: &str) -> usize {
+        let mut sessions = self.sessions.lock().unwrap();
+        let before = sessions.len();
+        sessions.retain(|_, session| {
+            !(session.user_id == user_id && session.file_path == file_path)
+        });
+        before.saturating_sub(sessions.len())
+    }
+
     pub fn get_session(&self, session_id: &str) -> Result<HlsSession> {
         let sessions = self.sessions.lock().unwrap();
         let session = sessions
@@ -318,6 +354,7 @@ impl HlsSessionManager {
             max_segments: session.max_segments,
             hkdf: HkdfBlake3::new_with_session_salt(&session.session_id, &session.pmk),
             zkp_registration: session.zkp_registration.clone(),
+            direct_mode: session.direct_mode,
         })
     }
 

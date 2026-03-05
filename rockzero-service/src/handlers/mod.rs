@@ -19,5 +19,5 @@ pub mod appstore;
 pub mod appstore_enhanced;
 pub mod files;
 pub mod widgets;
-pub mod docker;
 pub mod wasm_store;
+pub mod lan_transfer;

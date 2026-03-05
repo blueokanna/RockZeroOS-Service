@@ -350,10 +350,24 @@ pub struct HybridConfig {
     pub udp_loss_threshold: f64,
     /// 自适应比例调整启用
     pub adaptive_ratio: bool,
+    /// 自适应下 UDP 最小占比（默认 10%，即 TCP 最大 90%）
+    #[serde(default = "default_udp_min_ratio")]
+    pub udp_min_ratio: f32,
+    /// 自适应下 UDP 最大占比（默认 70%，即 TCP 最小 30%）
+    #[serde(default = "default_udp_max_ratio")]
+    pub udp_max_ratio: f32,
     /// 发送缓冲区大小
     pub send_buffer_size: usize,
     /// 接收乱序重排缓冲区大小
     pub reorder_buffer_size: usize,
+}
+
+fn default_udp_min_ratio() -> f32 {
+    0.10
+}
+
+fn default_udp_max_ratio() -> f32 {
+    0.70
 }
 
 impl Default for HybridConfig {
@@ -368,6 +382,8 @@ impl Default for HybridConfig {
             tcp_max_retries: 3,
             udp_loss_threshold: 0.05, // 5% 丢包率阈值
             adaptive_ratio: true,
+            udp_min_ratio: 0.10,
+            udp_max_ratio: 0.70,
             send_buffer_size: 8 * 1024 * 1024,  // 8MB
             reorder_buffer_size: 256,
         }
@@ -417,9 +433,24 @@ impl HybridTransport {
     /// 创建新的混合传输层
     pub fn new(
         transport: Arc<SecureStreamTransport>,
-        config: HybridConfig,
+        mut config: HybridConfig,
     ) -> Self {
-        let initial_ratio = config.udp_ratio;
+        // 归一化边界，确保满足：UDP ∈ [10%, 70%]，TCP ∈ [30%, 90%]
+        if config.udp_min_ratio < 0.0 {
+            config.udp_min_ratio = 0.0;
+        }
+        if config.udp_max_ratio > 1.0 {
+            config.udp_max_ratio = 1.0;
+        }
+        if config.udp_min_ratio > config.udp_max_ratio {
+            std::mem::swap(&mut config.udp_min_ratio, &mut config.udp_max_ratio);
+        }
+
+        let initial_ratio = config
+            .udp_ratio
+            .clamp(config.udp_min_ratio, config.udp_max_ratio);
+        config.udp_ratio = initial_ratio;
+        config.tcp_ratio = 1.0 - initial_ratio;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -700,10 +731,10 @@ impl HybridTransport {
     /// 自适应调整 UDP/TCP 比例
     ///
     /// 基于 UDP 丢包率动态调整：
-    /// - 丢包率 < 2%：增加 UDP 比例（最大 0.85）
+    /// - 丢包率 < 2%：增加 UDP 比例（最大 0.70）
     /// - 丢包率 2-5%：保持当前比例
-    /// - 丢包率 > 5%：减少 UDP 比例（最低 0.4）
-    /// - 丢包率 > 15%：大幅减少 UDP（最低 0.2）
+    /// - 丢包率 > 5%：减少 UDP 比例（最低 0.10）
+    /// - 丢包率 > 15%：大幅减少 UDP（最低 0.10）
     async fn adapt_ratio(&self) {
         let stats = self.stats.read().await;
         let total_udp = stats.udp_chunks_sent;
@@ -716,13 +747,15 @@ impl HybridTransport {
 
         let loss_rate = lost as f64 / total_udp as f64;
         let mut ratio = self.current_udp_ratio.write().await;
+        let min_udp = self.config.udp_min_ratio;
+        let max_udp = self.config.udp_max_ratio;
 
         if loss_rate < 0.02 {
             // 网络良好，逐步增加 UDP
-            *ratio = (*ratio + 0.02).min(0.85);
+            *ratio = (*ratio + 0.02).clamp(min_udp, max_udp);
         } else if loss_rate > 0.15 {
             // 网络极差，大幅减少 UDP
-            *ratio = (*ratio - 0.1).max(0.2);
+            *ratio = (*ratio - 0.10).clamp(min_udp, max_udp);
             log::warn!(
                 "High UDP loss rate ({:.1}%), reducing UDP ratio to {:.0}%",
                 loss_rate * 100.0,
@@ -730,13 +763,17 @@ impl HybridTransport {
             );
         } else if loss_rate > self.config.udp_loss_threshold {
             // 丢包率超阈值，减少 UDP
-            *ratio = (*ratio - 0.05).max(0.4);
+            *ratio = (*ratio - 0.05).clamp(min_udp, max_udp);
             log::info!(
                 "UDP loss rate ({:.1}%) above threshold, adjusting ratio to {:.0}%",
                 loss_rate * 100.0,
                 *ratio * 100.0
             );
         }
+
+        // 同步配置语义（current_tcp = 1 - current_udp）
+        let current_tcp = 1.0 - *ratio;
+        debug_assert!((0.30..=0.90).contains(&current_tcp));
     }
 
     /// 接收端：将接收到的块放入重排缓冲区

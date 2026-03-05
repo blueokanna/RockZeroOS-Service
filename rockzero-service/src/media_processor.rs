@@ -2,7 +2,13 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
-pub const UNSUPPORTED_AUDIO_CODECS: &[&str] = &["dts", "ac3", "truehd", "eac3", "dca"];
+pub const UNSUPPORTED_AUDIO_CODECS: &[&str] = &[
+    "dts", "dca", "ac3", "truehd", "eac3",
+    "wmav1", "wmav2", "wmapro", "wmalossless",
+    "pcm_bluray", "pcm_dvd",
+    "cook", "ra_288", "atrac3", "atrac3p",
+    "ape",
+];
 
 pub fn needs_audio_transcode(codec: &str) -> bool {
     let codec_lower = codec.to_lowercase();

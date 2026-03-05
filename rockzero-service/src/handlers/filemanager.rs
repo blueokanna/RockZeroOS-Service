@@ -1235,6 +1235,7 @@ fn generate_media_etag(metadata: &std::fs::Metadata) -> String {
 /// - 支持 ETag/条件请求减少重复传输
 /// - 自适应 chunk 大小（seek vs 顺序读取）
 /// - 支持 CORS 头，允许跨域播放
+#[allow(dead_code)]
 pub async fn stream_media(
     req: HttpRequest,
     query: web::Query<StreamQuery>,
@@ -1534,6 +1535,7 @@ pub async fn get_thumbnail(query: web::Query<StreamQuery>) -> Result<HttpRespons
 
 // ============ Helper Functions ============
 
+#[allow(dead_code)]
 fn parse_range_header(range: &str, file_size: u64) -> Option<(u64, u64)> {
     if !range.starts_with("bytes=") {
         return None;
