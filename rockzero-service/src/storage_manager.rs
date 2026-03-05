@@ -65,10 +65,10 @@ impl Default for StorageConfig {
             min_free_space: 512 * 1024 * 1024,           // 512 MB
             warning_free_space: 2 * 1024 * 1024 * 1024,  // 2 GB
             critical_free_space: 1024 * 1024 * 1024,     // 1 GB
-            max_hls_cache_size: 2 * 1024 * 1024 * 1024,  // 2 GB — 超过自动清理
-            max_temp_size: 2 * 1024 * 1024 * 1024,       // 2 GB — 超过自动清理
+            max_hls_cache_size: 1024 * 1024 * 1024,      // 1 GB — 超过自动清理
+            max_temp_size: 1024 * 1024 * 1024,            // 1 GB — 超过自动清理
             max_log_size: 512 * 1024 * 1024,             // 512 MB
-            hls_cache_retention_days: 7,
+            hls_cache_retention_days: 1,
             temp_file_retention_days: 1,
             log_retention_days: 30,
         }
@@ -318,7 +318,7 @@ impl StorageManager {
         let temp = self.temp_bytes.load(Ordering::Relaxed);
         let logs = self.log_bytes.load(Ordering::Relaxed);
         let total_cache = hls + temp;
-        let threshold: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+        let threshold: u64 = 1024 * 1024 * 1024; // 1 GB
 
         let usage_percent = if threshold > 0 {
             (total_cache as f64 / threshold as f64 * 100.0).min(100.0)
@@ -340,7 +340,7 @@ impl StorageManager {
             enabled: true,
             status,
             threshold_bytes: threshold,
-            threshold_display: "2 GB".to_string(),
+            threshold_display: "1 GB".to_string(),
             hls_cache_bytes: hls,
             temp_bytes: temp,
             log_bytes: logs,
@@ -427,10 +427,10 @@ impl StorageManager {
 
         let m = self.clone();
         tokio::spawn(async move {
-            let mut tick = interval(Duration::from_secs(300));
+            let mut tick = interval(Duration::from_secs(60));
             loop {
                 tick.tick().await;
-                if let Err(e) = m.cleanup_stale_hls_cache(30 * 60).await {
+                if let Err(e) = m.cleanup_stale_hls_cache(5 * 60).await {
                     warn!("Stale HLS cache cleanup failed: {}", e);
                 }
             }
@@ -481,7 +481,7 @@ impl StorageManager {
         // 替代仪表板的手动"Clean Cache / Clear Temp"按钮
         let m = self.clone();
         tokio::spawn(async move {
-            let threshold: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+            let threshold: u64 = 1024 * 1024 * 1024; // 1 GB
             let mut tick = interval(Duration::from_secs(30));
             loop {
                 tick.tick().await;
@@ -500,7 +500,7 @@ impl StorageManager {
                 if total > threshold {
                     let excess = total - threshold;
                     info!(
-                        "⚠️ Cache+Temp ({}) exceeds 2GB threshold, auto-cleaning {} ...",
+                        "⚠️ Cache+Temp ({}) exceeds 1GB threshold, auto-cleaning {} ...",
                         format_bytes(total),
                         format_bytes(excess),
                     );
@@ -1369,10 +1369,10 @@ mod tests {
     #[tokio::test]
     async fn test_storage_config_defaults() {
         let config = StorageConfig::default();
-        assert_eq!(config.hls_cache_retention_days, 7);
+        assert_eq!(config.hls_cache_retention_days, 1);
         assert_eq!(config.temp_file_retention_days, 1);
-        assert_eq!(config.max_hls_cache_size, 2 * 1024 * 1024 * 1024);
-        assert_eq!(config.max_temp_size, 2 * 1024 * 1024 * 1024);
+        assert_eq!(config.max_hls_cache_size, 1024 * 1024 * 1024);
+        assert_eq!(config.max_temp_size, 1024 * 1024 * 1024);
         assert_eq!(config.max_log_size, 512 * 1024 * 1024);
     }
 

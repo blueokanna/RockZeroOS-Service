@@ -25,9 +25,9 @@ RockZeroOS is a high-performance, secure cross-platform private cloud NAS operat
 
 - **Dashboard** — System overview with CPU, memory, disk, network monitoring, and chronograph-style speed test
 - **File Manager** — Browse disks, navigate directories, upload/download files, LAN file transfer, WebDAV, network shares
-- **Video Playback** — SAE-encrypted HLS streaming with session-based authentication and AES-256-GCM segment encryption (PMK → HKDF-BLAKE3 → AES-GCM)
+- **Video Playback** — SAE-encrypted HLS streaming with session-based authentication and AES-256-GCM segment encryption (PMK → HKDF-BLAKE3 → AES-GCM), codec-aware adaptive timeouts (30s H.264/120s AV1), on-demand seek segment generation for VP9/AV1 transcode
 - **Game Center** — Multi-platform gaming hub with Steam, Epic Games, WeGame, Ubisoft Connect, Xbox native store integration (no WebView), unified game library, daily Top 30 recommendations, and built-in SteamDB viewer
-- **WASM Runtime** — Run WebAssembly applications and scripts via Wasmtime, including built-in SteamDB viewer, M3U8 video downloader, and Steam P2P connection analyzer
+- **WASM Runtime** — Run WebAssembly applications and scripts via Wasmtime, including built-in SteamDB viewer (name + AppID dual search), M3U8 video downloader (custom save directory), and Steam P2P connection analyzer (with NAT type help docs)
 - **Storage Management** — Smart formatting (ext4/XFS/Btrfs/exFAT), auto mount, partition management, SMART monitoring, secure erase
 - **Hardware Transcoding** — Auto-detected FFmpeg hardware acceleration (VAAPI, V4L2 M2M, Rockchip MPP)
 - **Security** — FIDO2/WebAuthn, wallpaper customization with glassmorphic blur (BackdropFilter high-contrast frost), dynamic color (80% wallpaper + 20% system), Reed-Solomon + CRC32 secure storage, Bulletproofs ZKP for authentication
@@ -168,6 +168,12 @@ The server auto-detects available hardware at startup and selects the optimal en
 
 For ≤1080p content, the server uses stream copy (`-c:v copy -c:a copy -map 0:v? -map 0:a?`) which is near-instant. The `-map 0:v? -map 0:a?` flags ensure only video and audio streams are selected, avoiding mpegts muxer failures from subtitle or data tracks.
 
+**Codec-aware timeouts**: Before spawning ffmpeg, the server probes the video codec via ffprobe. H.264/HEVC videos get a 30-second first-segment timeout (stream copy is fast). AV1/VP9/other codecs get 120 seconds since software transcode is slower.
+
+**On-demand seek**: When a player seeks to a distant segment during transcode (>5 segments ahead of current progress), the server generates the requested segment on-demand using `-ss` + hardware/software encode, bypassing the need to wait for all preceding segments. The on-demand segment is encrypted at rest with the same AES-256-GCM storage key.
+
+**HLS cache defaults**: Max 1 GB HLS cache, 1-day retention, 5-minute idle cleanup interval. Auto-cleanup triggers when total cache exceeds 1 GB threshold.
+
 ### Adaptive Hybrid Transport (UDP/TCP)
 
 RockZeroOS uses an adaptive hybrid transport layer for secure media delivery. The runtime policy is now constrained to the following production bounds:
@@ -207,6 +213,7 @@ Multi-platform gaming hub with **fully native** UI integration (no WebView). Eac
 
 - All platform tabs show a **live data indicator** (🔴 实时) when displaying API-fetched data
 - Game cover images are loaded directly from official CDN URLs (Epic `cdn1.epicgames.com`, Ubisoft `staticctf.ubisoft.com`, Xbox `store-images.s-microsoft.com`)
+- **Built-in catalog images**: 25+ hardcoded games use Steam CDN (`cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg`) for instant image display without API calls
 - 30-minute server-side cache with automatic refresh on pull-to-refresh
 - Graceful degradation: if any API is unreachable, the tab seamlessly falls back to curated catalog data
 
@@ -218,9 +225,9 @@ The **Daily Top 30** tab shows curated recommendations with 30 games per platfor
 
 | App | Description |
 |-----|-------------|
-| SteamDB Viewer | Query Steam API for game details: price, online players, reviews, DLC, system requirements |
-| M3U8 Downloader | Parse M3U8 playlists, download TS segments, auto-merge with AES decryption support |
-| Steam P2P Info | View Steam player profiles, friends list, recent games, and P2P connection details |
+| SteamDB Viewer | Query Steam API for game details by **name search** (Steam Store storesearch + suggest fallback) or AppID: price, online players, reviews, DLC, system requirements |
+| M3U8 Downloader | Parse M3U8 playlists, download TS segments, auto-merge with AES decryption support. Supports **custom save directory** (NAS default / Downloads / custom path) with path sanitization and security checks |
+| Steam P2P Info | View Steam player profiles, friends list, recent games, and P2P connection details. Includes **collapsible help documentation** with NAT type explanations (Open/Moderate/Strict) and troubleshooting guide |
 
 ## Dynamic Theming & Wallpaper
 
@@ -556,6 +563,8 @@ POST /api/v1/invite/remaining                        # Check remaining time
 | HLS Segment (stream copy) | <100ms | ≤1080p, no re-encoding |
 | HLS Segment (hw transcode) | ~200-500ms | >1080p, VAAPI/V4L2 |
 | HLS Segment (sw transcode) | ~1-3s | >1080p, libx264 ultrafast |
+| On-demand seek (hw) | ~0.5-2s | Single segment via `-ss` + hw encode |
+| On-demand seek (sw) | ~2-5s | Single segment via `-ss` + libx264 ultrafast |
 
 ## Roadmap
 

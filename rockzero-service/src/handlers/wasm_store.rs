@@ -1877,10 +1877,14 @@ pub async fn uninstall_wasm_app(
 pub struct BuiltinAppQuery {
     /// Steam App ID（SteamDB 需要）
     pub app_id: Option<u32>,
+    /// 游戏名称搜索（SteamDB 名称搜索）
+    pub name: Option<String>,
     /// M3U8 URL（下载器需要）
     pub url: Option<String>,
     /// Steam ID（P2P Info 需要）
     pub steam_id: Option<String>,
+    /// M3U8 下载保存目录（可选，默认 wasm_store/downloads）
+    pub save_dir: Option<String>,
 }
 
 /// GET /api/v1/wasm-store/builtin/{app_id}/run - 运行内置应用
@@ -1900,10 +1904,21 @@ pub async fn run_builtin_app(
 }
 
 /// SteamDB 数据查看器 — 查询 Steam API 获取游戏详情
+///
+/// 支持两种查询方式:
+/// 1. 通过 `app_id` 直接查询（精确）
+/// 2. 通过 `name` 搜索游戏名称（模糊匹配，返回搜索结果列表后选择）
 async fn run_steamdb_viewer(query: &BuiltinAppQuery) -> Result<HttpResponse, AppError> {
+    // 如果提供了游戏名称，先搜索获取 App ID
+    if let Some(ref search_name) = query.name {
+        if query.app_id.is_none() {
+            return run_steamdb_name_search(search_name).await;
+        }
+    }
+
     let steam_app_id = query
         .app_id
-        .ok_or_else(|| AppError::BadRequest("缺少参数 app_id".to_string()))?;
+        .ok_or_else(|| AppError::BadRequest("缺少参数 app_id 或 name".to_string()))?;
 
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
@@ -2024,6 +2039,127 @@ async fn run_steamdb_viewer(query: &BuiltinAppQuery) -> Result<HttpResponse, App
     }
 
     Ok(HttpResponse::Ok().json(result))
+}
+
+/// Steam 游戏名称搜索 — 使用 Steam Store 搜索 API
+///
+/// 返回匹配的游戏列表（包含 app_id、名称、头像等），
+/// 前端可让用户选择后再以 app_id 查询完整详情。
+async fn run_steamdb_name_search(search_name: &str) -> Result<HttpResponse, AppError> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    // Steam Store 搜索建议 API（官方非文档化但稳定的接口）
+    let suggest_url = format!(
+        "https://store.steampowered.com/search/suggest?term={}&f=games&cc=cn&l=schinese&excluded_content_descriptors%5B%5D=3&excluded_content_descriptors%5B%5D=4&use_b64_image=1&category1=998",
+        urlencoding::encode(search_name)
+    );
+
+    // 同时也使用 storesearch API 作为备选（返回 JSON 结构化数据）
+    let storesearch_url = format!(
+        "https://store.steampowered.com/api/storesearch/?term={}&l=schinese&cc=cn",
+        urlencoding::encode(search_name)
+    );
+
+    let storesearch_resp = client
+        .get(&storesearch_url)
+        .header("User-Agent", "RockZeroOS/1.0")
+        .send()
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("Steam 搜索失败: {}", e)))?;
+
+    if storesearch_resp.status().is_success() {
+        if let Ok(json) = storesearch_resp.json::<Value>().await {
+            let items = json.get("items").and_then(|v| v.as_array());
+            if let Some(items) = items {
+                let results: Vec<Value> = items
+                    .iter()
+                    .take(20)
+                    .map(|item| {
+                        serde_json::json!({
+                            "app_id": item.get("id").and_then(|v| v.as_u64()).unwrap_or(0),
+                            "name": item.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                            "tiny_image": item.get("tiny_image").and_then(|v| v.as_str()).unwrap_or(""),
+                            "price": item.get("price").cloned().unwrap_or(Value::Null),
+                            "platforms": item.get("platforms").cloned().unwrap_or(Value::Null),
+                            "metascore": item.get("metascore").and_then(|v| v.as_str()).unwrap_or(""),
+                        })
+                    })
+                    .collect();
+
+                return Ok(HttpResponse::Ok().json(serde_json::json!({
+                    "source": "steamdb-viewer",
+                    "search_query": search_name,
+                    "search_results": results,
+                    "total": results.len(),
+                })));
+            }
+        }
+    }
+
+    // 搜索 API 也失败时 — 尝试 suggest HTML 解析的回退
+    // 但生产环境中 storesearch API 基本不会失败，这里仅做兜底
+    info!("Steam storesearch API failed for '{}', trying suggest API", search_name);
+
+    let suggest_resp = client
+        .get(&suggest_url)
+        .header("User-Agent", "RockZeroOS/1.0")
+        .send()
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("Steam 搜索回退失败: {}", e)))?;
+
+    if suggest_resp.status().is_success() {
+        let html = suggest_resp.text().await.unwrap_or_default();
+        // suggest API 返回 HTML 片段，解析 <a> 标签中的 data-ds-appid 和游戏名
+        let mut results = Vec::new();
+        for line in html.lines() {
+            let trimmed = line.trim();
+            if let Some(appid_start) = trimmed.find("data-ds-appid=\"") {
+                let after = &trimmed[appid_start + 15..];
+                if let Some(appid_end) = after.find('"') {
+                    let appid_str = &after[..appid_end];
+                    if let Ok(appid) = appid_str.parse::<u64>() {
+                        // 提取游戏名称
+                        let name = trimmed
+                            .find("match_name\">")
+                            .map(|start| {
+                                let after_name = &trimmed[start + 12..];
+                                after_name
+                                    .find('<')
+                                    .map(|end| after_name[..end].to_string())
+                                    .unwrap_or_default()
+                            })
+                            .unwrap_or_default();
+
+                        if !name.is_empty() {
+                            results.push(serde_json::json!({
+                                "app_id": appid,
+                                "name": name,
+                                "tiny_image": "",
+                            }));
+                        }
+                    }
+                }
+            }
+            if results.len() >= 20 {
+                break;
+            }
+        }
+
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "source": "steamdb-viewer",
+            "search_query": search_name,
+            "search_results": results,
+            "total": results.len(),
+        })));
+    }
+
+    Err(AppError::InternalServerError(
+        "无法搜索 Steam 游戏，请检查网络连接".to_string(),
+    ))
 }
 
 /// M3U8 下载器 — 解析 M3U8 播放列表并下载所有分片
@@ -2171,6 +2307,10 @@ pub struct M3u8DownloadRequest {
     pub url: String,
     pub output_name: Option<String>,
     pub variant_index: Option<usize>,
+    /// 自定义保存目录（相对于外部存储根目录）
+    /// 例如: "Downloads/Videos" 会保存到 /mnt/external/Downloads/Videos/
+    /// 默认保存到 wasm_store/downloads/
+    pub save_dir: Option<String>,
 }
 
 pub async fn download_m3u8_video(
@@ -2183,7 +2323,52 @@ pub async fn download_m3u8_video(
         .clone()
         .unwrap_or_else(|| format!("m3u8_video_{}.ts", now_epoch()));
 
-    let download_dir = wasm_store_root().join("downloads");
+    // 支持自定义保存目录：优先使用 save_dir，否则默认 wasm_store/downloads
+    let download_dir = if let Some(ref custom_dir) = body.save_dir {
+        let custom_dir = custom_dir.trim();
+        if custom_dir.is_empty() {
+            wasm_store_root().join("downloads")
+        } else {
+            // 安全性检查：防止路径遍历
+            let sanitized = custom_dir
+                .replace("..", "")
+                .trim_start_matches('/')
+                .trim_start_matches('\\')
+                .to_string();
+            if sanitized.is_empty() {
+                wasm_store_root().join("downloads")
+            } else {
+                // 允许绝对路径（在 allowed directories 内）或相对路径
+                let path = std::path::PathBuf::from(&sanitized);
+                if path.is_absolute() {
+                    // 验证绝对路径是否在允许目录内
+                    let path_str = path.to_string_lossy();
+                    const ALLOWED_DIRS: &[&str] =
+                        &["/mnt", "/media", "/home", "/data", "/storage"];
+                    let is_allowed = ALLOWED_DIRS.iter().any(|d| path_str.starts_with(d));
+                    #[cfg(target_os = "windows")]
+                    let is_allowed =
+                        is_allowed || (path_str.len() >= 2 && path_str.chars().nth(1) == Some(':'));
+                    if is_allowed {
+                        path
+                    } else {
+                        return Err(AppError::Forbidden(
+                            "保存路径不在允许的目录范围内".to_string(),
+                        ));
+                    }
+                } else {
+                    // 相对路径：基于外部存储根目录
+                    let base = std::env::var("EXTERNAL_STORAGE_PATH")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|_| std::path::PathBuf::from("/mnt/external"));
+                    base.join(sanitized)
+                }
+            }
+        }
+    } else {
+        wasm_store_root().join("downloads")
+    };
+
     tokio::fs::create_dir_all(&download_dir)
         .await
         .map_err(|e| AppError::IoError(e.to_string()))?;
