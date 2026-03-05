@@ -495,6 +495,35 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
     // 锁文件防止并发 ffmpeg 进程
     let lock_file = cache_dir.join(".lock");
 
+    // 清理过期锁文件（崩溃的 ffmpeg 进程可能遗留锁文件，阻笜后续转码）
+    if lock_file.exists() {
+        if let Ok(metadata) = tokio::fs::metadata(&lock_file).await {
+            if let Ok(modified) = metadata.modified() {
+                if modified
+                    .elapsed()
+                    .is_ok_and(|d| d > std::time::Duration::from_secs(300))
+                {
+                    warn!(
+                        "Removing stale HLS lock file (older than 5 minutes) for {}",
+                        video_id
+                    );
+                    let _ = tokio::fs::remove_file(&lock_file).await;
+                    // 同时清理残留的不完整分片
+                    if let Ok(mut entries) = tokio::fs::read_dir(&cache_dir).await {
+                        while let Ok(Some(entry)) = entries.next_entry().await {
+                            let path = entry.path();
+                            if path.extension().is_some_and(|e| {
+                                e == "ts" || e == "m3u8" || e == "enc"
+                            }) {
+                                let _ = tokio::fs::remove_file(&path).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 如果已完成分片，优先复用缓存；但要校验 playlist 引用的分片是否都存在
     if done_marker.exists() && playlist_path.exists() {
         let content = tokio::fs::read_to_string(&playlist_path)
@@ -739,6 +768,47 @@ async fn detect_video_codec(ffmpeg_path: &str, file_path: &str) -> Option<String
     None
 }
 
+/// 从 ffmpeg 路径推导 ffprobe 路径
+async fn get_ffprobe_path(ffmpeg_path: &str) -> String {
+    if let Some(dir) = std::path::Path::new(ffmpeg_path).parent() {
+        let probe = dir.join("ffprobe");
+        if tokio::fs::metadata(&probe).await.is_ok() {
+            return probe.to_string_lossy().to_string();
+        }
+    }
+    std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string())
+}
+
+/// 探测视频文件的 start_time（秒）
+///
+/// MKV 等容器的 PTS 时间戳可能不从 0 开始（例如 26:28:10）。
+/// stream copy 到 HLS 时这些时间戳会被保留，导致播放器显示错误的时间。
+/// 通过检测 start_time 并使用 -output_ts_offset 将输出时间戳归零。
+async fn detect_video_start_time(ffmpeg_path: &str, file_path: &str) -> f64 {
+    let ffprobe_path = get_ffprobe_path(ffmpeg_path).await;
+
+    let output = tokio::process::Command::new(&ffprobe_path)
+        .args([
+            "-v",
+            "quiet",
+            "-show_entries",
+            "format=start_time",
+            "-of",
+            "csv=p=0",
+            file_path,
+        ])
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            raw.trim().parse::<f64>().unwrap_or(0.0)
+        }
+        _ => 0.0,
+    }
+}
+
 /// 派生用于缓存分片文件静态加密的存储密钥
 ///
 /// 使用 Blake3 从固定上下文 + 视频路径派生，确保：
@@ -856,6 +926,15 @@ async fn run_ffmpeg_progressive(
     };
     info!("Detected video codec: {:?}", video_codec);
 
+    // 探测视频开始时间，用于修复 PTS 偏移
+    let start_time = detect_video_start_time(ffmpeg_path, file_path).await;
+    if start_time > 1.0 {
+        info!(
+            "Detected video start_time: {:.3}s — will apply -output_ts_offset to normalize timestamps",
+            start_time
+        );
+    }
+
     let allow_stream_copy = matches!(
         video_codec.as_deref(),
         Some("h264" | "avc" | "avc1" | "hevc" | "h265" | "hev1" | "hvc1")
@@ -895,6 +974,15 @@ async fn run_ffmpeg_progressive(
             // VP9, AV1 等其他编码不需要 bitstream filter
             info!("No bitstream filter needed for codec: {:?}", video_codec);
         }
+    }
+
+    // ★ PTS 偏移修复：如果源文件 start_time > 1s（典型的 MKV 内嵌时间戳偏移），
+    //   通过 -output_ts_offset 将输出时间戳归零，避免播放器显示错误时间（如 26:28:10）
+    if start_time > 1.0 {
+        copy_args.extend([
+            "-output_ts_offset".into(),
+            format!("{:.6}", -start_time),
+        ]);
     }
 
     copy_args.extend([
