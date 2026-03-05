@@ -866,6 +866,11 @@ async fn run_ffmpeg_progressive(
     // 否则 H.264/HEVC 的 NAL 封装格式不正确，导致播放器只有音频没有画面
     let mut copy_args: Vec<String> = vec![
         "-y".into(),
+        // ★ PTS 时间戳修复：重新生成 PTS 并丢弃损坏帧
+        // 解决：源文件（如 MKV）内嵌非零 start_time（例如 26:28:10），
+        //       stream copy 直接传递导致 HLS 播放器显示错误的时间戳
+        "-fflags".into(),
+        "+genpts+discardcorrupt".into(),
         "-i".into(),
         file_path.into(),
         "-map".into(),
@@ -893,6 +898,9 @@ async fn run_ffmpeg_progressive(
     }
 
     copy_args.extend([
+        // ★ 将首个 DTS 重置为 0，消除源文件的 start_time 偏移
+        "-avoid_negative_ts".into(),
+        "make_zero".into(),
         "-f".into(),
         "hls".into(),
         "-hls_time".into(),
@@ -968,7 +976,14 @@ async fn run_ffmpeg_progressive(
     let hw_accel = detect_hardware_acceleration().await;
 
     let build_transcode_args = |accel: HardwareAccel| {
-        let mut args: Vec<String> = vec!["-y".into(), "-i".into(), file_path.into()];
+        let mut args: Vec<String> = vec![
+            "-y".into(),
+            // ★ PTS 时间戳修复（转码路径）
+            "-fflags".into(),
+            "+genpts+discardcorrupt".into(),
+            "-i".into(),
+            file_path.into(),
+        ];
 
         match accel {
             HardwareAccel::Rkmpp => {
@@ -1147,6 +1162,9 @@ async fn generate_segment_on_demand(
 
     let mut args: Vec<String> = vec![
         "-y".into(),
+        // ★ PTS 时间戳修复（按需分片路径）
+        "-fflags".into(),
+        "+genpts+discardcorrupt".into(),
         "-ss".into(),
         format!("{:.3}", start_time),
         "-i".into(),
@@ -1229,6 +1247,9 @@ async fn generate_segment_on_demand(
             );
             let fallback_args = vec![
                 "-y".into(),
+                // ★ PTS 时间戳修复（软件回退路径）
+                "-fflags".into(),
+                "+genpts+discardcorrupt".into(),
                 "-ss".into(),
                 format!("{:.3}", start_time),
                 "-i".into(),

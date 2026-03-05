@@ -25,12 +25,13 @@ RockZeroOS is a high-performance, secure cross-platform private cloud NAS operat
 
 - **Dashboard** — System overview with CPU, memory, disk, network monitoring, and chronograph-style speed test
 - **File Manager** — Browse disks, navigate directories, upload/download files, LAN file transfer, WebDAV, network shares
-- **Video Playback** — SAE-encrypted HLS streaming with session-based authentication and AES-256-GCM segment encryption (PMK → HKDF-BLAKE3 → AES-GCM), codec-aware adaptive timeouts (30s H.264/120s AV1), on-demand seek segment generation for VP9/AV1 transcode
+- **Video Playback** — SAE-encrypted HLS streaming with session-based authentication and AES-256-GCM segment encryption (PMK → HKDF-BLAKE3 → AES-GCM), codec-aware adaptive timeouts (30s H.264/120s AV1), on-demand seek segment generation for VP9/AV1 transcode, PTS timestamp normalization (`-fflags +genpts+discardcorrupt -avoid_negative_ts make_zero`) + client-side offset detection for MKV sources with non-zero start time
 - **Game Center** — Multi-platform gaming hub with Steam, Epic Games, WeGame, Ubisoft Connect, Xbox native store integration (no WebView), unified game library, daily Top 30 recommendations, and built-in SteamDB viewer
 - **WASM Runtime** — Run WebAssembly applications and scripts via Wasmtime, including built-in SteamDB viewer (name + AppID dual search), M3U8 video downloader (custom save directory), and Steam P2P connection analyzer (with NAT type help docs)
 - **Storage Management** — Smart formatting (ext4/XFS/Btrfs/exFAT), auto mount, partition management, SMART monitoring, secure erase
 - **Hardware Transcoding** — Auto-detected FFmpeg hardware acceleration (VAAPI, V4L2 M2M, Rockchip MPP)
 - **Security** — FIDO2/WebAuthn, wallpaper customization with glassmorphic blur (BackdropFilter high-contrast frost), dynamic color (80% wallpaper + 20% system), Reed-Solomon + CRC32 secure storage, Bulletproofs ZKP for authentication
+- **MD3 Expressive Components** — Custom loading indicators (starburst spinner, wavy progress, pulsing dots, segmented spinner), secure connection shield animation for SAE handshake, buffering overlay with rotating dot ring
 - **Edge-to-Edge UI** — Full-screen gesture navigation support on Android, transparent system bars, predictive back gestures
 
 ## Security Architecture
@@ -111,6 +112,8 @@ sequenceDiagram
 The Flutter client uses media_kit (libmpv) with hardware decoding enabled by default. The `Video()` widget is wrapped in `SizedBox.expand()` to ensure proper sizing on all platforms. mpv is configured with:
 
 - `hwdec=auto-safe` — Automatically selects the best available hardware decoder
+- `rebase-start-time=yes` — Rebases stream start time to zero (fixes MKV files with non-zero PTS offset showing e.g. 26:28:10 instead of 00:00:00)
+- `demuxer-lavf-o=fflags=+genpts+discardcorrupt` — Regenerates presentation timestamps and discards corrupt frames
 - `cache=yes` with `demuxer-max-bytes=50MiB` / `demuxer-max-back-bytes=25MiB` — Reduces stalls
 - `stream-buffer-size=2MiB` — Optimized for network streaming
 
@@ -129,6 +132,8 @@ Audio uses `just_audio` with a **triple-fallback source strategy**:
 3. `setUrl` — Simple URL playback (20s timeout)
 
 Unsupported audio codecs (wmav1/2, wmapro, wmalossless, pcm_bluray/dvd, cook, ra_288, atrac3/3p, ape, etc.) are automatically transcoded to AAC/MP3 on the server side before streaming.
+
+The **back button** on the full-screen audio player minimizes playback to the background mini player (transferring position, volume, speed, and loop state to the global `AudioPlayerService`), rather than stopping audio. A dedicated **stop button** is provided in the app bar for explicit playback termination.
 
 ### Key Derivation
 
@@ -166,7 +171,7 @@ The server auto-detects available hardware at startup and selects the optimal en
 | Generic ARM | `/dev/video10`, `/dev/video11` | h264_v4l2m2m | h264_v4l2m2m | Verified via encode test; priority 2 on ARM |
 | Fallback | — | libx264 (ultrafast) | software | Used when no hardware is detected |
 
-For ≤1080p content, the server uses stream copy (`-c:v copy -c:a copy -map 0:v? -map 0:a?`) which is near-instant. The `-map 0:v? -map 0:a?` flags ensure only video and audio streams are selected, avoiding mpegts muxer failures from subtitle or data tracks.
+For ≤1080p content, the server uses stream copy (`-c:v copy -c:a copy -map 0:v? -map 0:a?`) which is near-instant. The `-map 0:v? -map 0:a?` flags ensure only video and audio streams are selected, avoiding mpegts muxer failures from subtitle or data tracks. All ffmpeg invocations include `-fflags +genpts+discardcorrupt` (input) and `-avoid_negative_ts make_zero` (output) to normalize PTS timestamps — this ensures MKV files with non-zero start times (e.g. 26:28:10) produce HLS segments starting from 00:00:00.
 
 **Codec-aware timeouts**: Before spawning ffmpeg, the server probes the video codec via ffprobe. H.264/HEVC videos get a 30-second first-segment timeout (stream copy is fast). AV1/VP9/other codecs get 120 seconds since software transcode is slower.
 
@@ -584,6 +589,9 @@ POST /api/v1/invite/remaining                        # Check remaining time
 - [x] WASM application runtime (with built-in SteamDB viewer, M3U8 downloader, Steam P2P info)
 - [x] Dynamic theming with wallpaper color extraction & glassmorphic UI
 - [x] Edge-to-edge UI with gesture navigation
+- [x] MD3 Expressive loading indicators (starburst spinner, wavy progress, secure shield animation)
+- [x] PTS timestamp normalization for MKV/non-zero start time sources
+- [x] Audio player back-minimizes to mini player (no audio interruption on back press)
 - [x] Network speed test (download/upload/ping with chronograph UI)
 - [x] Invite system with expiring codes
 - [ ] RAID support
