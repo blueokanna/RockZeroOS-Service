@@ -1070,7 +1070,7 @@ async fn main() -> std::io::Result<()> {
                                 "/{session_id}/stop",
                                 web::post().to(handlers::secure_hls::stop_session),
                             )
-                            // Direct segment access (GET, no encryption)
+                            // AES-256-GCM encrypted segment access (GET, proxy decrypts client-side)
                             .route(
                                 "/{session_id}/{segment}",
                                 web::get().to(handlers::secure_hls::get_segment_direct),
