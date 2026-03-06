@@ -495,6 +495,35 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
     // 锁文件防止并发 ffmpeg 进程
     let lock_file = cache_dir.join(".lock");
 
+    // 清理过期锁文件（崩溃的 ffmpeg 进程可能遗留锁文件，阻笜后续转码）
+    if lock_file.exists() {
+        if let Ok(metadata) = tokio::fs::metadata(&lock_file).await {
+            if let Ok(modified) = metadata.modified() {
+                if modified
+                    .elapsed()
+                    .is_ok_and(|d| d > std::time::Duration::from_secs(300))
+                {
+                    warn!(
+                        "Removing stale HLS lock file (older than 5 minutes) for {}",
+                        video_id
+                    );
+                    let _ = tokio::fs::remove_file(&lock_file).await;
+                    // 同时清理残留的不完整分片
+                    if let Ok(mut entries) = tokio::fs::read_dir(&cache_dir).await {
+                        while let Ok(Some(entry)) = entries.next_entry().await {
+                            let path = entry.path();
+                            if path.extension().is_some_and(|e| {
+                                e == "ts" || e == "m3u8" || e == "enc"
+                            }) {
+                                let _ = tokio::fs::remove_file(&path).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 如果已完成分片，优先复用缓存；但要校验 playlist 引用的分片是否都存在
     if done_marker.exists() && playlist_path.exists() {
         let content = tokio::fs::read_to_string(&playlist_path)
@@ -739,6 +768,47 @@ async fn detect_video_codec(ffmpeg_path: &str, file_path: &str) -> Option<String
     None
 }
 
+/// 从 ffmpeg 路径推导 ffprobe 路径
+async fn get_ffprobe_path(ffmpeg_path: &str) -> String {
+    if let Some(dir) = std::path::Path::new(ffmpeg_path).parent() {
+        let probe = dir.join("ffprobe");
+        if tokio::fs::metadata(&probe).await.is_ok() {
+            return probe.to_string_lossy().to_string();
+        }
+    }
+    std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string())
+}
+
+/// 探测视频文件的 start_time（秒）
+///
+/// MKV 等容器的 PTS 时间戳可能不从 0 开始（例如 26:28:10）。
+/// stream copy 到 HLS 时这些时间戳会被保留，导致播放器显示错误的时间。
+/// 通过检测 start_time 并使用 -output_ts_offset 将输出时间戳归零。
+async fn detect_video_start_time(ffmpeg_path: &str, file_path: &str) -> f64 {
+    let ffprobe_path = get_ffprobe_path(ffmpeg_path).await;
+
+    let output = tokio::process::Command::new(&ffprobe_path)
+        .args([
+            "-v",
+            "quiet",
+            "-show_entries",
+            "format=start_time",
+            "-of",
+            "csv=p=0",
+            file_path,
+        ])
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            raw.trim().parse::<f64>().unwrap_or(0.0)
+        }
+        _ => 0.0,
+    }
+}
+
 /// 派生用于缓存分片文件静态加密的存储密钥
 ///
 /// 使用 Blake3 从固定上下文 + 视频路径派生，确保：
@@ -759,8 +829,6 @@ async fn encrypt_segments_at_rest(
     cache_dir: &std::path::Path,
     storage_key: &[u8; 32],
 ) -> Result<usize, String> {
-    let mut encrypted_count = 0;
-
     let mut entries = tokio::fs::read_dir(cache_dir)
         .await
         .map_err(|e| format!("Failed to read cache dir: {}", e))?;
@@ -773,35 +841,70 @@ async fn encrypt_segments_at_rest(
         }
     }
 
-    for ts_path in &ts_files {
-        let enc_path = ts_path.with_extension("ts.enc");
+    if ts_files.is_empty() {
+        return Ok(0);
+    }
 
-        match tokio::fs::read(ts_path).await {
-            Ok(data) => {
-                match crate::crypto::aes_encrypt(storage_key, &data) {
-                    Ok(encrypted) => {
-                        if let Err(e) = tokio::fs::write(&enc_path, &encrypted).await {
-                            warn!("Failed to write encrypted segment {:?}: {}", enc_path, e);
-                            continue;
+    // ★ 并行加密：利用多核 CPU 同时加密多个分片，大幅减少加密总耗时
+    // AES-256-GCM 加密是 CPU 密集型操作，通过 spawn_blocking 在线程池中并行执行
+    let storage_key_owned = *storage_key;
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for ts_path in ts_files {
+        let key = storage_key_owned;
+        join_set.spawn(async move {
+            let enc_path = ts_path.with_extension("ts.enc");
+            match tokio::fs::read(&ts_path).await {
+                Ok(data) => {
+                    // 在阻塞线程池中执行 CPU 密集型加密
+                    let encrypt_result = tokio::task::spawn_blocking(move || {
+                        crate::crypto::aes_encrypt(&key, &data)
+                            .map_err(|e| format!("{}", e))
+                    })
+                    .await;
+
+                    match encrypt_result {
+                        Ok(Ok(encrypted)) => {
+                            if let Err(e) = tokio::fs::write(&enc_path, &encrypted).await {
+                                warn!(
+                                    "Failed to write encrypted segment {:?}: {}",
+                                    enc_path, e
+                                );
+                                return false;
+                            }
+                            // 安全删除原始明文段文件
+                            let _ = tokio::fs::remove_file(&ts_path).await;
+                            true
                         }
-                        // 安全删除原始明文段文件
-                        let _ = tokio::fs::remove_file(ts_path).await;
-                        encrypted_count += 1;
-                    }
-                    Err(e) => {
-                        warn!("Failed to encrypt segment {:?}: {}", ts_path, e);
+                        Ok(Err(e)) => {
+                            warn!("Failed to encrypt segment {:?}: {}", ts_path, e);
+                            false
+                        }
+                        Err(e) => {
+                            warn!("Encryption task panicked for {:?}: {}", ts_path, e);
+                            false
+                        }
                     }
                 }
+                Err(e) => {
+                    warn!("Failed to read segment {:?}: {}", ts_path, e);
+                    false
+                }
             }
-            Err(e) => {
-                warn!("Failed to read segment {:?}: {}", ts_path, e);
-            }
+        });
+    }
+
+    // 收集所有并行加密结果
+    let mut encrypted_count = 0usize;
+    while let Some(result) = join_set.join_next().await {
+        if let Ok(true) = result {
+            encrypted_count += 1;
         }
     }
 
     if encrypted_count > 0 {
         info!(
-            "🔒 Encrypted {} segment files at rest in {:?}",
+            "🔒 Encrypted {} segment files at rest in {:?} (parallel)",
             encrypted_count, cache_dir
         );
     }
@@ -856,6 +959,15 @@ async fn run_ffmpeg_progressive(
     };
     info!("Detected video codec: {:?}", video_codec);
 
+    // 探测视频开始时间，用于修复 PTS 偏移
+    let start_time = detect_video_start_time(ffmpeg_path, file_path).await;
+    if start_time > 1.0 {
+        info!(
+            "Detected video start_time: {:.3}s — will apply -output_ts_offset to normalize timestamps",
+            start_time
+        );
+    }
+
     let allow_stream_copy = matches!(
         video_codec.as_deref(),
         Some("h264" | "avc" | "avc1" | "hevc" | "h265" | "hev1" | "hvc1")
@@ -866,6 +978,9 @@ async fn run_ffmpeg_progressive(
     // 否则 H.264/HEVC 的 NAL 封装格式不正确，导致播放器只有音频没有画面
     let mut copy_args: Vec<String> = vec![
         "-y".into(),
+        // ★ 多核并行：使用所有 CPU 核心进行解复用/复用
+        "-threads".into(),
+        "0".into(),
         // ★ PTS 时间戳修复：重新生成 PTS 并丢弃损坏帧
         // 解决：源文件（如 MKV）内嵌非零 start_time（例如 26:28:10），
         //       stream copy 直接传递导致 HLS 播放器显示错误的时间戳
@@ -895,6 +1010,15 @@ async fn run_ffmpeg_progressive(
             // VP9, AV1 等其他编码不需要 bitstream filter
             info!("No bitstream filter needed for codec: {:?}", video_codec);
         }
+    }
+
+    // ★ PTS 偏移修复：如果源文件 start_time > 1s（典型的 MKV 内嵌时间戳偏移），
+    //   通过 -output_ts_offset 将输出时间戳归零，避免播放器显示错误时间（如 26:28:10）
+    if start_time > 1.0 {
+        copy_args.extend([
+            "-output_ts_offset".into(),
+            format!("{:.6}", -start_time),
+        ]);
     }
 
     copy_args.extend([
@@ -978,13 +1102,37 @@ async fn run_ffmpeg_progressive(
     let build_transcode_args = |accel: HardwareAccel| {
         let mut args: Vec<String> = vec![
             "-y".into(),
+            // ★ 多核并行：使用所有 CPU 核心进行编解码
+            "-threads".into(),
+            "0".into(),
             // ★ PTS 时间戳修复（转码路径）
             "-fflags".into(),
             "+genpts+discardcorrupt".into(),
-            "-i".into(),
-            file_path.into(),
         ];
 
+        // ★ 输入解码选项（必须在 -i 之前）
+        // -hwaccel auto：自动选择硬件解码器，支持 AV1/VP9 等非 H.264 源的硬件辅助解码
+        // 若硬件不支持（如 ARM 设备不支持 AV1 硬解）则自动回退到 CPU 多线程软解码
+        match accel {
+            HardwareAccel::Vaapi => {
+                // VAAPI 专用解码管线（需指定设备和输出格式）
+                args.extend([
+                    "-hwaccel".into(),
+                    "vaapi".into(),
+                    "-hwaccel_device".into(),
+                    "/dev/dri/renderD128".into(),
+                    "-hwaccel_output_format".into(),
+                    "vaapi".into(),
+                ]);
+            }
+            _ => {
+                args.extend(["-hwaccel".into(), "auto".into()]);
+            }
+        }
+
+        args.extend(["-i".into(), file_path.into()]);
+
+        // ★ 输出编码选项
         match accel {
             HardwareAccel::Rkmpp => {
                 info!("Using Rockchip MPP hardware encoding for HLS segmentation");
@@ -1009,12 +1157,6 @@ async fn run_ffmpeg_progressive(
             HardwareAccel::Vaapi => {
                 info!("Using VAAPI hardware encoding for HLS segmentation");
                 args.extend([
-                    "-hwaccel".into(),
-                    "vaapi".into(),
-                    "-hwaccel_device".into(),
-                    "/dev/dri/renderD128".into(),
-                    "-hwaccel_output_format".into(),
-                    "vaapi".into(),
                     "-c:v".into(),
                     "h264_vaapi".into(),
                     "-qp".into(),
@@ -1162,17 +1304,41 @@ async fn generate_segment_on_demand(
 
     let mut args: Vec<String> = vec![
         "-y".into(),
+        // ★ 多核并行：使用所有 CPU 核心
+        "-threads".into(),
+        "0".into(),
         // ★ PTS 时间戳修复（按需分片路径）
         "-fflags".into(),
         "+genpts+discardcorrupt".into(),
         "-ss".into(),
         format!("{:.3}", start_time),
+    ];
+
+    // ★ 输入解码加速（必须在 -i 之前）— 支持 AV1/VP9 等编码的硬件辅助解码
+    match hw_accel {
+        HardwareAccel::Vaapi => {
+            args.extend([
+                "-hwaccel".into(),
+                "vaapi".into(),
+                "-hwaccel_device".into(),
+                "/dev/dri/renderD128".into(),
+                "-hwaccel_output_format".into(),
+                "vaapi".into(),
+            ]);
+        }
+        _ => {
+            args.extend(["-hwaccel".into(), "auto".into()]);
+        }
+    }
+
+    args.extend([
         "-i".into(),
         file_path.into(),
         "-t".into(),
         format!("{:.3}", segment_duration + 0.1),
-    ];
+    ]);
 
+    // ★ 输出编码选项
     match hw_accel {
         HardwareAccel::Rkmpp => {
             args.extend([
@@ -1192,12 +1358,6 @@ async fn generate_segment_on_demand(
         }
         HardwareAccel::Vaapi => {
             args.extend([
-                "-hwaccel".into(),
-                "vaapi".into(),
-                "-hwaccel_device".into(),
-                "/dev/dri/renderD128".into(),
-                "-hwaccel_output_format".into(),
-                "vaapi".into(),
                 "-c:v".into(),
                 "h264_vaapi".into(),
                 "-qp".into(),
@@ -1247,11 +1407,17 @@ async fn generate_segment_on_demand(
             );
             let fallback_args = vec![
                 "-y".into(),
+                // ★ 多核并行 + 软件回退路径
+                "-threads".into(),
+                "0".into(),
                 // ★ PTS 时间戳修复（软件回退路径）
                 "-fflags".into(),
                 "+genpts+discardcorrupt".into(),
                 "-ss".into(),
                 format!("{:.3}", start_time),
+                // ★ 自动硬件辅助解码（AV1/VP9 输入支持）
+                "-hwaccel".into(),
+                "auto".into(),
                 "-i".into(),
                 file_path.into(),
                 "-t".into(),
@@ -1317,10 +1483,81 @@ async fn generate_segment_on_demand(
     Ok(())
 }
 
+/// 使用 ffprobe 获取视频文件的总时长（秒）
+///
+/// 用于生成覆盖全时长的虚拟 VOD 播放列表，使播放器可以 seek 到任何位置。
+/// 结果缓存到 `.duration` 文件中，避免重复调用 ffprobe。
+async fn get_video_duration(ffmpeg_path: &str, file_path: &str) -> Option<f64> {
+    let ffprobe_path = get_ffprobe_path(ffmpeg_path).await;
+
+    let output = tokio::process::Command::new(&ffprobe_path)
+        .args([
+            "-v",
+            "quiet",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+            file_path,
+        ])
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            raw.trim().parse::<f64>().ok().filter(|&d| d > 0.0)
+        }
+        _ => None,
+    }
+}
+
+/// 生成覆盖完整视频时长的 VOD 播放列表
+///
+/// 渐进式 HLS 的 ffmpeg playlist 仅列出已生成的分片，导致播放器无法 seek 到
+/// 尚未生成的位置。此函数生成一个列出所有分片的完整 VOD playlist，使播放器
+/// 可以 seek 到任何位置。当播放器请求尚未生成的分片时，`get_segment_direct`
+/// 会调用 `generate_segment_on_demand` 按需生成。
+fn generate_complete_vod_playlist(total_duration: f64, segment_duration: f64) -> String {
+    let total_segments = (total_duration / segment_duration).ceil() as usize;
+    // 实际 target duration 向上取整（HLS 规范要求 TARGETDURATION ≥ 所有 EXTINF）
+    let target_duration = segment_duration.ceil() as u64;
+
+    let mut playlist = String::with_capacity(total_segments * 40 + 200);
+    playlist.push_str("#EXTM3U\n");
+    playlist.push_str("#EXT-X-VERSION:3\n");
+    playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", target_duration));
+    playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    playlist.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+
+    for i in 0..total_segments {
+        let dur = if i == total_segments - 1 {
+            // 最后一个分片可能短于标准时长
+            let remaining = total_duration - (i as f64 * segment_duration);
+            if remaining > 0.001 {
+                remaining
+            } else {
+                segment_duration
+            }
+        } else {
+            segment_duration
+        };
+        playlist.push_str(&format!("#EXTINF:{:.6},\n", dur));
+        playlist.push_str(&format!("segment_{}.ts\n", i));
+    }
+
+    playlist.push_str("#EXT-X-ENDLIST\n");
+    playlist
+}
+
 /// 获取 HLS 播放列表（基于 ffmpeg 生成的真实分片）
 ///
 /// 不需要 JWT 认证 — session_id 本身就是鉴权 token（创建时已验证 JWT + SAE）。
 /// 首次请求时自动触发 ffmpeg 分片（优先 stream copy）。
+///
+/// ★ Seek 优化：当视频仍在渐进式分片时，返回覆盖全时长的虚拟 VOD 播放列表，
+/// 使播放器可以 seek 到任何位置（尚未生成的分片会被 get_segment_direct 按需生成）。
 pub async fn get_secure_playlist(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<String>,
@@ -1358,6 +1595,53 @@ pub async fn get_secure_playlist(
     // 确保 HLS 分片存在（首次会触发 ffmpeg 分片）
     let (_cache_dir, playlist_content) = ensure_hls_segments(&file_path).await?;
 
+    // ★ 关键优化：渐进式 HLS 的 playlist 仅列出已生成的分片，
+    //   导致播放器无法 seek 到尚未生成的位置（超出 ffmpeg 当前进度）。
+    //   解决方案：当视频仍在分片时，返回覆盖全时长的虚拟 VOD playlist。
+    //   播放器因此可以 seek 到任何位置；当它请求尚未生成的分片时，
+    //   get_segment_direct 会自动调用 generate_segment_on_demand 按需生成。
+    let final_content = if playlist_content.contains("#EXT-X-ENDLIST") {
+        // 分片已全部完成 — 使用 ffmpeg 生成的真实 playlist（时长精确）
+        playlist_content
+    } else {
+        // 视频仍在转码中 — 尝试生成覆盖全时长的虚拟 VOD playlist
+        let duration_file = _cache_dir.join(".duration");
+        let duration = if duration_file.exists() {
+            // 优先使用缓存的时长（避免重复调用 ffprobe）
+            tokio::fs::read_to_string(&duration_file)
+                .await
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|&d| d > 0.0)
+        } else {
+            // 首次：通过 ffprobe 获取时长并缓存
+            let ffmpeg_path = std::env::var("FFMPEG_PATH")
+                .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
+                .unwrap_or_else(|_| "ffmpeg".to_string());
+            let dur = get_video_duration(&ffmpeg_path, &file_path).await;
+            if let Some(d) = dur {
+                let _ = tokio::fs::write(&duration_file, format!("{:.6}", d)).await;
+            }
+            dur
+        };
+
+        match duration {
+            Some(d) => {
+                info!(
+                    "📋 Generating complete VOD playlist (duration={:.1}s, segments={}) for full seekability",
+                    d,
+                    (d / 2.0).ceil() as usize
+                );
+                generate_complete_vod_playlist(d, 2.0)
+            }
+            None => {
+                // 无法获取时长 — 回退使用 ffmpeg 渐进式 playlist（seek 受限但不影响播放）
+                warn!("📋 Cannot determine video duration, falling back to progressive playlist");
+                playlist_content
+            }
+        }
+    };
+
     info!(
         "📋 Serving playlist for session {} ({})",
         session_id, file_path
@@ -1367,7 +1651,7 @@ pub async fn get_secure_playlist(
         .content_type("application/vnd.apple.mpegurl")
         .insert_header(("Cache-Control", "no-cache, no-store"))
         .insert_header(("Access-Control-Allow-Origin", "*"))
-        .body(playlist_content))
+        .body(final_content))
 }
 
 fn parse_segment_index(segment_name: &str) -> Option<usize> {
@@ -1496,68 +1780,45 @@ pub async fn get_segment_direct(
 
     // 渐进式模式下，段文件可能在 playlist 暴露后短时间内尚未落盘。
     // 这里进行有限等待，避免播放器被 404 打断。
+    //
+    // ★ Seek 优化：当请求的分片远超当前 ffmpeg 进度时（seek 场景），
+    //   跳过初始等待，立即尝试按需生成，大幅减少 seek 延迟。
     if !segment_path.exists() && !enc_path.exists() {
         ensure_hls_segments(&file_path).await?;
 
-        // 先等待 15 秒，这对于顺序播放或近邻分片通常足够
-        let ready = wait_for_segment_ready(&cache_dir, &segment_name, 15_000).await?;
-        if !ready {
-            let done_marker = cache_dir.join(".done");
+        let done_marker = cache_dir.join(".done");
+        let target_idx = parse_segment_index(&segment_name);
+        let current_max = get_max_existing_segment_index(&cache_dir);
 
-            if done_marker.exists() {
-                let max_idx = get_max_existing_segment_index(&cache_dir);
-                let max_str = max_idx
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                return Err(AppError::NotFound(format!(
-                    "Segment '{}' not available (video_id={}, max_generated={})",
-                    segment_name, video_id, max_str
-                )));
-            }
+        // 判断是否为远距离 seek：目标分片远超当前渐进式转码进度
+        let is_far_ahead_seek = !done_marker.exists()
+            && target_idx
+                .map(|idx| idx > current_max.unwrap_or(0) + 5)
+                .unwrap_or(false);
 
-            // 视频仍在转码中 — 检查是否为远距离 seek
-            let target_idx = parse_segment_index(&segment_name);
-            let current_max = get_max_existing_segment_index(&cache_dir).unwrap_or(0);
-
-            if let Some(idx) = target_idx {
-                if idx > current_max + 5 {
-                    // 分片远超当前进度（seek 场景），尝试按需生成
-                    info!(
-                        "🎯 Segment {} requested but only {} generated, trying on-demand seek",
-                        idx, current_max
+        if is_far_ahead_seek {
+            // ★ 远距离 seek：跳过等待，立即按需生成目标分片
+            let idx = target_idx.unwrap();
+            let max = current_max.unwrap_or(0);
+            info!(
+                "🎯 Far-ahead seek detected: segment_{} requested (current max={}), generating on-demand immediately",
+                idx, max
+            );
+            match generate_segment_on_demand(&file_path, &cache_dir, idx, 2.0).await {
+                Ok(()) => {
+                    info!("🎯 On-demand segment_{} ready, serving", idx);
+                }
+                Err(e) => {
+                    warn!(
+                        "On-demand generation failed for segment_{}: {}",
+                        idx, e
                     );
-                    match generate_segment_on_demand(&file_path, &cache_dir, idx, 2.0).await {
-                        Ok(()) => {
-                            info!("🎯 On-demand segment {} ready, serving", idx);
-                            // 按需生成成功，继续到下方的读取
-                        }
-                        Err(e) => {
-                            warn!("On-demand generation failed for segment {}: {}", idx, e);
-                            // 按需失败，继续等待顺序生成（再等 30 秒）
-                            let ready2 =
-                                wait_for_segment_ready(&cache_dir, &segment_name, 30_000).await?;
-                            if !ready2 {
-                                return Ok(HttpResponse::ServiceUnavailable()
-                                    .insert_header(("Retry-After", "3"))
-                                    .insert_header((
-                                        "Cache-Control",
-                                        "no-cache, no-store, must-revalidate",
-                                    ))
-                                    .insert_header(("Access-Control-Allow-Origin", "*"))
-                                    .body(format!(
-                                        "Segment '{}' is still being generated, please retry",
-                                        segment_name
-                                    )));
-                            }
-                        }
-                    }
-                } else {
-                    // 分片距当前进度不远，继续等待顺序生成（再等 30 秒）
-                    let ready2 =
-                        wait_for_segment_ready(&cache_dir, &segment_name, 30_000).await?;
-                    if !ready2 {
+                    // 按需失败 — 回退等待顺序生成
+                    let ready =
+                        wait_for_segment_ready(&cache_dir, &segment_name, 45_000).await?;
+                    if !ready {
                         return Ok(HttpResponse::ServiceUnavailable()
-                            .insert_header(("Retry-After", "2"))
+                            .insert_header(("Retry-After", "3"))
                             .insert_header((
                                 "Cache-Control",
                                 "no-cache, no-store, must-revalidate",
@@ -1569,15 +1830,95 @@ pub async fn get_segment_direct(
                             )));
                     }
                 }
-            } else {
-                return Ok(HttpResponse::ServiceUnavailable()
-                    .insert_header(("Retry-After", "2"))
-                    .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
-                    .insert_header(("Access-Control-Allow-Origin", "*"))
-                    .body(format!(
-                        "Segment '{}' is still being generated, please retry",
-                        segment_name
+            }
+        } else {
+            // 顺序播放或近邻分片：正常等待 ffmpeg 渐进式生成
+            let ready =
+                wait_for_segment_ready(&cache_dir, &segment_name, 15_000).await?;
+            if !ready {
+                if done_marker.exists() {
+                    let max_str = current_max
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    return Err(AppError::NotFound(format!(
+                        "Segment '{}' not available (video_id={}, max_generated={})",
+                        segment_name, video_id, max_str
                     )));
+                }
+
+                if let Some(idx) = target_idx {
+                    let max = current_max.unwrap_or(0);
+                    if idx > max + 5 {
+                        // 在初始等待期间，ffmpeg 进度可能仍未达到 — 尝试按需生成
+                        info!(
+                            "🎯 Segment_{} still not ready after initial wait (max={}), trying on-demand",
+                            idx, max
+                        );
+                        match generate_segment_on_demand(&file_path, &cache_dir, idx, 2.0).await {
+                            Ok(()) => {
+                                info!("🎯 On-demand segment_{} ready, serving", idx);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "On-demand generation failed for segment_{}: {}",
+                                    idx, e
+                                );
+                                let ready2 = wait_for_segment_ready(
+                                    &cache_dir,
+                                    &segment_name,
+                                    30_000,
+                                )
+                                .await?;
+                                if !ready2 {
+                                    return Ok(HttpResponse::ServiceUnavailable()
+                                        .insert_header(("Retry-After", "3"))
+                                        .insert_header((
+                                            "Cache-Control",
+                                            "no-cache, no-store, must-revalidate",
+                                        ))
+                                        .insert_header(("Access-Control-Allow-Origin", "*"))
+                                        .body(format!(
+                                            "Segment '{}' is still being generated, please retry",
+                                            segment_name
+                                        )));
+                                }
+                            }
+                        }
+                    } else {
+                        // 近邻分片：继续等待顺序生成
+                        let ready2 = wait_for_segment_ready(
+                            &cache_dir,
+                            &segment_name,
+                            30_000,
+                        )
+                        .await?;
+                        if !ready2 {
+                            return Ok(HttpResponse::ServiceUnavailable()
+                                .insert_header(("Retry-After", "2"))
+                                .insert_header((
+                                    "Cache-Control",
+                                    "no-cache, no-store, must-revalidate",
+                                ))
+                                .insert_header(("Access-Control-Allow-Origin", "*"))
+                                .body(format!(
+                                    "Segment '{}' is still being generated, please retry",
+                                    segment_name
+                                )));
+                        }
+                    }
+                } else {
+                    return Ok(HttpResponse::ServiceUnavailable()
+                        .insert_header(("Retry-After", "2"))
+                        .insert_header((
+                            "Cache-Control",
+                            "no-cache, no-store, must-revalidate",
+                        ))
+                        .insert_header(("Access-Control-Allow-Origin", "*"))
+                        .body(format!(
+                            "Segment '{}' is still being generated, please retry",
+                            segment_name
+                        )));
+                }
             }
         }
     }
@@ -2149,15 +2490,40 @@ async fn transcode_segment_async(
     // 构建 FFmpeg 命令参数
     let mut args = vec![
         "-y".to_string(), // 覆盖输出文件
+        // ★ 多核并行：使用所有 CPU 核心进行编解码
+        "-threads".to_string(),
+        "0".to_string(),
         "-ss".to_string(),
         format!("{:.3}", start_time), // 起始时间
+    ];
+
+    // ★ 输入解码选项（必须在 -i 之前）
+    // -hwaccel auto：自动选择硬件解码器，支持 AV1/VP9 等非 H.264 源的硬件辅助解码
+    match hw_accel {
+        HardwareAccel::Vaapi => {
+            // VAAPI 专用解码管线（需指定设备和输出格式）
+            args.extend(vec![
+                "-hwaccel".to_string(),
+                "vaapi".to_string(),
+                "-hwaccel_device".to_string(),
+                "/dev/dri/renderD128".to_string(),
+                "-hwaccel_output_format".to_string(),
+                "vaapi".to_string(),
+            ]);
+        }
+        _ => {
+            args.extend(vec!["-hwaccel".to_string(), "auto".to_string()]);
+        }
+    }
+
+    args.extend(vec![
         "-i".to_string(),
         video_path.to_str().unwrap_or("").to_string(),
         "-t".to_string(),
         format!("{:.3}", SEGMENT_DURATION), // 段持续时间
-    ];
+    ]);
 
-    // 根据硬件加速能力选择编码器
+    // ★ 输出编码选项（根据硬件加速能力选择编码器）
     match hw_accel {
         HardwareAccel::Rkmpp => {
             info!(
@@ -2174,26 +2540,18 @@ async fn transcode_segment_async(
             ]);
         }
         HardwareAccel::Vaapi => {
-            // Intel/AMD GPU 硬件加速
             info!(
                 "Using VAAPI hardware acceleration for segment {}",
                 segment_index
             );
             args.extend(vec![
-                "-hwaccel".to_string(),
-                "vaapi".to_string(),
-                "-hwaccel_device".to_string(),
-                "/dev/dri/renderD128".to_string(),
-                "-hwaccel_output_format".to_string(),
-                "vaapi".to_string(),
                 "-c:v".to_string(),
                 "h264_vaapi".to_string(),
                 "-qp".to_string(),
-                "23".to_string(), // 质量参数
+                "23".to_string(),
             ]);
         }
         HardwareAccel::V4l2 => {
-            // V4L2 硬件编码器（ARM SoC）
             info!(
                 "Using V4L2 hardware acceleration for segment {}",
                 segment_index
@@ -2202,11 +2560,10 @@ async fn transcode_segment_async(
                 "-c:v".to_string(),
                 "h264_v4l2m2m".to_string(),
                 "-b:v".to_string(),
-                "2M".to_string(), // 码率
+                "2M".to_string(),
             ]);
         }
         HardwareAccel::None => {
-            // 软件编码（libx264）
             info!(
                 "Using software encoding (libx264) for segment {}",
                 segment_index
