@@ -896,8 +896,24 @@ impl StorageManager {
             if !md.is_dir() {
                 continue;
             }
-            let most_recent = most_recent_access_in_dir(&entry.path()).await;
-            if now.saturating_sub(most_recent) > max_idle_secs {
+
+            if is_cache_entry_protected(&entry.path(), max_idle_secs).await {
+                continue;
+            }
+            let last_activity = {
+                let access_file = entry.path().join(".last_access");
+                if let Ok(amd) = fs::metadata(&access_file).await {
+                    amd.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                } else {
+                    most_recent_access_in_dir(&entry.path()).await
+                }
+            };
+
+            if now.saturating_sub(last_activity) > max_idle_secs {
                 let sz = get_directory_size(&entry.path()).await.unwrap_or(0);
                 if fs::remove_dir_all(entry.path()).await.is_ok() {
                     freed += sz;
@@ -1306,8 +1322,37 @@ async fn cleanup_old_entries_bytes(path: &Path, retention_secs: u64) -> std::io:
     Ok(freed)
 }
 
+/// Check if a cache directory is protected from eviction.
+///
+/// A directory is protected if:
+/// - It contains a `.lock` file (ffmpeg is actively segmenting)
+/// - It contains a `.last_access` file that was modified within `protection_secs`
+///   (an HLS session is actively serving segments from it)
+async fn is_cache_entry_protected(path: &Path, protection_secs: u64) -> bool {
+    // .lock → ffmpeg 正在运行
+    let lock_file = path.join(".lock");
+    if fs::metadata(&lock_file).await.is_ok() {
+        return true;
+    }
+
+    // .last_access → HLS session 最近在服务分片
+    let access_file = path.join(".last_access");
+    if let Ok(md) = fs::metadata(&access_file).await {
+        if let Ok(modified) = md.modified() {
+            if let Ok(elapsed) = modified.elapsed() {
+                return elapsed.as_secs() < protection_secs;
+            }
+        }
+    }
+
+    false
+}
+
 /// LRU eviction: remove the oldest entries from a directory until at least
 /// `target_bytes` have been freed. Returns actual bytes freed.
+///
+/// Protected directories (active ffmpeg processes, active HLS sessions) are
+/// excluded from eviction to prevent breaking ongoing playback.
 async fn lru_evict_from_directory(path: &Path, target_bytes: u64) -> std::io::Result<u64> {
     let mut heap: BinaryHeap<CacheEntry> = BinaryHeap::new();
     let mut entries = fs::read_dir(path).await?;
@@ -1317,6 +1362,13 @@ async fn lru_evict_from_directory(path: &Path, target_bytes: u64) -> std::io::Re
             Ok(m) => m,
             Err(_) => continue,
         };
+
+        // ★ 保护活跃的缓存目录：跳过正在被 ffmpeg 或 HLS session 使用的目录
+        //   protection_secs = 600 (10 分钟)，即最近 10 分钟内有 segment 被请求过的目录不会被驱逐
+        if md.is_dir() && is_cache_entry_protected(&entry.path(), 600).await {
+            continue;
+        }
+
         let last_access = md
             .accessed()
             .or_else(|_| md.modified())
@@ -1350,8 +1402,9 @@ async fn lru_evict_from_directory(path: &Path, target_bytes: u64) -> std::io::Re
         };
         if ok {
             freed += ce.size;
+            info!("LRU eviction: removed {:?} ({} freed)", ce.path, format_bytes(ce.size));
         } else {
-            warn!("LRU eviction: failed to remove {:?}", ce.path);
+            warn!("LRU eviction: failed to remove {:?} (may be in use)", ce.path);
         }
     }
 
