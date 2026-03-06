@@ -829,8 +829,6 @@ async fn encrypt_segments_at_rest(
     cache_dir: &std::path::Path,
     storage_key: &[u8; 32],
 ) -> Result<usize, String> {
-    let mut encrypted_count = 0;
-
     let mut entries = tokio::fs::read_dir(cache_dir)
         .await
         .map_err(|e| format!("Failed to read cache dir: {}", e))?;
@@ -843,35 +841,70 @@ async fn encrypt_segments_at_rest(
         }
     }
 
-    for ts_path in &ts_files {
-        let enc_path = ts_path.with_extension("ts.enc");
+    if ts_files.is_empty() {
+        return Ok(0);
+    }
 
-        match tokio::fs::read(ts_path).await {
-            Ok(data) => {
-                match crate::crypto::aes_encrypt(storage_key, &data) {
-                    Ok(encrypted) => {
-                        if let Err(e) = tokio::fs::write(&enc_path, &encrypted).await {
-                            warn!("Failed to write encrypted segment {:?}: {}", enc_path, e);
-                            continue;
+    // ★ 并行加密：利用多核 CPU 同时加密多个分片，大幅减少加密总耗时
+    // AES-256-GCM 加密是 CPU 密集型操作，通过 spawn_blocking 在线程池中并行执行
+    let storage_key_owned = *storage_key;
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for ts_path in ts_files {
+        let key = storage_key_owned;
+        join_set.spawn(async move {
+            let enc_path = ts_path.with_extension("ts.enc");
+            match tokio::fs::read(&ts_path).await {
+                Ok(data) => {
+                    // 在阻塞线程池中执行 CPU 密集型加密
+                    let encrypt_result = tokio::task::spawn_blocking(move || {
+                        crate::crypto::aes_encrypt(&key, &data)
+                            .map_err(|e| format!("{}", e))
+                    })
+                    .await;
+
+                    match encrypt_result {
+                        Ok(Ok(encrypted)) => {
+                            if let Err(e) = tokio::fs::write(&enc_path, &encrypted).await {
+                                warn!(
+                                    "Failed to write encrypted segment {:?}: {}",
+                                    enc_path, e
+                                );
+                                return false;
+                            }
+                            // 安全删除原始明文段文件
+                            let _ = tokio::fs::remove_file(&ts_path).await;
+                            true
                         }
-                        // 安全删除原始明文段文件
-                        let _ = tokio::fs::remove_file(ts_path).await;
-                        encrypted_count += 1;
-                    }
-                    Err(e) => {
-                        warn!("Failed to encrypt segment {:?}: {}", ts_path, e);
+                        Ok(Err(e)) => {
+                            warn!("Failed to encrypt segment {:?}: {}", ts_path, e);
+                            false
+                        }
+                        Err(e) => {
+                            warn!("Encryption task panicked for {:?}: {}", ts_path, e);
+                            false
+                        }
                     }
                 }
+                Err(e) => {
+                    warn!("Failed to read segment {:?}: {}", ts_path, e);
+                    false
+                }
             }
-            Err(e) => {
-                warn!("Failed to read segment {:?}: {}", ts_path, e);
-            }
+        });
+    }
+
+    // 收集所有并行加密结果
+    let mut encrypted_count = 0usize;
+    while let Some(result) = join_set.join_next().await {
+        if let Ok(true) = result {
+            encrypted_count += 1;
         }
     }
 
     if encrypted_count > 0 {
         info!(
-            "🔒 Encrypted {} segment files at rest in {:?}",
+            "🔒 Encrypted {} segment files at rest in {:?} (parallel)",
             encrypted_count, cache_dir
         );
     }
@@ -945,6 +978,9 @@ async fn run_ffmpeg_progressive(
     // 否则 H.264/HEVC 的 NAL 封装格式不正确，导致播放器只有音频没有画面
     let mut copy_args: Vec<String> = vec![
         "-y".into(),
+        // ★ 多核并行：使用所有 CPU 核心进行解复用/复用
+        "-threads".into(),
+        "0".into(),
         // ★ PTS 时间戳修复：重新生成 PTS 并丢弃损坏帧
         // 解决：源文件（如 MKV）内嵌非零 start_time（例如 26:28:10），
         //       stream copy 直接传递导致 HLS 播放器显示错误的时间戳
@@ -1066,13 +1102,37 @@ async fn run_ffmpeg_progressive(
     let build_transcode_args = |accel: HardwareAccel| {
         let mut args: Vec<String> = vec![
             "-y".into(),
+            // ★ 多核并行：使用所有 CPU 核心进行编解码
+            "-threads".into(),
+            "0".into(),
             // ★ PTS 时间戳修复（转码路径）
             "-fflags".into(),
             "+genpts+discardcorrupt".into(),
-            "-i".into(),
-            file_path.into(),
         ];
 
+        // ★ 输入解码选项（必须在 -i 之前）
+        // -hwaccel auto：自动选择硬件解码器，支持 AV1/VP9 等非 H.264 源的硬件辅助解码
+        // 若硬件不支持（如 ARM 设备不支持 AV1 硬解）则自动回退到 CPU 多线程软解码
+        match accel {
+            HardwareAccel::Vaapi => {
+                // VAAPI 专用解码管线（需指定设备和输出格式）
+                args.extend([
+                    "-hwaccel".into(),
+                    "vaapi".into(),
+                    "-hwaccel_device".into(),
+                    "/dev/dri/renderD128".into(),
+                    "-hwaccel_output_format".into(),
+                    "vaapi".into(),
+                ]);
+            }
+            _ => {
+                args.extend(["-hwaccel".into(), "auto".into()]);
+            }
+        }
+
+        args.extend(["-i".into(), file_path.into()]);
+
+        // ★ 输出编码选项
         match accel {
             HardwareAccel::Rkmpp => {
                 info!("Using Rockchip MPP hardware encoding for HLS segmentation");
@@ -1097,12 +1157,6 @@ async fn run_ffmpeg_progressive(
             HardwareAccel::Vaapi => {
                 info!("Using VAAPI hardware encoding for HLS segmentation");
                 args.extend([
-                    "-hwaccel".into(),
-                    "vaapi".into(),
-                    "-hwaccel_device".into(),
-                    "/dev/dri/renderD128".into(),
-                    "-hwaccel_output_format".into(),
-                    "vaapi".into(),
                     "-c:v".into(),
                     "h264_vaapi".into(),
                     "-qp".into(),
@@ -1250,17 +1304,41 @@ async fn generate_segment_on_demand(
 
     let mut args: Vec<String> = vec![
         "-y".into(),
+        // ★ 多核并行：使用所有 CPU 核心
+        "-threads".into(),
+        "0".into(),
         // ★ PTS 时间戳修复（按需分片路径）
         "-fflags".into(),
         "+genpts+discardcorrupt".into(),
         "-ss".into(),
         format!("{:.3}", start_time),
+    ];
+
+    // ★ 输入解码加速（必须在 -i 之前）— 支持 AV1/VP9 等编码的硬件辅助解码
+    match hw_accel {
+        HardwareAccel::Vaapi => {
+            args.extend([
+                "-hwaccel".into(),
+                "vaapi".into(),
+                "-hwaccel_device".into(),
+                "/dev/dri/renderD128".into(),
+                "-hwaccel_output_format".into(),
+                "vaapi".into(),
+            ]);
+        }
+        _ => {
+            args.extend(["-hwaccel".into(), "auto".into()]);
+        }
+    }
+
+    args.extend([
         "-i".into(),
         file_path.into(),
         "-t".into(),
         format!("{:.3}", segment_duration + 0.1),
-    ];
+    ]);
 
+    // ★ 输出编码选项
     match hw_accel {
         HardwareAccel::Rkmpp => {
             args.extend([
@@ -1280,12 +1358,6 @@ async fn generate_segment_on_demand(
         }
         HardwareAccel::Vaapi => {
             args.extend([
-                "-hwaccel".into(),
-                "vaapi".into(),
-                "-hwaccel_device".into(),
-                "/dev/dri/renderD128".into(),
-                "-hwaccel_output_format".into(),
-                "vaapi".into(),
                 "-c:v".into(),
                 "h264_vaapi".into(),
                 "-qp".into(),
@@ -1335,11 +1407,17 @@ async fn generate_segment_on_demand(
             );
             let fallback_args = vec![
                 "-y".into(),
+                // ★ 多核并行 + 软件回退路径
+                "-threads".into(),
+                "0".into(),
                 // ★ PTS 时间戳修复（软件回退路径）
                 "-fflags".into(),
                 "+genpts+discardcorrupt".into(),
                 "-ss".into(),
                 format!("{:.3}", start_time),
+                // ★ 自动硬件辅助解码（AV1/VP9 输入支持）
+                "-hwaccel".into(),
+                "auto".into(),
                 "-i".into(),
                 file_path.into(),
                 "-t".into(),
@@ -2412,15 +2490,40 @@ async fn transcode_segment_async(
     // 构建 FFmpeg 命令参数
     let mut args = vec![
         "-y".to_string(), // 覆盖输出文件
+        // ★ 多核并行：使用所有 CPU 核心进行编解码
+        "-threads".to_string(),
+        "0".to_string(),
         "-ss".to_string(),
         format!("{:.3}", start_time), // 起始时间
+    ];
+
+    // ★ 输入解码选项（必须在 -i 之前）
+    // -hwaccel auto：自动选择硬件解码器，支持 AV1/VP9 等非 H.264 源的硬件辅助解码
+    match hw_accel {
+        HardwareAccel::Vaapi => {
+            // VAAPI 专用解码管线（需指定设备和输出格式）
+            args.extend(vec![
+                "-hwaccel".to_string(),
+                "vaapi".to_string(),
+                "-hwaccel_device".to_string(),
+                "/dev/dri/renderD128".to_string(),
+                "-hwaccel_output_format".to_string(),
+                "vaapi".to_string(),
+            ]);
+        }
+        _ => {
+            args.extend(vec!["-hwaccel".to_string(), "auto".to_string()]);
+        }
+    }
+
+    args.extend(vec![
         "-i".to_string(),
         video_path.to_str().unwrap_or("").to_string(),
         "-t".to_string(),
         format!("{:.3}", SEGMENT_DURATION), // 段持续时间
-    ];
+    ]);
 
-    // 根据硬件加速能力选择编码器
+    // ★ 输出编码选项（根据硬件加速能力选择编码器）
     match hw_accel {
         HardwareAccel::Rkmpp => {
             info!(
@@ -2437,26 +2540,18 @@ async fn transcode_segment_async(
             ]);
         }
         HardwareAccel::Vaapi => {
-            // Intel/AMD GPU 硬件加速
             info!(
                 "Using VAAPI hardware acceleration for segment {}",
                 segment_index
             );
             args.extend(vec![
-                "-hwaccel".to_string(),
-                "vaapi".to_string(),
-                "-hwaccel_device".to_string(),
-                "/dev/dri/renderD128".to_string(),
-                "-hwaccel_output_format".to_string(),
-                "vaapi".to_string(),
                 "-c:v".to_string(),
                 "h264_vaapi".to_string(),
                 "-qp".to_string(),
-                "23".to_string(), // 质量参数
+                "23".to_string(),
             ]);
         }
         HardwareAccel::V4l2 => {
-            // V4L2 硬件编码器（ARM SoC）
             info!(
                 "Using V4L2 hardware acceleration for segment {}",
                 segment_index
@@ -2465,11 +2560,10 @@ async fn transcode_segment_async(
                 "-c:v".to_string(),
                 "h264_v4l2m2m".to_string(),
                 "-b:v".to_string(),
-                "2M".to_string(), // 码率
+                "2M".to_string(),
             ]);
         }
         HardwareAccel::None => {
-            // 软件编码（libx264）
             info!(
                 "Using software encoding (libx264) for segment {}",
                 segment_index
