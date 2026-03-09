@@ -897,17 +897,30 @@ impl StorageManager {
                 continue;
             }
 
-            if is_cache_entry_protected(&entry.path(), max_idle_secs).await {
+            // Check .lock file first: ffmpeg is actively running, skip eviction
+            let lock_file = entry.path().join(".lock");
+            if fs::metadata(&lock_file).await.is_ok() {
                 continue;
             }
+
+            // Read .last_access once for both the protection check and the idle check,
+            // avoiding the redundant I/O that would occur by calling is_cache_entry_protected
+            // followed by a second metadata read of the same file.
             let last_activity = {
                 let access_file = entry.path().join(".last_access");
                 if let Ok(amd) = fs::metadata(&access_file).await {
-                    amd.modified()
+                    let ts = amd
+                        .modified()
                         .ok()
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs())
-                        .unwrap_or(0)
+                        .unwrap_or(0);
+                    // If recently accessed within the idle window, this directory is
+                    // still active — skip eviction (same check as is_cache_entry_protected)
+                    if now.saturating_sub(ts) < max_idle_secs {
+                        continue;
+                    }
+                    ts
                 } else {
                     most_recent_access_in_dir(&entry.path()).await
                 }
@@ -1348,6 +1361,12 @@ async fn is_cache_entry_protected(path: &Path, protection_secs: u64) -> bool {
     false
 }
 
+/// Protection window for active HLS cache directories during LRU eviction.
+///
+/// Directories whose `.last_access` file was touched within this many seconds
+/// are considered active (ongoing HLS playback) and are excluded from eviction.
+const LRU_PROTECTION_SECS: u64 = 600;
+
 /// LRU eviction: remove the oldest entries from a directory until at least
 /// `target_bytes` have been freed. Returns actual bytes freed.
 ///
@@ -1364,8 +1383,8 @@ async fn lru_evict_from_directory(path: &Path, target_bytes: u64) -> std::io::Re
         };
 
         // ★ 保护活跃的缓存目录：跳过正在被 ffmpeg 或 HLS session 使用的目录
-        //   protection_secs = 600 (10 分钟)，即最近 10 分钟内有 segment 被请求过的目录不会被驱逐
-        if md.is_dir() && is_cache_entry_protected(&entry.path(), 600).await {
+        //   protection_secs = LRU_PROTECTION_SECS (10 分钟)，即最近 10 分钟内有 segment 被请求过的目录不会被驱逐
+        if md.is_dir() && is_cache_entry_protected(&entry.path(), LRU_PROTECTION_SECS).await {
             continue;
         }
 

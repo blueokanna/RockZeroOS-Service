@@ -308,10 +308,16 @@ pub struct CreateSessionRequest {
     pub file_path: Option<String>,
     pub zkp_registration: Option<String>,
 
+    /// Deprecated: this flag is ignored. Direct mode has been permanently disabled
+    /// by the security policy. This field is kept only for backward compatibility
+    /// with older clients; it has no effect and all segments are always encrypted
+    /// with AES-256-GCM regardless of this value.
+    #[deprecated(note = "direct_mode is ignored; direct streaming mode is permanently disabled by security policy")]
     #[serde(default)]
     pub direct_mode: bool,
 }
 
+#[allow(deprecated)] // body.direct_mode is deprecated but still read to emit a warning to callers
 pub async fn create_hls_session(
     pool: web::Data<SqlitePool>,
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
@@ -1302,6 +1308,15 @@ async fn generate_segment_on_demand(
         Some("h264" | "avc" | "avc1" | "hevc" | "h265" | "hev1" | "hvc1")
     );
 
+    // 探测视频开始时间，与渐进式路径一致（修复 MKV 等含非零 start_time 的文件）
+    let video_start_time = detect_video_start_time(&ffmpeg_path, file_path).await;
+    if video_start_time > 1.0 {
+        info!(
+            "Detected video start_time: {:.3}s — will apply -output_ts_offset to normalize timestamps",
+            video_start_time
+        );
+    }
+
     // ══════════════════════════════════════════════════════════════
     //  Phase 1: 尝试 stream copy（与渐进式分片编码一致，瞬间完成）
     // ══════════════════════════════════════════════════════════════
@@ -1338,6 +1353,14 @@ async fn generate_segment_on_demand(
             _ => {}
         }
 
+        // ★ PTS 偏移修复：与渐进式路径一致，修正 MKV 等文件内嵌的非零 start_time
+        if video_start_time > 1.0 {
+            copy_args.extend([
+                "-output_ts_offset".into(),
+                format!("{:.6}", -video_start_time),
+            ]);
+        }
+
         copy_args.extend([
             "-avoid_negative_ts".into(),
             "make_zero".into(),
@@ -1356,7 +1379,9 @@ async fn generate_segment_on_demand(
 
         if output.status.success() {
             // stream copy 成功 — 加密并返回
-            encrypt_on_demand_segment(&segment_path, file_path).await;
+            encrypt_on_demand_segment(&segment_path, file_path).await.map_err(|e| {
+                format!("On-demand stream copy succeeded but encryption failed: {}", e)
+            })?;
             info!(
                 "✅ On-demand segment_{}.ts generated via stream copy and encrypted",
                 segment_index
@@ -1512,7 +1537,9 @@ async fn generate_segment_on_demand(
     }
 
     // 对按需生成的分片同样进行静态加密
-    encrypt_on_demand_segment(&segment_path, file_path).await;
+    encrypt_on_demand_segment(&segment_path, file_path).await.map_err(|e| {
+        format!("On-demand transcode succeeded but encryption failed: {}", e)
+    })?;
 
     info!(
         "✅ On-demand segment_{}.ts generated (transcode) and encrypted",
@@ -1525,16 +1552,38 @@ async fn generate_segment_on_demand(
 ///
 /// 和渐进式分片加密使用相同的 `derive_segment_storage_key` 密钥派生，
 /// 确保所有分片（无论生成方式）都使用一致的加密策略。
-async fn encrypt_on_demand_segment(segment_path: &std::path::Path, file_path: &str) {
+///
+/// Returns an error if any step (read, encrypt, write) fails, so the caller
+/// can avoid treating a failed-encryption segment as successfully served.
+async fn encrypt_on_demand_segment(
+    segment_path: &std::path::Path,
+    file_path: &str,
+) -> Result<(), String> {
     let storage_key = derive_segment_storage_key(file_path);
-    if let Ok(data) = tokio::fs::read(segment_path).await {
-        if let Ok(encrypted) = crate::crypto::aes_encrypt(&storage_key, &data) {
-            let enc_path = segment_path.with_extension("ts.enc");
-            if tokio::fs::write(&enc_path, &encrypted).await.is_ok() {
-                let _ = tokio::fs::remove_file(segment_path).await;
-            }
-        }
-    }
+    let data = tokio::fs::read(segment_path).await.map_err(|e| {
+        warn!(
+            "Failed to read segment {:?} for encryption: {}",
+            segment_path, e
+        );
+        format!("Failed to read segment for encryption: {}", e)
+    })?;
+    let encrypted = crate::crypto::aes_encrypt(&storage_key, &data).map_err(|e| {
+        warn!(
+            "AES-256-GCM encryption failed for segment {:?}: {}",
+            segment_path, e
+        );
+        format!("Encryption failed: {}", e)
+    })?;
+    let enc_path = segment_path.with_extension("ts.enc");
+    tokio::fs::write(&enc_path, &encrypted).await.map_err(|e| {
+        warn!(
+            "Failed to write encrypted segment {:?}: {}",
+            enc_path, e
+        );
+        format!("Failed to write encrypted segment: {}", e)
+    })?;
+    let _ = tokio::fs::remove_file(segment_path).await;
+    Ok(())
 }
 
 /// 使用 ffprobe 获取视频文件的总时长（秒）
@@ -1647,7 +1696,7 @@ pub async fn get_secure_playlist(
     };
 
     // 确保 HLS 分片存在（首次会触发 ffmpeg 分片）
-    let (_cache_dir, playlist_content) = ensure_hls_segments(&file_path).await?;
+    let (cache_dir, playlist_content) = ensure_hls_segments(&file_path).await?;
 
     // ★ 关键优化：渐进式 HLS 的 playlist 仅列出已生成的分片，
     //   导致播放器无法 seek 到尚未生成的位置（超出 ffmpeg 当前进度）。
@@ -1659,7 +1708,7 @@ pub async fn get_secure_playlist(
         playlist_content
     } else {
         // 视频仍在转码中 — 尝试生成覆盖全时长的虚拟 VOD playlist
-        let duration_file = _cache_dir.join(".duration");
+        let duration_file = cache_dir.join(".duration");
         let duration = if duration_file.exists() {
             // 优先使用缓存的时长（避免重复调用 ffprobe）
             tokio::fs::read_to_string(&duration_file)
@@ -1697,7 +1746,7 @@ pub async fn get_secure_playlist(
     };
 
     // ★ 更新 .last_access 标记，防止活跃缓存被 LRU 驱逐
-    touch_cache_access(&_cache_dir).await;
+    touch_cache_access(&cache_dir).await;
 
     info!(
         "📋 Serving playlist for session {} ({})",
@@ -2063,7 +2112,7 @@ pub async fn get_secure_segment(
     );
 
     Ok(HttpResponse::Ok()
-        .content_type("video/mp2t")
+        .content_type("application/octet-stream")
         .insert_header(("X-Encrypted", "true"))
         .insert_header(("X-Encryption-Method", "AES-256-GCM"))
         .insert_header(("X-ZKP-Verified", "true"))
