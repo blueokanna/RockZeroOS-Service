@@ -33,6 +33,11 @@ tmp/
 temp/
 *.tmp
 
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+
 # HLS 缓存
 /var/cache/rockzero/
 .hls-cache/
