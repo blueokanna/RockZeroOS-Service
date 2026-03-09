@@ -9,6 +9,11 @@ use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
+/// Protection window used by `lru_evict_from_directory`: cache directories that
+/// have had a segment accessed within this many seconds are skipped during LRU
+/// eviction to avoid interrupting active HLS sessions.
+const LRU_PROTECTION_SECS: u64 = 600;
+
 // ════════════════════════════════════════════════════════════════
 //  Pressure level
 // ════════════════════════════════════════════════════════════════
@@ -1365,7 +1370,7 @@ async fn lru_evict_from_directory(path: &Path, target_bytes: u64) -> std::io::Re
 
         // ★ 保护活跃的缓存目录：跳过正在被 ffmpeg 或 HLS session 使用的目录
         //   protection_secs = 600 (10 分钟)，即最近 10 分钟内有 segment 被请求过的目录不会被驱逐
-        if md.is_dir() && is_cache_entry_protected(&entry.path(), 600).await {
+        if md.is_dir() && is_cache_entry_protected(&entry.path(), LRU_PROTECTION_SECS).await {
             continue;
         }
 
