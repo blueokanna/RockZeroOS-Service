@@ -36,3 +36,8 @@ temp/
 # HLS 缓存
 /var/cache/rockzero/
 .hls-cache/
+
+# SQLite 数据库文件（运行时生成）
+*.db
+*.sqlite
+*.sqlite3
