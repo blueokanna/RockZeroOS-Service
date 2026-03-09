@@ -897,20 +897,9 @@ impl StorageManager {
                 continue;
             }
 
-            if is_cache_entry_protected(&entry.path(), max_idle_secs).await {
-                continue;
-            }
-            let last_activity = {
-                let access_file = entry.path().join(".last_access");
-                if let Ok(amd) = fs::metadata(&access_file).await {
-                    amd.modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)
-                } else {
-                    most_recent_access_in_dir(&entry.path()).await
-                }
+            let last_activity = match cache_entry_last_activity(&entry.path(), max_idle_secs).await {
+                None => continue,
+                Some(ts) => ts,
             };
 
             if now.saturating_sub(last_activity) > max_idle_secs {
@@ -1322,30 +1311,43 @@ async fn cleanup_old_entries_bytes(path: &Path, retention_secs: u64) -> std::io:
     Ok(freed)
 }
 
-/// Check if a cache directory is protected from eviction.
+/// Check if a cache directory is protected from eviction, and if not, return its last
+/// activity timestamp.
 ///
-/// A directory is protected if:
-/// - It contains a `.lock` file (ffmpeg is actively segmenting)
-/// - It contains a `.last_access` file that was modified within `protection_secs`
-///   (an HLS session is actively serving segments from it)
-async fn is_cache_entry_protected(path: &Path, protection_secs: u64) -> bool {
+/// Returns `None` if the entry is protected (`.lock` file present or `.last_access`
+/// modified within `protection_secs`). Otherwise returns `Some(last_activity_secs)` —
+/// the last recorded access time as seconds since `UNIX_EPOCH` — so that callers avoid
+/// a second filesystem metadata read.
+async fn cache_entry_last_activity(path: &Path, protection_secs: u64) -> Option<u64> {
     // .lock → ffmpeg 正在运行
     let lock_file = path.join(".lock");
     if fs::metadata(&lock_file).await.is_ok() {
-        return true;
+        return None;
     }
 
     // .last_access → HLS session 最近在服务分片
     let access_file = path.join(".last_access");
     if let Ok(md) = fs::metadata(&access_file).await {
         if let Ok(modified) = md.modified() {
-            if let Ok(elapsed) = modified.elapsed() {
-                return elapsed.as_secs() < protection_secs;
+            match modified.elapsed() {
+                Ok(elapsed) if elapsed.as_secs() < protection_secs => return None,
+                Err(_) => return None, // mtime is in the future → treat as very recent access
+                Ok(_) => {}
+            }
+            // Not protected; return the timestamp to avoid a second metadata read.
+            // If the conversion fails (pre-epoch timestamp), fall through to the directory scan.
+            if let Some(ts) = modified
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs())
+            {
+                return Some(ts);
             }
         }
     }
 
-    false
+    // No .last_access file (or timestamp conversion failed); fall back to scanning directory mtimes
+    Some(most_recent_access_in_dir(path).await)
 }
 
 /// LRU eviction: remove the oldest entries from a directory until at least
@@ -1365,7 +1367,7 @@ async fn lru_evict_from_directory(path: &Path, target_bytes: u64) -> std::io::Re
 
         // ★ 保护活跃的缓存目录：跳过正在被 ffmpeg 或 HLS session 使用的目录
         //   protection_secs = 600 (10 分钟)，即最近 10 分钟内有 segment 被请求过的目录不会被驱逐
-        if md.is_dir() && is_cache_entry_protected(&entry.path(), 600).await {
+        if md.is_dir() && cache_entry_last_activity(&entry.path(), 600).await.is_none() {
             continue;
         }
 
