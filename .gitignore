@@ -36,3 +36,4 @@ temp/
 # HLS 缓存
 /var/cache/rockzero/
 .hls-cache/
+rockzero.db
