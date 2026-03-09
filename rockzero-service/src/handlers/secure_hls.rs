@@ -2063,7 +2063,7 @@ pub async fn get_secure_segment(
     );
 
     Ok(HttpResponse::Ok()
-        .content_type("video/mp2t")
+        .content_type("application/octet-stream")
         .insert_header(("X-Encrypted", "true"))
         .insert_header(("X-Encryption-Method", "AES-256-GCM"))
         .insert_header(("X-ZKP-Verified", "true"))
