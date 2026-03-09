@@ -897,9 +897,14 @@ impl StorageManager {
                 continue;
             }
 
-            if is_cache_entry_protected(&entry.path(), max_idle_secs).await {
+            // Check .lock file first (cheapest check — ffmpeg is still running)
+            let lock_file = entry.path().join(".lock");
+            if fs::metadata(&lock_file).await.is_ok() {
                 continue;
             }
+            // Compute last_activity from .last_access in a single read.
+            // This also serves as the protection check: if the entry was
+            // accessed within max_idle_secs it will not be evicted below.
             let last_activity = {
                 let access_file = entry.path().join(".last_access");
                 if let Ok(amd) = fs::metadata(&access_file).await {
@@ -1322,6 +1327,10 @@ async fn cleanup_old_entries_bytes(path: &Path, retention_secs: u64) -> std::io:
     Ok(freed)
 }
 
+/// Protection window (in seconds) used by the LRU eviction to skip directories
+/// that were recently accessed by an active HLS session.
+const LRU_PROTECTION_SECS: u64 = 600;
+
 /// Check if a cache directory is protected from eviction.
 ///
 /// A directory is protected if:
@@ -1364,8 +1373,8 @@ async fn lru_evict_from_directory(path: &Path, target_bytes: u64) -> std::io::Re
         };
 
         // ★ 保护活跃的缓存目录：跳过正在被 ffmpeg 或 HLS session 使用的目录
-        //   protection_secs = 600 (10 分钟)，即最近 10 分钟内有 segment 被请求过的目录不会被驱逐
-        if md.is_dir() && is_cache_entry_protected(&entry.path(), 600).await {
+        //   即最近 LRU_PROTECTION_SECS 内有 segment 被请求过的目录不会被驱逐
+        if md.is_dir() && is_cache_entry_protected(&entry.path(), LRU_PROTECTION_SECS).await {
             continue;
         }
 

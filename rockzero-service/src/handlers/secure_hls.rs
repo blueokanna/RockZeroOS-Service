@@ -9,6 +9,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+/// Minimum embedded start_time (in seconds) in a source file that triggers
+/// `-output_ts_offset` normalization. Files with a start_time below this
+/// threshold are treated as already 0-based and do not need correction.
+const VIDEO_START_TIME_THRESHOLD_SECS: f64 = 1.0;
+
 fn convert_hls_error(err: rockzero_media::HlsError) -> AppError {
     match err {
         rockzero_media::HlsError::SessionNotFound(msg) => AppError::NotFound(msg),
@@ -308,6 +313,10 @@ pub struct CreateSessionRequest {
     pub file_path: Option<String>,
     pub zkp_registration: Option<String>,
 
+    /// Deprecated: this flag is ignored. Direct mode has been permanently disabled
+    /// by the security policy and this field is kept only for backward
+    /// compatibility with older clients.
+    #[deprecated(note = "direct_mode is ignored; direct streaming mode is permanently disabled")]
     #[serde(default)]
     pub direct_mode: bool,
 }
@@ -409,6 +418,7 @@ pub async fn create_hls_session(
 
     // 安全策略：所有 segment 必须 AES-256-GCM 加密传输，不允许明文模式。
     // direct_mode 字段被忽略，始终为 false。
+    #[allow(deprecated)]
     if body.direct_mode {
         warn!(
             "Client requested direct_mode for session {}, but it is disabled by security policy. \
@@ -956,7 +966,7 @@ async fn run_ffmpeg_progressive(
 
     // 探测视频开始时间，用于修复 PTS 偏移
     let start_time = detect_video_start_time(ffmpeg_path, file_path).await;
-    if start_time > 1.0 {
+    if start_time > VIDEO_START_TIME_THRESHOLD_SECS {
         info!(
             "Detected video start_time: {:.3}s — will apply -output_ts_offset to normalize timestamps",
             start_time
@@ -1009,7 +1019,7 @@ async fn run_ffmpeg_progressive(
 
     // ★ PTS 偏移修复：如果源文件 start_time > 1s（典型的 MKV 内嵌时间戳偏移），
     //   通过 -output_ts_offset 将输出时间戳归零，避免播放器显示错误时间（如 26:28:10）
-    if start_time > 1.0 {
+    if start_time > VIDEO_START_TIME_THRESHOLD_SECS {
         copy_args.extend(["-output_ts_offset".into(), format!("{:.6}", -start_time)]);
     }
 
@@ -1283,16 +1293,20 @@ async fn generate_segment_on_demand(
         return Ok(());
     }
 
+    // Helper closure for consistent encryption error messages
+    let fmt_enc_error =
+        |e: String| format!("Encryption failed for on-demand segment_{}: {}", segment_index, e);
+
     let ffmpeg_path = std::env::var("FFMPEG_PATH")
         .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
         .unwrap_or_else(|_| "ffmpeg".to_string());
 
-    let start_time = segment_index as f64 * segment_duration;
+    let seek_time = segment_index as f64 * segment_duration;
     let seg_path_str = segment_path.to_string_lossy().to_string();
 
     info!(
         "🎯 On-demand segment generation: segment_{}.ts (seek to {:.1}s)",
-        segment_index, start_time
+        segment_index, seek_time
     );
 
     // 检测视频编码，决定是否可以 stream copy（与渐进式分片保持一致）
@@ -1301,6 +1315,15 @@ async fn generate_segment_on_demand(
         video_codec.as_deref(),
         Some("h264" | "avc" | "avc1" | "hevc" | "h265" | "hev1" | "hvc1")
     );
+
+    // 探测视频开始时间，用于修复 PTS 偏移（与渐进式分片路径一致）
+    let video_start_time = detect_video_start_time(&ffmpeg_path, file_path).await;
+    if video_start_time > VIDEO_START_TIME_THRESHOLD_SECS {
+        info!(
+            "Detected video start_time: {:.3}s — will apply -output_ts_offset to normalize on-demand segment timestamps",
+            video_start_time
+        );
+    }
 
     // ══════════════════════════════════════════════════════════════
     //  Phase 1: 尝试 stream copy（与渐进式分片编码一致，瞬间完成）
@@ -1314,7 +1337,7 @@ async fn generate_segment_on_demand(
             "+genpts+discardcorrupt".into(),
             // -ss 在 -i 前 = input seeking（极快，跳到最近的 keyframe）
             "-ss".into(),
-            format!("{:.3}", start_time),
+            format!("{:.3}", seek_time),
             "-i".into(),
             file_path.into(),
             "-t".into(),
@@ -1338,6 +1361,14 @@ async fn generate_segment_on_demand(
             _ => {}
         }
 
+        // ★ PTS 偏移修复：与渐进式分片路径一致，修正源文件内嵌的非零 start_time
+        if video_start_time > VIDEO_START_TIME_THRESHOLD_SECS {
+            copy_args.extend([
+                "-output_ts_offset".into(),
+                format!("{:.6}", -video_start_time),
+            ]);
+        }
+
         copy_args.extend([
             "-avoid_negative_ts".into(),
             "make_zero".into(),
@@ -1356,7 +1387,9 @@ async fn generate_segment_on_demand(
 
         if output.status.success() {
             // stream copy 成功 — 加密并返回
-            encrypt_on_demand_segment(&segment_path, file_path).await;
+            encrypt_on_demand_segment(&segment_path, file_path)
+                .await
+                .map_err(&fmt_enc_error)?;
             info!(
                 "✅ On-demand segment_{}.ts generated via stream copy and encrypted",
                 segment_index
@@ -1387,7 +1420,7 @@ async fn generate_segment_on_demand(
             "-fflags".into(),
             "+genpts+discardcorrupt".into(),
             "-ss".into(),
-            format!("{:.3}", start_time),
+            format!("{:.3}", seek_time),
         ];
 
         // 输入解码加速
@@ -1512,7 +1545,9 @@ async fn generate_segment_on_demand(
     }
 
     // 对按需生成的分片同样进行静态加密
-    encrypt_on_demand_segment(&segment_path, file_path).await;
+    encrypt_on_demand_segment(&segment_path, file_path)
+        .await
+        .map_err(&fmt_enc_error)?;
 
     info!(
         "✅ On-demand segment_{}.ts generated (transcode) and encrypted",
@@ -1525,16 +1560,38 @@ async fn generate_segment_on_demand(
 ///
 /// 和渐进式分片加密使用相同的 `derive_segment_storage_key` 密钥派生，
 /// 确保所有分片（无论生成方式）都使用一致的加密策略。
-async fn encrypt_on_demand_segment(segment_path: &std::path::Path, file_path: &str) {
+async fn encrypt_on_demand_segment(
+    segment_path: &std::path::Path,
+    file_path: &str,
+) -> Result<(), String> {
     let storage_key = derive_segment_storage_key(file_path);
-    if let Ok(data) = tokio::fs::read(segment_path).await {
-        if let Ok(encrypted) = crate::crypto::aes_encrypt(&storage_key, &data) {
-            let enc_path = segment_path.with_extension("ts.enc");
-            if tokio::fs::write(&enc_path, &encrypted).await.is_ok() {
-                let _ = tokio::fs::remove_file(segment_path).await;
-            }
-        }
-    }
+    let data = tokio::fs::read(segment_path).await.map_err(|e| {
+        warn!(
+            "Failed to read on-demand segment for encryption ({}): {}",
+            segment_path.display(),
+            e
+        );
+        format!("read failed: {}", e)
+    })?;
+    let encrypted = crate::crypto::aes_encrypt(&storage_key, &data).map_err(|e| {
+        warn!(
+            "AES-256-GCM encryption failed for on-demand segment ({}): {}",
+            segment_path.display(),
+            e
+        );
+        format!("encryption failed: {}", e)
+    })?;
+    let enc_path = segment_path.with_extension("ts.enc");
+    tokio::fs::write(&enc_path, &encrypted).await.map_err(|e| {
+        warn!(
+            "Failed to write encrypted on-demand segment ({}): {}",
+            enc_path.display(),
+            e
+        );
+        format!("write failed: {}", e)
+    })?;
+    let _ = tokio::fs::remove_file(segment_path).await;
+    Ok(())
 }
 
 /// 使用 ffprobe 获取视频文件的总时长（秒）
@@ -1647,7 +1704,7 @@ pub async fn get_secure_playlist(
     };
 
     // 确保 HLS 分片存在（首次会触发 ffmpeg 分片）
-    let (_cache_dir, playlist_content) = ensure_hls_segments(&file_path).await?;
+    let (cache_dir, playlist_content) = ensure_hls_segments(&file_path).await?;
 
     // ★ 关键优化：渐进式 HLS 的 playlist 仅列出已生成的分片，
     //   导致播放器无法 seek 到尚未生成的位置（超出 ffmpeg 当前进度）。
@@ -1659,7 +1716,7 @@ pub async fn get_secure_playlist(
         playlist_content
     } else {
         // 视频仍在转码中 — 尝试生成覆盖全时长的虚拟 VOD playlist
-        let duration_file = _cache_dir.join(".duration");
+        let duration_file = cache_dir.join(".duration");
         let duration = if duration_file.exists() {
             // 优先使用缓存的时长（避免重复调用 ffprobe）
             tokio::fs::read_to_string(&duration_file)
@@ -1697,7 +1754,7 @@ pub async fn get_secure_playlist(
     };
 
     // ★ 更新 .last_access 标记，防止活跃缓存被 LRU 驱逐
-    touch_cache_access(&_cache_dir).await;
+    touch_cache_access(&cache_dir).await;
 
     info!(
         "📋 Serving playlist for session {} ({})",
@@ -2063,7 +2120,7 @@ pub async fn get_secure_segment(
     );
 
     Ok(HttpResponse::Ok()
-        .content_type("video/mp2t")
+        .content_type("application/octet-stream")
         .insert_header(("X-Encrypted", "true"))
         .insert_header(("X-Encryption-Method", "AES-256-GCM"))
         .insert_header(("X-ZKP-Verified", "true"))
