@@ -112,8 +112,10 @@ lto = "thin"
 codegen-units = 4
 strip = true
 incremental = false
+panic = "unwind"
 
 [profile.dev]
 opt-level = 0
 debug = true
 incremental = false
+panic = "unwind"

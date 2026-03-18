@@ -4,7 +4,7 @@ use rockzero_common::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::pin::Pin;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeekExt};
 use tracing::warn;
@@ -41,7 +41,10 @@ pub struct MediaStreamInfo {
     pub audio_tracks: Option<Vec<AudioTrackInfo>>,
     pub has_audio: bool,
     pub needs_audio_transcode: bool,
+    pub needs_video_transcode: bool,
     pub transcode_url: Option<String>,
+    pub video_transcode_url: Option<String>,
+    pub playback_url: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -127,6 +130,11 @@ pub async fn get_media_info(path: web::Path<String>) -> Result<HttpResponse, App
         .as_ref()
         .map(|codec| needs_audio_transcode(codec))
         .unwrap_or(false);
+    let needs_video_transcode = media_details
+        .video_codec
+        .as_ref()
+        .map(|codec| needs_video_transcode(codec))
+        .unwrap_or(false);
 
     let relative_path = file_path
         .strip_prefix(MEDIA_BASE)
@@ -138,6 +146,19 @@ pub async fn get_media_info(path: web::Path<String>) -> Result<HttpResponse, App
         Some(format!("/api/v1/streaming/transcode/{}", relative_path))
     } else {
         None
+    };
+    let video_transcode_url = if needs_video_transcode {
+        Some(format!("/api/v1/streaming/transcode-video/{}", relative_path))
+    } else {
+        None
+    };
+
+    let playback_url = if needs_video_transcode {
+        format!("/api/v1/streaming/transcode-video/{}", relative_path)
+    } else if needs_transcode {
+        format!("/api/v1/streaming/transcode/{}", relative_path)
+    } else {
+        format!("/api/v1/streaming/play/{}", relative_path)
     };
 
     let info = MediaStreamInfo {
@@ -166,7 +187,10 @@ pub async fn get_media_info(path: web::Path<String>) -> Result<HttpResponse, App
         },
         has_audio: media_details.has_audio,
         needs_audio_transcode: needs_transcode,
+        needs_video_transcode,
         transcode_url,
+        video_transcode_url,
+        playback_url,
     };
 
     Ok(HttpResponse::Ok().json(info))
@@ -615,15 +639,7 @@ pub async fn transcode_audio(
     }
 
     // Parse seek parameter from query string
-    let seek: Option<f64> = req
-        .uri()
-        .query()
-        .and_then(|q| {
-            q.split('&')
-                .find(|p| p.starts_with("seek="))
-                .and_then(|p| p.strip_prefix("seek="))
-                .and_then(|v| v.parse().ok())
-        });
+    let seek = parse_seek(&req);
 
     // Start ffmpeg transcode process
     let transcoder = crate::media_processor::StreamingTranscoder::new();
@@ -662,6 +678,147 @@ pub async fn transcode_audio(
     }
 
     Ok(response.streaming(stream))
+}
+
+/// Unified playback endpoint: choose direct stream or on-the-fly transcode.
+/// Priority: unsupported video codec -> full transcode, unsupported audio -> audio transcode.
+pub async fn smart_play(req: HttpRequest, path: web::Path<String>) -> Result<HttpResponse, AppError> {
+    let media_path = path.into_inner();
+    let file_path = get_media_path(&media_path)?;
+    if !file_path.exists() {
+        return Err(AppError::NotFound("Media file not found".to_string()));
+    }
+
+    let media_details = get_detailed_ffprobe_info(&file_path);
+    let need_video = media_details
+        .video_codec
+        .as_ref()
+        .map(|c| needs_video_transcode(c))
+        .unwrap_or(false);
+
+    if need_video {
+        return transcode_video(req, web::Path::from(media_path)).await;
+    }
+
+    let need_audio = media_details
+        .audio_codec
+        .as_ref()
+        .map(|c| crate::media_processor::needs_audio_transcode(c))
+        .unwrap_or(false);
+
+    if need_audio {
+        return transcode_audio(req, web::Path::from(media_path)).await;
+    }
+
+    stream_media(req, web::Path::from(media_path)).await
+}
+
+/// Video+audio transcode endpoint for maximum browser compatibility.
+/// Converts to H.264 + AAC fragmented MP4 to ensure playback across browsers/devices.
+pub async fn transcode_video(
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, AppError> {
+    let file_path = get_media_path(&path.into_inner())?;
+
+    if !file_path.exists() {
+        return Err(AppError::NotFound("Media file not found".to_string()));
+    }
+
+    let metadata = std::fs::metadata(&file_path).map_err(|_| AppError::InternalError)?;
+    if metadata.len() == 0 {
+        return Err(AppError::BadRequest("Empty file".to_string()));
+    }
+
+    let ffmpeg_cmd = crate::ffmpeg_manager::get_global_ffmpeg_path()
+        .unwrap_or_else(|| "ffmpeg".to_string());
+    let seek = parse_seek(&req);
+
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+    ];
+    if let Some(s) = seek {
+        args.push("-ss".to_string());
+        args.push(s.to_string());
+    }
+
+    args.extend_from_slice(&[
+        "-i".to_string(),
+        file_path.to_string_lossy().to_string(),
+        "-map".to_string(),
+        "0:v:0".to_string(),
+        "-map".to_string(),
+        "0:a?".to_string(),
+        "-c:v".to_string(),
+        "libx264".to_string(),
+        "-preset".to_string(),
+        "veryfast".to_string(),
+        "-tune".to_string(),
+        "zerolatency".to_string(),
+        "-profile:v".to_string(),
+        "high".to_string(),
+        "-level".to_string(),
+        "4.1".to_string(),
+        "-pix_fmt".to_string(),
+        "yuv420p".to_string(),
+        "-crf".to_string(),
+        "23".to_string(),
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-b:a".to_string(),
+        "160k".to_string(),
+        "-ac".to_string(),
+        "2".to_string(),
+        "-f".to_string(),
+        "mp4".to_string(),
+        "-movflags".to_string(),
+        "frag_keyframe+empty_moov+faststart".to_string(),
+        "pipe:1".to_string(),
+    ]);
+
+    let child = Command::new(&ffmpeg_cmd)
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            warn!("Failed to start full transcode: {}", e);
+            AppError::InternalError
+        })?;
+
+    let stream = crate::media_processor::TranscodeStream::new(child);
+
+    let mut response = HttpResponse::Ok();
+    response.insert_header(("Content-Type", "video/mp4"));
+    response.insert_header(("Accept-Ranges", "none"));
+    response.insert_header(("Cache-Control", "no-cache, no-store"));
+    response.insert_header(("Transfer-Encoding", "chunked"));
+    response.insert_header(("Access-Control-Allow-Origin", "*"));
+    response.insert_header(("X-Playback-Mode", "transcode-video"));
+    Ok(response.streaming(stream))
+}
+
+fn parse_seek(req: &HttpRequest) -> Option<f64> {
+    req.uri().query().and_then(|q| {
+        q.split('&')
+            .find(|p| p.starts_with("seek="))
+            .and_then(|p| p.strip_prefix("seek="))
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+fn needs_video_transcode(codec: &str) -> bool {
+    let c = codec.to_lowercase();
+    // Baseline compatibility list for browser/mobile playback.
+    !(c.contains("h264")
+        || c.contains("avc")
+        || c.contains("hevc")
+        || c.contains("h265")
+        || c.contains("vp8")
+        || c.contains("vp9")
+        || c.contains("av1"))
 }
 
 pub async fn get_supported_formats() -> Result<HttpResponse, AppError> {

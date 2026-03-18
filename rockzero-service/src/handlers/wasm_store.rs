@@ -53,6 +53,12 @@ async fn cache_get(key: &str) -> Option<Vec<Value>> {
     })
 }
 
+/// Read cache even if expired. Used as graceful fallback when upstream APIs fail.
+async fn cache_get_stale(key: &str) -> Option<Vec<Value>> {
+    let cache = get_cache().read().await;
+    cache.get(key).map(|entry| entry.data.clone())
+}
+
 /// 写入缓存
 async fn cache_set(key: &str, data: Vec<Value>, ttl_secs: u64) {
     let mut cache = get_cache().write().await;
@@ -3258,6 +3264,8 @@ pub struct PlatformGamesQuery {
     pub platform: String,
     pub page: Option<u32>,
     pub page_size: Option<u32>,
+    pub market: Option<String>,
+    pub locale: Option<String>,
 }
 
 /// GET /api/v1/wasm-store/platform/games - 获取指定平台的游戏列表
@@ -3268,16 +3276,31 @@ pub async fn get_platform_games(
     query: web::Query<PlatformGamesQuery>,
 ) -> Result<HttpResponse, AppError> {
     let platform = query.platform.to_lowercase();
+    let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(30).min(100);
+    let market = query.market.clone().unwrap_or_else(|| "CN".to_string());
+    let locale = query
+        .locale
+        .clone()
+        .unwrap_or_else(|| "zh-cn".to_string());
 
-    info!("获取平台游戏数据: platform={}, page_size={}", platform, page_size);
+    info!(
+        "获取平台游戏数据: platform={}, page={}, page_size={}, market={}, locale={}",
+        platform, page, page_size, market, locale
+    );
 
-    let cache_key = format!("platform_games_{}", platform);
+    let cache_key = format!("platform_games_{}_{}_{}", platform, market.to_uppercase(), locale.to_lowercase());
     if let Some(cached) = cache_get(&cache_key).await {
+        let total = cached.len();
+        let start = ((page - 1) * page_size) as usize;
+        let items: Vec<Value> = cached.into_iter().skip(start).take(page_size as usize).collect();
         return Ok(HttpResponse::Ok().json(serde_json::json!({
             "platform": platform,
-            "items": cached,
-            "total": cached.len(),
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": ((total as f64) / (page_size as f64)).ceil() as u32,
             "cached": true,
             "source": "cache",
         })));
@@ -3289,11 +3312,12 @@ pub async fn get_platform_games(
         .build()
         .unwrap_or_default();
 
+    let fetch_count = (page * page_size).min(300);
     let games = match platform.as_str() {
-        "epic" => fetch_epic_platform_games(&client, page_size).await,
+        "epic" => fetch_epic_platform_games(&client, fetch_count, &market, &locale).await,
         "wegame" => fetch_wegame_platform_games(&client, page_size).await,
         "ubisoft" => fetch_ubisoft_platform_games(&client, page_size).await,
-        "xbox" => fetch_xbox_platform_games(&client, page_size).await,
+        "xbox" => fetch_xbox_platform_games(&client, fetch_count, &market, &locale).await,
         _ => {
             return Err(AppError::BadRequest(format!(
                 "不支持的平台: {}。支持: epic, wegame, ubisoft, xbox",
@@ -3302,8 +3326,38 @@ pub async fn get_platform_games(
         }
     };
 
-    let items = games.unwrap_or_default();
+    let mut items = games.unwrap_or_default();
+
+    // Live fetch failed or returned empty: fallback to stale cache to keep UI consistent.
+    if items.is_empty() {
+        if let Some(stale) = cache_get_stale(&cache_key).await {
+            let total = stale.len();
+            let start = ((page - 1) * page_size) as usize;
+            let paged: Vec<Value> = stale.into_iter().skip(start).take(page_size as usize).collect();
+            return Ok(HttpResponse::Ok().json(serde_json::json!({
+                "platform": platform,
+                "items": paged,
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": ((total as f64) / (page_size as f64)).ceil() as u32,
+                "cached": true,
+                "stale": true,
+                "source": "stale-cache",
+            })));
+        }
+    }
+
+    // Keep deterministic ordering for pagination.
+    items.sort_by(|a, b| {
+        let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let bn = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        an.cmp(bn)
+    });
+
     let total = items.len();
+    let start = ((page - 1) * page_size) as usize;
+    let paged: Vec<Value> = items.clone().into_iter().skip(start).take(page_size as usize).collect();
 
     if !items.is_empty() {
         cache_set(&cache_key, items.clone(), 1800).await; // 缓存 30 分钟
@@ -3313,15 +3367,23 @@ pub async fn get_platform_games(
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "platform": platform,
-        "items": items,
+        "items": paged,
         "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": ((total as f64) / (page_size as f64)).ceil() as u32,
         "cached": false,
         "source": "api",
     })))
 }
 
 /// Epic Games — 使用 GraphQL API 获取全品类游戏
-async fn fetch_epic_platform_games(client: &Client, count: u32) -> Result<Vec<Value>, AppError> {
+async fn fetch_epic_platform_games(
+    client: &Client,
+    count: u32,
+    market: &str,
+    locale: &str,
+) -> Result<Vec<Value>, AppError> {
     let query_body = serde_json::json!({
         "query": r#"query searchStoreQuery($count: Int, $country: String!, $locale: String, $sortBy: String, $sortDir: String, $start: Int, $withPrice: Boolean = true) {
             Catalog {
@@ -3350,8 +3412,8 @@ async fn fetch_epic_platform_games(client: &Client, count: u32) -> Result<Vec<Va
         }"#,
         "variables": {
             "count": count,
-            "country": "CN",
-            "locale": "zh-CN",
+            "country": market.to_uppercase(),
+            "locale": locale,
             "sortBy": "releaseDate",
             "sortDir": "DESC",
             "start": 0,
@@ -3882,13 +3944,22 @@ async fn fetch_ubisoft_from_api_v2(client: &Client, count: u32) -> Result<Vec<Va
 }
 
 /// Xbox / Microsoft — 使用 Xbox Game Pass 目录 API + Microsoft Display Catalog
-async fn fetch_xbox_platform_games(client: &Client, count: u32) -> Result<Vec<Value>, AppError> {
+async fn fetch_xbox_platform_games(
+    client: &Client,
+    count: u32,
+    market: &str,
+    locale: &str,
+) -> Result<Vec<Value>, AppError> {
     // Xbox Game Pass PC 目录 (公开 API, 无需密钥)
     // sigls ID 对照: fdd9e2a7-... = Game Pass PC
-    let gp_url = "https://catalog.gamepass.com/sigls/v2?id=fdd9e2a7-0fee-49f6-ad69-4354098401ff&language=zh-cn&market=CN";
+    let gp_url = format!(
+        "https://catalog.gamepass.com/sigls/v2?id=fdd9e2a7-0fee-49f6-ad69-4354098401ff&language={}&market={}",
+        locale,
+        market.to_uppercase()
+    );
 
     let resp = match client
-        .get(gp_url)
+        .get(&gp_url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         .header("Accept", "application/json")
         .header("ms-cv", "RockZeroOS")
@@ -3920,7 +3991,7 @@ async fn fetch_xbox_platform_games(client: &Client, count: u32) -> Result<Vec<Va
         }
 
         if !product_ids.is_empty() {
-            return fetch_xbox_product_details(client, &product_ids).await;
+            return fetch_xbox_product_details(client, &product_ids, market, locale).await;
         }
     }
 
@@ -3932,6 +4003,8 @@ async fn fetch_xbox_platform_games(client: &Client, count: u32) -> Result<Vec<Va
 async fn fetch_xbox_product_details(
     client: &Client,
     product_ids: &[String],
+    market: &str,
+    locale: &str,
 ) -> Result<Vec<Value>, AppError> {
     // DisplayCatalog API 每次最多查 20 个
     let mut all_games = Vec::new();
@@ -3939,8 +4012,10 @@ async fn fetch_xbox_product_details(
     for chunk in product_ids.chunks(20) {
         let big_ids = chunk.join(",");
         let url = format!(
-            "https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds={}&market=CN&languages=zh-cn,en-us&MS-CV=RockZeroOS",
-            big_ids
+            "https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds={}&market={}&languages={},en-us&MS-CV=RockZeroOS",
+            big_ids,
+            market.to_uppercase(),
+            locale
         );
 
         let resp = match client.get(&url).send().await {

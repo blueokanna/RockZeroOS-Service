@@ -21,3 +21,4 @@ pub mod files;
 pub mod widgets;
 pub mod wasm_store;
 pub mod lan_transfer;
+pub mod edge_compute;

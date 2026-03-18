@@ -1115,8 +1115,88 @@ async fn main() -> std::io::Result<()> {
                                 web::get().to(handlers::streaming::get_thumbnail),
                             )
                             .route(
+                                "/play/{path:.*}",
+                                web::get().to(handlers::streaming::stream_media),
+                            )
+                            .route(
+                                "/smart-play/{path:.*}",
+                                web::get().to(handlers::streaming::smart_play),
+                            )
+                            .route(
                                 "/transcode/{path:.*}",
                                 web::get().to(handlers::streaming::transcode_audio),
+                            )
+                            .route(
+                                "/transcode-video/{path:.*}",
+                                web::get().to(handlers::streaming::transcode_video),
+                            ),
+                    ),
+            )
+            .service(
+                web::scope("/api/v1/edge")
+                    .route("/health", web::get().to(handlers::edge_compute::health))
+                    .service(
+                        web::scope("")
+                            .wrap(middleware::JwtAuth)
+                            .route("/stats", web::get().to(handlers::edge_compute::edge_stats))
+                            .route("/nodes", web::get().to(handlers::edge_compute::list_nodes))
+                            .route(
+                                "/nodes/register",
+                                web::post().to(handlers::edge_compute::register_node),
+                            )
+                            .route(
+                                "/nodes/{node_id}/heartbeat",
+                                web::post().to(handlers::edge_compute::node_heartbeat),
+                            )
+                            .route("/jobs", web::get().to(handlers::edge_compute::list_jobs))
+                            .route(
+                                "/jobs/submit",
+                                web::post().to(handlers::edge_compute::submit_job),
+                            )
+                            .route(
+                                "/wxy/qr/start",
+                                web::post().to(handlers::edge_compute::start_wxy_qr_login),
+                            )
+                            .route(
+                                "/wxy/qr/{session_id}",
+                                web::get().to(handlers::edge_compute::poll_wxy_qr_login),
+                            )
+                            .route(
+                                "/wxy/auth/bind",
+                                web::post().to(handlers::edge_compute::bind_wxy_token),
+                            )
+                            .route(
+                                "/wxy/auth/status",
+                                web::get().to(handlers::edge_compute::wxy_auth_status),
+                            )
+                            .route(
+                                "/wxy/auth/refresh",
+                                web::post().to(handlers::edge_compute::refresh_wxy_auth_token),
+                            )
+                            .route(
+                                "/wxy/auth/logout",
+                                web::post().to(handlers::edge_compute::wxy_logout),
+                            )
+                            .route(
+                                "/wxy/adapter/inspect",
+                                web::post().to(handlers::edge_compute::inspect_wxy_adapter),
+                            )
+                            .route(
+                                "/self-check/startup",
+                                web::get().to(handlers::edge_compute::get_startup_self_check),
+                            )
+                            .route(
+                                "/self-check/run",
+                                web::post().to(handlers::edge_compute::run_startup_self_check_now),
+                            )
+                            .route("/jobs/{job_id}", web::get().to(handlers::edge_compute::get_job))
+                            .route(
+                                "/jobs/{job_id}/cancel",
+                                web::post().to(handlers::edge_compute::cancel_job),
+                            )
+                            .route(
+                                "/jobs/{job_id}/retry",
+                                web::post().to(handlers::edge_compute::retry_job),
                             ),
                     ),
             )
