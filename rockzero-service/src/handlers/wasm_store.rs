@@ -293,6 +293,22 @@ fn builtin_wasm_apps() -> Vec<WasmApp> {
             created_at: 0,
             updated_at: 0,
         },
+        WasmApp {
+            id: "wxy-edge-node".to_string(),
+            name: "网心云边缘节点".to_string(),
+            description: "网心云账号状态、扫码登录与边缘节点运行状态查看".to_string(),
+            version: "1.0.0".to_string(),
+            author: "RockZero".to_string(),
+            icon_url: String::new(),
+            wasm_url: String::new(),
+            category: WasmAppCategory::Tool,
+            size_bytes: 0,
+            installed: false,
+            installed_path: None,
+            permissions: vec!["net:/api/v1/edge/*".to_string()],
+            created_at: 0,
+            updated_at: 0,
+        },
     ]
 }
 

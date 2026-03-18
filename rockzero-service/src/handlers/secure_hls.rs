@@ -1646,6 +1646,27 @@ pub async fn get_secure_playlist(
         session.file_path.clone()
     };
 
+    // 默认禁用磁盘缓存：直接返回完整 VOD playlist，segment 请求按需实时读取。
+    if !hls_disk_cache_enabled() {
+        cleanup_hls_cache_for_file(&file_path).await;
+
+        let ffmpeg_path = std::env::var("FFMPEG_PATH")
+            .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
+            .unwrap_or_else(|_| "ffmpeg".to_string());
+
+        let duration = get_video_duration(&ffmpeg_path, &file_path).await.ok_or_else(|| {
+            AppError::InternalServerError("无法读取视频时长，无法生成播放列表".to_string())
+        })?;
+
+        let final_content = generate_complete_vod_playlist(duration, 2.0);
+
+        return Ok(HttpResponse::Ok()
+            .content_type("application/vnd.apple.mpegurl")
+            .insert_header(("Cache-Control", "no-cache, no-store"))
+            .insert_header(("Access-Control-Allow-Origin", "*"))
+            .body(final_content));
+    }
+
     // 确保 HLS 分片存在（首次会触发 ffmpeg 分片）
     let (_cache_dir, playlist_content) = ensure_hls_segments(&file_path).await?;
 
@@ -1816,6 +1837,29 @@ pub async fn get_segment_direct(
             .map_err(convert_hls_error)?;
         session.file_path.clone()
     };
+
+    if !hls_disk_cache_enabled() {
+        let segment_data = read_video_segment_from_ffmpeg(&file_path, &segment_name).await?;
+
+        let manager = hls_manager.read().await;
+        let session = manager
+            .get_session(&session_id)
+            .map_err(convert_hls_error)?;
+        let encrypted_data = session
+            .encrypt_segment(&segment_data)
+            .map_err(convert_hls_error)?;
+
+        return Ok(HttpResponse::Ok()
+            .content_type("application/octet-stream")
+            .insert_header(("X-Encrypted", "true"))
+            .insert_header(("X-Encryption-Method", "AES-256-GCM"))
+            .insert_header(("X-Key-Exchange", "WPA3-SAE"))
+            .insert_header(("X-Integrity", "Blake3"))
+            .insert_header(("Content-Length", encrypted_data.len()))
+            .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
+            .insert_header(("Access-Control-Allow-Origin", "*"))
+            .body(encrypted_data));
+    }
 
     // 构建缓存路径
     let video_hash = blake3::hash(file_path.as_bytes());
@@ -2031,7 +2075,9 @@ pub async fn get_secure_segment(
         session_id, segment_name
     );
 
-    let segment_data = {
+    let segment_data = if !hls_disk_cache_enabled() {
+        read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?
+    } else {
         let video_hash = blake3::hash(session.file_path.as_bytes());
         let video_id = hex::encode(&video_hash.as_bytes()[..8]);
         let cache_dir = get_hls_cache_dir().join(&video_id);
@@ -2083,8 +2129,20 @@ pub async fn stop_session(
     info!("Stopping HLS session: {}", session_id);
     let manager = hls_manager.read().await;
 
-    match manager.remove_session(&session_id) {
-        Ok(_) => {
+    let cache_root = get_hls_cache_dir();
+
+    match manager.remove_session_with_cleanup(&session_id, &cache_root) {
+        Ok(cache_dir_to_remove) => {
+            if let Some(cache_dir) = cache_dir_to_remove {
+                tokio::spawn(async move {
+                    if let Err(e) = tokio::fs::remove_dir_all(&cache_dir).await {
+                        warn!("Failed to remove HLS cache dir {:?}: {}", cache_dir, e);
+                    } else {
+                        info!("🗑️ Removed HLS cache dir: {:?}", cache_dir);
+                    }
+                });
+            }
+
             info!("✅ HLS session stopped successfully: {}", session_id);
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "success": true,
@@ -2306,6 +2364,30 @@ async fn touch_cache_access(cache_dir: &std::path::Path) {
     let _ = tokio::fs::write(&marker, ts.to_string().as_bytes()).await;
 }
 
+fn hls_disk_cache_enabled() -> bool {
+    let disable = std::env::var("ROCKZERO_HLS_DISABLE_DISK_CACHE")
+        .ok()
+        .map(|v| {
+            let s = v.to_ascii_lowercase();
+            s == "1" || s == "true" || s == "yes" || s == "on"
+        })
+        .unwrap_or(true);
+    !disable
+}
+
+async fn cleanup_hls_cache_for_file(file_path: &str) {
+    let video_hash = blake3::hash(file_path.as_bytes());
+    let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+    let cache_dir = get_hls_cache_dir().join(video_id);
+    if cache_dir.exists() {
+        if let Err(e) = tokio::fs::remove_dir_all(&cache_dir).await {
+            warn!("Failed to cleanup cache dir {:?}: {}", cache_dir, e);
+        } else {
+            info!("🧹 Cleaned stale cache dir: {:?}", cache_dir);
+        }
+    }
+}
+
 /// 视频段缓存目录配置
 ///
 /// 与 StorageConfig 使用相同的环境变量配置，确保清理任务能正确清理缓存。
@@ -2375,12 +2457,27 @@ async fn read_video_segment_from_ffmpeg(
     let video_hash = blake3::hash(file_path.as_bytes());
     let video_id = hex::encode(&video_hash.as_bytes()[..8]); // 使用前 8 字节作为 ID
 
+    // 检查原始视频文件
+    let original_video = PathBuf::from(file_path);
+    if !original_video.exists() {
+        return Err(AppError::NotFound(format!(
+            "Original video file not found: {}",
+            file_path
+        )));
+    }
+
+    let use_disk_cache = hls_disk_cache_enabled();
+
+    if !use_disk_cache {
+        return transcode_segment_to_memory_async(&original_video, segment_index).await;
+    }
+
     // 5. 构建缓存目录路径
     let cache_dir = get_hls_cache_dir().join(&video_id);
     let cached_segment_path = cache_dir.join(segment_name);
 
-    // 6. 尝试从缓存读取
-    if cached_segment_path.exists() {
+    // 6. 尝试从缓存读取（仅磁盘缓存开启时）
+    if use_disk_cache && cached_segment_path.exists() {
         info!(
             "Cache hit for segment {} of video {}",
             segment_name, video_id
@@ -2393,16 +2490,7 @@ async fn read_video_segment_from_ffmpeg(
         });
     }
 
-    // 7. 缓存不存在，检查原始视频文件
-    let original_video = PathBuf::from(file_path);
-    if !original_video.exists() {
-        return Err(AppError::NotFound(format!(
-            "Original video file not found: {}",
-            file_path
-        )));
-    }
-
-    // 8. 触发实时转码
+    // 7. 触发实时转码
     info!(
         "Cache miss for segment {} of video {}, triggering FFmpeg transcode",
         segment_name, video_id
@@ -2418,14 +2506,16 @@ async fn read_video_segment_from_ffmpeg(
     // 调用 FFmpeg 进行转码（异步版本）
     let segment_data = transcode_segment_async(&original_video, &cache_dir, segment_index).await?;
 
-    // 将转码结果写入缓存（异步，失败不阻塞）
-    let cache_path_clone = cached_segment_path.clone();
-    let data_clone = segment_data.clone();
-    tokio::spawn(async move {
-        if let Err(e) = tokio::fs::write(&cache_path_clone, &data_clone).await {
-            warn!("Failed to cache segment: {}", e);
-        }
-    });
+    if use_disk_cache {
+        // 将转码结果写入缓存（异步，失败不阻塞）
+        let cache_path_clone = cached_segment_path.clone();
+        let data_clone = segment_data.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tokio::fs::write(&cache_path_clone, &data_clone).await {
+                warn!("Failed to cache segment: {}", e);
+            }
+        });
+    }
 
     Ok(segment_data)
 }
@@ -2603,6 +2693,135 @@ async fn transcode_segment_async(
     tokio::fs::read(&output_path)
         .await
         .map_err(|e| AppError::IoError(format!("Failed to read transcoded segment: {}", e)))
+}
+
+/// 使用 FFmpeg 将单个视频段直接输出到内存（stdout），不落盘。
+///
+/// 用于禁用磁盘缓存场景，避免任何内部存储写放大。
+async fn transcode_segment_to_memory_async(
+    video_path: &std::path::Path,
+    segment_index: usize,
+) -> Result<Vec<u8>, AppError> {
+    use tokio::process::Command;
+
+    const SEGMENT_DURATION: f64 = 10.0;
+    let start_time = segment_index as f64 * SEGMENT_DURATION;
+
+    let ffmpeg_path = std::env::var("FFMPEG_PATH")
+        .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
+        .unwrap_or_else(|_| "ffmpeg".to_string());
+
+    let hw_accel = detect_hardware_acceleration().await;
+
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-v".to_string(),
+        "error".to_string(),
+        "-ss".to_string(),
+        format!("{:.3}", start_time),
+    ];
+
+    match hw_accel {
+        HardwareAccel::Vaapi => {
+            args.extend(vec![
+                "-hwaccel".to_string(),
+                "vaapi".to_string(),
+                "-hwaccel_device".to_string(),
+                "/dev/dri/renderD128".to_string(),
+                "-hwaccel_output_format".to_string(),
+                "vaapi".to_string(),
+            ]);
+        }
+        _ => {
+            args.extend(vec!["-hwaccel".to_string(), "auto".to_string()]);
+        }
+    }
+
+    args.extend(vec![
+        "-i".to_string(),
+        video_path.to_string_lossy().to_string(),
+        "-t".to_string(),
+        format!("{:.3}", SEGMENT_DURATION),
+    ]);
+
+    match hw_accel {
+        HardwareAccel::Rkmpp => args.extend(vec![
+            "-c:v".to_string(),
+            "h264_rkmpp".to_string(),
+            "-b:v".to_string(),
+            "3M".to_string(),
+            "-rc_mode".to_string(),
+            "VBR".to_string(),
+        ]),
+        HardwareAccel::Vaapi => args.extend(vec![
+            "-c:v".to_string(),
+            "h264_vaapi".to_string(),
+            "-qp".to_string(),
+            "23".to_string(),
+        ]),
+        HardwareAccel::V4l2 => args.extend(vec![
+            "-c:v".to_string(),
+            "h264_v4l2m2m".to_string(),
+            "-b:v".to_string(),
+            "2M".to_string(),
+        ]),
+        HardwareAccel::None => args.extend(vec![
+            "-c:v".to_string(),
+            "libx264".to_string(),
+            "-preset".to_string(),
+            "veryfast".to_string(),
+            "-tune".to_string(),
+            "zerolatency".to_string(),
+            "-profile:v".to_string(),
+            "main".to_string(),
+            "-level".to_string(),
+            "4.0".to_string(),
+            "-crf".to_string(),
+            "23".to_string(),
+        ]),
+    }
+
+    args.extend(vec![
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-b:a".to_string(),
+        "128k".to_string(),
+        "-ac".to_string(),
+        "2".to_string(),
+        "-ar".to_string(),
+        "44100".to_string(),
+        "-f".to_string(),
+        "mpegts".to_string(),
+        "pipe:1".to_string(),
+    ]);
+
+    let output = Command::new(&ffmpeg_path)
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| {
+            AppError::IoError(format!(
+                "Failed to execute FFmpeg in no-cache mode: {}",
+                e
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::InternalServerError(format!(
+            "FFmpeg no-cache transcode failed for segment {}: {}",
+            segment_index, stderr
+        )));
+    }
+
+    if output.stdout.is_empty() {
+        return Err(AppError::InternalServerError(format!(
+            "FFmpeg returned empty segment data for segment {}",
+            segment_index
+        )));
+    }
+
+    Ok(output.stdout)
 }
 
 /// 硬件加速类型
