@@ -2408,6 +2408,20 @@ fn is_same_filesystem_as_root(_path: &std::path::Path) -> bool {
 
 fn ensure_external_hls_cache_root() -> Result<std::path::PathBuf, AppError> {
     let root = get_hls_cache_dir();
+    let allow_internal = std::env::var("ROCKZERO_ALLOW_INTERNAL_HLS_CACHE")
+        .ok()
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+
+    if allow_internal {
+        std::fs::create_dir_all(&root).map_err(|e| {
+            AppError::IoError(format!(
+                "Failed to create HLS cache directory {:?}: {}",
+                root, e
+            ))
+        })?;
+        return Ok(root);
+    }
 
     #[cfg(target_os = "linux")]
     {
@@ -2922,7 +2936,21 @@ mod tests {
     };
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
     use rockzero_media::HlsSession;
+    use std::sync::OnceLock;
     use std::time::{Duration, Instant};
+
+    fn ensure_test_cache_env() -> std::path::PathBuf {
+        static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
+        ROOT.get_or_init(|| {
+            let root = std::env::temp_dir().join("rockzero_hls_cache_tests");
+            let _ = std::fs::create_dir_all(&root);
+            // CI/tests can run without external mount; enable internal cache only in test scope.
+            std::env::set_var("HLS_CACHE_PATH", &root);
+            std::env::set_var("ROCKZERO_ALLOW_INTERNAL_HLS_CACHE", "1");
+            root
+        })
+        .clone()
+    }
 
     #[test]
     fn test_secure_playlist_generation() {
@@ -2960,6 +2988,7 @@ mod tests {
     }
 
     fn test_cache_dir_for_file(file_path: &str) -> std::path::PathBuf {
+        let _ = ensure_test_cache_env();
         let video_hash = blake3::hash(file_path.as_bytes());
         let video_id = hex::encode(&video_hash.as_bytes()[..8]);
         get_hls_cache_dir().join(video_id)
