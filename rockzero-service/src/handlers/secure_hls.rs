@@ -27,10 +27,14 @@ static EXTERNAL_CACHE_STARTUP_GUARD: OnceLock<Mutex<ExternalCacheStartupGuard>> 
 static SEGMENT_TICKET_SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 static SESSION_CACHE_DIRS: OnceLock<Mutex<HashMap<String, std::path::PathBuf>>> = OnceLock::new();
 static A311D_PROFILE_CACHE: OnceLock<bool> = OnceLock::new();
+static NO_DISK_SEGMENT_CACHE_MAX_BYTES: OnceLock<usize> = OnceLock::new();
+static NO_DISK_SEGMENT_CACHE_MAX_ENTRY_BYTES: OnceLock<usize> = OnceLock::new();
 
 const NO_DISK_SEGMENT_TTL_SECS: u64 = 300;
 const NO_DISK_SEGMENT_MAX_ENTRIES: usize = 512;
 const SEGMENT_TICKET_MAX_AGE_SECONDS: i64 = 1800;
+const DEFAULT_NO_DISK_SEGMENT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_NO_DISK_SEGMENT_CACHE_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SegmentAccessTicketPayload {
@@ -84,6 +88,12 @@ fn remove_session_cache_dir(session_id: &str) -> Option<std::path::PathBuf> {
 }
 
 fn resolve_session_cache_dir(file_path: &str, session_id: Option<&str>) -> Result<std::path::PathBuf, AppError> {
+    if let Some(sid) = session_id {
+        if let Some(existing) = get_session_cache_dir(sid) {
+            return Ok(existing);
+        }
+    }
+
     let source = std::path::PathBuf::from(file_path);
     let parent = source.parent().ok_or_else(|| {
         AppError::PreconditionFailed(format!(
@@ -169,6 +179,26 @@ pub fn get_no_disk_playback_status() -> (bool, usize) {
 
 fn no_disk_segment_cache() -> &'static Mutex<HashMap<String, NoDiskSegmentCacheEntry>> {
     NO_DISK_SEGMENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn no_disk_segment_cache_max_bytes() -> usize {
+    *NO_DISK_SEGMENT_CACHE_MAX_BYTES.get_or_init(|| {
+        std::env::var("ROCKZERO_NO_DISK_SEGMENT_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v >= (4 * 1024 * 1024))
+            .unwrap_or(DEFAULT_NO_DISK_SEGMENT_CACHE_MAX_BYTES)
+    })
+}
+
+fn no_disk_segment_cache_max_entry_bytes() -> usize {
+    *NO_DISK_SEGMENT_CACHE_MAX_ENTRY_BYTES.get_or_init(|| {
+        std::env::var("ROCKZERO_NO_DISK_SEGMENT_CACHE_MAX_ENTRY_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v >= (512 * 1024))
+            .unwrap_or(DEFAULT_NO_DISK_SEGMENT_CACHE_MAX_ENTRY_BYTES)
+    })
 }
 
 fn no_disk_segment_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
@@ -330,21 +360,50 @@ fn get_cached_no_disk_segment(cache_key: &str) -> Option<Vec<u8>> {
     cache.get(cache_key).map(|entry| entry.data.clone())
 }
 
-fn put_cached_no_disk_segment(cache_key: String, data: Vec<u8>) {
-    let mut cache = no_disk_segment_cache().lock().unwrap_or_else(|e| e.into_inner());
+fn trim_no_disk_segment_cache_locked(cache: &mut HashMap<String, NoDiskSegmentCacheEntry>) {
     cache.retain(|_, entry| {
         entry.created_at.elapsed() < std::time::Duration::from_secs(NO_DISK_SEGMENT_TTL_SECS)
     });
 
-    if cache.len() >= NO_DISK_SEGMENT_MAX_ENTRIES {
+    let max_bytes = no_disk_segment_cache_max_bytes();
+
+    while cache.len() > NO_DISK_SEGMENT_MAX_ENTRIES {
         let oldest_key = cache
             .iter()
             .min_by_key(|(_, entry)| entry.created_at)
             .map(|(k, _)| k.clone());
         if let Some(key) = oldest_key {
             cache.remove(&key);
+        } else {
+            break;
         }
     }
+
+    loop {
+        let total_bytes: usize = cache.values().map(|entry| entry.data.len()).sum();
+        if total_bytes <= max_bytes {
+            break;
+        }
+
+        let oldest_key = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.created_at)
+            .map(|(k, _)| k.clone());
+        if let Some(key) = oldest_key {
+            cache.remove(&key);
+        } else {
+            break;
+        }
+    }
+}
+
+fn put_cached_no_disk_segment(cache_key: String, data: Vec<u8>) {
+    if data.len() > no_disk_segment_cache_max_entry_bytes() {
+        return;
+    }
+
+    let mut cache = no_disk_segment_cache().lock().unwrap_or_else(|e| e.into_inner());
+    trim_no_disk_segment_cache_locked(&mut cache);
 
     cache.insert(
         cache_key,
@@ -353,6 +412,17 @@ fn put_cached_no_disk_segment(cache_key: String, data: Vec<u8>) {
             created_at: std::time::Instant::now(),
         },
     );
+
+    trim_no_disk_segment_cache_locked(&mut cache);
+}
+
+fn clear_no_disk_segment_cache_for_session(session_id: &str) {
+    let prefix = format!("{}:", session_id);
+    let mut cache = no_disk_segment_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|k, _| !k.starts_with(&prefix));
+
+    let mut locks = no_disk_segment_locks().lock().unwrap_or_else(|e| e.into_inner());
+    locks.retain(|k, _| !k.starts_with(&prefix));
 }
 
 fn get_no_disk_segment_lock(cache_key: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -2269,11 +2339,7 @@ pub async fn get_secure_playlist(
 
     let (_cache_dir, playlist_content, no_disk_mode) = match ensured {
         Ok((cache_dir, content)) => (Some(cache_dir), content, false),
-        Err(AppError::PreconditionFailed(msg))
-            if msg.contains("Refusing to write cache")
-                || msg.contains("refusing to create cache")
-                || msg.contains("External storage") =>
-        {
+        Err(AppError::PreconditionFailed(msg)) => {
             warn!(
                 "External cache unavailable for session {}, using no-disk virtual playlist: {}",
                 session_id, msg
@@ -2463,8 +2529,52 @@ pub async fn get_segment_direct(
 
     let video_hash = blake3::hash(file_path.as_bytes());
     let video_id = hex::encode(&video_hash.as_bytes()[..8]);
-    let cache_dir = resolve_session_cache_dir(&file_path, Some(&session_id))?;
-    set_session_cache_dir(&session_id, cache_dir.clone());
+    let cache_dir = match resolve_session_cache_dir(&file_path, Some(&session_id)) {
+        Ok(dir) => {
+            set_session_cache_dir(&session_id, dir.clone());
+            Some(dir)
+        }
+        Err(AppError::PreconditionFailed(msg)) => {
+            warn_no_disk_fallback_once(Some(&session_id), &segment_name);
+            warn!(
+                "Session {} cannot use disk cache for segment {}: {}",
+                session_id, segment_name, msg
+            );
+            None
+        }
+        Err(e) => return Err(e),
+    };
+
+    if cache_dir.is_none() {
+        if let Some(idx) = parse_segment_index_from_name(&segment_name) {
+            prewarm_no_disk_segments(file_path.clone(), session_id.clone(), idx);
+        }
+
+        let segment_data =
+            read_video_segment_from_ffmpeg(&file_path, &segment_name, Some(&session_id)).await?;
+
+        let manager = hls_manager.read().await;
+        let session = manager
+            .get_session(&session_id)
+            .map_err(convert_hls_error)?;
+        let encrypted_data = session
+            .encrypt_segment(&segment_data)
+            .map_err(convert_hls_error)?;
+
+        return Ok(HttpResponse::Ok()
+            .content_type("application/octet-stream")
+            .insert_header(("X-Encrypted", "true"))
+            .insert_header(("X-Encryption-Method", "AES-256-GCM"))
+            .insert_header(("X-Key-Exchange", "WPA3-SAE"))
+            .insert_header(("X-Integrity", "Blake3"))
+            .insert_header(("X-No-Disk-Mode", "true"))
+            .insert_header(("Content-Length", encrypted_data.len()))
+            .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
+            .insert_header(("Access-Control-Allow-Origin", "*"))
+            .body(encrypted_data));
+    }
+
+    let cache_dir = cache_dir.expect("checked above");
     let segment_path = cache_dir.join(&segment_name);
     let enc_path = segment_path.with_extension("ts.enc");
 
@@ -2628,24 +2738,41 @@ pub async fn get_secure_segment(
         );
     }
 
-    let no_disk_mode = false;
+    let mut no_disk_mode = false;
 
     let segment_data = {
-        let cache_dir = resolve_session_cache_dir(&session.file_path, Some(&session_id))?;
-        set_session_cache_dir(&session_id, cache_dir.clone());
-        let segment_path = cache_dir.join(&segment_name);
+        match resolve_session_cache_dir(&session.file_path, Some(&session_id)) {
+            Ok(cache_dir) => {
+                set_session_cache_dir(&session_id, cache_dir.clone());
+                let segment_path = cache_dir.join(&segment_name);
 
-        let storage_key = derive_segment_storage_key(&session.file_path);
-        let enc_path = segment_path.with_extension("ts.enc");
+                let storage_key = derive_segment_storage_key(&session.file_path);
+                let enc_path = segment_path.with_extension("ts.enc");
 
-        // ★ 更新 .last_access 标记，防止活跃缓存被 LRU 驱逐
-        touch_cache_access(&cache_dir).await;
+                // ★ 更新 .last_access 标记，防止活跃缓存被 LRU 驱逐
+                touch_cache_access(&cache_dir).await;
 
-        if enc_path.exists() || segment_path.exists() {
-            read_segment_data(&segment_path, &storage_key).await?
-        } else {
-            read_video_segment_from_ffmpeg(&session.file_path, &segment_name, Some(&session_id))
-                .await?
+                if enc_path.exists() || segment_path.exists() {
+                    read_segment_data(&segment_path, &storage_key).await?
+                } else {
+                    read_video_segment_from_ffmpeg(&session.file_path, &segment_name, Some(&session_id))
+                        .await?
+                }
+            }
+            Err(AppError::PreconditionFailed(msg)) => {
+                no_disk_mode = true;
+                warn_no_disk_fallback_once(Some(&session_id), &segment_name);
+                warn!(
+                    "Session {} segment {} switched to no-disk mode: {}",
+                    session_id, segment_name, msg
+                );
+                if let Some(idx) = parse_segment_index_from_name(&segment_name) {
+                    prewarm_no_disk_segments(session.file_path.clone(), session_id.clone(), idx);
+                }
+                read_video_segment_from_ffmpeg(&session.file_path, &segment_name, Some(&session_id))
+                    .await?
+            }
+            Err(e) => return Err(e),
         }
     };
 
@@ -2684,6 +2811,7 @@ pub async fn stop_session(
     let session_id = path.into_inner();
 
     clear_session_no_disk_mode(&session_id);
+    clear_no_disk_segment_cache_for_session(&session_id);
 
     info!("Stopping HLS session: {}", session_id);
     let manager = hls_manager.read().await;
@@ -3060,11 +3188,62 @@ async fn read_video_segment_from_ffmpeg(
     let video_hash = blake3::hash(file_path.as_bytes());
     let video_id = hex::encode(&video_hash.as_bytes()[..8]); // 使用前 8 字节作为 ID
 
-    // 5. 构建会话级缓存目录路径（强制外置存储，位于视频目录下）
-    let cache_dir = resolve_session_cache_dir(file_path, session_id)?;
-    if let Some(sid) = session_id {
-        set_session_cache_dir(sid, cache_dir.clone());
+    // 5. 构建会话级缓存目录路径（优先外置落盘；失败时回退 no-disk 内存缓存）
+    let cache_dir = match resolve_session_cache_dir(file_path, session_id) {
+        Ok(dir) => {
+            if let Some(sid) = session_id {
+                set_session_cache_dir(sid, dir.clone());
+            }
+            Some(dir)
+        }
+        Err(AppError::PreconditionFailed(msg)) => {
+            warn_no_disk_fallback_once(session_id, segment_name);
+            warn!(
+                "No-disk fallback for segment {} of {}: {}",
+                segment_name, video_id, msg
+            );
+            None
+        }
+        Err(e) => return Err(e),
+    };
+
+    if cache_dir.is_none() {
+        let cache_scope = session_id.unwrap_or("global");
+        let cache_key = format!("{}:{}:{}", cache_scope, video_id, segment_name);
+        if let Some(cached) = get_cached_no_disk_segment(&cache_key) {
+            return Ok(cached);
+        }
+
+        let lock = get_no_disk_segment_lock(&cache_key);
+        let guard = lock.lock().await;
+
+        if let Some(cached) = get_cached_no_disk_segment(&cache_key) {
+            drop(guard);
+            release_no_disk_segment_lock(&cache_key);
+            return Ok(cached);
+        }
+
+        let original_video = PathBuf::from(file_path);
+        if !original_video.exists() {
+            drop(guard);
+            release_no_disk_segment_lock(&cache_key);
+            return Err(AppError::NotFound(format!(
+                "Original video file not found: {}",
+                file_path
+            )));
+        }
+
+        let transcode_result = transcode_segment_in_memory(&original_video, segment_index).await;
+        if let Ok(ref segment_data) = transcode_result {
+            put_cached_no_disk_segment(cache_key.clone(), segment_data.clone());
+        }
+
+        drop(guard);
+        release_no_disk_segment_lock(&cache_key);
+        return transcode_result;
     }
+
+    let cache_dir = cache_dir.expect("checked above");
     let cached_segment_path = cache_dir.join(segment_name);
     let cached_segment_enc_path = cached_segment_path.with_extension("ts.enc");
     let storage_key = derive_segment_storage_key(file_path);

@@ -246,6 +246,7 @@ impl Default for SecurePasswordHandler {
 #[derive(Debug, Clone)]
 pub struct PasswordCredentials {
     pub password_hash: String,
+    #[allow(dead_code)]
     pub zkp_registration: PasswordRegistration,
 }
 
