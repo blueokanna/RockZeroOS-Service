@@ -118,6 +118,16 @@ fn is_strict_external_cache_required() -> bool {
         .unwrap_or(false)
 }
 
+fn allow_stream_copy_for_hls() -> bool {
+    std::env::var("ROCKZERO_HLS_ALLOW_STREAM_COPY")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 pub fn initialize_external_cache_startup_guard() -> bool {
     let strict = is_strict_external_cache_required();
 
@@ -1420,10 +1430,11 @@ async fn run_ffmpeg_progressive(
         );
     }
 
-    let allow_stream_copy = matches!(
+    let codec_supports_copy = matches!(
         video_codec.as_deref(),
         Some("h264" | "avc" | "avc1" | "hevc" | "h265" | "hev1" | "hvc1")
     );
+    let allow_stream_copy = codec_supports_copy && allow_stream_copy_for_hls();
 
     // 构建 stream copy 参数
     // 关键修复：对于 mpegts 容器必须添加正确的 bitstream filter
@@ -1532,8 +1543,9 @@ async fn run_ffmpeg_progressive(
         );
     } else {
         info!(
-            "Skipping stream copy for codec {:?}, using H.264/AAC transcode for compatibility",
-            video_codec
+            "Skipping stream copy (codec_supports_copy={}, stream_copy_enabled={}), using fixed-cadence transcode for stable seek/sync",
+            codec_supports_copy,
+            allow_stream_copy_for_hls()
         );
     }
 
@@ -1592,6 +1604,8 @@ async fn run_ffmpeg_progressive(
                     "3M".into(),
                     "-rc_mode".into(),
                     "VBR".into(),
+                    "-g".into(),
+                    "48".into(),
                 ]);
             }
             HardwareAccel::V4l2 => {
@@ -1601,6 +1615,8 @@ async fn run_ffmpeg_progressive(
                     "h264_v4l2m2m".into(),
                     "-b:v".into(),
                     "2M".into(),
+                    "-g".into(),
+                    "48".into(),
                 ]);
             }
             HardwareAccel::Vaapi => {
@@ -1610,6 +1626,8 @@ async fn run_ffmpeg_progressive(
                     "h264_vaapi".into(),
                     "-qp".into(),
                     "23".into(),
+                    "-g".into(),
+                    "48".into(),
                 ]);
             }
             HardwareAccel::None => {
@@ -1618,14 +1636,29 @@ async fn run_ffmpeg_progressive(
                     "-c:v".into(),
                     "libx264".into(),
                     "-preset".into(),
-                    "ultrafast".into(), // ultrafast 更快输出首个 segment
+                    "veryfast".into(),
                     "-crf".into(),
-                    "23".into(),
+                    "22".into(),
+                    "-x264-params".into(),
+                    "keyint=48:min-keyint=48:scenecut=0".into(),
                     "-pix_fmt".into(),
                     "yuv420p".into(),
                 ]);
             }
         }
+
+        args.extend([
+            "-force_key_frames".into(),
+            "expr:gte(t,n_forced*2)".into(),
+            "-sc_threshold".into(),
+            "0".into(),
+            "-muxpreload".into(),
+            "0".into(),
+            "-muxdelay".into(),
+            "0".into(),
+            "-avoid_negative_ts".into(),
+            "make_zero".into(),
+        ]);
 
         args.extend([
             "-c:a".into(),
@@ -1754,86 +1787,10 @@ async fn generate_segment_on_demand(
 
     // 检测视频编码，决定是否可以 stream copy（与渐进式分片保持一致）
     let video_codec = detect_video_codec(&ffmpeg_path, file_path).await;
-    let can_stream_copy = matches!(
-        video_codec.as_deref(),
-        Some("h264" | "avc" | "avc1" | "hevc" | "h265" | "hev1" | "hvc1")
-    );
+    // On-demand 分片必须走精确转码，避免 keyframe 对齐误差导致回跳。
+    // video_codec 变量保留用于日志和后续调优。
+    let _ = video_codec;
 
-    // ══════════════════════════════════════════════════════════════
-    //  Phase 1: 尝试 stream copy（与渐进式分片编码一致，瞬间完成）
-    // ══════════════════════════════════════════════════════════════
-    if can_stream_copy {
-        let mut copy_args: Vec<String> = vec![
-            "-y".into(),
-            "-threads".into(),
-            "0".into(),
-            "-fflags".into(),
-            "+genpts+discardcorrupt".into(),
-            // -ss 在 -i 前 = input seeking（极快，跳到最近的 keyframe）
-            "-ss".into(),
-            format!("{:.3}", start_time),
-            "-i".into(),
-            file_path.into(),
-            "-t".into(),
-            format!("{:.3}", segment_duration + 0.5), // 多 0.5s 容错
-            "-map".into(),
-            "0:v?".into(),
-            "-map".into(),
-            "0:a?".into(),
-            "-c".into(),
-            "copy".into(),
-        ];
-
-        // 关键：添加 bitstream filter，与渐进式分片路径一致
-        match video_codec.as_deref() {
-            Some("h264" | "avc" | "avc1") => {
-                copy_args.extend(["-bsf:v".into(), "h264_mp4toannexb".into()]);
-            }
-            Some("hevc" | "h265" | "hev1" | "hvc1") => {
-                copy_args.extend(["-bsf:v".into(), "hevc_mp4toannexb".into()]);
-            }
-            _ => {}
-        }
-
-        copy_args.extend([
-            "-avoid_negative_ts".into(),
-            "make_zero".into(),
-            "-f".into(),
-            "mpegts".into(),
-            seg_path_str.clone(),
-        ]);
-
-        let output = tokio::process::Command::new(&ffmpeg_path)
-            .args(&copy_args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| format!("On-demand stream copy failed: {}", e))?;
-
-        if output.status.success() {
-            // stream copy 成功 — 加密并返回
-            encrypt_on_demand_segment(&segment_path, file_path).await;
-            info!(
-                "✅ On-demand segment_{}.ts generated via stream copy and encrypted",
-                segment_index
-            );
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(
-            "Stream copy failed for on-demand segment_{}, trying transcode: {}",
-            segment_index,
-            &stderr[..stderr.len().min(300)]
-        );
-        // 清理失败的输出文件
-        let _ = tokio::fs::remove_file(&segment_path).await;
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    //  Phase 2: 转码（stream copy 不可用或失败时的回退路径）
-    // ══════════════════════════════════════════════════════════════
     let hw_accel = detect_hardware_acceleration().await;
 
     let build_on_demand_transcode_args = |accel: HardwareAccel| -> Vec<String> {
@@ -1843,8 +1800,6 @@ async fn generate_segment_on_demand(
             "0".into(),
             "-fflags".into(),
             "+genpts+discardcorrupt".into(),
-            "-ss".into(),
-            format!("{:.3}", start_time),
         ];
 
         // 输入解码加速
@@ -1867,8 +1822,10 @@ async fn generate_segment_on_demand(
         args.extend([
             "-i".into(),
             file_path.into(),
+            "-ss".into(),
+            format!("{:.3}", start_time),
             "-t".into(),
-            format!("{:.3}", segment_duration + 0.1),
+            format!("{:.3}", segment_duration),
         ]);
 
         // 输出编码选项
@@ -1879,6 +1836,8 @@ async fn generate_segment_on_demand(
                     "h264_rkmpp".into(),
                     "-b:v".into(),
                     "3M".into(),
+                    "-g".into(),
+                    "48".into(),
                 ]);
             }
             HardwareAccel::V4l2 => {
@@ -1887,6 +1846,8 @@ async fn generate_segment_on_demand(
                     "h264_v4l2m2m".into(),
                     "-b:v".into(),
                     "2M".into(),
+                    "-g".into(),
+                    "48".into(),
                 ]);
             }
             HardwareAccel::Vaapi => {
@@ -1895,6 +1856,8 @@ async fn generate_segment_on_demand(
                     "h264_vaapi".into(),
                     "-qp".into(),
                     "23".into(),
+                    "-g".into(),
+                    "48".into(),
                 ]);
             }
             HardwareAccel::None => {
@@ -1902,14 +1865,29 @@ async fn generate_segment_on_demand(
                     "-c:v".into(),
                     "libx264".into(),
                     "-preset".into(),
-                    "ultrafast".into(),
+                    "veryfast".into(),
                     "-crf".into(),
-                    "23".into(),
+                    "22".into(),
+                    "-x264-params".into(),
+                    "keyint=48:min-keyint=48:scenecut=0".into(),
                     "-pix_fmt".into(),
                     "yuv420p".into(),
                 ]);
             }
         }
+
+        args.extend([
+            "-force_key_frames".into(),
+            "expr:gte(t,n_forced*2)".into(),
+            "-sc_threshold".into(),
+            "0".into(),
+            "-muxpreload".into(),
+            "0".into(),
+            "-muxdelay".into(),
+            "0".into(),
+            "-avoid_negative_ts".into(),
+            "make_zero".into(),
+        ]);
 
         args.extend([
             "-c:a".into(),
