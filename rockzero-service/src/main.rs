@@ -1073,6 +1073,11 @@ async fn main() -> std::io::Result<()> {
                                     .route(
                                         "/create",
                                         web::post().to(handlers::secure_hls::create_hls_session),
+                                    )
+                                    .route(
+                                        "/{session_id}/proof-ticket",
+                                        web::post()
+                                            .to(handlers::secure_hls::create_session_proof_ticket),
                                     ),
                             )
                             // Playback routes: authenticated by session_id (no JWT needed)

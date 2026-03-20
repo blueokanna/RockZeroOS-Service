@@ -4,7 +4,7 @@ use rockzero_common::AppError;
 use rockzero_crypto::{EnhancedPasswordProof, PasswordRegistration, ZkpContext};
 use rockzero_media::{HlsSession, HlsSessionManager};
 use rockzero_sae::{SaeCommit, SaeConfirm};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,9 +24,20 @@ static HW_ACCEL_DETECTION_CACHE: OnceLock<HardwareAccel> = OnceLock::new();
 static VIDEO_CODEC_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
 static EXTERNAL_CACHE_STARTUP_GUARD: OnceLock<Mutex<ExternalCacheStartupGuard>> =
     OnceLock::new();
+static SEGMENT_TICKET_SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
 const NO_DISK_SEGMENT_TTL_SECS: u64 = 300;
 const NO_DISK_SEGMENT_MAX_ENTRIES: usize = 512;
+const SEGMENT_TICKET_MAX_AGE_SECONDS: i64 = 1800;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SegmentAccessTicketPayload {
+    session_id: String,
+    user_id: String,
+    issued_at: i64,
+    expires_at: i64,
+    scope: String,
+}
 
 #[derive(Clone)]
 struct NoDiskSegmentCacheEntry {
@@ -273,6 +284,105 @@ fn verify_anti_clogging_token(temp_session_id: &str, user_id: &str, token: &str)
     expected == token
 }
 
+fn segment_ticket_signing_key() -> &'static [u8; 32] {
+    SEGMENT_TICKET_SIGNING_KEY.get_or_init(|| {
+        if let Ok(secret_hex) = std::env::var("ROCKZERO_SEGMENT_TICKET_SECRET") {
+            if let Ok(bytes) = hex::decode(secret_hex) {
+                if bytes.len() == 32 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&bytes);
+                    return key;
+                }
+            }
+            warn!(
+                "ROCKZERO_SEGMENT_TICKET_SECRET is set but invalid; falling back to derived startup key"
+            );
+        }
+
+        let mut key_material = Vec::new();
+        key_material.extend_from_slice(get_sae_anti_clogging_key());
+        key_material.extend_from_slice(b"RockZero-Segment-Ticket-v1");
+        *blake3::hash(&key_material).as_bytes()
+    })
+}
+
+fn issue_segment_access_ticket(session: &HlsSession) -> Result<String, AppError> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
+
+    let now = chrono::Utc::now().timestamp();
+    let expires_at = (now + SEGMENT_TICKET_MAX_AGE_SECONDS).min(session.expires_at.timestamp());
+
+    let payload = SegmentAccessTicketPayload {
+        session_id: session.session_id.clone(),
+        user_id: session.user_id.clone(),
+        issued_at: now,
+        expires_at,
+        scope: "hls_segment_access".to_string(),
+    };
+
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|e| AppError::InternalServerError(format!("Failed to encode ticket: {}", e)))?;
+    let payload_b64 = B64URL.encode(&payload_bytes);
+
+    let sig = blake3::keyed_hash(segment_ticket_signing_key(), payload_b64.as_bytes());
+    let sig_b64 = B64URL.encode(sig.as_bytes());
+
+    Ok(format!("{}.{}", payload_b64, sig_b64))
+}
+
+fn verify_segment_access_ticket(session: &HlsSession, ticket: &str) -> Result<bool, AppError> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
+
+    let mut parts = ticket.split('.');
+    let payload_b64 = parts.next().unwrap_or_default();
+    let sig_b64 = parts.next().unwrap_or_default();
+    if payload_b64.is_empty() || sig_b64.is_empty() || parts.next().is_some() {
+        return Ok(false);
+    }
+
+    let expected_sig = blake3::keyed_hash(segment_ticket_signing_key(), payload_b64.as_bytes());
+    let provided_sig = B64URL.decode(sig_b64).map_err(|_| {
+        AppError::BadRequest("Invalid segment ticket signature encoding".to_string())
+    })?;
+
+    if provided_sig.len() != expected_sig.as_bytes().len()
+        || !constant_time_compare(&provided_sig, expected_sig.as_bytes())
+    {
+        return Ok(false);
+    }
+
+    let payload_bytes = B64URL
+        .decode(payload_b64)
+        .map_err(|_| AppError::BadRequest("Invalid segment ticket payload encoding".to_string()))?;
+    let payload: SegmentAccessTicketPayload = serde_json::from_slice(&payload_bytes)
+        .map_err(|_| AppError::BadRequest("Invalid segment ticket payload structure".to_string()))?;
+
+    let now = chrono::Utc::now().timestamp();
+    if payload.scope != "hls_segment_access" {
+        return Ok(false);
+    }
+    if payload.session_id != session.session_id || payload.user_id != session.user_id {
+        return Ok(false);
+    }
+    if payload.expires_at < now || payload.issued_at > now + 60 {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn convert_hls_error(err: rockzero_media::HlsError) -> AppError {
     match err {
         rockzero_media::HlsError::SessionNotFound(msg) => AppError::NotFound(msg),
@@ -377,6 +487,12 @@ pub struct CompleteSaeRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct SecureSegmentRequest {
+    pub zkp_proof: Option<String>,
+    pub zkp_ticket: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateProofTicketRequest {
     pub zkp_proof: String,
 }
 
@@ -740,8 +856,47 @@ pub async fn create_hls_session(
         "expires_at": session.expires_at.timestamp(),
         "playlist_url": format!("/api/v1/secure-hls/{}/playlist.m3u8", session_id),
         "zkp_enabled": has_zkp,
+        "segment_ticket_supported": true,
         "direct_mode": false,
         "encryption_method": "AES-256-GCM",
+    })))
+}
+
+pub async fn create_session_proof_ticket(
+    hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
+    path: web::Path<String>,
+    body: web::Json<CreateProofTicketRequest>,
+) -> Result<impl Responder, AppError> {
+    let session_id = path.into_inner();
+    let user_id = claims.sub.clone();
+
+    let manager = hls_manager.read().await;
+    let session = manager
+        .get_session(&session_id)
+        .map_err(convert_hls_error)?;
+
+    if session.user_id != user_id {
+        return Err(AppError::Unauthorized(
+            "Session does not belong to current user".to_string(),
+        ));
+    }
+
+    if !verify_zkp_proof(&session, &body.zkp_proof)? {
+        return Err(AppError::Unauthorized(
+            "Invalid ZKP proof - authentication failed".to_string(),
+        ));
+    }
+
+    let ticket = issue_segment_access_ticket(&session)?;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "ticket": ticket,
+        "expires_at": (chrono::Utc::now().timestamp() + SEGMENT_TICKET_MAX_AGE_SECONDS)
+            .min(session.expires_at.timestamp()),
+        "scope": "hls_segment_access",
+        "session_id": session.session_id,
     })))
 }
 
@@ -2354,10 +2509,15 @@ pub async fn get_secure_segment(
     })?;
 
     info!(
-        "Secure segment request: session={}, segment={}, zkp_proof_len={}",
+        "Secure segment request: session={}, segment={}, has_ticket={}, zkp_proof_len={}",
         session_id,
         segment_name,
-        segment_request.zkp_proof.len()
+        segment_request
+            .zkp_ticket
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false),
+        segment_request.zkp_proof.as_ref().map(|v| v.len()).unwrap_or(0)
     );
 
     let manager = hls_manager.read().await;
@@ -2365,20 +2525,49 @@ pub async fn get_secure_segment(
         .get_session(&session_id)
         .map_err(convert_hls_error)?;
 
-    if !verify_zkp_proof(&session, &segment_request.zkp_proof)? {
-        warn!(
-            "Invalid ZKP proof for session {} segment {}",
+    let ticket_verified = if let Some(ticket) = segment_request.zkp_ticket.as_ref() {
+        if ticket.is_empty() {
+            false
+        } else {
+            verify_segment_access_ticket(&session, ticket)?
+        }
+    } else {
+        false
+    };
+    let ticket_provided = segment_request
+        .zkp_ticket
+        .as_ref()
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+
+    if !ticket_verified {
+        let Some(proof) = segment_request.zkp_proof.as_ref() else {
+            if ticket_provided {
+                return Err(AppError::Unauthorized(
+                    "Invalid segment access ticket".to_string(),
+                ));
+            }
+            return Err(AppError::Unauthorized(
+                "Missing authentication material: zkp_ticket or zkp_proof is required"
+                    .to_string(),
+            ));
+        };
+
+        if !verify_zkp_proof(&session, proof)? {
+            warn!(
+                "Invalid ZKP proof for session {} segment {}",
+                session_id, segment_name
+            );
+            return Err(AppError::Unauthorized(
+                "Invalid ZKP proof - authentication failed".to_string(),
+            ));
+        }
+
+        info!(
+            "✅ ZKP proof verified for session {} segment {}",
             session_id, segment_name
         );
-        return Err(AppError::Unauthorized(
-            "Invalid ZKP proof - authentication failed".to_string(),
-        ));
     }
-
-    info!(
-        "✅ ZKP proof verified for session {} segment {}",
-        session_id, segment_name
-    );
 
     let mut no_disk_mode = false;
 
