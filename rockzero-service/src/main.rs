@@ -355,6 +355,10 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/proof/generate",
                                 web::post().to(handlers::zkp_auth::generate_zkp_proof),
+                            )
+                            .route(
+                                "/proof/generate-batch",
+                                web::post().to(handlers::zkp_auth::generate_zkp_proof_batch),
                             ),
                     )
                     .service(

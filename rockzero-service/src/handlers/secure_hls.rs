@@ -3083,7 +3083,7 @@ async fn transcode_segment_async(
 ) -> Result<Vec<u8>, AppError> {
     use tokio::process::Command;
 
-    const SEGMENT_DURATION: f64 = 10.0; // 每段 10 秒
+    const SEGMENT_DURATION: f64 = 2.0; // 与 HLS playlist 保持一致（2 秒分片）
     let start_time = segment_index as f64 * SEGMENT_DURATION;
 
     let output_path = output_dir.join(format!("segment_{}.ts", segment_index));
@@ -3130,6 +3130,10 @@ async fn transcode_segment_async(
         video_path.to_str().unwrap_or("").to_string(),
         "-t".to_string(),
         format!("{:.3}", SEGMENT_DURATION), // 段持续时间
+        "-fflags".to_string(),
+        "+genpts".to_string(),
+        "-avoid_negative_ts".to_string(),
+        "make_zero".to_string(),
     ]);
 
     // ★ 输出编码选项（根据硬件加速能力选择编码器）
@@ -3204,6 +3208,10 @@ async fn transcode_segment_async(
         "2".to_string(), // 立体声
         "-ar".to_string(),
         "44100".to_string(), // 采样率
+        "-muxdelay".to_string(),
+        "0".to_string(),
+        "-muxpreload".to_string(),
+        "0".to_string(),
         "-f".to_string(),
         "mpegts".to_string(), // MPEG-TS 容器
         output_path.to_str().unwrap_or("").to_string(),

@@ -52,6 +52,10 @@ pub struct SchnorrProof {
 pub struct BoundStrengthProof {
     /// Commitment to entropy value
     pub entropy_value_commitment: String,
+    /// Optional aggregated commitments for prove_multiple/verify_multiple.
+    /// For streaming we bind two lanes (audio/video) to the same entropy level.
+    #[serde(default)]
+    pub entropy_value_commitments: Vec<String>,
     /// Bulletproof range proof that entropy >= MIN_PASSWORD_ENTROPY_BITS
     pub range_proof: String,
 }
@@ -86,7 +90,9 @@ impl ZkpContext {
     pub fn new() -> Self {
         Self {
             pedersen_gens: PedersenGens::default(),
-            bulletproof_gens: BulletproofGens::new(64, 1),
+            // Use 2-party capacity so prove_multiple/verify_multiple can bind
+            // audio/video prebuffer lanes in one aggregated range proof.
+            bulletproof_gens: BulletproofGens::new(64, 2),
         }
     }
 
@@ -320,22 +326,32 @@ impl ZkpContext {
         // Add schnorr commitment to transcript for binding
         transcript.append_message(b"schnorr_commitment", schnorr_commitment.as_bytes());
 
-        // Random entropy blinding
-        let entropy_blinding = Self::generate_random_scalar()?;
+        // Bind two lanes (audio/video) in one aggregated proof.
+        let values = [entropy_bits, entropy_bits];
+        let blindings = [Self::generate_random_scalar()?, Self::generate_random_scalar()?];
 
-        // Generate range proof using SAME transcript (ensures binding)
-        let (range_proof, entropy_value_commitment) = RangeProof::prove_single(
+        let (range_proof, entropy_value_commitments) = RangeProof::prove_multiple(
             &self.bulletproof_gens,
             &self.pedersen_gens,
             transcript,
-            entropy_bits,
-            &entropy_blinding,
+            &values,
+            &blindings,
             64,
         )
         .map_err(|e| AppError::CryptoError(format!("Failed to generate range proof: {:?}", e)))?;
 
+        let encoded_commitments: Vec<String> = entropy_value_commitments
+            .iter()
+            .map(|c| BASE64.encode(c.as_bytes()))
+            .collect();
+
+        let first_commitment = encoded_commitments.first().cloned().ok_or_else(|| {
+            AppError::CryptoError("Range proof commitments are empty".to_string())
+        })?;
+
         Ok(BoundStrengthProof {
-            entropy_value_commitment: BASE64.encode(entropy_value_commitment.as_bytes()),
+            entropy_value_commitment: first_commitment,
+            entropy_value_commitments: encoded_commitments,
             range_proof: BASE64.encode(range_proof.to_bytes()),
         })
     }
@@ -350,15 +366,6 @@ impl ZkpContext {
         // Add schnorr commitment to transcript for binding verification
         transcript.append_message(b"schnorr_commitment", schnorr_commitment.as_bytes());
 
-        // Decode entropy_value_commitment
-        let entropy_value_commitment_bytes = BASE64
-            .decode(&proof.entropy_value_commitment)
-            .map_err(|_| AppError::CryptoError("Invalid entropy value commitment".to_string()))?;
-        let entropy_value_commitment =
-            CompressedRistretto::from_slice(&entropy_value_commitment_bytes).map_err(|_| {
-                AppError::CryptoError("Invalid entropy value commitment point".to_string())
-            })?;
-
         // Verify range proof using SAME transcript (binding is verified through transcript)
         let range_proof_bytes = BASE64
             .decode(&proof.range_proof)
@@ -366,17 +373,53 @@ impl ZkpContext {
         let range_proof = RangeProof::from_bytes(&range_proof_bytes)
             .map_err(|_| AppError::CryptoError("Invalid range proof format".to_string()))?;
 
-        range_proof
-            .verify_single(
-                &self.bulletproof_gens,
-                &self.pedersen_gens,
-                transcript,
-                &entropy_value_commitment,
-                64,
-            )
-            .map_err(|e| {
-                AppError::CryptoError(format!("Range proof verification failed: {:?}", e))
-            })?;
+        if !proof.entropy_value_commitments.is_empty() {
+            let mut commitments = Vec::with_capacity(proof.entropy_value_commitments.len());
+            for encoded in &proof.entropy_value_commitments {
+                let bytes = BASE64.decode(encoded).map_err(|_| {
+                    AppError::CryptoError("Invalid entropy value commitment".to_string())
+                })?;
+                let commitment = CompressedRistretto::from_slice(&bytes).map_err(|_| {
+                    AppError::CryptoError("Invalid entropy value commitment point".to_string())
+                })?;
+                commitments.push(commitment);
+            }
+
+            range_proof
+                .verify_multiple(
+                    &self.bulletproof_gens,
+                    &self.pedersen_gens,
+                    transcript,
+                    &commitments,
+                    64,
+                )
+                .map_err(|e| {
+                    AppError::CryptoError(format!("Range proof verification failed: {:?}", e))
+                })?;
+        } else {
+            // Backward compatibility with legacy single-commitment proofs.
+            let entropy_value_commitment_bytes = BASE64
+                .decode(&proof.entropy_value_commitment)
+                .map_err(|_| {
+                    AppError::CryptoError("Invalid entropy value commitment".to_string())
+                })?;
+            let entropy_value_commitment =
+                CompressedRistretto::from_slice(&entropy_value_commitment_bytes).map_err(|_| {
+                    AppError::CryptoError("Invalid entropy value commitment point".to_string())
+                })?;
+
+            range_proof
+                .verify_single(
+                    &self.bulletproof_gens,
+                    &self.pedersen_gens,
+                    transcript,
+                    &entropy_value_commitment,
+                    64,
+                )
+                .map_err(|e| {
+                    AppError::CryptoError(format!("Range proof verification failed: {:?}", e))
+                })?;
+        }
 
         Ok(true)
     }

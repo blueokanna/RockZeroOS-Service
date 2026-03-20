@@ -581,6 +581,53 @@ pub struct GenerateProofRequest {
     pub context: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GenerateBatchProofRequest {
+    pub context: String,
+    pub count: usize,
+}
+
+fn resolve_registration_and_password(
+    stored_registration_json: Option<String>,
+    stored_sae_secret: Option<String>,
+    body_registration: Option<PasswordRegistration>,
+    body_password: Option<String>,
+    context: &str,
+) -> Result<(PasswordRegistration, String), AppError> {
+    let registration = if let Some(registration) = body_registration {
+        registration
+    } else {
+        let zkp_registration_json = stored_registration_json.ok_or_else(|| {
+            AppError::BadRequest(
+                "User does not have ZKP registration data; please re-login or re-register"
+                    .to_string(),
+            )
+        })?;
+
+        serde_json::from_str::<PasswordRegistration>(&zkp_registration_json).map_err(|e| {
+            AppError::InternalServerError(format!(
+                "Invalid ZKP registration data in database: {}",
+                e
+            ))
+        })?
+    };
+
+    let proof_password = if context == "hls_segment_access" {
+        stored_sae_secret.ok_or_else(|| {
+            AppError::BadRequest(
+                "User does not have SAE secret; please re-login to refresh credentials"
+                    .to_string(),
+            )
+        })?
+    } else {
+        body_password.ok_or_else(|| {
+            AppError::BadRequest("Missing password for proof generation".to_string())
+        })?
+    };
+
+    Ok((registration, proof_password))
+}
+
 pub async fn generate_zkp_proof(
     pool: web::Data<SqlitePool>,
     claims: web::ReqData<Claims>,
@@ -593,33 +640,13 @@ pub async fn generate_zkp_proof(
         .await?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    let registration = if let Some(registration) = body.registration.clone() {
-        registration
-    } else {
-        let zkp_registration_json = user.zkp_registration.ok_or_else(|| {
-            AppError::BadRequest(
-                "User does not have ZKP registration data; please re-login or re-register"
-                    .to_string(),
-            )
-        })?;
-
-        serde_json::from_str::<PasswordRegistration>(&zkp_registration_json).map_err(|e| {
-            AppError::InternalServerError(format!("Invalid ZKP registration data in database: {}", e))
-        })?
-    };
-
-    let proof_password = if body.context == "hls_segment_access" {
-        user.sae_secret.clone().ok_or_else(|| {
-            AppError::BadRequest(
-                "User does not have SAE secret; please re-login to refresh credentials"
-                    .to_string(),
-            )
-        })?
-    } else {
-        body.password
-            .clone()
-            .ok_or_else(|| AppError::BadRequest("Missing password for proof generation".to_string()))?
-    };
+    let (registration, proof_password) = resolve_registration_and_password(
+        user.zkp_registration.clone(),
+        user.sae_secret.clone(),
+        body.registration.clone(),
+        body.password.clone(),
+        &body.context,
+    )?;
 
     match zkp_context.generate_enhanced_proof(&proof_password, &registration, &body.context) {
         Ok(proof) => Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -631,4 +658,39 @@ pub async fn generate_zkp_proof(
             "error": e.to_string()
         }))),
     }
+}
+
+pub async fn generate_zkp_proof_batch(
+    pool: web::Data<SqlitePool>,
+    claims: web::ReqData<Claims>,
+    body: web::Json<GenerateBatchProofRequest>,
+) -> Result<impl Responder, AppError> {
+    let user_id = claims.sub.clone();
+    let user = crate::db::find_user_by_id(&pool, &user_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    let count = body.count.clamp(1, 12);
+    let zkp_context = ZkpContext::new();
+    let (registration, proof_password) = resolve_registration_and_password(
+        user.zkp_registration.clone(),
+        user.sae_secret.clone(),
+        None,
+        None,
+        &body.context,
+    )?;
+
+    let mut proofs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let proof = zkp_context
+            .generate_enhanced_proof(&proof_password, &registration, &body.context)
+            .map_err(|e| AppError::BadRequest(format!("Proof generation failed: {}", e)))?;
+        proofs.push(proof);
+    }
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "proofs": proofs,
+        "count": proofs.len(),
+    })))
 }
