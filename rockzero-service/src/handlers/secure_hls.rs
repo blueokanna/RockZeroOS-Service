@@ -104,7 +104,7 @@ fn is_strict_external_cache_required() -> bool {
             let v = v.trim().to_ascii_lowercase();
             matches!(v.as_str(), "1" | "true" | "yes" | "on")
         })
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 pub fn initialize_external_cache_startup_guard() -> bool {
@@ -143,41 +143,6 @@ pub fn initialize_external_cache_startup_guard() -> bool {
             false
         }
     }
-}
-
-fn ensure_playback_chain_allowed() -> Result<(), AppError> {
-    if !is_strict_external_cache_required() {
-        return Ok(());
-    }
-
-    {
-        let guard = external_cache_startup_guard()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if guard.checked && guard.ready {
-            return Ok(());
-        }
-        if guard.checked && !guard.ready {
-            return Err(AppError::PreconditionFailed(format!(
-                "Secure playback chain is blocked: {}. Please mount external storage under /mnt and configure HLS_CACHE_PATH before starting playback.",
-                guard.message
-            )));
-        }
-    }
-
-    // Defensive fallback: if startup initialization was skipped, validate lazily once.
-    let ok = initialize_external_cache_startup_guard();
-    if ok {
-        return Ok(());
-    }
-
-    let guard = external_cache_startup_guard()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    Err(AppError::PreconditionFailed(format!(
-        "Secure playback chain is blocked: {}. Please mount external storage under /mnt and configure HLS_CACHE_PATH before starting playback.",
-        guard.message
-    )))
 }
 
 fn get_cached_no_disk_segment(cache_key: &str) -> Option<Vec<u8>> {
@@ -654,8 +619,6 @@ pub async fn create_hls_session(
     claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<CreateSessionRequest>,
 ) -> Result<impl Responder, AppError> {
-    ensure_playback_chain_allowed()?;
-
     let user_id = claims.sub.clone();
 
     let file_path = if let Some(ref file_id) = body.file_id {
@@ -1955,8 +1918,6 @@ pub async fn get_secure_playlist(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<String>,
 ) -> Result<impl Responder, AppError> {
-    ensure_playback_chain_allowed()?;
-
     let session_id = path.into_inner();
 
     info!(
@@ -2166,8 +2127,6 @@ pub async fn get_segment_direct(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<(String, String)>,
 ) -> Result<impl Responder, AppError> {
-    ensure_playback_chain_allowed()?;
-
     let (session_id, segment_name) = path.into_inner();
 
     // 验证段名称格式
@@ -2377,8 +2336,6 @@ pub async fn get_secure_segment(
     req: actix_web::HttpRequest,
     body: web::Bytes,
 ) -> Result<impl Responder, AppError> {
-    ensure_playback_chain_allowed()?;
-
     let (session_id, segment_name) = path.into_inner();
 
     if req.method() != actix_web::http::Method::POST {
