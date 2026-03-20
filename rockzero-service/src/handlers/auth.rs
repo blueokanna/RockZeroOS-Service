@@ -518,8 +518,12 @@ pub async fn register(
 
     let sae_secret = compute_sae_secret(&body.password);
 
+    // Unify ZKP credential source with SAE secret so client never needs to persist raw password.
+    let zkp_ctx = ZkpContext::new();
+    let sae_based_registration = zkp_ctx.register_password(&sae_secret)?;
+
     let zkp_registration_json =
-        serde_json::to_string(&credentials.zkp_registration).map_err(|e| {
+        serde_json::to_string(&sae_based_registration).map_err(|e| {
             AppError::InternalServerError(format!("Failed to serialize ZKP registration: {}", e))
         })?;
 
@@ -581,6 +585,21 @@ pub async fn login(
             warn!("Failed to update sae_secret for user {}: {}", user.id, e);
         } else {
             info!("Updated sae_secret for user {}", user.id);
+        }
+    }
+
+    // Keep ZKP registration aligned with SAE secret representation for HLS proof generation.
+    let zkp_ctx = ZkpContext::new();
+    match zkp_ctx.register_password(&sae_secret) {
+        Ok(registration) => {
+            if let Ok(reg_json) = serde_json::to_string(&registration) {
+                if let Err(e) = crate::db::update_user_zkp_registration(&pool, &user.id, &reg_json).await {
+                    warn!("Failed to update zkp_registration for user {}: {}", user.id, e);
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Failed to regenerate ZKP registration for user {}: {}", user.id, e);
         }
     }
 

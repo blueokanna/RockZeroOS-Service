@@ -469,3 +469,24 @@ pub async fn update_user_sae_secret(
 
     Ok(())
 }
+
+/// Update user's ZKP registration payload
+pub async fn update_user_zkp_registration(
+    pool: &SqlitePool,
+    user_id: &str,
+    zkp_registration: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        UPDATE users SET zkp_registration = ?, updated_at = datetime('now')
+        WHERE id = ?
+        "#,
+    )
+    .bind(zkp_registration)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    Ok(())
+}

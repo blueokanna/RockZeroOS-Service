@@ -576,7 +576,7 @@ mod tests {
 pub struct GenerateProofRequest {
     #[allow(dead_code)]
     pub username: Option<String>,
-    pub password: String,
+    pub password: Option<String>,
     pub registration: Option<PasswordRegistration>,
     pub context: String,
 }
@@ -589,13 +589,13 @@ pub async fn generate_zkp_proof(
     let zkp_context = ZkpContext::new();
     let user_id = claims.sub.clone();
 
+    let user = crate::db::find_user_by_id(&pool, &user_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
     let registration = if let Some(registration) = body.registration.clone() {
         registration
     } else {
-        let user = crate::db::find_user_by_id(&pool, &user_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
-
         let zkp_registration_json = user.zkp_registration.ok_or_else(|| {
             AppError::BadRequest(
                 "User does not have ZKP registration data; please re-login or re-register"
@@ -608,7 +608,20 @@ pub async fn generate_zkp_proof(
         })?
     };
 
-    match zkp_context.generate_enhanced_proof(&body.password, &registration, &body.context) {
+    let proof_password = if body.context == "hls_segment_access" {
+        user.sae_secret.clone().ok_or_else(|| {
+            AppError::BadRequest(
+                "User does not have SAE secret; please re-login to refresh credentials"
+                    .to_string(),
+            )
+        })?
+    } else {
+        body.password
+            .clone()
+            .ok_or_else(|| AppError::BadRequest("Missing password for proof generation".to_string()))?
+    };
+
+    match zkp_context.generate_enhanced_proof(&proof_password, &registration, &body.context) {
         Ok(proof) => Ok(HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "proof": proof

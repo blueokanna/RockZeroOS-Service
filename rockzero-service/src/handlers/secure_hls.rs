@@ -2374,15 +2374,15 @@ async fn touch_cache_access(cache_dir: &std::path::Path) {
 /// 优先级:
 /// 1. `HLS_CACHE_PATH` 环境变量（与 StorageConfig 一致）
 /// 2. `ROCKZERO_HLS_CACHE_DIR` 环境变量（兼容旧配置）
-/// 3. 默认 `./data/hls_cache`（与 StorageConfig 默认值一致）
+/// 3. 默认 `/mnt/external/cache/hls`（与 StorageConfig 默认值一致）
 fn get_hls_cache_dir() -> std::path::PathBuf {
     // 优先使用 HLS_CACHE_PATH（与 StorageConfig 一致）
     std::env::var("HLS_CACHE_PATH")
         .or_else(|_| std::env::var("ROCKZERO_HLS_CACHE_DIR"))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
-            // 默认使用 ./data/hls_cache（与 StorageConfig 默认值一致）
-            std::path::PathBuf::from("./data/hls_cache")
+            // 默认使用 /mnt/external/cache/hls（与 StorageConfig 默认值一致）
+            std::path::PathBuf::from("/mnt/external/cache/hls")
         })
 }
 

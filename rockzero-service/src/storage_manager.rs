@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use sysinfo::System;
 use tokio::fs;
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
@@ -44,6 +45,8 @@ pub struct StorageConfig {
     pub hls_cache_path: PathBuf,
     pub log_path: PathBuf,
     pub min_free_space: u64,
+    pub min_free_memory: u64,
+    pub warning_free_memory: u64,
     pub warning_free_space: u64,
     pub critical_free_space: u64,
     pub max_hls_cache_size: u64,
@@ -56,13 +59,16 @@ pub struct StorageConfig {
 
 impl Default for StorageConfig {
     fn default() -> Self {
+        let external = PathBuf::from("/mnt/external");
         Self {
-            external_storage_path: PathBuf::from("/mnt/external"),
-            video_storage_path: PathBuf::from("/mnt/external/videos"),
-            temp_storage_path: PathBuf::from("/mnt/external/temp"),
-            hls_cache_path: PathBuf::from("./data/hls_cache"),
-            log_path: PathBuf::from("./data/logs"),
+            external_storage_path: external.clone(),
+            video_storage_path: external.join("videos"),
+            temp_storage_path: external.join("temp"),
+            hls_cache_path: external.join("cache/hls"),
+            log_path: external.join("logs"),
             min_free_space: 512 * 1024 * 1024,           // 512 MB
+            min_free_memory: 512 * 1024 * 1024,          // 512 MB
+            warning_free_memory: 768 * 1024 * 1024,      // 768 MB
             warning_free_space: 2 * 1024 * 1024 * 1024,  // 2 GB
             critical_free_space: 1024 * 1024 * 1024,     // 1 GB
             max_hls_cache_size: 1024 * 1024 * 1024,      // 1 GB — 超过自动清理
@@ -96,12 +102,17 @@ impl StorageConfig {
                 .unwrap_or_else(|_| "/mnt/external/temp".to_string())
                 .into(),
             hls_cache_path: std::env::var("HLS_CACHE_PATH")
-                .unwrap_or_else(|_| "./data/hls_cache".to_string())
+                .unwrap_or_else(|_| "/mnt/external/cache/hls".to_string())
                 .into(),
             log_path: std::env::var("LOG_PATH")
-                .unwrap_or_else(|_| "./data/logs".to_string())
+                .unwrap_or_else(|_| "/mnt/external/logs".to_string())
                 .into(),
             min_free_space: env_u64("MIN_FREE_SPACE", defaults.min_free_space),
+            min_free_memory: env_u64("MIN_FREE_MEMORY", defaults.min_free_memory),
+            warning_free_memory: env_u64(
+                "WARNING_FREE_MEMORY",
+                defaults.warning_free_memory,
+            ),
             warning_free_space: env_u64("WARNING_FREE_SPACE", defaults.warning_free_space),
             critical_free_space: env_u64("CRITICAL_FREE_SPACE", defaults.critical_free_space),
             max_hls_cache_size: env_u64("MAX_HLS_CACHE_SIZE", defaults.max_hls_cache_size),
@@ -117,6 +128,27 @@ impl StorageConfig {
             ),
             log_retention_days: env_u64("LOG_RETENTION_DAYS", defaults.log_retention_days),
         }
+        .normalize_external_paths()
+    }
+
+    fn normalize_external_paths(mut self) -> Self {
+        self.video_storage_path = coerce_external_path(
+            &self.video_storage_path,
+            &self.external_storage_path,
+            "videos",
+        );
+        self.temp_storage_path = coerce_external_path(
+            &self.temp_storage_path,
+            &self.external_storage_path,
+            "temp",
+        );
+        self.hls_cache_path = coerce_external_path(
+            &self.hls_cache_path,
+            &self.external_storage_path,
+            "cache/hls",
+        );
+        self.log_path = coerce_external_path(&self.log_path, &self.external_storage_path, "logs");
+        self
     }
 
     pub async fn init_directories(&self) -> std::io::Result<()> {
@@ -234,6 +266,17 @@ impl StorageManager {
         }
     }
 
+    pub fn get_memory_pressure_level(&self) -> CachePressureLevel {
+        let available = get_available_memory_bytes();
+        if available < self.config.min_free_memory {
+            CachePressureLevel::Emergency
+        } else if available < self.config.warning_free_memory {
+            CachePressureLevel::Warning
+        } else {
+            CachePressureLevel::Normal
+        }
+    }
+
     // ─── queries ───────────────────────────────────────────────
 
     pub async fn get_accurate_disk_usage(
@@ -326,15 +369,19 @@ impl StorageManager {
             0.0
         };
 
-        let status = if total_cache > threshold {
+        let memory_pressure = self.get_memory_pressure_level();
+        let status = if total_cache > threshold || memory_pressure == CachePressureLevel::Emergency {
             "cleaning".to_string()
-        } else if total_cache as f64 > threshold as f64 * 0.8 {
+        } else if total_cache as f64 > threshold as f64 * 0.8
+            || memory_pressure == CachePressureLevel::Warning
+        {
             "warning".to_string()
         } else {
             "healthy".to_string()
         };
 
         let pressure = self.get_pressure_level().await;
+        let available_memory = get_available_memory_bytes();
 
         AutoCleanupStatus {
             enabled: true,
@@ -347,6 +394,9 @@ impl StorageManager {
             total_cache_bytes: total_cache,
             usage_percent,
             pressure_level: format!("{}", pressure),
+            available_memory_bytes: available_memory,
+            min_reserved_memory_bytes: self.config.min_free_memory,
+            memory_pressure_level: format!("{}", memory_pressure),
             check_interval_secs: 30,
         }
     }
@@ -441,6 +491,31 @@ impl StorageManager {
             let mut tick = interval(Duration::from_secs(60));
             loop {
                 tick.tick().await;
+                match m.get_memory_pressure_level() {
+                    CachePressureLevel::Emergency => {
+                        warn!(
+                            "EMERGENCY memory pressure — available {} below minimum {}",
+                            format_bytes(get_available_memory_bytes()),
+                            format_bytes(m.config.min_free_memory),
+                        );
+                        if let Err(e) = m.emergency_eviction().await {
+                            error!("Emergency memory eviction failed: {}", e);
+                        }
+                        continue;
+                    }
+                    CachePressureLevel::Warning => {
+                        warn!(
+                            "Memory pressure warning — available {} below warning {}",
+                            format_bytes(get_available_memory_bytes()),
+                            format_bytes(m.config.warning_free_memory),
+                        );
+                        if let Err(e) = m.aggressive_cleanup().await {
+                            error!("Aggressive cleanup (memory pressure) failed: {}", e);
+                        }
+                    }
+                    _ => {}
+                }
+
                 match m.get_pressure_level().await {
                     CachePressureLevel::Emergency => {
                         warn!("EMERGENCY disk pressure — evicting all caches");
@@ -1028,6 +1103,12 @@ pub struct AutoCleanupStatus {
     pub usage_percent: f64,
     /// 磁盘压力级别
     pub pressure_level: String,
+    /// 当前可用内存
+    pub available_memory_bytes: u64,
+    /// 内存保底阈值（至少保留）
+    pub min_reserved_memory_bytes: u64,
+    /// 内存压力级别
+    pub memory_pressure_level: String,
     /// 检查间隔（秒）
     pub check_interval_secs: u32,
 }
@@ -1053,6 +1134,32 @@ pub fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{} B", bytes)
     }
+}
+
+fn path_is_external_like(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    if cfg!(target_os = "windows") {
+        return true;
+    }
+    s.starts_with("/mnt") || s.starts_with("/media") || s.starts_with("/storage")
+}
+
+fn coerce_external_path(path: &Path, external_root: &Path, fallback_suffix: &str) -> PathBuf {
+    if path_is_external_like(path) {
+        return path.to_path_buf();
+    }
+    let fallback = external_root.join(fallback_suffix);
+    warn!(
+        "Storage path {:?} is not external; redirecting to {:?}",
+        path, fallback
+    );
+    fallback
+}
+
+fn get_available_memory_bytes() -> u64 {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.available_memory()
 }
 
 /// Get filesystem-level statistics via platform syscalls
