@@ -559,7 +559,8 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
 
     let video_hash = blake3::hash(file_path.as_bytes());
     let video_id = hex::encode(&video_hash.as_bytes()[..8]);
-    let cache_dir = get_hls_cache_dir().join(&video_id);
+    let cache_root = ensure_external_hls_cache_root()?;
+    let cache_dir = cache_root.join(&video_id);
     let playlist_path = cache_dir.join("playlist.m3u8");
     // 标记文件表示分片完成 (包含 #EXT-X-ENDLIST)
     let done_marker = cache_dir.join(".done");
@@ -1892,7 +1893,8 @@ pub async fn get_segment_direct(
 
     let video_hash = blake3::hash(file_path.as_bytes());
     let video_id = hex::encode(&video_hash.as_bytes()[..8]);
-    let cache_dir = get_hls_cache_dir().join(&video_id);
+    let cache_root = ensure_external_hls_cache_root()?;
+    let cache_dir = cache_root.join(&video_id);
     let segment_path = cache_dir.join(&segment_name);
     let enc_path = segment_path.with_extension("ts.enc");
 
@@ -2095,7 +2097,8 @@ pub async fn get_secure_segment(
     let segment_data = {
         let video_hash = blake3::hash(session.file_path.as_bytes());
         let video_id = hex::encode(&video_hash.as_bytes()[..8]);
-        let cache_dir = get_hls_cache_dir().join(&video_id);
+        let cache_root = ensure_external_hls_cache_root()?;
+        let cache_dir = cache_root.join(&video_id);
         let segment_path = cache_dir.join(&segment_name);
 
         let storage_key = derive_segment_storage_key(&session.file_path);
@@ -2343,10 +2346,7 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
                 "Bulletproofs ZKP proof verification error for session {}: {}",
                 session.session_id, e
             );
-            Err(AppError::CryptoError(format!(
-                "Bulletproofs ZKP verification failed: {}",
-                e
-            )))
+            Ok(false)
         }
     }
 }
@@ -2384,6 +2384,72 @@ fn get_hls_cache_dir() -> std::path::PathBuf {
             // 默认使用 /mnt/external/cache/hls（与 StorageConfig 默认值一致）
             std::path::PathBuf::from("/mnt/external/cache/hls")
         })
+}
+
+#[cfg(target_os = "linux")]
+fn is_same_filesystem_as_root(path: &std::path::Path) -> bool {
+    use std::os::linux::fs::MetadataExt;
+
+    let root_md = match std::fs::metadata("/") {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let path_md = match std::fs::metadata(path) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    root_md.st_dev() == path_md.st_dev()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_same_filesystem_as_root(_path: &std::path::Path) -> bool {
+    false
+}
+
+fn ensure_external_hls_cache_root() -> Result<std::path::PathBuf, AppError> {
+    let root = get_hls_cache_dir();
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(stripped) = root.strip_prefix("/") {
+            let mut parts = stripped.components();
+            if let (Some(first), Some(second)) = (parts.next(), parts.next()) {
+                if first.as_os_str() == "mnt" {
+                    let anchor = std::path::Path::new("/")
+                        .join(first.as_os_str())
+                        .join(second.as_os_str());
+                    if !anchor.exists() {
+                        return Err(AppError::PreconditionFailed(format!(
+                            "External storage anchor {:?} is missing; refusing to create cache on internal storage",
+                            anchor
+                        )));
+                    }
+                    if is_same_filesystem_as_root(&anchor) {
+                        return Err(AppError::PreconditionFailed(format!(
+                            "External storage anchor {:?} is on root filesystem; refusing internal cache writes",
+                            anchor
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    std::fs::create_dir_all(&root).map_err(|e| {
+        AppError::IoError(format!(
+            "Failed to create external HLS cache directory {:?}: {}",
+            root, e
+        ))
+    })?;
+
+    if is_same_filesystem_as_root(&root) {
+        return Err(AppError::PreconditionFailed(format!(
+            "External HLS cache path {:?} is on root filesystem. Refusing to write cache to internal storage. Please mount external storage under /mnt and set HLS_CACHE_PATH.",
+            root
+        )));
+    }
+
+    Ok(root)
 }
 
 /// 从 FFmpeg 转码输出读取视频段
