@@ -15,6 +15,21 @@ use tracing::{info, warn};
 
 static SAE_ANTI_CLOGGING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 static SESSION_NO_DISK_MODE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+static NO_DISK_SEGMENT_CACHE: OnceLock<Mutex<HashMap<String, NoDiskSegmentCacheEntry>>> =
+    OnceLock::new();
+static NO_DISK_SEGMENT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+static NO_DISK_FALLBACK_WARNED: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+static HW_ACCEL_DETECTION_CACHE: OnceLock<HardwareAccel> = OnceLock::new();
+
+const NO_DISK_SEGMENT_TTL_SECS: u64 = 300;
+const NO_DISK_SEGMENT_MAX_ENTRIES: usize = 512;
+
+#[derive(Clone)]
+struct NoDiskSegmentCacheEntry {
+    data: Vec<u8>,
+    created_at: std::time::Instant,
+}
 
 fn no_disk_mode_registry() -> &'static Mutex<HashMap<String, bool>> {
     SESSION_NO_DISK_MODE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -28,12 +43,103 @@ fn set_session_no_disk_mode(session_id: &str, enabled: bool) {
 fn clear_session_no_disk_mode(session_id: &str) {
     let mut modes = no_disk_mode_registry().lock().unwrap_or_else(|e| e.into_inner());
     modes.remove(session_id);
+
+    // 清理 no-disk 告警去重键，防止长期运行造成无界增长。
+    let mut warned = no_disk_fallback_warned_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    warned.remove(session_id);
 }
 
 pub fn get_no_disk_playback_status() -> (bool, usize) {
     let modes = no_disk_mode_registry().lock().unwrap_or_else(|e| e.into_inner());
     let count = modes.values().filter(|&&enabled| enabled).count();
     (count > 0, count)
+}
+
+fn no_disk_segment_cache() -> &'static Mutex<HashMap<String, NoDiskSegmentCacheEntry>> {
+    NO_DISK_SEGMENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn no_disk_segment_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    NO_DISK_SEGMENT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn no_disk_fallback_warned_registry() -> &'static Mutex<HashMap<String, bool>> {
+    NO_DISK_FALLBACK_WARNED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_cached_no_disk_segment(cache_key: &str) -> Option<Vec<u8>> {
+    let mut cache = no_disk_segment_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|_, entry| {
+        entry.created_at.elapsed() < std::time::Duration::from_secs(NO_DISK_SEGMENT_TTL_SECS)
+    });
+    cache.get(cache_key).map(|entry| entry.data.clone())
+}
+
+fn put_cached_no_disk_segment(cache_key: String, data: Vec<u8>) {
+    let mut cache = no_disk_segment_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|_, entry| {
+        entry.created_at.elapsed() < std::time::Duration::from_secs(NO_DISK_SEGMENT_TTL_SECS)
+    });
+
+    if cache.len() >= NO_DISK_SEGMENT_MAX_ENTRIES {
+        let oldest_key = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.created_at)
+            .map(|(k, _)| k.clone());
+        if let Some(key) = oldest_key {
+            cache.remove(&key);
+        }
+    }
+
+    cache.insert(
+        cache_key,
+        NoDiskSegmentCacheEntry {
+            data,
+            created_at: std::time::Instant::now(),
+        },
+    );
+}
+
+fn get_no_disk_segment_lock(cache_key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = no_disk_segment_locks().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = locks.get(cache_key) {
+        return existing.clone();
+    }
+
+    let created = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(cache_key.to_string(), created.clone());
+    created
+}
+
+fn release_no_disk_segment_lock(cache_key: &str) {
+    let mut locks = no_disk_segment_locks().lock().unwrap_or_else(|e| e.into_inner());
+    locks.remove(cache_key);
+}
+
+fn warn_no_disk_fallback_once(session_id: Option<&str>, segment_name: &str) {
+    let Some(session_id) = session_id else {
+        warn!(
+            "External HLS cache unavailable, using no-disk transcoding for {}",
+            segment_name
+        );
+        return;
+    };
+
+    let mut warned = no_disk_fallback_warned_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if warned.contains_key(session_id) {
+        return;
+    }
+
+    warned.insert(session_id.to_string(), true);
+    warn!(
+        "External HLS cache unavailable for session {}, switching to no-disk transcoding path (first segment: {})",
+        session_id, segment_name
+    );
 }
 
 fn get_sae_anti_clogging_key() -> &'static [u8; 32] {
@@ -1946,11 +2052,9 @@ pub async fn get_segment_direct(
     let cache_root = ensure_external_hls_cache_root().ok();
 
     if cache_root.is_none() {
-        warn!(
-            "External cache unavailable for session {}, serving {} via no-disk transcoding",
-            session_id, segment_name
-        );
-        let segment_data = read_video_segment_from_ffmpeg(&file_path, &segment_name).await?;
+        warn_no_disk_fallback_once(Some(&session_id), &segment_name);
+        let segment_data =
+            read_video_segment_from_ffmpeg(&file_path, &segment_name, Some(&session_id)).await?;
 
         let manager = hls_manager.read().await;
         let session = manager
@@ -2188,14 +2292,17 @@ pub async fn get_secure_segment(
             if enc_path.exists() || segment_path.exists() {
                 read_segment_data(&segment_path, &storage_key).await?
             } else {
-                read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?
+                read_video_segment_from_ffmpeg(
+                    &session.file_path,
+                    &segment_name,
+                    Some(&session_id),
+                )
+                .await?
             }
         } else {
-            warn!(
-                "External cache unavailable for secure segment {}, using no-disk transcoding",
-                segment_name
-            );
-            read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?
+            warn_no_disk_fallback_once(Some(&session_id), &segment_name);
+            read_video_segment_from_ffmpeg(&session.file_path, &segment_name, Some(&session_id))
+                .await?
         }
     };
 
@@ -2570,6 +2677,7 @@ fn ensure_external_hls_cache_root() -> Result<std::path::PathBuf, AppError> {
 async fn read_video_segment_from_ffmpeg(
     file_path: &str,
     segment_name: &str,
+    session_id: Option<&str>,
 ) -> Result<Vec<u8>, AppError> {
     use std::path::PathBuf;
 
@@ -2609,10 +2717,20 @@ async fn read_video_segment_from_ffmpeg(
     let cached_segment_path = cache_dir.as_ref().map(|dir| dir.join(segment_name));
 
     if cache_dir.is_none() {
-        warn!(
-            "External HLS cache unavailable, using no-disk transcoding for {}",
-            segment_name
-        );
+        warn_no_disk_fallback_once(session_id, segment_name);
+
+        let cache_key = format!("{}:{}", video_id, segment_name);
+        if let Some(cached) = get_cached_no_disk_segment(&cache_key) {
+            return Ok(cached);
+        }
+
+        let lock = get_no_disk_segment_lock(&cache_key);
+        let _guard = lock.lock().await;
+
+        if let Some(cached) = get_cached_no_disk_segment(&cache_key) {
+            return Ok(cached);
+        }
+
         let original_video = PathBuf::from(file_path);
         if !original_video.exists() {
             return Err(AppError::NotFound(format!(
@@ -2620,7 +2738,14 @@ async fn read_video_segment_from_ffmpeg(
                 file_path
             )));
         }
-        return transcode_segment_in_memory(&original_video, segment_index).await;
+
+        let transcode_result = transcode_segment_in_memory(&original_video, segment_index).await;
+        if let Ok(ref segment_data) = transcode_result {
+            put_cached_no_disk_segment(cache_key.clone(), segment_data.clone());
+        }
+        drop(_guard);
+        release_no_disk_segment_lock(&cache_key);
+        return transcode_result;
     }
 
     let cache_dir = cache_dir.expect("checked above");
@@ -2944,6 +3069,16 @@ enum HardwareAccel {
 /// 4. VAAPI (`h264_vaapi`) — Intel/AMD GPU（仅 x86_64）
 /// 5. 软件编码 (`libx264`) — 最终回退
 async fn detect_hardware_acceleration() -> HardwareAccel {
+    if let Some(cached) = HW_ACCEL_DETECTION_CACHE.get() {
+        return *cached;
+    }
+
+    let detected = detect_hardware_acceleration_uncached().await;
+    let _ = HW_ACCEL_DETECTION_CACHE.set(detected);
+    detected
+}
+
+async fn detect_hardware_acceleration_uncached() -> HardwareAccel {
     use tokio::fs;
 
     let is_arm = cfg!(target_arch = "aarch64") || cfg!(target_arch = "arm") || {
@@ -3146,15 +3281,16 @@ mod tests {
     #[tokio::test]
     async fn test_segment_name_validation() {
         // 无效的段名称格式（路径遍历攻击）
-        let result = read_video_segment_from_ffmpeg("/video.mp4", "../../../etc/passwd").await;
+        let result =
+            read_video_segment_from_ffmpeg("/video.mp4", "../../../etc/passwd", None).await;
         assert!(matches!(result, Err(AppError::BadRequest(_))));
 
         // 无效的段名称格式（负数索引）
-        let result = read_video_segment_from_ffmpeg("/video.mp4", "segment_-1.ts").await;
+        let result = read_video_segment_from_ffmpeg("/video.mp4", "segment_-1.ts", None).await;
         assert!(matches!(result, Err(AppError::BadRequest(_))));
 
         // 无效的段名称格式（非数字索引）
-        let result = read_video_segment_from_ffmpeg("/video.mp4", "segment_abc.ts").await;
+        let result = read_video_segment_from_ffmpeg("/video.mp4", "segment_abc.ts", None).await;
         assert!(matches!(result, Err(AppError::BadRequest(_))));
     }
 
