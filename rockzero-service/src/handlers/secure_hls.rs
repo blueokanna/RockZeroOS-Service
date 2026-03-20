@@ -421,8 +421,6 @@ pub async fn init_sae_handshake(
     claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<InitSaeRequest>,
 ) -> Result<impl Responder, AppError> {
-    ensure_playback_chain_allowed()?;
-
     let user_id = claims.sub.clone();
 
     let file_path = if let Some(ref file_id) = body.file_id {
@@ -502,8 +500,6 @@ pub async fn send_client_commit(
     claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<SendClientCommitRequest>,
 ) -> Result<impl Responder, AppError> {
-    ensure_playback_chain_allowed()?;
-
     let user_id = claims.sub.clone();
 
     if !verify_anti_clogging_token(
@@ -554,8 +550,6 @@ pub async fn send_client_confirm(
     claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<SendClientConfirmRequest>,
 ) -> Result<impl Responder, AppError> {
-    ensure_playback_chain_allowed()?;
-
     let user_id = claims.sub.clone();
 
     if !verify_anti_clogging_token(
@@ -601,8 +595,6 @@ pub async fn complete_sae_handshake(
     claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<CompleteSaeRequest>,
 ) -> Result<impl Responder, AppError> {
-    ensure_playback_chain_allowed()?;
-
     let user_id = claims.sub.clone();
 
     if !verify_anti_clogging_token(
