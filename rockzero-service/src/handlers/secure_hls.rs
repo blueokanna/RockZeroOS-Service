@@ -21,6 +21,9 @@ static NO_DISK_SEGMENT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mu
     OnceLock::new();
 static NO_DISK_FALLBACK_WARNED: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 static HW_ACCEL_DETECTION_CACHE: OnceLock<HardwareAccel> = OnceLock::new();
+static VIDEO_CODEC_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+static EXTERNAL_CACHE_STARTUP_GUARD: OnceLock<Mutex<ExternalCacheStartupGuard>> =
+    OnceLock::new();
 
 const NO_DISK_SEGMENT_TTL_SECS: u64 = 300;
 const NO_DISK_SEGMENT_MAX_ENTRIES: usize = 512;
@@ -29,6 +32,13 @@ const NO_DISK_SEGMENT_MAX_ENTRIES: usize = 512;
 struct NoDiskSegmentCacheEntry {
     data: Vec<u8>,
     created_at: std::time::Instant,
+}
+
+#[derive(Clone)]
+struct ExternalCacheStartupGuard {
+    checked: bool,
+    ready: bool,
+    message: String,
 }
 
 fn no_disk_mode_registry() -> &'static Mutex<HashMap<String, bool>> {
@@ -67,6 +77,107 @@ fn no_disk_segment_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mu
 
 fn no_disk_fallback_warned_registry() -> &'static Mutex<HashMap<String, bool>> {
     NO_DISK_FALLBACK_WARNED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn video_codec_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    VIDEO_CODEC_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn external_cache_startup_guard() -> &'static Mutex<ExternalCacheStartupGuard> {
+    EXTERNAL_CACHE_STARTUP_GUARD.get_or_init(|| {
+        Mutex::new(ExternalCacheStartupGuard {
+            checked: false,
+            ready: false,
+            message: "external cache guard has not been initialized".to_string(),
+        })
+    })
+}
+
+fn is_strict_external_cache_required() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+
+    std::env::var("ROCKZERO_STRICT_EXTERNAL_HLS_CACHE")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(true)
+}
+
+pub fn initialize_external_cache_startup_guard() -> bool {
+    let strict = is_strict_external_cache_required();
+
+    let mut guard = external_cache_startup_guard()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if !strict {
+        guard.checked = true;
+        guard.ready = true;
+        guard.message =
+            "strict external HLS cache guard is disabled by ROCKZERO_STRICT_EXTERNAL_HLS_CACHE"
+                .to_string();
+        return true;
+    }
+
+    match ensure_external_hls_cache_root() {
+        Ok(path) => {
+            guard.checked = true;
+            guard.ready = true;
+            guard.message = format!(
+                "external HLS cache validated at startup: {}",
+                path.display()
+            );
+            true
+        }
+        Err(e) => {
+            guard.checked = true;
+            guard.ready = false;
+            guard.message = format!(
+                "external HLS cache startup validation failed: {}",
+                e
+            );
+            false
+        }
+    }
+}
+
+fn ensure_playback_chain_allowed() -> Result<(), AppError> {
+    if !is_strict_external_cache_required() {
+        return Ok(());
+    }
+
+    {
+        let guard = external_cache_startup_guard()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.checked && guard.ready {
+            return Ok(());
+        }
+        if guard.checked && !guard.ready {
+            return Err(AppError::PreconditionFailed(format!(
+                "Secure playback chain is blocked: {}. Please mount external storage under /mnt and configure HLS_CACHE_PATH before starting playback.",
+                guard.message
+            )));
+        }
+    }
+
+    // Defensive fallback: if startup initialization was skipped, validate lazily once.
+    let ok = initialize_external_cache_startup_guard();
+    if ok {
+        return Ok(());
+    }
+
+    let guard = external_cache_startup_guard()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    Err(AppError::PreconditionFailed(format!(
+        "Secure playback chain is blocked: {}. Please mount external storage under /mnt and configure HLS_CACHE_PATH before starting playback.",
+        guard.message
+    )))
 }
 
 fn get_cached_no_disk_segment(cache_key: &str) -> Option<Vec<u8>> {
@@ -140,6 +251,29 @@ fn warn_no_disk_fallback_once(session_id: Option<&str>, segment_name: &str) {
         "External HLS cache unavailable for session {}, switching to no-disk transcoding path (first segment: {})",
         session_id, segment_name
     );
+}
+
+fn parse_segment_index_from_name(segment_name: &str) -> Option<usize> {
+    if !segment_name.starts_with("segment_") || !segment_name.ends_with(".ts") {
+        return None;
+    }
+
+    segment_name
+        .trim_start_matches("segment_")
+        .trim_end_matches(".ts")
+        .parse::<usize>()
+        .ok()
+}
+
+fn prewarm_no_disk_segments(file_path: String, session_id: String, current_idx: usize) {
+    tokio::spawn(async move {
+        const PREWARM_WINDOW: usize = 2;
+        for next in 1..=PREWARM_WINDOW {
+            let idx = current_idx.saturating_add(next);
+            let segment_name = format!("segment_{}.ts", idx);
+            let _ = read_video_segment_from_ffmpeg(&file_path, &segment_name, Some(&session_id)).await;
+        }
+    });
 }
 
 fn get_sae_anti_clogging_key() -> &'static [u8; 32] {
@@ -287,6 +421,8 @@ pub async fn init_sae_handshake(
     claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<InitSaeRequest>,
 ) -> Result<impl Responder, AppError> {
+    ensure_playback_chain_allowed()?;
+
     let user_id = claims.sub.clone();
 
     let file_path = if let Some(ref file_id) = body.file_id {
@@ -366,6 +502,8 @@ pub async fn send_client_commit(
     claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<SendClientCommitRequest>,
 ) -> Result<impl Responder, AppError> {
+    ensure_playback_chain_allowed()?;
+
     let user_id = claims.sub.clone();
 
     if !verify_anti_clogging_token(
@@ -416,6 +554,8 @@ pub async fn send_client_confirm(
     claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<SendClientConfirmRequest>,
 ) -> Result<impl Responder, AppError> {
+    ensure_playback_chain_allowed()?;
+
     let user_id = claims.sub.clone();
 
     if !verify_anti_clogging_token(
@@ -461,6 +601,8 @@ pub async fn complete_sae_handshake(
     claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<CompleteSaeRequest>,
 ) -> Result<impl Responder, AppError> {
+    ensure_playback_chain_allowed()?;
+
     let user_id = claims.sub.clone();
 
     if !verify_anti_clogging_token(
@@ -520,6 +662,8 @@ pub async fn create_hls_session(
     claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<CreateSessionRequest>,
 ) -> Result<impl Responder, AppError> {
+    ensure_playback_chain_allowed()?;
+
     let user_id = claims.sub.clone();
 
     let file_path = if let Some(ref file_id) = body.file_id {
@@ -1819,6 +1963,8 @@ pub async fn get_secure_playlist(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<String>,
 ) -> Result<impl Responder, AppError> {
+    ensure_playback_chain_allowed()?;
+
     let session_id = path.into_inner();
 
     info!(
@@ -2028,6 +2174,8 @@ pub async fn get_segment_direct(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<(String, String)>,
 ) -> Result<impl Responder, AppError> {
+    ensure_playback_chain_allowed()?;
+
     let (session_id, segment_name) = path.into_inner();
 
     // 验证段名称格式
@@ -2053,6 +2201,9 @@ pub async fn get_segment_direct(
 
     if cache_root.is_none() {
         warn_no_disk_fallback_once(Some(&session_id), &segment_name);
+        if let Some(idx) = parse_segment_index_from_name(&segment_name) {
+            prewarm_no_disk_segments(file_path.clone(), session_id.clone(), idx);
+        }
         let segment_data =
             read_video_segment_from_ffmpeg(&file_path, &segment_name, Some(&session_id)).await?;
 
@@ -2070,6 +2221,7 @@ pub async fn get_segment_direct(
             .insert_header(("X-Encryption-Method", "AES-256-GCM"))
             .insert_header(("X-Key-Exchange", "WPA3-SAE"))
             .insert_header(("X-Integrity", "Blake3"))
+            .insert_header(("X-No-Disk-Mode", "true"))
             .insert_header(("Content-Length", encrypted_data.len()))
             .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
             .insert_header(("Access-Control-Allow-Origin", "*"))
@@ -2220,6 +2372,7 @@ pub async fn get_segment_direct(
         .insert_header(("X-Encryption-Method", "AES-256-GCM"))
         .insert_header(("X-Key-Exchange", "WPA3-SAE"))
         .insert_header(("X-Integrity", "Blake3"))
+        .insert_header(("X-No-Disk-Mode", "false"))
         .insert_header(("Content-Length", encrypted_data.len()))
         .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
         .insert_header(("Access-Control-Allow-Origin", "*"))
@@ -2232,6 +2385,8 @@ pub async fn get_secure_segment(
     req: actix_web::HttpRequest,
     body: web::Bytes,
 ) -> Result<impl Responder, AppError> {
+    ensure_playback_chain_allowed()?;
+
     let (session_id, segment_name) = path.into_inner();
 
     if req.method() != actix_web::http::Method::POST {
@@ -2276,6 +2431,8 @@ pub async fn get_secure_segment(
         session_id, segment_name
     );
 
+    let mut no_disk_mode = false;
+
     let segment_data = {
         let video_hash = blake3::hash(session.file_path.as_bytes());
         let video_id = hex::encode(&video_hash.as_bytes()[..8]);
@@ -2301,6 +2458,10 @@ pub async fn get_secure_segment(
             }
         } else {
             warn_no_disk_fallback_once(Some(&session_id), &segment_name);
+            no_disk_mode = true;
+            if let Some(idx) = parse_segment_index_from_name(&segment_name) {
+                prewarm_no_disk_segments(session.file_path.clone(), session_id.clone(), idx);
+            }
             read_video_segment_from_ffmpeg(&session.file_path, &segment_name, Some(&session_id))
                 .await?
         }
@@ -2323,6 +2484,10 @@ pub async fn get_secure_segment(
         .insert_header(("X-Encrypted", "true"))
         .insert_header(("X-Encryption-Method", "AES-256-GCM"))
         .insert_header(("X-ZKP-Verified", "true"))
+        .insert_header((
+            "X-No-Disk-Mode",
+            if no_disk_mode { "true" } else { "false" },
+        ))
         .insert_header(("Content-Length", encrypted_segment.len()))
         .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
         .insert_header(("Pragma", "no-cache"))
@@ -2815,6 +2980,76 @@ async fn transcode_segment_in_memory(
         .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
         .unwrap_or_else(|_| "ffmpeg".to_string());
 
+    let file_path_str = video_path.to_string_lossy().to_string();
+    let codec_key = hex::encode(blake3::hash(file_path_str.as_bytes()).as_bytes());
+
+    let maybe_codec = {
+        let cache = video_codec_cache().lock().unwrap_or_else(|e| e.into_inner());
+        cache.get(&codec_key).cloned().flatten()
+    };
+
+    let video_codec = match maybe_codec {
+        Some(codec) => Some(codec),
+        None => {
+            let detected = detect_video_codec(&ffmpeg_path, &file_path_str).await;
+            let mut cache = video_codec_cache().lock().unwrap_or_else(|e| e.into_inner());
+            cache.insert(codec_key, detected.clone());
+            detected
+        }
+    };
+
+    let can_try_stream_copy = matches!(video_codec.as_deref(), Some("h264" | "hevc" | "h265"));
+
+    if can_try_stream_copy {
+        let bsf = if matches!(video_codec.as_deref(), Some("hevc" | "h265")) {
+            "hevc_mp4toannexb"
+        } else {
+            "h264_mp4toannexb"
+        };
+
+        let copy_args = vec![
+            "-v".to_string(),
+            "warning".to_string(),
+            "-ss".to_string(),
+            format!("{:.3}", start_time),
+            "-i".to_string(),
+            file_path_str.clone(),
+            "-t".to_string(),
+            format!("{:.3}", SEGMENT_DURATION),
+            "-map".to_string(),
+            "0:v:0".to_string(),
+            "-map".to_string(),
+            "0:a?".to_string(),
+            "-c".to_string(),
+            "copy".to_string(),
+            "-bsf:v".to_string(),
+            bsf.to_string(),
+            "-fflags".to_string(),
+            "+genpts".to_string(),
+            "-avoid_negative_ts".to_string(),
+            "make_zero".to_string(),
+            "-muxdelay".to_string(),
+            "0".to_string(),
+            "-muxpreload".to_string(),
+            "0".to_string(),
+            "-f".to_string(),
+            "mpegts".to_string(),
+            "pipe:1".to_string(),
+        ];
+
+        let copy_out = Command::new(&ffmpeg_path)
+            .args(&copy_args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| AppError::IoError(format!("Failed to run ffmpeg copy mode: {}", e)))?;
+
+        if copy_out.status.success() && !copy_out.stdout.is_empty() {
+            return Ok(copy_out.stdout);
+        }
+    }
+
     let hw_accel = detect_hardware_acceleration().await;
     let mut args = vec![
         "-v".to_string(),
@@ -2843,7 +3078,7 @@ async fn transcode_segment_in_memory(
 
     args.extend(vec![
         "-i".to_string(),
-        video_path.to_string_lossy().to_string(),
+        file_path_str,
         "-t".to_string(),
         format!("{:.3}", SEGMENT_DURATION),
         "-c:v".to_string(),

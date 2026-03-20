@@ -151,6 +151,17 @@ async fn main() -> std::io::Result<()> {
     let secure_hls_manager = Arc::new(RwLock::new(rockzero_media::HlsSessionManager::new()));
     info!("Secure HLS streaming: WPA3-SAE + ZKP + AES-256-GCM enabled");
 
+    let external_cache_ready = handlers::secure_hls::initialize_external_cache_startup_guard();
+    if external_cache_ready {
+        info!(
+            "Secure HLS startup guard passed: external cache is ready for production playback"
+        );
+    } else {
+        info!(
+            "Secure HLS startup guard failed: playback chain will be blocked until external cache is correctly mounted"
+        );
+    }
+
     // Initialize hybrid transport (UDP 70% + TCP 30%)
     let stream_config = rockzero_media::secure_transport::StreamConfig::default();
     let secure_transport = Arc::new(
