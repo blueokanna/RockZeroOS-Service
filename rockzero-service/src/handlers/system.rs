@@ -102,6 +102,8 @@ pub struct HardwareInfo {
     pub disks: Vec<DiskInfo>,
     pub usb_devices: Vec<UsbDevice>,
     pub network_interfaces: Vec<NetworkInterfaceInfo>,
+    pub no_disk_playback_mode_active: bool,
+    pub no_disk_playback_session_count: usize,
 }
 
 pub async fn get_system_info() -> Result<impl Responder, AppError> {
@@ -630,6 +632,8 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
 
         let usb_devices = detect_usb_devices();
         let network_interfaces = detect_network_interfaces();
+        let (no_disk_playback_mode_active, no_disk_playback_session_count) =
+            crate::handlers::secure_hls::get_no_disk_playback_status();
 
         Ok(HardwareInfo {
             system: system_info,
@@ -638,6 +642,8 @@ pub async fn get_hardware_info() -> Result<impl Responder, AppError> {
             disks,
             usb_devices,
             network_interfaces,
+            no_disk_playback_mode_active,
+            no_disk_playback_session_count,
         })
     })
     .await
