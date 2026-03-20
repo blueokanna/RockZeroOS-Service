@@ -3,10 +3,11 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use rand::RngCore;
+use rockzero_crypto::{EnhancedPasswordProof, PasswordRegistration, ZkpContext};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -65,8 +66,10 @@ pub struct EncryptedChunk {
 pub struct SecureStreamTransport {
     config: StreamConfig,
     auth_state: Arc<RwLock<Option<SaeAuthState>>>,
-    cipher: Arc<Aes256Gcm>,
+    cipher: Arc<RwLock<Aes256Gcm>>,
     sequence_counter: Arc<RwLock<u64>>,
+    zkp_registration: Arc<RwLock<Option<PasswordRegistration>>>,
+    zkp_password: Arc<RwLock<Option<String>>>,
 }
 
 impl SecureStreamTransport {
@@ -78,9 +81,16 @@ impl SecureStreamTransport {
         Ok(Self {
             config,
             auth_state: Arc::new(RwLock::new(None)),
-            cipher: Arc::new(cipher),
+            cipher: Arc::new(RwLock::new(cipher)),
             sequence_counter: Arc::new(RwLock::new(0)),
+            zkp_registration: Arc::new(RwLock::new(None)),
+            zkp_password: Arc::new(RwLock::new(None)),
         })
+    }
+
+    pub async fn configure_zkp_auth(&self, password: String, registration: PasswordRegistration) {
+        *self.zkp_password.write().await = Some(password);
+        *self.zkp_registration.write().await = Some(registration);
     }
 
     pub async fn initiate_sae_auth(
@@ -121,7 +131,16 @@ impl SecureStreamTransport {
             let mut hasher = blake3::Hasher::new();
             hasher.update(&state.commit_scalar);
             hasher.update(peer_commit);
-            let _confirm_hash = hasher.finalize();
+            let confirm_hash = hasher.finalize();
+
+            // SAE 认证成功后，派生会话 AES-256-GCM 密钥并重置 cipher。
+            let mut key_hasher = blake3::Hasher::new();
+            key_hasher.update(b"rockzero-secure-stream-aes-key-v1");
+            key_hasher.update(&state.shared_secret);
+            key_hasher.update(confirm_hash.as_bytes());
+            let derived_key = *key_hasher.finalize().as_bytes();
+            let rekeyed_cipher = Aes256Gcm::new(&derived_key.into());
+            *self.cipher.write().await = rekeyed_cipher;
 
             state.confirmed = true;
             Ok(true)
@@ -148,6 +167,8 @@ impl SecureStreamTransport {
         // 加密数据
         let encrypted = self
             .cipher
+            .read()
+            .await
             .encrypt(nonce, data)
             .map_err(|e| format!("Encryption failed: {}", e))?;
 
@@ -165,7 +186,7 @@ impl SecureStreamTransport {
 
         // 生成零知识证明（如果启用）
         let zkp_proof = if self.config.enable_zkp {
-            Some(self.generate_zkp_proof(&encrypted, sequence).await?)
+            Some(self.generate_zkp_proof(sequence).await?)
         } else {
             None
         };
@@ -183,44 +204,56 @@ impl SecureStreamTransport {
         })
     }
 
-    /// 生成Bulletproofs风格的零知识证明（使用 Blake3）
     async fn generate_zkp_proof(
         &self,
-        data: &[u8],
         sequence: u64,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        // 简化版Bulletproofs证明
-        // 证明：我知道数据的哈希值，但不透露数据本身
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(data);
-        hasher.update(&sequence.to_le_bytes());
+        let maybe_password = self.zkp_password.read().await.clone();
+        let maybe_registration = self.zkp_registration.read().await.clone();
 
-        // 添加随机盲化因子
-        let mut blinding_factor = [0u8; 32];
-        OsRng.fill_bytes(&mut blinding_factor);
-        hasher.update(&blinding_factor);
+        if let (Some(password), Some(registration)) = (maybe_password, maybe_registration) {
+            let zkp_ctx = ZkpContext::new();
+            let context = format!("secure_stream_chunk:{}", sequence);
+            let proof = zkp_ctx.generate_enhanced_proof(&password, &registration, &context)?;
+            return Ok(serde_json::to_vec(&proof)?);
+        }
 
-        let proof = hasher.finalize().as_bytes().to_vec();
-        Ok(proof)
+        Err("ZKP auth is enabled but registration/password is not configured".into())
     }
 
-    /// 验证零知识证明（使用 Blake3）
     pub async fn verify_zkp_proof(
         &self,
         chunk: &EncryptedChunk,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        if let Some(ref _proof) = chunk.zkp_proof {
-            // 验证MAC
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&chunk.sequence.to_le_bytes());
-            hasher.update(&chunk.data);
-            hasher.update(&chunk.nonce);
-            let computed_mac = hasher.finalize().as_bytes().to_vec();
+        if self.config.enable_zkp {
+            let proof = chunk
+                .zkp_proof
+                .as_ref()
+                .ok_or("Missing ZKP proof while ZKP is enabled")?;
 
-            Ok(computed_mac == chunk.mac)
-        } else {
-            Ok(true) // 如果没有ZKP，只验证MAC
+            let registration = self
+                .zkp_registration
+                .read()
+                .await
+                .clone()
+                .ok_or("Missing ZKP registration while ZKP is enabled")?;
+
+            let parsed_proof: EnhancedPasswordProof =
+                serde_json::from_slice(proof).map_err(|_| "Invalid EnhancedPasswordProof payload")?;
+            let context = format!("secure_stream_chunk:{}", chunk.sequence);
+            let zkp_ctx = ZkpContext::new();
+            return zkp_ctx
+                .verify_enhanced_proof(&parsed_proof, &registration, &context, 300)
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) });
         }
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&chunk.sequence.to_le_bytes());
+        hasher.update(&chunk.data);
+        hasher.update(&chunk.nonce);
+        let computed_mac = hasher.finalize().as_bytes().to_vec();
+
+        Ok(computed_mac == chunk.mac)
     }
 
     /// 解密数据块
@@ -237,6 +270,8 @@ impl SecureStreamTransport {
         let nonce = Nonce::from_slice(&chunk.nonce);
         let decrypted = self
             .cipher
+            .read()
+            .await
             .decrypt(nonce, chunk.data.as_ref())
             .map_err(|e| format!("Decryption failed: {}", e))?;
 
@@ -268,6 +303,29 @@ impl SecureStreamTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+
+    async fn setup_authenticated_transport(enable_zkp: bool) -> SecureStreamTransport {
+        let config = StreamConfig {
+            enable_zkp,
+            ..StreamConfig::default()
+        };
+        let transport = SecureStreamTransport::new(config).unwrap();
+        transport.initiate_sae_auth("peer1").await.unwrap();
+        transport.confirm_sae_auth(&[0u8; 32]).await.unwrap();
+        transport
+    }
+
+    async fn setup_transport_with_zkp_auth() -> (SecureStreamTransport, String, PasswordRegistration) {
+        let transport = setup_authenticated_transport(true).await;
+        let password = "SecureTestPassword123!@#".to_string();
+        let zkp_ctx = ZkpContext::new();
+        let registration = zkp_ctx.register_password(&password).unwrap();
+        transport
+            .configure_zkp_auth(password.clone(), registration.clone())
+            .await;
+        (transport, password, registration)
+    }
 
     #[tokio::test]
     async fn test_sae_auth() {
@@ -286,12 +344,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_encryption() {
-        let config = StreamConfig::default();
-        let transport = SecureStreamTransport::new(config).unwrap();
-
-        // 先认证
-        transport.initiate_sae_auth("peer1").await.unwrap();
-        transport.confirm_sae_auth(&[0u8; 32]).await.unwrap();
+        let (transport, _, _) = setup_transport_with_zkp_auth().await;
 
         let data = b"test data";
         let encrypted = transport
@@ -304,6 +357,75 @@ mod tests {
 
         let decrypted = transport.decrypt_chunk(&encrypted).await.unwrap();
         assert_eq!(decrypted, data);
+    }
+
+    #[tokio::test]
+    async fn test_encrypt_fails_when_zkp_registration_missing() {
+        let transport = setup_authenticated_transport(true).await;
+        let result = transport
+            .encrypt_chunk(b"test data", ChunkType::NormalFrame)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_verify_fails_when_proof_missing() {
+        let (transport, _, _) = setup_transport_with_zkp_auth().await;
+        let mut chunk = transport
+            .encrypt_chunk(b"test data", ChunkType::NormalFrame)
+            .await
+            .unwrap();
+        chunk.zkp_proof = None;
+
+        let result = transport.verify_zkp_proof(&chunk).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_verify_fails_for_fake_proof() {
+        let (transport, _, _) = setup_transport_with_zkp_auth().await;
+        let mut chunk = transport
+            .encrypt_chunk(b"test data", ChunkType::NormalFrame)
+            .await
+            .unwrap();
+        chunk.zkp_proof = Some(b"{\"fake\":true}".to_vec());
+
+        let result = transport.verify_zkp_proof(&chunk).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_verify_fails_for_expired_proof() {
+        let (transport, _, _) = setup_transport_with_zkp_auth().await;
+        let mut chunk = transport
+            .encrypt_chunk(b"test data", ChunkType::NormalFrame)
+            .await
+            .unwrap();
+
+        let mut proof: EnhancedPasswordProof =
+            serde_json::from_slice(chunk.zkp_proof.as_ref().unwrap()).unwrap();
+        proof.timestamp = Utc::now().timestamp() - 3600;
+        chunk.zkp_proof = Some(serde_json::to_vec(&proof).unwrap());
+
+        let result = transport.verify_zkp_proof(&chunk).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_verify_fails_for_context_mismatch() {
+        let (transport, _, _) = setup_transport_with_zkp_auth().await;
+        let mut chunk = transport
+            .encrypt_chunk(b"test data", ChunkType::NormalFrame)
+            .await
+            .unwrap();
+
+        let mut proof: EnhancedPasswordProof =
+            serde_json::from_slice(chunk.zkp_proof.as_ref().unwrap()).unwrap();
+        proof.context = "secure_stream_chunk:wrong".to_string();
+        chunk.zkp_proof = Some(serde_json::to_vec(&proof).unwrap());
+
+        let result = transport.verify_zkp_proof(&chunk).await;
+        assert!(result.is_err());
     }
 }
 
