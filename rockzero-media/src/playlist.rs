@@ -43,10 +43,7 @@ impl PlaylistGenerator {
         ));
         playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
         if use_encryption {
-            playlist.push_str(&format!(
-                "#EXT-X-KEY:METHOD=AES-256,URI=\"{}/api/v1/hls/{}/key\"\n",
-                self.base_url, self.session_id
-            ));
+            playlist.push_str("# Encryption is handled out-of-band via SAE + ChaCha20-Poly1305\n");
         }
 
         playlist.push('\n');
@@ -78,10 +75,7 @@ impl PlaylistGenerator {
 
         // 每个分片使用不同的密钥
         for i in 0..segment_count {
-            playlist.push_str(&format!(
-                "#EXT-X-KEY:METHOD=AES-256,URI=\"{}/api/v1/hls/{}/key/{}\"\n",
-                self.base_url, self.session_id, i
-            ));
+            playlist.push_str("# Segment encryption key is negotiated out-of-band\n");
             playlist.push_str(&format!("#EXTINF:{:.3},\n", segment_duration));
             playlist.push_str(&format!(
                 "{}/api/v1/hls/{}/segment_{}.ts\n",
@@ -108,11 +102,8 @@ impl PlaylistGenerator {
         ));
         playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", sequence_number));
 
-        // 加密密钥
-        playlist.push_str(&format!(
-            "#EXT-X-KEY:METHOD=AES-256,URI=\"{}/api/v1/hls/{}/key\"\n\n",
-            self.base_url, self.session_id
-        ));
+        // 分片加密通过 SAE 会话密钥在传输层完成
+        playlist.push('\n');
 
         // 添加分片
         for i in 0..segment_count {

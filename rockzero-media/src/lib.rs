@@ -1,4 +1,3 @@
-pub mod bulletproof_auth;
 pub mod chunk_manager;
 pub mod encryptor;
 pub mod error;
@@ -10,7 +9,6 @@ pub mod session;
 pub mod tcp_stream;
 pub mod udp_stream;
 
-pub use bulletproof_auth::BulletproofAuthenticator;
 pub use chunk_manager::ChunkManager;
 pub use encryptor::HlsEncryptor;
 pub use error::{HlsError, Result};

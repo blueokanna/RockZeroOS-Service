@@ -149,7 +149,7 @@ async fn main() -> std::io::Result<()> {
 
     // Initialize secure HLS manager
     let secure_hls_manager = Arc::new(RwLock::new(rockzero_media::HlsSessionManager::new()));
-    info!("Secure HLS streaming: WPA3-SAE + ZKP + AES-256-GCM enabled");
+    info!("Secure HLS streaming: WPA3-SAE + ChaCha20-Poly1305 enabled");
 
     let external_cache_ready = handlers::secure_hls::initialize_external_cache_startup_guard();
     if external_cache_ready {
@@ -1090,12 +1090,12 @@ async fn main() -> std::io::Result<()> {
                                 "/{session_id}/stop",
                                 web::post().to(handlers::secure_hls::stop_session),
                             )
-                            // AES-256-GCM encrypted segment access (GET, proxy decrypts client-side)
+                            // ChaCha20-Poly1305 encrypted segment access (GET, proxy decrypts client-side)
                             .route(
                                 "/{session_id}/{segment}",
                                 web::get().to(handlers::secure_hls::get_segment_direct),
                             )
-                            // Encrypted segment access (POST with ZKP proof)
+                            // Legacy encrypted segment access (POST proof path, optional)
                             .route(
                                 "/{session_id}/{segment}",
                                 web::post().to(handlers::secure_hls::get_secure_segment),

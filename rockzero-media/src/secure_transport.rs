@@ -1,6 +1,6 @@
-use aes_gcm::{
+use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
-    Aes256Gcm, Nonce,
+    ChaCha20Poly1305, Nonce,
 };
 use rand::RngCore;
 use rockzero_crypto::{EnhancedPasswordProof, PasswordRegistration, ZkpContext};
@@ -8,6 +8,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+fn blake3_hash_bytes(data: &[u8]) -> [u8; 32] {
+    let digest = blake3::hash(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_bytes());
+    out
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -38,7 +45,7 @@ impl Default for StreamConfig {
             chunk_size: 64 * 1024,
             udp_port: 9001,
             tcp_port: 9002,
-            enable_zkp: true,
+            enable_zkp: false,
             buffer_seconds: 15,
         }
     }
@@ -66,7 +73,7 @@ pub struct EncryptedChunk {
 pub struct SecureStreamTransport {
     config: StreamConfig,
     auth_state: Arc<RwLock<Option<SaeAuthState>>>,
-    cipher: Arc<RwLock<Aes256Gcm>>,
+    cipher: Arc<RwLock<ChaCha20Poly1305>>,
     sequence_counter: Arc<RwLock<u64>>,
     zkp_registration: Arc<RwLock<Option<PasswordRegistration>>>,
     zkp_password: Arc<RwLock<Option<String>>>,
@@ -76,7 +83,7 @@ impl SecureStreamTransport {
     pub fn new(config: StreamConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let mut key_bytes = [0u8; 32];
         OsRng.fill_bytes(&mut key_bytes);
-        let cipher = Aes256Gcm::new(&key_bytes.into());
+        let cipher = ChaCha20Poly1305::new(&key_bytes.into());
 
         Ok(Self {
             config,
@@ -102,12 +109,12 @@ impl SecureStreamTransport {
         OsRng.fill_bytes(&mut commit_scalar);
         OsRng.fill_bytes(&mut commit_element);
 
-        // 使用 Blake3 计算共享密钥
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&commit_scalar);
-        hasher.update(&commit_element);
-        hasher.update(peer_id.as_bytes());
-        let shared_secret = hasher.finalize().as_bytes().to_vec();
+        // 使用 BLAKE3 计算共享密钥
+        let mut secret_input = Vec::with_capacity(commit_scalar.len() + commit_element.len() + peer_id.len());
+        secret_input.extend_from_slice(&commit_scalar);
+        secret_input.extend_from_slice(&commit_element);
+        secret_input.extend_from_slice(peer_id.as_bytes());
+        let shared_secret = blake3_hash_bytes(&secret_input).to_vec();
 
         let auth_state = SaeAuthState {
             session_id: uuid::Uuid::new_v4().to_string(),
@@ -127,19 +134,19 @@ impl SecureStreamTransport {
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let mut auth = self.auth_state.write().await;
         if let Some(ref mut state) = *auth {
-            // 验证peer的commit（简化版，使用 Blake3）
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&state.commit_scalar);
-            hasher.update(peer_commit);
-            let confirm_hash = hasher.finalize();
+            // 验证peer的commit（简化版，使用 BLAKE3）
+            let mut confirm_input = Vec::with_capacity(state.commit_scalar.len() + peer_commit.len());
+            confirm_input.extend_from_slice(&state.commit_scalar);
+            confirm_input.extend_from_slice(peer_commit);
+            let confirm_hash = blake3_hash_bytes(&confirm_input);
 
-            // SAE 认证成功后，派生会话 AES-256-GCM 密钥并重置 cipher。
-            let mut key_hasher = blake3::Hasher::new();
-            key_hasher.update(b"rockzero-secure-stream-aes-key-v1");
-            key_hasher.update(&state.shared_secret);
-            key_hasher.update(confirm_hash.as_bytes());
-            let derived_key = *key_hasher.finalize().as_bytes();
-            let rekeyed_cipher = Aes256Gcm::new(&derived_key.into());
+            // SAE 认证成功后，派生会话 ChaCha20-Poly1305 密钥并重置 cipher。
+            let mut key_input = Vec::with_capacity(64 + state.shared_secret.len());
+            key_input.extend_from_slice(b"rockzero-secure-stream-chacha-key-v1");
+            key_input.extend_from_slice(&state.shared_secret);
+            key_input.extend_from_slice(&confirm_hash);
+            let derived_key = blake3_hash_bytes(&key_input);
+            let rekeyed_cipher = ChaCha20Poly1305::new(&derived_key.into());
             *self.cipher.write().await = rekeyed_cipher;
 
             state.confirmed = true;
@@ -177,14 +184,14 @@ impl SecureStreamTransport {
         let sequence = *seq;
         *seq += 1;
 
-        // 生成MAC（使用 Blake3）
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&sequence.to_le_bytes());
-        hasher.update(&encrypted);
-        hasher.update(&nonce_bytes);
-        let mac = hasher.finalize().as_bytes().to_vec();
+        // 生成 MAC（使用 BLAKE3，与加密标签分层）
+        let mut mac_input = Vec::with_capacity(8 + encrypted.len() + nonce_bytes.len());
+        mac_input.extend_from_slice(&sequence.to_le_bytes());
+        mac_input.extend_from_slice(&encrypted);
+        mac_input.extend_from_slice(&nonce_bytes);
+        let mac = blake3_hash_bytes(&mac_input).to_vec();
 
-        // 生成零知识证明（如果启用）
+        // 视频播放链路默认不使用 ZKP，保持字段兼容仅做空值返回。
         let zkp_proof = if self.config.enable_zkp {
             Some(self.generate_zkp_proof(sequence).await?)
         } else {
@@ -247,11 +254,11 @@ impl SecureStreamTransport {
                 .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) });
         }
 
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&chunk.sequence.to_le_bytes());
-        hasher.update(&chunk.data);
-        hasher.update(&chunk.nonce);
-        let computed_mac = hasher.finalize().as_bytes().to_vec();
+        let mut mac_input = Vec::with_capacity(8 + chunk.data.len() + chunk.nonce.len());
+        mac_input.extend_from_slice(&chunk.sequence.to_le_bytes());
+        mac_input.extend_from_slice(&chunk.data);
+        mac_input.extend_from_slice(&chunk.nonce);
+        let computed_mac = blake3_hash_bytes(&mac_input).to_vec();
 
         Ok(computed_mac == chunk.mac)
     }

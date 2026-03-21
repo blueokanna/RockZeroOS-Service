@@ -1,4 +1,8 @@
 use actix_web::{web, HttpResponse, Responder};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, OsRng},
+    ChaCha20Poly1305, Nonce,
+};
 use rand::RngCore;
 use rockzero_common::AppError;
 use rockzero_crypto::{EnhancedPasswordProof, PasswordRegistration, ZkpContext};
@@ -35,6 +39,49 @@ const NO_DISK_SEGMENT_MAX_ENTRIES: usize = 512;
 const SEGMENT_TICKET_MAX_AGE_SECONDS: i64 = 1800;
 const DEFAULT_NO_DISK_SEGMENT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_NO_DISK_SEGMENT_CACHE_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
+
+fn blake3_hash_bytes(data: &[u8]) -> [u8; 32] {
+    let digest = blake3::hash(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_bytes());
+    out
+}
+
+fn blake3_hex8(data: &[u8]) -> String {
+    let digest = blake3_hash_bytes(data);
+    hex::encode(&digest[..8])
+}
+
+fn chacha_encrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, AppError> {
+    let cipher = ChaCha20Poly1305::new(key.into());
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, data)
+        .map_err(|e| AppError::CryptoError(format!("ChaCha20-Poly1305 encryption failed: {}", e)))?;
+
+    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+fn chacha_decrypt(key: &[u8; 32], encrypted: &[u8]) -> Result<Vec<u8>, AppError> {
+    if encrypted.len() < 12 {
+        return Err(AppError::CryptoError(
+            "ChaCha20-Poly1305 payload too short".to_string(),
+        ));
+    }
+    let (nonce_bytes, ciphertext) = encrypted.split_at(12);
+    let cipher = ChaCha20Poly1305::new(key.into());
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| AppError::CryptoError(format!("ChaCha20-Poly1305 decryption failed: {}", e)))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SegmentAccessTicketPayload {
@@ -125,8 +172,7 @@ fn resolve_session_cache_dir(file_path: &str, session_id: Option<&str>) -> Resul
     let cache_dir = if let Some(sid) = session_id {
         cache_root.join(sid)
     } else {
-        let video_hash = blake3::hash(file_path.as_bytes());
-        let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+        let video_id = blake3_hex8(file_path.as_bytes());
         cache_root.join(video_id)
     };
 
@@ -149,7 +195,7 @@ fn clear_session_no_disk_mode(session_id: &str) {
     let mut modes = no_disk_mode_registry().lock().unwrap_or_else(|e| e.into_inner());
     modes.remove(session_id);
 
-    // 清理 no-disk 告警去重键，防止长期运行造成无界增长。
+    // 清理 no-disk 告警去重键，防止长期运行造成无界增长�?
     let mut warned = no_disk_fallback_warned_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -245,6 +291,16 @@ fn allow_stream_copy_for_hls() -> bool {
             matches!(v.as_str(), "1" | "true" | "yes" | "on")
         })
         .unwrap_or(false)
+}
+
+fn require_hardware_codec_for_video() -> bool {
+    std::env::var("ROCKZERO_REQUIRE_HW_CODEC")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(true)
 }
 
 fn is_a311d_device() -> bool {
@@ -512,7 +568,7 @@ fn compute_anti_clogging_token(temp_session_id: &str, user_id: &str) -> String {
     payload.extend_from_slice(key);
     payload.extend_from_slice(temp_session_id.as_bytes());
     payload.extend_from_slice(user_id.as_bytes());
-    hex::encode(blake3::hash(&payload).as_bytes())
+    hex::encode(blake3_hash_bytes(&payload))
 }
 
 fn verify_anti_clogging_token(temp_session_id: &str, user_id: &str, token: &str) -> bool {
@@ -538,8 +594,15 @@ fn segment_ticket_signing_key() -> &'static [u8; 32] {
         let mut key_material = Vec::new();
         key_material.extend_from_slice(get_sae_anti_clogging_key());
         key_material.extend_from_slice(b"RockZero-Segment-Ticket-v1");
-        *blake3::hash(&key_material).as_bytes()
+        blake3_hash_bytes(&key_material)
     })
+}
+
+fn sign_ticket_payload(payload_b64: &str) -> [u8; 32] {
+    let mut input = Vec::with_capacity(32 + payload_b64.len());
+    input.extend_from_slice(segment_ticket_signing_key());
+    input.extend_from_slice(payload_b64.as_bytes());
+    blake3_hash_bytes(&input)
 }
 
 fn issue_segment_access_ticket(session: &HlsSession) -> Result<String, AppError> {
@@ -560,8 +623,8 @@ fn issue_segment_access_ticket(session: &HlsSession) -> Result<String, AppError>
         .map_err(|e| AppError::InternalServerError(format!("Failed to encode ticket: {}", e)))?;
     let payload_b64 = B64URL.encode(&payload_bytes);
 
-    let sig = blake3::keyed_hash(segment_ticket_signing_key(), payload_b64.as_bytes());
-    let sig_b64 = B64URL.encode(sig.as_bytes());
+    let sig = sign_ticket_payload(&payload_b64);
+    let sig_b64 = B64URL.encode(sig);
 
     Ok(format!("{}.{}", payload_b64, sig_b64))
 }
@@ -576,13 +639,13 @@ fn verify_segment_access_ticket(session: &HlsSession, ticket: &str) -> Result<bo
         return Ok(false);
     }
 
-    let expected_sig = blake3::keyed_hash(segment_ticket_signing_key(), payload_b64.as_bytes());
+    let expected_sig = sign_ticket_payload(payload_b64);
     let provided_sig = B64URL.decode(sig_b64).map_err(|_| {
         AppError::BadRequest("Invalid segment ticket signature encoding".to_string())
     })?;
 
-    if provided_sig.len() != expected_sig.as_bytes().len()
-        || !constant_time_compare(&provided_sig, expected_sig.as_bytes())
+    if provided_sig.len() != expected_sig.len()
+        || !constant_time_compare(&provided_sig, &expected_sig)
     {
         return Ok(false);
     }
@@ -1060,12 +1123,12 @@ pub async fn create_hls_session(
         )
         .map_err(convert_hls_error)?;
 
-    // 安全策略：所有 segment 必须 AES-256-GCM 加密传输，不允许明文模式。
-    // direct_mode 字段被忽略，始终为 false。
+    // 安全策略：所�?segment 必须 ChaCha20-Poly1305 加密传输，不允许明文模式�?
+    // direct_mode 字段被忽略，始终�?false�?
     if body.direct_mode {
         warn!(
             "Client requested direct_mode for session {}, but it is disabled by security policy. \
-             All segments will be AES-256-GCM encrypted.",
+             All segments will be ChaCha20-Poly1305 encrypted.",
             session_id
         );
     }
@@ -1085,7 +1148,7 @@ pub async fn create_hls_session(
         let total = sessions.len();
         let exists = sessions.contains_key(&session_id);
         info!(
-            "✅ Created HLS session {} for user {} - file {} (ZKP: {}, encrypted: true, verified_stored: {}, total_sessions: {})",
+            "�?Created HLS session {} for user {} - file {} (ZKP: {}, encrypted: true, verified_stored: {}, total_sessions: {})",
             session_id, user_id, file_path, has_zkp, exists, total
         );
     }
@@ -1097,7 +1160,7 @@ pub async fn create_hls_session(
         "zkp_enabled": has_zkp,
         "segment_ticket_supported": true,
         "direct_mode": false,
-        "encryption_method": "AES-256-GCM",
+        "encryption_method": "ChaCha20-Poly1305",
     })))
 }
 
@@ -1166,24 +1229,23 @@ async fn get_user_zkp_registration(
 
 // ============ 安全播放列表和段获取 ============
 
-/// 使用 ffmpeg 对视频进行 HLS 分片（渐进式 — 不等待完成）
+/// 使用 ffmpeg 对视频进�?HLS 分片（渐进式 �?不等待完成）
 ///
-/// 关键优化：
-/// 1. 后台启动 ffmpeg (spawn, 不 await 完成)
-/// 2. 使用 `-hls_playlist_type event` + `-hls_flags append_list` 实现渐进式分片
-/// 3. 等待第一个 segment 生成后立即返回 playlist
-/// 4. 对于 stream copy 场景（大多数情况），首个 segment 在 1-2 秒内可用
-/// 5. 播放器一边播放，ffmpeg 一边继续生成后续 segments
+/// 关键优化�?
+/// 1. 后台启动 ffmpeg (spawn, �?await 完成)
+/// 2. 使用 `-hls_playlist_type event` + `-hls_flags append_list` 实现渐进式分�?
+/// 3. 等待第一�?segment 生成后立即返�?playlist
+/// 4. 对于 stream copy 场景（大多数情况），首个 segment �?1-2 秒内可用
+/// 5. 播放器一边播放，ffmpeg 一边继续生成后�?segments
 ///
-/// 结果缓存在 `hls_cache/{video_hash}/` 目录中。
+/// 结果缓存�?`hls_cache/{video_hash}/` 目录中�?
 async fn ensure_hls_segments(
     file_path: &str,
     session_id: Option<&str>,
 ) -> Result<(std::path::PathBuf, String), AppError> {
     use std::path::PathBuf;
 
-    let video_hash = blake3::hash(file_path.as_bytes());
-    let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+    let video_id = blake3_hex8(file_path.as_bytes());
     let cache_dir = resolve_session_cache_dir(file_path, session_id)?;
     if let Some(sid) = session_id {
         set_session_cache_dir(sid, cache_dir.clone());
@@ -1191,10 +1253,10 @@ async fn ensure_hls_segments(
     let playlist_path = cache_dir.join("playlist.m3u8");
     // 标记文件表示分片完成 (包含 #EXT-X-ENDLIST)
     let done_marker = cache_dir.join(".done");
-    // 锁文件防止并发 ffmpeg 进程
+    // 锁文件防止并�?ffmpeg 进程
     let lock_file = cache_dir.join(".lock");
 
-    // 清理过期锁文件（崩溃的 ffmpeg 进程可能遗留锁文件，阻笜后续转码）
+    // 清理过期锁文件（崩溃�?ffmpeg 进程可能遗留锁文件，阻笜后续转码�?
     if lock_file.exists() {
         if let Ok(metadata) = tokio::fs::metadata(&lock_file).await {
             if let Ok(modified) = metadata.modified() {
@@ -1224,7 +1286,7 @@ async fn ensure_hls_segments(
         }
     }
 
-    // 如果已完成分片，优先复用缓存；但要校验 playlist 引用的分片是否都存在
+    // 如果已完成分片，优先复用缓存；但要校�?playlist 引用的分片是否都存在
     if done_marker.exists() && playlist_path.exists() {
         let content = tokio::fs::read_to_string(&playlist_path)
             .await
@@ -1241,7 +1303,7 @@ async fn ensure_hls_segments(
         let _ = tokio::fs::remove_file(&done_marker).await;
     }
 
-    // 如果有播放列表且至少有一个 segment，说明上一次分片正在进行中或中断
+    // 如果有播放列表且至少有一�?segment，说明上一次分片正在进行中或中�?
     // 如果 ffmpeg 正在运行（lock 文件存在），直接返回当前 playlist
     if playlist_path.exists() && lock_file.exists() {
         let content = tokio::fs::read_to_string(&playlist_path).await.ok();
@@ -1262,7 +1324,7 @@ async fn ensure_hls_segments(
         .await
         .map_err(|e| AppError::IoError(format!("Failed to create cache dir: {}", e)))?;
 
-    // 验证源文件存在
+    // 验证源文件存�?
     let original = PathBuf::from(file_path);
     if !original.exists() {
         return Err(AppError::NotFound(format!(
@@ -1293,7 +1355,7 @@ async fn ensure_hls_segments(
     let playlist_str = playlist_path.to_str().unwrap_or("").to_string();
 
     info!(
-        "🎬 Starting progressive segmentation: {} → {}",
+        "🎬 Starting progressive segmentation: {} �?{}",
         file_path,
         cache_dir.display()
     );
@@ -1337,16 +1399,16 @@ async fn ensure_hls_segments(
         .await;
 
         match result {
-            Ok(_) => info!("✅ Video segmented successfully: {}", video_id),
-            Err(e) => warn!("❌ FFmpeg segmentation failed: {}", e),
+            Ok(_) => info!("�?Video segmented successfully: {}", video_id),
+            Err(e) => warn!("�?FFmpeg segmentation failed: {}", e),
         }
 
         // 清理 lock 文件
         let _ = tokio::fs::remove_file(&lock_file_clone).await;
     });
 
-    // 等待第一个 segment 生成
-    // AV1/VP9 等需要软件转码的格式，首个 segment 生成较慢，给予 120 秒超时
+    // 等待第一�?segment 生成
+    // AV1/VP9 等需要软件转码的格式，首�?segment 生成较慢，给�?120 秒超�?
     let first_segment = cache_dir.join("segment_0.ts");
     let mut waited = 0;
     let max_wait_ms: u64 = if needs_transcode { 120_000 } else { 30_000 };
@@ -1354,7 +1416,7 @@ async fn ensure_hls_segments(
 
     while waited < max_wait_ms {
         if first_segment.exists() && playlist_path.exists() {
-            // 等待 playlist 至少包含一个可播放段；对于长视频尽量等待 2 段，降低 segment_1 早到 404
+            // 等待 playlist 至少包含一个可播放段；对于长视频尽量等�?2 段，降低 segment_1 早到 404
             if let Ok(content) = tokio::fs::read_to_string(&playlist_path).await {
                 let is_done = done_marker.exists();
                 let min_segments = if is_done { 1 } else { 2 };
@@ -1371,7 +1433,7 @@ async fn ensure_hls_segments(
         waited += poll_interval_ms;
     }
 
-    // 超时检查 — 可能 ffmpeg 失败了
+    // 超时检�?�?可能 ffmpeg 失败�?
     if playlist_path.exists() {
         let content = tokio::fs::read_to_string(&playlist_path)
             .await
@@ -1384,7 +1446,7 @@ async fn ensure_hls_segments(
     }
 
     Err(AppError::InternalServerError(
-        "视频分片超时，请检查 ffmpeg 是否正确安装".to_string(),
+        "视频分片超时，请检�?ffmpeg 是否正确安装".to_string(),
     ))
 }
 
@@ -1422,13 +1484,13 @@ fn playlist_segments_exist_on_disk(cache_dir: &std::path::Path, playlist_content
     })
 }
 
-/// 探测视频文件的视频编码格式
+/// 探测视频文件的视频编码格�?
 ///
-/// 使用 ffprobe 获取视频编码格式，用于决定是否需要添加 bitstream filter。
-/// 这是解决 HLS mpegts 黑屏的关键 — H.264/HEVC 的 MP4 封装使用 length-prefixed NALUs，
-/// 而 mpegts 要求 Annex B 格式的 start codes，必须通过 bitstream filter 转换。
+/// 使用 ffprobe 获取视频编码格式，用于决定是否需要添�?bitstream filter�?
+/// 这是解决 HLS mpegts 黑屏的关�?�?H.264/HEVC �?MP4 封装使用 length-prefixed NALUs�?
+/// �?mpegts 要求 Annex B 格式�?start codes，必须通过 bitstream filter 转换�?
 async fn detect_video_codec(ffmpeg_path: &str, file_path: &str) -> Option<String> {
-    // 从 ffmpeg 路径推导 ffprobe 路径
+    // �?ffmpeg 路径推导 ffprobe 路径
     let ffprobe_path = if let Some(dir) = std::path::Path::new(ffmpeg_path).parent() {
         let probe = dir.join("ffprobe");
         if tokio::fs::metadata(&probe).await.is_ok() {
@@ -1468,7 +1530,7 @@ async fn detect_video_codec(ffmpeg_path: &str, file_path: &str) -> Option<String
     None
 }
 
-/// 从 ffmpeg 路径推导 ffprobe 路径
+/// �?ffmpeg 路径推导 ffprobe 路径
 async fn get_ffprobe_path(ffmpeg_path: &str) -> String {
     if let Some(dir) = std::path::Path::new(ffmpeg_path).parent() {
         let probe = dir.join("ffprobe");
@@ -1479,11 +1541,11 @@ async fn get_ffprobe_path(ffmpeg_path: &str) -> String {
     std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string())
 }
 
-/// 探测视频文件的 start_time（秒）
+/// 探测视频文件�?start_time（秒�?
 ///
-/// MKV 等容器的 PTS 时间戳可能不从 0 开始（例如 26:28:10）。
-/// stream copy 到 HLS 时这些时间戳会被保留，导致播放器显示错误的时间。
-/// 通过检测 start_time 并使用 -output_ts_offset 将输出时间戳归零。
+/// MKV 等容器的 PTS 时间戳可能不�?0 开始（例如 26:28:10）�?
+/// stream copy �?HLS 时这些时间戳会被保留，导致播放器显示错误的时间�?
+/// 通过检�?start_time 并使�?-output_ts_offset 将输出时间戳归零�?
 async fn detect_video_start_time(ffmpeg_path: &str, file_path: &str) -> f64 {
     let ffprobe_path = get_ffprobe_path(ffmpeg_path).await;
 
@@ -1511,20 +1573,20 @@ async fn detect_video_start_time(ffmpeg_path: &str, file_path: &str) -> f64 {
 
 /// 派生用于缓存分片文件静态加密的存储密钥
 ///
-/// 使用 Blake3 从固定上下文 + 视频路径派生，确保：
-/// - 同一视频的分片使用相同密钥（缓存命中）
+/// 使用 BLAKE3 从固定上下文 + 视频路径派生，确保：
+/// - 同一视频的分片使用相同密钥（缓存命中�?
 /// - 不同视频使用不同密钥（隔离性）
-/// - 密钥不存储于磁盘（运行时派生）
+/// - 密钥不存储于磁盘（运行时派生�?
 fn derive_segment_storage_key(file_path: &str) -> [u8; 32] {
     let context = format!("rockzero-segment-at-rest-v1:{}", file_path);
-    crate::crypto::blake3_hash_bytes(context.as_bytes())
+    blake3_hash_bytes(context.as_bytes())
 }
 
-/// 加密所有已生成的 TS 段文件（静态存储加密）
+/// 加密所有已生成�?TS 段文件（静态存储加密）
 ///
-/// 在 ffmpeg 完成分片后调用，使用 AES-256-GCM 加密每个 .ts 文件。
-/// 加密后的文件使用 .ts.enc 扩展名存储，原始 .ts 文件安全删除。
-/// 这确保即使磁盘被物理访问，缓存的视频数据也是加密的。
+/// �?ffmpeg 完成分片后调用，使用 ChaCha20-Poly1305 加密每个 .ts 文件�?
+/// 加密后的文件使用 .ts.enc 扩展名存储，原始 .ts 文件安全删除�?
+/// 这确保即使磁盘被物理访问，缓存的视频数据也是加密的�?
 async fn encrypt_segments_at_rest(
     cache_dir: &std::path::Path,
     storage_key: &[u8; 32],
@@ -1545,8 +1607,8 @@ async fn encrypt_segments_at_rest(
         return Ok(0);
     }
 
-    // ★ 并行加密：利用多核 CPU 同时加密多个分片，大幅减少加密总耗时
-    // AES-256-GCM 加密是 CPU 密集型操作，通过 spawn_blocking 在线程池中并行执行
+    // �?并行加密：利用多�?CPU 同时加密多个分片，大幅减少加密总耗时
+    // ChaCha20-Poly1305 加密�?CPU 密集型操作，通过 spawn_blocking 在线程池中并行执�?
     let storage_key_owned = *storage_key;
     let mut join_set = tokio::task::JoinSet::new();
 
@@ -1556,9 +1618,9 @@ async fn encrypt_segments_at_rest(
             let enc_path = ts_path.with_extension("ts.enc");
             match tokio::fs::read(&ts_path).await {
                 Ok(data) => {
-                    // 在阻塞线程池中执行 CPU 密集型加密
+                    // 在阻塞线程池中执�?CPU 密集型加�?
                     let encrypt_result = tokio::task::spawn_blocking(move || {
-                        crate::crypto::aes_encrypt(&key, &data).map_err(|e| format!("{}", e))
+                        chacha_encrypt(&key, &data).map_err(|e| format!("{}", e))
                     })
                     .await;
 
@@ -1568,7 +1630,7 @@ async fn encrypt_segments_at_rest(
                                 warn!("Failed to write encrypted segment {:?}: {}", enc_path, e);
                                 return false;
                             }
-                            // 安全删除原始明文段文件
+                            // 安全删除原始明文段文�?
                             let _ = tokio::fs::remove_file(&ts_path).await;
                             true
                         }
@@ -1590,7 +1652,7 @@ async fn encrypt_segments_at_rest(
         });
     }
 
-    // 收集所有并行加密结果
+    // 收集所有并行加密结�?
     let mut encrypted_count = 0usize;
     while let Some(result) = join_set.join_next().await {
         if let Ok(true) = result {
@@ -1618,7 +1680,7 @@ async fn read_segment_data(
         let encrypted = tokio::fs::read(&enc_path)
             .await
             .map_err(|e| AppError::IoError(format!("Failed to read encrypted segment: {}", e)))?;
-        let data = crate::crypto::aes_decrypt(storage_key, &encrypted)?;
+        let data = chacha_decrypt(storage_key, &encrypted)?;
         return Ok(data);
     }
 
@@ -1635,7 +1697,7 @@ async fn read_segment_data(
     )))
 }
 
-/// 运行 ffmpeg 渐进式分片（在后台 task 中执行）
+/// 运行 ffmpeg 渐进式分片（在后�?task 中执行）
 #[allow(clippy::too_many_arguments)]
 async fn run_ffmpeg_progressive(
     ffmpeg_path: &str,
@@ -1647,7 +1709,7 @@ async fn run_ffmpeg_progressive(
     lock_file: &std::path::Path,
     pre_detected_codec: Option<String>,
 ) -> Result<(), String> {
-    // 使用预检测结果避免重复调用 ffprobe
+    // 使用预检测结果避免重复调�?ffprobe
     let video_codec = if pre_detected_codec.is_some() {
         pre_detected_codec
     } else {
@@ -1659,7 +1721,7 @@ async fn run_ffmpeg_progressive(
     let start_time = detect_video_start_time(ffmpeg_path, file_path).await;
     if start_time > 1.0 {
         info!(
-            "Detected video start_time: {:.3}s — will apply -output_ts_offset to normalize timestamps",
+            "Detected video start_time: {:.3}s �?will apply -output_ts_offset to normalize timestamps",
             start_time
         );
     }
@@ -1671,16 +1733,16 @@ async fn run_ffmpeg_progressive(
     let allow_stream_copy = codec_supports_copy && allow_stream_copy_for_hls();
 
     // 构建 stream copy 参数
-    // 关键修复：对于 mpegts 容器必须添加正确的 bitstream filter
-    // 否则 H.264/HEVC 的 NAL 封装格式不正确，导致播放器只有音频没有画面
+    // 关键修复：对�?mpegts 容器必须添加正确�?bitstream filter
+    // 否则 H.264/HEVC �?NAL 封装格式不正确，导致播放器只有音频没有画�?
     let mut copy_args: Vec<String> = vec![
         "-y".into(),
-        // ★ 多核并行：使用所有 CPU 核心进行解复用/复用
+        // �?多核并行：使用所�?CPU 核心进行解复�?复用
         "-threads".into(),
         "0".into(),
-        // ★ PTS 时间戳修复：重新生成 PTS 并丢弃损坏帧
-        // 解决：源文件（如 MKV）内嵌非零 start_time（例如 26:28:10），
-        //       stream copy 直接传递导致 HLS 播放器显示错误的时间戳
+        // �?PTS 时间戳修复：重新生成 PTS 并丢弃损坏帧
+        // 解决：源文件（如 MKV）内嵌非�?start_time（例�?26:28:10），
+        //       stream copy 直接传递导�?HLS 播放器显示错误的时间�?
         "-fflags".into(),
         "+genpts+discardcorrupt".into(),
         "-i".into(),
@@ -1693,7 +1755,7 @@ async fn run_ffmpeg_progressive(
         "copy".into(),
     ];
 
-    // 根据视频编码添加 bitstream filter — 这是解决黑屏问题的关键
+    // 根据视频编码添加 bitstream filter �?这是解决黑屏问题的关�?
     match video_codec.as_deref() {
         Some("h264" | "avc" | "avc1") => {
             copy_args.extend(["-bsf:v".into(), "h264_mp4toannexb".into()]);
@@ -1704,19 +1766,19 @@ async fn run_ffmpeg_progressive(
             info!("Applied hevc_mp4toannexb bitstream filter for TS muxing");
         }
         _ => {
-            // VP9, AV1 等其他编码不需要 bitstream filter
+            // VP9, AV1 等其他编码不需�?bitstream filter
             info!("No bitstream filter needed for codec: {:?}", video_codec);
         }
     }
 
-    // ★ PTS 偏移修复：如果源文件 start_time > 1s（典型的 MKV 内嵌时间戳偏移），
-    //   通过 -output_ts_offset 将输出时间戳归零，避免播放器显示错误时间（如 26:28:10）
+    // �?PTS 偏移修复：如果源文件 start_time > 1s（典型的 MKV 内嵌时间戳偏移）�?
+    //   通过 -output_ts_offset 将输出时间戳归零，避免播放器显示错误时间（如 26:28:10�?
     if start_time > 1.0 {
         copy_args.extend(["-output_ts_offset".into(), format!("{:.6}", -start_time)]);
     }
 
     copy_args.extend([
-        // ★ 将首个 DTS 重置为 0，消除源文件的 start_time 偏移
+        // �?将首�?DTS 重置�?0，消除源文件�?start_time 偏移
         "-avoid_negative_ts".into(),
         "make_zero".into(),
         "-f".into(),
@@ -1726,7 +1788,7 @@ async fn run_ffmpeg_progressive(
         "-hls_list_size".into(),
         "0".into(),
         "-hls_playlist_type".into(),
-        "event".into(), // event 模式 = 渐进式播放列表
+        "event".into(), // event 模式 = 渐进式播放列�?
         "-hls_flags".into(),
         "append_list+independent_segments".into(),
         "-hls_segment_type".into(),
@@ -1737,7 +1799,7 @@ async fn run_ffmpeg_progressive(
     ]);
 
     if allow_stream_copy {
-        // 先尝试 stream copy + bitstream filter（极快，不需要转码）
+        // 先尝�?stream copy + bitstream filter（极快，不需要转码）
         let output = tokio::process::Command::new(ffmpeg_path)
             .args(&copy_args)
             .stdout(std::process::Stdio::null())
@@ -1750,7 +1812,7 @@ async fn run_ffmpeg_progressive(
             })?;
 
         if output.status.success() {
-            // stream copy 成功 — 添加 #EXT-X-ENDLIST 标记完成
+            // stream copy 成功 �?添加 #EXT-X-ENDLIST 标记完成
             if let Ok(mut content) = tokio::fs::read_to_string(playlist_path).await {
                 if !content.contains("#EXT-X-ENDLIST") {
                     content.push_str("\n#EXT-X-ENDLIST\n");
@@ -1783,7 +1845,7 @@ async fn run_ffmpeg_progressive(
         );
     }
 
-    // 清理出错的输出
+    // 清理出错的输�?
     for entry in std::fs::read_dir(cache_dir).into_iter().flatten().flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "ts" || e == "m3u8") {
@@ -1791,24 +1853,31 @@ async fn run_ffmpeg_progressive(
         }
     }
 
-    // 检测硬件加速
+    // 检测硬件加�?
     let hw_accel = detect_hardware_acceleration().await;
+    if require_hardware_codec_for_video() && hw_accel == HardwareAccel::None {
+        let _ = tokio::fs::remove_file(lock_file).await;
+        return Err(
+            "Hardware video codec is required but no supported hardware encoder is available"
+                .to_string(),
+        );
+    }
     let a311d_profile = is_a311d_device();
 
     let build_transcode_args = |accel: HardwareAccel| {
         let mut args: Vec<String> = vec![
             "-y".into(),
-            // ★ 多核并行：使用所有 CPU 核心进行编解码
+            // �?多核并行：使用所�?CPU 核心进行编解�?
             "-threads".into(),
             "0".into(),
-            // ★ PTS 时间戳修复（转码路径）
+            // �?PTS 时间戳修复（转码路径�?
             "-fflags".into(),
             "+genpts+discardcorrupt".into(),
         ];
 
-        // ★ 输入解码选项（必须在 -i 之前）
+        // �?输入解码选项（必须在 -i 之前�?
         // -hwaccel auto：自动选择硬件解码器，支持 AV1/VP9 等非 H.264 源的硬件辅助解码
-        // 若硬件不支持（如 ARM 设备不支持 AV1 硬解）则自动回退到 CPU 多线程软解码
+        // 若硬件不支持（如 ARM 设备不支�?AV1 硬解）则自动回退�?CPU 多线程软解码
         match accel {
             HardwareAccel::Vaapi => {
                 // VAAPI 专用解码管线（需指定设备和输出格式）
@@ -1828,7 +1897,7 @@ async fn run_ffmpeg_progressive(
 
         args.extend(["-i".into(), file_path.into()]);
 
-        // ★ 输出编码选项
+        // �?输出编码选项
         match accel {
             HardwareAccel::Rkmpp => {
                 info!("Using Rockchip MPP hardware encoding for HLS segmentation");
@@ -1940,6 +2009,14 @@ async fn run_ffmpeg_progressive(
 
     if !output.status.success() && hw_accel != HardwareAccel::None {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if require_hardware_codec_for_video() {
+            let _ = tokio::fs::remove_file(lock_file).await;
+            return Err(format!(
+                "Hardware transcode failed with strict hardware policy enabled: {}",
+                &stderr[..stderr.len().min(500)]
+            ));
+        }
+
         warn!(
             "Hardware transcode failed ({:?}), retrying with software libx264: {}",
             hw_accel,
@@ -1992,17 +2069,17 @@ async fn run_ffmpeg_progressive(
     Ok(())
 }
 
-/// 按需生成单个 HLS 分片（用于 seek 场景）
+/// 按需生成单个 HLS 分片（用�?seek 场景�?
 ///
 /// 当播放器 seek 到视频远处、但 ffmpeg 渐进式转码尚未到达请求的分片时，
-/// 使用 `-ss` 直接跳转到目标时间戳，单独生成该分片。
-/// 这避免了等待全部前序分片生成完成的漫长延迟，极大改善 seek 体验。
+/// 使用 `-ss` 直接跳转到目标时间戳，单独生成该分片�?
+/// 这避免了等待全部前序分片生成完成的漫长延迟，极大改善 seek 体验�?
 ///
-/// ★ 关键修复：优先使用 stream copy + bitstream filter（与渐进式分片一致），
+/// �?关键修复：优先使�?stream copy + bitstream filter（与渐进式分片一致）�?
 ///   避免 on-demand 分片使用 transcode 而渐进式分片使用 stream copy 导致
-///   编码参数不匹配、播放器 seek 回退时黑屏/卡死。
+///   编码参数不匹配、播放器 seek 回退时黑�?卡死�?
 ///
-/// 生成的分片会同样进行静态加密（AES-256-GCM）以保持一致的安全策略。
+/// 生成的分片会同样进行静态加密（ChaCha20-Poly1305）以保持一致的安全策略�?
 async fn generate_segment_on_demand(
     file_path: &str,
     cache_dir: &std::path::Path,
@@ -2011,7 +2088,7 @@ async fn generate_segment_on_demand(
 ) -> Result<(), String> {
     let segment_path = cache_dir.join(format!("segment_{}.ts", segment_index));
 
-    // 如果分片已存在（明文或密文），直接返回
+    // 如果分片已存在（明文或密文），直接返�?
     if segment_path.exists() || segment_path.with_extension("ts.enc").exists() {
         return Ok(());
     }
@@ -2030,11 +2107,16 @@ async fn generate_segment_on_demand(
 
     // 检测视频编码，决定是否可以 stream copy（与渐进式分片保持一致）
     let video_codec = detect_video_codec(&ffmpeg_path, file_path).await;
-    // On-demand 分片必须走精确转码，避免 keyframe 对齐误差导致回跳。
-    // video_codec 变量保留用于日志和后续调优。
+    // On-demand 分片必须走精确转码，避免 keyframe 对齐误差导致回跳�?
+    // video_codec 变量保留用于日志和后续调优�?
     let _ = video_codec;
 
     let hw_accel = detect_hardware_acceleration().await;
+    if require_hardware_codec_for_video() && hw_accel == HardwareAccel::None {
+        return Err(
+            "Hardware video codec is required but no supported hardware encoder is available for on-demand segment generation".to_string(),
+        );
+    }
     let a311d_profile = is_a311d_device();
 
     let build_on_demand_transcode_args = |accel: HardwareAccel| -> Vec<String> {
@@ -2046,7 +2128,7 @@ async fn generate_segment_on_demand(
             "+genpts+discardcorrupt".into(),
         ];
 
-        // 输入解码加速
+        // 输入解码加�?
         match accel {
             HardwareAccel::Vaapi => {
                 args.extend([
@@ -2167,11 +2249,19 @@ async fn generate_segment_on_demand(
     if !output.status.success() {
         // 硬件编码失败时使用软件回退
         if hw_accel != HardwareAccel::None {
+            if require_hardware_codec_for_video() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!(
+                    "Hardware on-demand encode failed with strict hardware policy enabled: {}",
+                    &stderr[..stderr.len().min(500)]
+                ));
+            }
+
             warn!(
                 "Hardware on-demand encode failed ({:?}), retrying with software libx264",
                 hw_accel
             );
-            // 清理失败的输出
+            // 清理失败的输�?
             let _ = tokio::fs::remove_file(&segment_path).await;
 
             let fallback_output = tokio::process::Command::new(&ffmpeg_path)
@@ -2198,24 +2288,24 @@ async fn generate_segment_on_demand(
         }
     }
 
-    // 对按需生成的分片同样进行静态加密
+    // 对按需生成的分片同样进行静态加�?
     encrypt_on_demand_segment(&segment_path, file_path).await;
 
     info!(
-        "✅ On-demand segment_{}.ts generated (transcode) and encrypted",
+        "�?On-demand segment_{}.ts generated (transcode) and encrypted",
         segment_index
     );
     Ok(())
 }
 
-/// 加密单个按需生成的分片文件
+/// 加密单个按需生成的分片文�?
 ///
-/// 和渐进式分片加密使用相同的 `derive_segment_storage_key` 密钥派生，
-/// 确保所有分片（无论生成方式）都使用一致的加密策略。
+/// 和渐进式分片加密使用相同�?`derive_segment_storage_key` 密钥派生�?
+/// 确保所有分片（无论生成方式）都使用一致的加密策略�?
 async fn encrypt_on_demand_segment(segment_path: &std::path::Path, file_path: &str) {
     let storage_key = derive_segment_storage_key(file_path);
     if let Ok(data) = tokio::fs::read(segment_path).await {
-        if let Ok(encrypted) = crate::crypto::aes_encrypt(&storage_key, &data) {
+        if let Ok(encrypted) = chacha_encrypt(&storage_key, &data) {
             let enc_path = segment_path.with_extension("ts.enc");
             if tokio::fs::write(&enc_path, &encrypted).await.is_ok() {
                 let _ = tokio::fs::remove_file(segment_path).await;
@@ -2226,8 +2316,8 @@ async fn encrypt_on_demand_segment(segment_path: &std::path::Path, file_path: &s
 
 /// 使用 ffprobe 获取视频文件的总时长（秒）
 ///
-/// 用于生成覆盖全时长的虚拟 VOD 播放列表，使播放器可以 seek 到任何位置。
-/// 结果缓存到 `.duration` 文件中，避免重复调用 ffprobe。
+/// 用于生成覆盖全时长的虚拟 VOD 播放列表，使播放器可�?seek 到任何位置�?
+/// 结果缓存�?`.duration` 文件中，避免重复调用 ffprobe�?
 async fn get_video_duration(ffmpeg_path: &str, file_path: &str) -> Option<f64> {
     let ffprobe_path = get_ffprobe_path(ffmpeg_path).await;
 
@@ -2253,15 +2343,15 @@ async fn get_video_duration(ffmpeg_path: &str, file_path: &str) -> Option<f64> {
     }
 }
 
-/// 生成覆盖完整视频时长的 VOD 播放列表
+/// 生成覆盖完整视频时长�?VOD 播放列表
 ///
-/// 渐进式 HLS 的 ffmpeg playlist 仅列出已生成的分片，导致播放器无法 seek 到
-/// 尚未生成的位置。此函数生成一个列出所有分片的完整 VOD playlist，使播放器
+/// 渐进�?HLS �?ffmpeg playlist 仅列出已生成的分片，导致播放器无�?seek �?
+/// 尚未生成的位置。此函数生成一个列出所有分片的完整 VOD playlist，使播放�?
 /// 可以 seek 到任何位置。当播放器请求尚未生成的分片时，`get_segment_direct`
-/// 会调用 `generate_segment_on_demand` 按需生成。
+/// 会调�?`generate_segment_on_demand` 按需生成�?
 fn generate_complete_vod_playlist(total_duration: f64, segment_duration: f64) -> String {
     let total_segments = (total_duration / segment_duration).ceil() as usize;
-    // 实际 target duration 向上取整（HLS 规范要求 TARGETDURATION ≥ 所有 EXTINF）
+    // 实际 target duration 向上取整（HLS 规范要求 TARGETDURATION �?所�?EXTINF�?
     let target_duration = segment_duration.ceil() as u64;
 
     let mut playlist = String::with_capacity(total_segments * 40 + 200);
@@ -2274,7 +2364,7 @@ fn generate_complete_vod_playlist(total_duration: f64, segment_duration: f64) ->
 
     for i in 0..total_segments {
         let dur = if i == total_segments - 1 {
-            // 最后一个分片可能短于标准时长
+            // 最后一个分片可能短于标准时�?
             let remaining = total_duration - (i as f64 * segment_duration);
             if remaining > 0.001 {
                 remaining
@@ -2292,13 +2382,13 @@ fn generate_complete_vod_playlist(total_duration: f64, segment_duration: f64) ->
     playlist
 }
 
-/// 获取 HLS 播放列表（基于 ffmpeg 生成的真实分片）
+/// 获取 HLS 播放列表（基�?ffmpeg 生成的真实分片）
 ///
-/// 不需要 JWT 认证 — session_id 本身就是鉴权 token（创建时已验证 JWT + SAE）。
-/// 首次请求时自动触发 ffmpeg 分片（优先 stream copy）。
+/// 不需�?JWT 认证 �?session_id 本身就是鉴权 token（创建时已验�?JWT + SAE）�?
+/// 首次请求时自动触�?ffmpeg 分片（优�?stream copy）�?
 ///
-/// ★ Seek 优化：当视频仍在渐进式分片时，返回覆盖全时长的虚拟 VOD 播放列表，
-/// 使播放器可以 seek 到任何位置（尚未生成的分片会被 get_segment_direct 按需生成）。
+/// �?Seek 优化：当视频仍在渐进式分片时，返回覆盖全时长的虚�?VOD 播放列表�?
+/// 使播放器可以 seek 到任何位置（尚未生成的分片会�?get_segment_direct 按需生成）�?
 pub async fn get_secure_playlist(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
     path: web::Path<String>,
@@ -2311,7 +2401,7 @@ pub async fn get_secure_playlist(
         session_id.len()
     );
 
-    // 验证会话并获取文件路径（然后释放读锁）
+    // 验证会话并获取文件路径（然后释放读锁�?
     let file_path = {
         let manager = hls_manager.read().await;
 
@@ -2333,8 +2423,8 @@ pub async fn get_secure_playlist(
         session.file_path.clone()
     };
 
-    // 确保 HLS 分片存在（首次会触发 ffmpeg 分片）。
-    // 若外部缓存不可用，降级为无落盘的虚拟 VOD playlist，避免播放器长时间卡在等待分片。
+    // 确保 HLS 分片存在（首次会触发 ffmpeg 分片）�?
+    // 若外部缓存不可用，降级为无落盘的虚拟 VOD playlist，避免播放器长时间卡在等待分片�?
     let ensured = ensure_hls_segments(&file_path, Some(&session_id)).await;
 
     let (_cache_dir, playlist_content, no_disk_mode) = match ensured {
@@ -2349,26 +2439,26 @@ pub async fn get_secure_playlist(
         Err(e) => return Err(e),
     };
 
-    // ★ 关键优化：渐进式 HLS 的 playlist 仅列出已生成的分片，
-    //   导致播放器无法 seek 到尚未生成的位置（超出 ffmpeg 当前进度）。
-    //   解决方案：当视频仍在分片时，返回覆盖全时长的虚拟 VOD playlist。
-    //   播放器因此可以 seek 到任何位置；当它请求尚未生成的分片时，
-    //   get_segment_direct 会自动调用 generate_segment_on_demand 按需生成。
+    // �?关键优化：渐进式 HLS �?playlist 仅列出已生成的分片，
+    //   导致播放器无�?seek 到尚未生成的位置（超�?ffmpeg 当前进度）�?
+    //   解决方案：当视频仍在分片时，返回覆盖全时长的虚拟 VOD playlist�?
+    //   播放器因此可�?seek 到任何位置；当它请求尚未生成的分片时�?
+    //   get_segment_direct 会自动调�?generate_segment_on_demand 按需生成�?
     let final_content = if !no_disk_mode && playlist_content.contains("#EXT-X-ENDLIST") {
-        // 分片已全部完成 — 使用 ffmpeg 生成的真实 playlist（时长精确）
+        // 分片已全部完�?�?使用 ffmpeg 生成的真�?playlist（时长精确）
         playlist_content
     } else {
-        // 视频仍在转码中 — 尝试生成覆盖全时长的虚拟 VOD playlist
+        // 视频仍在转码�?�?尝试生成覆盖全时长的虚拟 VOD playlist
         let duration_file = _cache_dir.as_ref().map(|d| d.join(".duration"));
         let duration = if duration_file.as_ref().is_some_and(|p| p.exists()) {
-            // 优先使用缓存的时长（避免重复调用 ffprobe）
+            // 优先使用缓存的时长（避免重复调用 ffprobe�?
             tokio::fs::read_to_string(duration_file.as_ref().unwrap())
                 .await
                 .ok()
                 .and_then(|s| s.trim().parse::<f64>().ok())
                 .filter(|&d| d > 0.0)
         } else {
-            // 首次：通过 ffprobe 获取时长并缓存
+            // 首次：通过 ffprobe 获取时长并缓�?
             let ffmpeg_path = std::env::var("FFMPEG_PATH")
                 .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
                 .unwrap_or_else(|_| "ffmpeg".to_string());
@@ -2389,7 +2479,7 @@ pub async fn get_secure_playlist(
                 generate_complete_vod_playlist(d, 2.0)
             }
             None => {
-                // 无法获取时长 — 在 no-disk 模式下回退一个短窗口 playlist，保障尽快起播。
+                // 无法获取时长 �?�?no-disk 模式下回退一个短窗口 playlist，保障尽快起播�?
                 if no_disk_mode {
                     warn!("📋 Cannot determine duration in no-disk mode, using short fallback playlist");
                     generate_complete_vod_playlist(1800.0, 2.0)
@@ -2401,12 +2491,12 @@ pub async fn get_secure_playlist(
         }
     };
 
-    // ★ 更新 .last_access 标记，防止活跃缓存被 LRU 驱逐
+    // �?更新 .last_access 标记，防止活跃缓存被 LRU 驱�?
     if let Some(cache_dir) = _cache_dir.as_ref() {
         touch_cache_access(cache_dir).await;
     }
 
-    // 记录该会话当前是否处于无落盘模式，供系统状态接口实时查询。
+    // 记录该会话当前是否处于无落盘模式，供系统状态接口实时查询�?
     set_session_no_disk_mode(&session_id, no_disk_mode);
 
     info!(
@@ -2510,7 +2600,7 @@ pub async fn get_segment_direct(
 ) -> Result<impl Responder, AppError> {
     let (session_id, segment_name) = path.into_inner();
 
-    // 验证段名称格式
+    // 验证段名称格�?
     if !segment_name.ends_with(".ts") {
         return Err(AppError::BadRequest(format!(
             "Invalid segment name: '{}'",
@@ -2518,7 +2608,7 @@ pub async fn get_segment_direct(
         )));
     }
 
-    // 先读取会话必要数据，避免在 await 期间持有 RwLock 读锁
+    // 先读取会话必要数据，避免�?await 期间持有 RwLock 读锁
     let file_path = {
         let manager = hls_manager.read().await;
         let session = manager
@@ -2527,8 +2617,7 @@ pub async fn get_segment_direct(
         session.file_path.clone()
     };
 
-    let video_hash = blake3::hash(file_path.as_bytes());
-    let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+    let video_id = blake3_hex8(file_path.as_bytes());
     let cache_dir = match resolve_session_cache_dir(&file_path, Some(&session_id)) {
         Ok(dir) => {
             set_session_cache_dir(&session_id, dir.clone());
@@ -2564,9 +2653,9 @@ pub async fn get_segment_direct(
         return Ok(HttpResponse::Ok()
             .content_type("application/octet-stream")
             .insert_header(("X-Encrypted", "true"))
-            .insert_header(("X-Encryption-Method", "AES-256-GCM"))
+            .insert_header(("X-Encryption-Method", "ChaCha20-Poly1305"))
             .insert_header(("X-Key-Exchange", "WPA3-SAE"))
-            .insert_header(("X-Integrity", "Blake3"))
+            .insert_header(("X-Integrity", "Poly1305"))
             .insert_header(("X-No-Disk-Mode", "true"))
             .insert_header(("Content-Length", encrypted_data.len()))
             .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
@@ -2596,7 +2685,7 @@ pub async fn get_segment_direct(
             }
         }
 
-        // 为避免播放器因短暂 503 回退到头部循环播放，缺段场景优先长等待。
+        // 为避免播放器因短�?503 回退到头部循环播放，缺段场景优先长等待�?
         let ready = wait_for_segment_ready(&cache_dir, &segment_name, 60_000).await?;
         if !ready {
             if done_marker.exists() {
@@ -2634,7 +2723,7 @@ pub async fn get_segment_direct(
         .map_err(convert_hls_error)?;
 
     info!(
-        "🔒 Serving AES-256-GCM encrypted segment {} for session {} (plain: {} bytes, encrypted: {} bytes)",
+        "🔒 Serving ChaCha20-Poly1305 encrypted segment {} for session {} (plain: {} bytes, encrypted: {} bytes)",
         segment_name,
         session_id,
         segment_data.len(),
@@ -2644,9 +2733,9 @@ pub async fn get_segment_direct(
     Ok(HttpResponse::Ok()
         .content_type("application/octet-stream")
         .insert_header(("X-Encrypted", "true"))
-        .insert_header(("X-Encryption-Method", "AES-256-GCM"))
+        .insert_header(("X-Encryption-Method", "ChaCha20-Poly1305"))
         .insert_header(("X-Key-Exchange", "WPA3-SAE"))
-        .insert_header(("X-Integrity", "Blake3"))
+        .insert_header(("X-Integrity", "Poly1305"))
         .insert_header(("X-No-Disk-Mode", "false"))
         .insert_header(("Content-Length", encrypted_data.len()))
         .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
@@ -2733,7 +2822,7 @@ pub async fn get_secure_segment(
         }
 
         info!(
-            "✅ ZKP proof verified for session {} segment {}",
+            "�?ZKP proof verified for session {} segment {}",
             session_id, segment_name
         );
     }
@@ -2749,7 +2838,7 @@ pub async fn get_secure_segment(
                 let storage_key = derive_segment_storage_key(&session.file_path);
                 let enc_path = segment_path.with_extension("ts.enc");
 
-                // ★ 更新 .last_access 标记，防止活跃缓存被 LRU 驱逐
+                // �?更新 .last_access 标记，防止活跃缓存被 LRU 驱�?
                 touch_cache_access(&cache_dir).await;
 
                 if enc_path.exists() || segment_path.exists() {
@@ -2791,7 +2880,7 @@ pub async fn get_secure_segment(
     Ok(HttpResponse::Ok()
         .content_type("video/mp2t")
         .insert_header(("X-Encrypted", "true"))
-        .insert_header(("X-Encryption-Method", "AES-256-GCM"))
+        .insert_header(("X-Encryption-Method", "ChaCha20-Poly1305"))
         .insert_header(("X-ZKP-Verified", "true"))
         .insert_header((
             "X-No-Disk-Mode",
@@ -2819,7 +2908,7 @@ pub async fn stop_session(
     match manager.remove_session(&session_id) {
         Ok(_) => {
             cleanup_session_cache_dir(&session_id).await;
-            info!("✅ HLS session stopped successfully: {}", session_id);
+            info!("�?HLS session stopped successfully: {}", session_id);
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "success": true,
                 "message": "Session stopped successfully",
@@ -2872,10 +2961,10 @@ pub async fn get_transport_stats(
             "bandwidth_mbps": bandwidth as f64 / 1_000_000.0
         },
         "encryption": {
-            "method": "AES-256-GCM",
+            "method": "ChaCha20-Poly1305",
             "key_exchange": "WPA3-SAE",
-            "integrity": "Blake3",
-            "zkp": "Bulletproofs"
+            "integrity": "Poly1305",
+            "zkp": "disabled"
         }
     })))
 }
@@ -2890,10 +2979,10 @@ fn generate_secure_m3u8(segment_count: usize, segment_duration: f32) -> String {
     ));
     playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
 
-    // ❌ 不包含 #EXT-X-KEY（密钥通过 SAE 握手获得）
-    // ✅ 客户端已经拥有解密密钥（AES-256-GCM）
+    // �?不包�?#EXT-X-KEY（密钥通过 SAE 握手获得�?
+    // �?客户端已经拥有解密密钥（ChaCha20-Poly1305�?
 
-    playlist.push_str("# Encrypted with AES-256-GCM\n");
+    playlist.push_str("# Encrypted with ChaCha20-Poly1305\n");
     playlist.push_str("# Requires ZKP proof for segment access\n\n");
 
     for i in 0..segment_count {
@@ -2905,52 +2994,52 @@ fn generate_secure_m3u8(segment_count: usize, segment_duration: f32) -> String {
     playlist
 }
 
-/// 验证客户端的 Bulletproofs ZKP 证明
+/// 验证客户端的 disabled ZKP 证明
 ///
-/// **生产级安全实现**：使用 Bulletproofs 零知识证明验证
+/// **生产级安全实�?*：使�?disabled 零知识证明验�?
 ///
 /// ## 验证流程
-/// 1. 解码 Base64 编码的证明
-/// 2. 解析为 EnhancedPasswordProof 结构
-/// 3. 验证上下文绑定（必须是 "hls_segment_access"）
-/// 4. 验证时间戳（防止延迟重放，5分钟有效期）
-/// 5. 使用 ZkpContext 验证 Schnorr 证明和范围证明
+/// 1. 解码 Base64 编码的证�?
+/// 2. 解析�?EnhancedPasswordProof 结构
+/// 3. 验证上下文绑定（必须�?"hls_segment_access"�?
+/// 4. 验证时间戳（防止延迟重放�?分钟有效期）
+/// 5. 使用 ZkpContext 验证 Schnorr 证明和范围证�?
 ///
-/// ## 安全特性
+/// ## 安全特�?
 /// - Schnorr 证明：验证客户端知道密码，不泄露密码本身
-/// - Schnorr 证明：验证密码知识
-/// - Bulletproofs 范围证明：密码熵值 >= 28 bits（密码学证明）
-/// - 时间戳 + nonce：防止重放攻击
+/// - Schnorr 证明：验证密码知�?
+/// - disabled 范围证明：密码熵�?>= 28 bits（密码学证明�?
+/// - 时间�?+ nonce：防止重放攻�?
 /// - 上下文绑定：防止跨上下文攻击
 ///
 /// ## 证明类型
-/// - EnhancedPasswordProof: Schnorr 证明 + Bulletproofs 范围证明（完整版）
+/// - EnhancedPasswordProof: Schnorr 证明 + disabled 范围证明（完整版�?
 ///
 /// ## 要求
-/// - 会话必须包含 PasswordRegistration（用户注册时生成）
+/// - 会话必须包含 PasswordRegistration（用户注册时生成�?
 /// - 客户端必须使用相同的密码生成证明
 ///
 fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, AppError> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
-    // 1. 解码 Base64 编码的证明
+    // 1. 解码 Base64 编码的证�?
     let proof_bytes = BASE64.decode(proof_base64).map_err(|e| {
         AppError::BadRequest(format!("Invalid Base64 encoding in ZKP proof: {}", e))
     })?;
 
-    // 2. 解析为 EnhancedPasswordProof（完整的 Bulletproofs 证明）
+    // 2. 解析�?EnhancedPasswordProof（完整的 disabled 证明�?
     let proof: EnhancedPasswordProof = serde_json::from_slice(&proof_bytes).map_err(|e| {
         AppError::BadRequest(format!(
             "Invalid EnhancedPasswordProof structure: {}. \
-             Ensure the client is using the full Bulletproofs implementation.",
+             Ensure the client is using the full disabled implementation.",
             e
         ))
     })?;
 
     const EXPECTED_CONTEXT: &str = "hls_segment_access";
-    const MAX_AGE_SECONDS: i64 = 300; // 5分钟有效期
+    const MAX_AGE_SECONDS: i64 = 300; // 5分钟有效�?
 
-    // 3. 验证上下文
+    // 3. 验证上下�?
     if proof.context != EXPECTED_CONTEXT {
         warn!(
             "ZKP proof context mismatch: expected '{}', got '{}'",
@@ -2959,7 +3048,7 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
         return Ok(false);
     }
 
-    // 4. 验证时间戳（防止延迟重放）
+    // 4. 验证时间戳（防止延迟重放�?
     let now = chrono::Utc::now().timestamp();
     if now - proof.timestamp > MAX_AGE_SECONDS {
         warn!(
@@ -2988,11 +3077,11 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
         )
     })?;
 
-    // 6. 使用 ZkpContext 验证完整的 Bulletproofs 证明
+    // 6. 使用 ZkpContext 验证完整�?disabled 证明
     let zkp_context = ZkpContext::new();
 
     info!(
-        "Verifying EnhancedPasswordProof (Bulletproofs) for session {}",
+        "Verifying EnhancedPasswordProof (disabled) for session {}",
         session.session_id
     );
 
@@ -3001,12 +3090,12 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
         Ok(valid) => {
             if valid {
                 info!(
-                    "✅ Bulletproofs ZKP proof verified for session {}",
+                    "�?disabled ZKP proof verified for session {}",
                     session.session_id
                 );
             } else {
                 warn!(
-                    "❌ Bulletproofs ZKP proof verification failed for session {}",
+                    "�?disabled ZKP proof verification failed for session {}",
                     session.session_id
                 );
             }
@@ -3014,7 +3103,7 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
         }
         Err(e) => {
             warn!(
-                "Bulletproofs ZKP proof verification error for session {}: {}",
+                "disabled ZKP proof verification error for session {}: {}",
                 session.session_id, e
             );
             Ok(false)
@@ -3022,13 +3111,13 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
     }
 }
 
-/// 更新缓存目录的 `.last_access` 时间戳标记
+/// 更新缓存目录�?`.last_access` 时间戳标�?
 ///
-/// 每次从缓存目录读取并服务一个 segment 时调用此函数。
-/// StorageManager 的 LRU 驱逐和过期清理会检查此标记文件，
-/// 避免删除正在被 HLS session 活跃使用的缓存目录。
+/// 每次从缓存目录读取并服务一�?segment 时调用此函数�?
+/// StorageManager �?LRU 驱逐和过期清理会检查此标记文件�?
+/// 避免删除正在�?HLS session 活跃使用的缓存目录�?
 ///
-/// 与文件系统 atime 相比，此方法不受 Linux noatime 挂载选项影响。
+/// 与文件系�?atime 相比，此方法不受 Linux noatime 挂载选项影响�?
 async fn touch_cache_access(cache_dir: &std::path::Path) {
     let marker = cache_dir.join(".last_access");
     let ts = std::time::SystemTime::now()
@@ -3038,13 +3127,13 @@ async fn touch_cache_access(cache_dir: &std::path::Path) {
     let _ = tokio::fs::write(&marker, ts.to_string().as_bytes()).await;
 }
 
-/// 视频段缓存目录配置
+/// 视频段缓存目录配�?
 ///
-/// 与 StorageConfig 使用相同的环境变量配置，确保清理任务能正确清理缓存。
+/// �?StorageConfig 使用相同的环境变量配置，确保清理任务能正确清理缓存�?
 ///
-/// 优先级:
+/// 优先�?
 /// 1. `HLS_CACHE_PATH` 环境变量（与 StorageConfig 一致）
-/// 2. `ROCKZERO_HLS_CACHE_DIR` 环境变量（兼容旧配置）
+/// 2. `ROCKZERO_HLS_CACHE_DIR` 环境变量（兼容旧配置�?
 /// 3. 默认 `/mnt/external/cache/hls`（与 StorageConfig 默认值一致）
 fn get_hls_cache_dir() -> std::path::PathBuf {
     // 优先使用 HLS_CACHE_PATH（与 StorageConfig 一致）
@@ -3137,20 +3226,20 @@ fn ensure_external_hls_cache_root() -> Result<std::path::PathBuf, AppError> {
     Ok(root)
 }
 
-/// 从 FFmpeg 转码输出读取视频段
+/// �?FFmpeg 转码输出读取视频�?
 ///
 /// 生产级实现流程：
-/// 1. 验证段名称格式（防止路径遍历攻击）
-/// 2. 计算视频文件的唯一标识符（用于缓存目录）
-/// 3. 尝试从 HLS 缓存目录读取预转码的段
-/// 4. 如果缓存不存在，触发实时转码（通过 FFmpeg）
+/// 1. 验证段名称格式（防止路径遍历攻击�?
+/// 2. 计算视频文件的唯一标识符（用于缓存目录�?
+/// 3. 尝试�?HLS 缓存目录读取预转码的�?
+/// 4. 如果缓存不存在，触发实时转码（通过 FFmpeg�?
 /// 5. 支持段索引验证和路径遍历保护
 ///
 /// # 缓存策略
 /// - 缓存目录：`/var/cache/rockzero/hls/{video_hash}/`
 /// - 段文件命名：`segment_N.ts`
 /// - 自动创建缓存目录
-/// - 转码失败时返回错误，不阻塞服务
+/// - 转码失败时返回错误，不阻塞服�?
 async fn read_video_segment_from_ffmpeg(
     file_path: &str,
     segment_name: &str,
@@ -3158,7 +3247,7 @@ async fn read_video_segment_from_ffmpeg(
 ) -> Result<Vec<u8>, AppError> {
     use std::path::PathBuf;
 
-    // 1. 验证段名称格式（防止路径遍历攻击）
+    // 1. 验证段名称格式（防止路径遍历攻击�?
     if !segment_name.starts_with("segment_") || !segment_name.ends_with(".ts") {
         return Err(AppError::BadRequest(format!(
             "Invalid segment name format: '{}'. Expected 'segment_N.ts'",
@@ -3166,7 +3255,7 @@ async fn read_video_segment_from_ffmpeg(
         )));
     }
 
-    // 2. 解析段索引
+    // 2. 解析段索�?
     let segment_index: usize = segment_name
         .trim_start_matches("segment_")
         .trim_end_matches(".ts")
@@ -3184,11 +3273,10 @@ async fn read_video_segment_from_ffmpeg(
         )));
     }
 
-    // 4. 计算视频文件的唯一标识符（用于缓存目录）
-    let video_hash = blake3::hash(file_path.as_bytes());
-    let video_id = hex::encode(&video_hash.as_bytes()[..8]); // 使用前 8 字节作为 ID
+    // 4. 计算视频文件的唯一标识符（用于缓存目录�?
+    let video_id = blake3_hex8(file_path.as_bytes()); // 使用前 8 字节作为 ID
 
-    // 5. 构建会话级缓存目录路径（优先外置落盘；失败时回退 no-disk 内存缓存）
+    // 5. 构建会话级缓存目录路径（优先外置落盘；失败时回退 no-disk 内存缓存�?
     let cache_dir = match resolve_session_cache_dir(file_path, session_id) {
         Ok(dir) => {
             if let Some(sid) = session_id {
@@ -3248,7 +3336,7 @@ async fn read_video_segment_from_ffmpeg(
     let cached_segment_enc_path = cached_segment_path.with_extension("ts.enc");
     let storage_key = derive_segment_storage_key(file_path);
 
-    // 6. 尝试从缓存读取
+    // 6. 尝试从缓存读�?
     if cached_segment_enc_path.exists() {
         info!(
             "Cache hit for segment {} of video {}",
@@ -3260,10 +3348,10 @@ async fn read_video_segment_from_ffmpeg(
                 segment_name, e
             ))
         })?;
-        return crate::crypto::aes_decrypt(&storage_key, &encrypted);
+        return chacha_decrypt(&storage_key, &encrypted);
     }
 
-    // 7. 缓存不存在，检查原始视频文件
+    // 7. 缓存不存在，检查原始视频文�?
     let original_video = PathBuf::from(file_path);
     if !original_video.exists() {
         return Err(AppError::NotFound(format!(
@@ -3289,7 +3377,7 @@ async fn read_video_segment_from_ffmpeg(
                 segment_name, e
             ))
         })?;
-        let data = crate::crypto::aes_decrypt(&storage_key, &encrypted)?;
+        let data = chacha_decrypt(&storage_key, &encrypted)?;
         drop(_guard);
         release_no_disk_segment_lock(&cache_key);
         return Ok(data);
@@ -3305,12 +3393,12 @@ async fn read_video_segment_from_ffmpeg(
     // 调用 FFmpeg 进行转码（异步版本）
     let segment_data = transcode_segment_async(&original_video, &cache_dir, segment_index).await?;
 
-    // 将转码结果写入加密缓存（异步，失败不阻塞）
+    // 将转码结果写入加密缓存（异步，失败不阻塞�?
     let cache_path_clone = cached_segment_enc_path.clone();
     let data_clone = segment_data.clone();
     let storage_key_clone = storage_key;
     tokio::spawn(async move {
-        match crate::crypto::aes_encrypt(&storage_key_clone, &data_clone) {
+        match chacha_encrypt(&storage_key_clone, &data_clone) {
             Ok(encrypted) => {
                 if let Err(e) = tokio::fs::write(&cache_path_clone, &encrypted).await {
                     warn!("Failed to cache encrypted segment: {}", e);
@@ -3342,7 +3430,7 @@ async fn transcode_segment_in_memory(
         .unwrap_or_else(|_| "ffmpeg".to_string());
 
     let file_path_str = video_path.to_string_lossy().to_string();
-    let codec_key = hex::encode(blake3::hash(file_path_str.as_bytes()).as_bytes());
+    let codec_key = hex::encode(blake3_hash_bytes(file_path_str.as_bytes()));
 
     let maybe_codec = {
         let cache = video_codec_cache().lock().unwrap_or_else(|e| e.into_inner());
@@ -3360,11 +3448,17 @@ async fn transcode_segment_in_memory(
     };
 
     // 禁用 in-memory stream-copy：输入侧 -ss 会按关键帧对齐，
-    // 在 seek/缺段场景可能导致不同 segment 返回同一内容片段。
-    // 这里统一使用精确转码路径，优先保证时间轴正确性。
+    // �?seek/缺段场景可能导致不同 segment 返回同一内容片段�?
+    // 这里统一使用精确转码路径，优先保证时间轴正确性�?
     let _ = video_codec;
 
     let hw_accel = detect_hardware_acceleration().await;
+    if require_hardware_codec_for_video() && hw_accel == HardwareAccel::None {
+        return Err(AppError::InternalServerError(
+            "Hardware video codec is required but no supported hardware encoder is available"
+                .to_string(),
+        ));
+    }
     let mut args = vec![
         "-v".to_string(),
         "warning".to_string(),
@@ -3425,22 +3519,22 @@ async fn transcode_segment_in_memory(
     Ok(out.stdout)
 }
 
-/// 使用 FFmpeg 异步转码单个视频段
+/// 使用 FFmpeg 异步转码单个视频�?
 ///
-/// 这是一个异步实现，用于按需转码。
-/// 支持硬件加速和多种编码器选择。
+/// 这是一个异步实现，用于按需转码�?
+/// 支持硬件加速和多种编码器选择�?
 ///
 /// # FFmpeg 参数说明
-/// - `-ss`: 起始时间（基于段索引计算）
+/// - `-ss`: 起始时间（基于段索引计算�?
 /// - `-t`: 段持续时间（默认 10 秒）
 /// - `-c:v libx264`: 使用 H.264 编码（软件编码）
 /// - `-c:a aac`: 使用 AAC 音频编码
 /// - `-f mpegts`: 输出 MPEG-TS 格式
 ///
-/// # 硬件加速支持
-/// - 检测 `/dev/dri` 设备（Intel/AMD GPU）
-/// - 检测 `/dev/video*` 设备（V4L2 硬件编码器）
-/// - ARM 平台优化（A311D 等 SoC）
+/// # 硬件加速支�?
+/// - 检�?`/dev/dri` 设备（Intel/AMD GPU�?
+/// - 检�?`/dev/video*` 设备（V4L2 硬件编码器）
+/// - ARM 平台优化（A311D �?SoC�?
 async fn transcode_segment_async(
     video_path: &std::path::Path,
     output_dir: &std::path::Path,
@@ -3448,29 +3542,35 @@ async fn transcode_segment_async(
 ) -> Result<Vec<u8>, AppError> {
     use tokio::process::Command;
 
-    const SEGMENT_DURATION: f64 = 2.0; // 与 HLS playlist 保持一致（2 秒分片）
+    const SEGMENT_DURATION: f64 = 2.0; // �?HLS playlist 保持一致（2 秒分片）
     let start_time = segment_index as f64 * SEGMENT_DURATION;
 
     let output_path = output_dir.join(format!("segment_{}.ts", segment_index));
 
-    // 检测 FFmpeg 可执行文件路径
+    // 检�?FFmpeg 可执行文件路�?
     let ffmpeg_path = std::env::var("FFMPEG_PATH")
         .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
         .unwrap_or_else(|_| "ffmpeg".to_string());
 
-    // 检测硬件加速能力
+    // 检测硬件加速能�?
     let hw_accel = detect_hardware_acceleration().await;
+    if require_hardware_codec_for_video() && hw_accel == HardwareAccel::None {
+        return Err(AppError::InternalServerError(
+            "Hardware video codec is required but no supported hardware encoder is available"
+                .to_string(),
+        ));
+    }
     let a311d_profile = is_a311d_device();
 
     // 构建 FFmpeg 命令参数
     let mut args = vec![
         "-y".to_string(), // 覆盖输出文件
-        // ★ 多核并行：使用所有 CPU 核心进行编解码
+        // �?多核并行：使用所�?CPU 核心进行编解�?
         "-threads".to_string(),
         "0".to_string(),
     ];
 
-    // ★ 输入解码选项（必须在 -i 之前）
+    // �?输入解码选项（必须在 -i 之前�?
     // -hwaccel auto：自动选择硬件解码器，支持 AV1/VP9 等非 H.264 源的硬件辅助解码
     match hw_accel {
         HardwareAccel::Vaapi => {
@@ -3495,14 +3595,14 @@ async fn transcode_segment_async(
         "-ss".to_string(),
         format!("{:.3}", start_time), // 精确 seek：避免关键帧回跳
         "-t".to_string(),
-        format!("{:.3}", SEGMENT_DURATION), // 段持续时间
+        format!("{:.3}", SEGMENT_DURATION), // 段持续时�?
         "-fflags".to_string(),
         "+genpts".to_string(),
         "-avoid_negative_ts".to_string(),
         "make_zero".to_string(),
     ]);
 
-    // ★ 输出编码选项（根据硬件加速能力选择编码器）
+    // �?输出编码选项（根据硬件加速能力选择编码器）
     match hw_accel {
         HardwareAccel::Rkmpp => {
             info!(
@@ -3569,7 +3669,7 @@ async fn transcode_segment_async(
                     "veryfast".to_string()
                 },
                 "-tune".to_string(),
-                "zerolatency".to_string(), // 低延迟调优
+                "zerolatency".to_string(), // 低延迟调�?
                 "-profile:v".to_string(),
                 "main".to_string(), // Main Profile
                 "-level".to_string(),
@@ -3580,16 +3680,16 @@ async fn transcode_segment_async(
         }
     }
 
-    // 音频编码参数（通用）
+    // 音频编码参数（通用�?
     args.extend(vec![
         "-c:a".to_string(),
         "aac".to_string(), // AAC 音频编码
         "-b:a".to_string(),
         "128k".to_string(), // 音频码率
         "-ac".to_string(),
-        "2".to_string(), // 立体声
+        "2".to_string(), // 立体�?
         "-ar".to_string(),
-        "44100".to_string(), // 采样率
+        "44100".to_string(), // 采样�?
         "-muxdelay".to_string(),
         "0".to_string(),
         "-muxpreload".to_string(),
@@ -3619,7 +3719,7 @@ async fn transcode_segment_async(
         )));
     }
 
-    // 读取生成的段文件，并立即删除明文临时文件。
+    // 读取生成的段文件，并立即删除明文临时文件�?
     let data = tokio::fs::read(&output_path)
         .await
         .map_err(|e| AppError::IoError(format!("Failed to read transcoded segment: {}", e)))?;
@@ -3629,23 +3729,23 @@ async fn transcode_segment_async(
     Ok(data)
 }
 
-/// 硬件加速类型
+/// 硬件加速类�?
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HardwareAccel {
-    Rkmpp, // Rockchip MPP (RK3588 等)
+    Rkmpp, // Rockchip MPP (RK3588 �?
     Vaapi, // Intel/AMD GPU (VA-API)
     V4l2,  // V4L2 M2M (ARM SoC)
     None,  // 软件编码
 }
 
-/// 检测可用的硬件加速
+/// 检测可用的硬件加�?
 ///
 /// 检测顺序（优先ARM场景）：
-/// 1. 检查 CPU 架构 — aarch64 优先使用 ARM 编码器
-/// 2. Rockchip MPP (`h264_rkmpp`) — RK3588/RK3399 等 SoC
-/// 3. V4L2 M2M (`h264_v4l2m2m`) — 通用 ARM 硬件编码
-/// 4. VAAPI (`h264_vaapi`) — Intel/AMD GPU（仅 x86_64）
-/// 5. 软件编码 (`libx264`) — 最终回退
+/// 1. 检�?CPU 架构 �?aarch64 优先使用 ARM 编码�?
+/// 2. Rockchip MPP (`h264_rkmpp`) �?RK3588/RK3399 �?SoC
+/// 3. V4L2 M2M (`h264_v4l2m2m`) �?通用 ARM 硬件编码
+/// 4. VAAPI (`h264_vaapi`) �?Intel/AMD GPU（仅 x86_64�?
+/// 5. 软件编码 (`libx264`) �?最终回退
 async fn detect_hardware_acceleration() -> HardwareAccel {
     if let Some(cached) = HW_ACCEL_DETECTION_CACHE.get() {
         return *cached;
@@ -3660,7 +3760,7 @@ async fn detect_hardware_acceleration_uncached() -> HardwareAccel {
     use tokio::fs;
 
     let is_arm = cfg!(target_arch = "aarch64") || cfg!(target_arch = "arm") || {
-        // 运行时检测（交叉编译场景）
+        // 运行时检测（交叉编译场景�?
         if let Ok(machine) = tokio::process::Command::new("uname")
             .arg("-m")
             .output()
@@ -3676,8 +3776,8 @@ async fn detect_hardware_acceleration_uncached() -> HardwareAccel {
     };
 
     if is_arm {
-        // ARM 平台：优先 Rockchip MPP → V4L2 → 软件编码
-        // 不使用 VAAPI（即使 /dev/dri/renderD128 存在也可能是 Mali 显示驱动）
+        // ARM 平台：优�?Rockchip MPP �?V4L2 �?软件编码
+        // 不使�?VAAPI（即�?/dev/dri/renderD128 存在也可能是 Mali 显示驱动�?
 
         // Rockchip MPP
         if check_ffmpeg_encoder("h264_rkmpp").await {
@@ -3685,7 +3785,7 @@ async fn detect_hardware_acceleration_uncached() -> HardwareAccel {
             return HardwareAccel::Rkmpp;
         }
 
-        // V4L2 M2M — 检测设备节点和编码器支持
+        // V4L2 M2M �?检测设备节点和编码器支�?
         let has_v4l2_device = fs::metadata("/dev/video10").await.is_ok()
             || fs::metadata("/dev/video11").await.is_ok()
             || fs::metadata("/dev/video0").await.is_ok();
@@ -3704,7 +3804,7 @@ async fn detect_hardware_acceleration_uncached() -> HardwareAccel {
         return HardwareAccel::None;
     }
 
-    // x86_64 平台：VAAPI → V4L2 → 软件编码
+    // x86_64 平台：VAAPI �?V4L2 �?软件编码
     if fs::metadata("/dev/dri/renderD128").await.is_ok() && check_ffmpeg_encoder("h264_vaapi").await
     {
         // 验证 VAAPI 真正可用
@@ -3726,7 +3826,7 @@ async fn detect_hardware_acceleration_uncached() -> HardwareAccel {
     HardwareAccel::None
 }
 
-/// 检查 FFmpeg 是否支持指定的编码器
+/// 检�?FFmpeg 是否支持指定的编码器
 async fn check_ffmpeg_encoder(encoder: &str) -> bool {
     use tokio::process::Command;
 
@@ -3749,8 +3849,8 @@ async fn check_ffmpeg_encoder(encoder: &str) -> bool {
 
 /// 验证硬件编码器真正可用（而非仅列出）
 ///
-/// 通过生成一帧测试视频来验证编码器是否真正工作。
-/// 某些设备（如 Mali GPU）虽然有 /dev/dri/renderD128 但不支持编码。
+/// 通过生成一帧测试视频来验证编码器是否真正工作�?
+/// 某些设备（如 Mali GPU）虽然有 /dev/dri/renderD128 但不支持编码�?
 async fn verify_encoder_works(encoder: &str) -> bool {
     use tokio::process::Command;
 
@@ -3782,7 +3882,7 @@ async fn verify_encoder_works(encoder: &str) -> bool {
     matches!(result, Ok(status) if status.success())
 }
 
-/// 验证 VAAPI 编码器真正可用
+/// 验证 VAAPI 编码器真正可�?
 async fn verify_vaapi_works() -> bool {
     use tokio::process::Command;
 
@@ -3853,7 +3953,7 @@ mod tests {
         assert!(playlist.contains("segment_0.ts"));
         assert!(playlist.contains("segment_4.ts"));
         assert!(!playlist.contains("#EXT-X-KEY"));
-        assert!(playlist.contains("AES-256-GCM"));
+        assert!(playlist.contains("ChaCha20-Poly1305"));
     }
 
     #[tokio::test]
@@ -3867,7 +3967,7 @@ mod tests {
         let result = read_video_segment_from_ffmpeg("/video.mp4", "segment_-1.ts", None).await;
         assert!(matches!(result, Err(AppError::BadRequest(_))));
 
-        // 无效的段名称格式（非数字索引）
+        // 无效的段名称格式（非数字索引�?
         let result = read_video_segment_from_ffmpeg("/video.mp4", "segment_abc.ts", None).await;
         assert!(matches!(result, Err(AppError::BadRequest(_))));
     }
@@ -3883,8 +3983,7 @@ mod tests {
 
     fn test_cache_dir_for_file(file_path: &str) -> std::path::PathBuf {
         let _ = ensure_test_cache_env();
-        let video_hash = blake3::hash(file_path.as_bytes());
-        let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+        let video_id = blake3_hex8(file_path.as_bytes());
         get_hls_cache_dir().join(video_id)
     }
 

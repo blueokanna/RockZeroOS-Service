@@ -9,6 +9,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+fn blake3_hash_bytes(data: &[u8]) -> [u8; 32] {
+    let digest = blake3::hash(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_bytes());
+    out
+}
+
 pub struct HlsSession {
     pub session_id: String,
     pub user_id: String,
@@ -24,16 +31,16 @@ pub struct HlsSession {
     /// HKDF instance for lazy key derivation
     hkdf: HkdfBlake3,
     pub zkp_registration: Option<PasswordRegistration>,
-    /// When true, GET segment requests return plaintext (no AES-256-GCM transport encryption).
+    /// When true, GET segment requests return plaintext (no ChaCha20-Poly1305 transport encryption).
     /// Security is still guaranteed by session UUID + SAE handshake requirement.
     /// Designed for ARM / low-performance devices where per-segment
     /// encryption/decryption overhead is prohibitive.
     pub direct_mode: bool,
 }
 
-/// HKDF-Blake3 key derivation
+/// HKDF-BLAKE3 key derivation
 /// 
-/// This implementation uses Blake3 for both extract and expand phases.
+/// This implementation uses BLAKE3 for both extract and expand phases.
 /// Salt is derived from session_id for per-session uniqueness.
 struct HkdfBlake3 {
     prk: [u8; 32],
@@ -45,13 +52,13 @@ impl HkdfBlake3 {
         // Derive salt from session_id: blake3("hls-session-salt:" + session_id)
         let salt_input = format!("hls-session-salt:{}", session_id);
         let salt_input_bytes = salt_input.as_bytes();
-        let salt = *blake3::hash(salt_input_bytes).as_bytes();
+        let salt = blake3_hash_bytes(salt_input_bytes);
 
         // PRK = blake3(salt + ikm)
         let mut input = Vec::with_capacity(32 + ikm.len());
         input.extend_from_slice(&salt);
         input.extend_from_slice(ikm);
-        let prk = *blake3::hash(&input).as_bytes();
+        let prk = blake3_hash_bytes(&input);
 
         Self { prk }
     }
@@ -65,14 +72,14 @@ impl HkdfBlake3 {
                 key.copy_from_slice(s);
                 key
             }
-            Some(s) => *blake3::hash(s).as_bytes(),
+            Some(s) => blake3_hash_bytes(s),
             None => [0u8; 32],
         };
 
         let mut input = Vec::with_capacity(32 + ikm.len());
         input.extend_from_slice(&salt_key);
         input.extend_from_slice(ikm);
-        let prk = *blake3::hash(&input).as_bytes();
+        let prk = blake3_hash_bytes(&input);
 
         Self { prk }
     }
@@ -96,8 +103,7 @@ impl HkdfBlake3 {
             input.extend_from_slice(info);
             input.push(counter);
 
-            let hash = blake3::hash(&input);
-            t = hash.as_bytes().to_vec();
+            t = blake3_hash_bytes(&input).to_vec();
 
             let copy_len = std::cmp::min(32, okm.len() - offset);
             okm[offset..offset + copy_len].copy_from_slice(&t[..copy_len]);
@@ -185,7 +191,7 @@ impl HlsSession {
 
     /// Enable direct (plaintext) segment delivery mode.
     /// When enabled, `get_segment_direct` returns raw TS data instead of
-    /// AES-256-GCM encrypted data. Session UUID + SAE handshake still guard access.
+    /// ChaCha20-Poly1305 encrypted data. Session UUID + SAE handshake still guard access.
     pub fn set_direct_mode(&mut self, enabled: bool) {
         self.direct_mode = enabled;
     }
@@ -235,8 +241,8 @@ impl HlsSessionManager {
     pub fn init_sae_handshake(&self, user_id: String, password: Vec<u8>) -> Result<String> {
         let temp_session_id = Uuid::new_v4().to_string();
 
-        let server_id: [u8; 32] = blake3::hash(b"rockzero-server-device-id").into();
-        let client_id: [u8; 32] = blake3::hash(user_id.as_bytes()).into();
+        let server_id = blake3_hash_bytes(b"rockzero-server-device-id");
+        let client_id = blake3_hash_bytes(user_id.as_bytes());
 
         tracing::info!(
             "[SAE] Initializing handshake - temp_session: {}, user: {}",
@@ -376,8 +382,8 @@ impl HlsSessionManager {
             .remove(session_id)
             .ok_or_else(|| HlsError::SessionNotFound(session_id.to_string()))?;
 
-        let video_hash = blake3::hash(session.file_path.as_bytes());
-        let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+        let video_hash = blake3_hash_bytes(session.file_path.as_bytes());
+        let video_id = hex::encode(&video_hash[..8]);
         let cache_dir = hls_cache_dir.join(&video_id);
 
         if cache_dir.exists() {
@@ -406,8 +412,8 @@ impl HlsSessionManager {
             .collect();
 
         for (session_id, file_path) in expired_sessions {
-            let video_hash = blake3::hash(file_path.as_bytes());
-            let video_id = hex::encode(&video_hash.as_bytes()[..8]);
+            let video_hash = blake3_hash_bytes(file_path.as_bytes());
+            let video_id = hex::encode(&video_hash[..8]);
             let cache_dir = hls_cache_dir.join(&video_id);
 
             if cache_dir.exists() {
@@ -437,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_hkdf_blake3_with_session_salt() {
-        // Test that HKDF-Blake3 with session salt produces consistent results
+        // Test that HKDF-BLAKE3 with session salt produces consistent results
         let pmk = [0x42u8; 32];
         let session_id = "test-session-123";
 
@@ -463,7 +469,7 @@ mod tests {
 
     #[test]
     fn test_hkdf_blake3_legacy() {
-        // Test legacy HKDF-Blake3 with zero salt
+        // Test legacy HKDF-BLAKE3 with zero salt
         let pmk = [0x42u8; 32];
 
         let hk = HkdfBlake3::new(None, &pmk);
