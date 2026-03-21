@@ -1256,6 +1256,11 @@ async fn ensure_hls_segments(
     // 锁文件防止并�?ffmpeg 进程
     let lock_file = cache_dir.join(".lock");
 
+    // 占位 playlist：用于分片尚未就绪时快速返回，后续由上层生成完整 VOD playlist。
+    let placeholder_playlist = || {
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n".to_string()
+    };
+
     // 清理过期锁文件（崩溃�?ffmpeg 进程可能遗留锁文件，阻笜后续转码�?
     if lock_file.exists() {
         if let Ok(metadata) = tokio::fs::metadata(&lock_file).await {
@@ -1303,20 +1308,50 @@ async fn ensure_hls_segments(
         let _ = tokio::fs::remove_file(&done_marker).await;
     }
 
-    // 如果有播放列表且至少有一�?segment，说明上一次分片正在进行中或中�?
-    // 如果 ffmpeg 正在运行（lock 文件存在），直接返回当前 playlist
-    if playlist_path.exists() && lock_file.exists() {
-        let content = tokio::fs::read_to_string(&playlist_path).await.ok();
-        if let Some(content) = content {
-            if content.contains("#EXTINF") && playlist_segments_exist_on_disk(&cache_dir, &content)
-            {
-                info!(
-                    "FFmpeg still running for {}, returning progressive playlist",
-                    video_id
-                );
-                return Ok((cache_dir, content));
+    // 如已有分片任务在运行，绝不重复启动 ffmpeg。
+    // 先短暂等待首段就绪，若仍未就绪则返回占位 playlist，由上层走虚拟 VOD 路径。
+    if lock_file.exists() {
+        if playlist_path.exists() {
+            if let Ok(content) = tokio::fs::read_to_string(&playlist_path).await {
+                if content.contains("#EXTINF")
+                    && playlist_segments_exist_on_disk(&cache_dir, &content)
+                {
+                    info!(
+                        "FFmpeg still running for {}, returning progressive playlist",
+                        video_id
+                    );
+                    return Ok((cache_dir, content));
+                }
             }
         }
+
+        let mut waited_ms: u64 = 0;
+        let max_wait_ms: u64 = 8_000;
+        let poll_interval_ms: u64 = 200;
+        while waited_ms < max_wait_ms {
+            if playlist_path.exists() {
+                if let Ok(content) = tokio::fs::read_to_string(&playlist_path).await {
+                    if content.contains("#EXTINF")
+                        && playlist_segments_exist_on_disk(&cache_dir, &content)
+                    {
+                        info!(
+                            "FFmpeg in-flight for {}, playlist became ready after {}ms",
+                            video_id, waited_ms
+                        );
+                        return Ok((cache_dir, content));
+                    }
+                }
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
+            waited_ms += poll_interval_ms;
+        }
+
+        warn!(
+            "FFmpeg in-flight for {}, playlist not ready after {}ms; returning placeholder playlist",
+            video_id, max_wait_ms
+        );
+        return Ok((cache_dir, placeholder_playlist()));
     }
 
     // 创建缓存目录
@@ -1384,6 +1419,7 @@ async fn ensure_hls_segments(
     let lock_file_clone = lock_file.clone();
     let ffmpeg_path_clone = ffmpeg_path.clone();
     let video_codec_clone = video_codec.clone();
+    let video_id_for_task = video_id.clone();
 
     tokio::spawn(async move {
         let result = run_ffmpeg_progressive(
@@ -1399,7 +1435,7 @@ async fn ensure_hls_segments(
         .await;
 
         match result {
-            Ok(_) => info!("�?Video segmented successfully: {}", video_id),
+            Ok(_) => info!("�?Video segmented successfully: {}", video_id_for_task),
             Err(e) => warn!("�?FFmpeg segmentation failed: {}", e),
         }
 
@@ -1445,9 +1481,11 @@ async fn ensure_hls_segments(
         }
     }
 
-    Err(AppError::InternalServerError(
-        "视频分片超时，请检�?ffmpeg 是否正确安装".to_string(),
-    ))
+    warn!(
+        "Progressive segmentation timed out for {} after {}ms; returning placeholder playlist",
+        video_id, max_wait_ms
+    );
+    Ok((cache_dir, placeholder_playlist()))
 }
 
 fn extract_playlist_segment_names(playlist_content: &str) -> Vec<String> {
@@ -2479,13 +2517,13 @@ pub async fn get_secure_playlist(
                 generate_complete_vod_playlist(d, 2.0)
             }
             None => {
-                // 无法获取时长 �?�?no-disk 模式下回退一个短窗口 playlist，保障尽快起播�?
+                // 无法获取时长时也返回可播放的完整 VOD 占位列表，避免前端长时间等待。
                 if no_disk_mode {
                     warn!("📋 Cannot determine duration in no-disk mode, using short fallback playlist");
                     generate_complete_vod_playlist(1800.0, 2.0)
                 } else {
-                    warn!("📋 Cannot determine video duration, falling back to progressive playlist");
-                    playlist_content
+                    warn!("📋 Cannot determine video duration, using bounded fallback VOD playlist");
+                    generate_complete_vod_playlist(1800.0, 2.0)
                 }
             }
         }
