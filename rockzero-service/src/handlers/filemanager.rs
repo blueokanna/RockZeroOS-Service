@@ -1,3 +1,7 @@
+use crate::storage_manager::{
+    is_windows_drive_root, load_windows_storage_binding, persist_windows_storage_binding,
+    windows_storage_binding_path, StorageConfig,
+};
 use actix_multipart::Multipart;
 use actix_web::http::header::{
     ContentDisposition, ContentType, DispositionType, CONTENT_RANGE, RANGE,
@@ -9,20 +13,20 @@ use rockzero_common::AppError;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeekExt};
 use tracing::{info, warn};
 
+#[cfg(not(target_os = "windows"))]
 const BASE_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
 const MAX_FILE_SIZE: usize = 1000 * 1024 * 1024 * 1024;
 const MAX_TEXT_PREVIEW_SIZE: usize = 1024 * 1024;
 
-/// Chunk sizes for different streaming scenarios
-const INITIAL_CHUNK_SIZE: usize = 256 * 1024; // 256KB for initial probe
-const STREAMING_CHUNK_SIZE: usize = 2 * 1024 * 1024; // 2MB for sequential streaming
-const SEEK_CHUNK_SIZE: usize = 512 * 1024; // 512KB for seek (faster time-to-first-byte)
+const INITIAL_CHUNK_SIZE: usize = 256 * 1024;
+const STREAMING_CHUNK_SIZE: usize = 2 * 1024 * 1024;
+const SEEK_CHUNK_SIZE: usize = 512 * 1024;
 const ALLOWED_TEXT_EXTENSIONS: &[&str] = &[
     "txt",
     "md",
@@ -63,6 +67,7 @@ const ALLOWED_TEXT_EXTENSIONS: &[&str] = &[
     "env",
     "properties",
 ];
+const MAX_TEXT_SAVE_SIZE: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 pub struct FileEntry {
@@ -158,6 +163,226 @@ pub struct StreamQuery {
     pub quality: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct StorageRootBindingStatus {
+    pub platform: String,
+    pub scoped_mode: bool,
+    pub configured: bool,
+    pub requires_selection: bool,
+    pub selected_root: Option<String>,
+    pub config_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StorageRootBrowseEntry {
+    pub name: String,
+    pub path: String,
+    pub is_directory: bool,
+    pub total_space: Option<u64>,
+    pub available_space: Option<u64>,
+    pub file_system: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StorageRootBrowseResponse {
+    pub current_path: String,
+    pub parent_path: Option<String>,
+    pub entries: Vec<StorageRootBrowseEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StorageRootBrowseQuery {
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConfigureStorageRootRequest {
+    pub path: String,
+    pub create_if_missing: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SaveTextFileRequest {
+    pub path: String,
+    pub content: String,
+}
+
+pub async fn get_storage_scope_status() -> Result<impl Responder, AppError> {
+    let binding = load_windows_storage_binding()
+        .map_err(|e| AppError::InternalServerError(format!("Failed to read Windows storage binding: {e}")))?;
+
+    Ok(HttpResponse::Ok().json(StorageRootBindingStatus {
+        platform: std::env::consts::OS.to_string(),
+        scoped_mode: cfg!(target_os = "windows"),
+        configured: !cfg!(target_os = "windows") || binding.is_some(),
+        requires_selection: cfg!(target_os = "windows") && binding.is_none(),
+        selected_root: binding
+            .as_ref()
+            .map(|entry| entry.selected_root.to_string_lossy().to_string()),
+        config_path: if cfg!(target_os = "windows") {
+            Some(windows_storage_binding_path().to_string_lossy().to_string())
+        } else {
+            None
+        },
+    }))
+}
+
+pub async fn browse_storage_scope(
+    query: web::Query<StorageRootBrowseQuery>,
+) -> Result<impl Responder, AppError> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = query;
+        return Err(AppError::BadRequest(
+            "Storage root browsing is only required on Windows".to_string(),
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let requested_path = query.path.as_deref().unwrap_or("");
+        let decoded_path = decode_path_value(requested_path);
+
+        if decoded_path.is_empty() {
+            let mut entries = Vec::new();
+            let disks = sysinfo::Disks::new_with_refreshed_list();
+
+            for disk in disks.list() {
+                let mount_point = disk.mount_point().to_path_buf();
+                if !has_windows_drive_prefix(&mount_point) {
+                    continue;
+                }
+
+                let path = mount_point.to_string_lossy().to_string();
+                let disk_name = disk.name().to_string_lossy().trim().to_string();
+                let display_name = if disk_name.is_empty() {
+                    path.clone()
+                } else {
+                    format!("{} ({})", path, disk_name)
+                };
+
+                entries.push(StorageRootBrowseEntry {
+                    name: display_name,
+                    path,
+                    is_directory: true,
+                    total_space: Some(disk.total_space()),
+                    available_space: Some(disk.available_space()),
+                    file_system: Some(disk.file_system().to_string_lossy().to_string()),
+                });
+            }
+
+            entries.sort_by(|left, right| left.path.cmp(&right.path));
+
+            return Ok(HttpResponse::Ok().json(StorageRootBrowseResponse {
+                current_path: String::new(),
+                parent_path: None,
+                entries,
+            }));
+        }
+
+        let target_path = sanitize_windows_storage_selection_path(&decoded_path, false)?;
+        if !target_path.exists() {
+            return Err(AppError::NotFound("Directory not found".to_string()));
+        }
+
+        if !target_path.is_dir() {
+            return Err(AppError::BadRequest(
+                "Selected path is not a directory".to_string(),
+            ));
+        }
+
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&target_path).map_err(|_| AppError::InternalError)? {
+            let entry = entry.map_err(|_| AppError::InternalError)?;
+            let metadata = entry.metadata().map_err(|_| AppError::InternalError)?;
+            if !metadata.is_dir() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path().to_string_lossy().to_string();
+            entries.push(StorageRootBrowseEntry {
+                name,
+                path,
+                is_directory: true,
+                total_space: None,
+                available_space: None,
+                file_system: None,
+            });
+        }
+
+        entries.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+
+        Ok(HttpResponse::Ok().json(StorageRootBrowseResponse {
+            current_path: target_path.to_string_lossy().to_string(),
+            parent_path: target_path.parent().and_then(|parent| {
+                let value = parent.to_string_lossy().to_string();
+                if value == target_path.to_string_lossy() {
+                    None
+                } else {
+                    Some(value)
+                }
+            }),
+            entries,
+        }))
+    }
+}
+
+pub async fn configure_storage_scope(
+    body: web::Json<ConfigureStorageRootRequest>,
+) -> Result<impl Responder, AppError> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = body;
+        return Err(AppError::BadRequest(
+            "Storage root configuration is only required on Windows".to_string(),
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let requested_path = decode_path_value(&body.path);
+        let allow_missing = body.create_if_missing.unwrap_or(false);
+        let target_path = sanitize_windows_storage_selection_path(&requested_path, allow_missing)?;
+
+        if !target_path.exists() {
+            fs::create_dir_all(&target_path).map_err(|e| {
+                AppError::InternalServerError(format!(
+                    "Failed to create Windows storage root {}: {e}",
+                    target_path.display()
+                ))
+            })?;
+        }
+
+        if !target_path.is_dir() {
+            return Err(AppError::BadRequest(
+                "Selected Windows storage root must be a directory".to_string(),
+            ));
+        }
+
+        let binding = persist_windows_storage_binding(&target_path).map_err(|e| {
+            AppError::InternalServerError(format!("Failed to persist Windows storage root: {e}"))
+        })?;
+
+        let storage_config = StorageConfig::from_env();
+        storage_config
+            .init_directories()
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("Failed to initialize scoped storage directories: {e}")))?;
+
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "message": "Windows storage root configured successfully",
+            "selected_root": binding.selected_root.to_string_lossy(),
+            "managed_directories": {
+                "videos": storage_config.video_storage_path.to_string_lossy(),
+                "temp": storage_config.temp_storage_path.to_string_lossy(),
+                "cache": storage_config.hls_cache_path.to_string_lossy(),
+                "logs": storage_config.log_path.to_string_lossy(),
+            }
+        })))
+    }
+}
+
 pub async fn list_directory(
     query: web::Query<ListDirectoryQuery>,
 ) -> Result<impl Responder, AppError> {
@@ -196,7 +421,6 @@ pub async fn list_directory(
     })?;
 
     for entry in read_dir {
-        // Skip entries that can't be read
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -354,7 +578,7 @@ pub async fn upload_files(
     mut payload: Multipart,
     req: actix_web::HttpRequest,
 ) -> Result<impl Responder, AppError> {
-    tracing::info!("📤 Upload request received");
+    tracing::info!("馃摛 Upload request received");
     tracing::info!(
         "  - Authorization header: {:?}",
         req.headers().get("authorization")
@@ -362,11 +586,11 @@ pub async fn upload_files(
     tracing::info!("  - Content-Type: {:?}", req.headers().get("content-type"));
 
     if let Err(e) = crate::middleware::verify_fido2_or_passkey(&req).await {
-        tracing::error!("❌ Authentication failed: {:?}", e);
+        tracing::error!("鉂?Authentication failed: {:?}", e);
         return Err(e);
     }
 
-    tracing::info!("✅ Authentication successful");
+    tracing::info!("鉁?Authentication successful");
 
     let target_path = query.path.as_deref().unwrap_or("");
     tracing::info!("  - Target path: {:?}", target_path);
@@ -383,34 +607,33 @@ pub async fn upload_files(
     let full_path = match sanitize_path(&decoded_target_path) {
         Ok(path) => path,
         Err(e) => {
-            tracing::error!("❌ Path sanitization failed: {:?}", e);
+            tracing::error!("鉂?Path sanitization failed: {:?}", e);
             return Err(e);
         }
     };
 
-    tracing::info!("📂 Resolved upload path: {:?}", full_path);
+    tracing::info!("馃搨 Resolved upload path: {:?}", full_path);
 
-    // 🔒 验证目标路径是否在外部存储上（非eMMC）
     #[cfg(target_os = "linux")]
     {
         let path_str = full_path.to_string_lossy();
         if let Err(e) = crate::handlers::storage::validate_external_storage_path(&path_str) {
-            tracing::error!("❌ External storage validation failed: {:?}", e);
+            tracing::error!("鉂?External storage validation failed: {:?}", e);
             return Err(e);
         }
-        tracing::info!("✅ External storage validation passed");
+        tracing::info!("鉁?External storage validation passed");
     }
 
     if !full_path.exists() {
-        tracing::info!("📁 Creating upload directory: {:?}", full_path);
+        tracing::info!("馃搧 Creating upload directory: {:?}", full_path);
         std::fs::create_dir_all(&full_path).map_err(|e| {
-            tracing::error!("❌ Failed to create directory: {}", e);
+            tracing::error!("鉂?Failed to create directory: {}", e);
             AppError::InternalError
         })?;
     }
 
     if !full_path.is_dir() {
-        tracing::error!("❌ Target path is not a directory: {:?}", full_path);
+        tracing::error!("鉂?Target path is not a directory: {:?}", full_path);
         return Err(AppError::BadRequest(format!(
             "Target path is not a directory: {}",
             full_path.display()
@@ -421,7 +644,7 @@ pub async fn upload_files(
         .canonicalize()
         .unwrap_or_else(|_| full_path.clone());
 
-    tracing::info!("✅ Upload target validated: {:?}", canonical_path);
+    tracing::info!("鉁?Upload target validated: {:?}", canonical_path);
 
     let mut uploaded_files = Vec::new();
     let start_time = std::time::Instant::now();
@@ -520,7 +743,6 @@ pub async fn upload_files(
 
         let checksum = hasher.finalize().to_hex().to_string();
 
-        // 计算最终速度
         let elapsed = file_start_time.elapsed().as_secs_f64();
         let speed_mbps = if elapsed > 0.0 {
             (file_size as f64 * 8.0) / (elapsed * 1_000_000.0)
@@ -529,7 +751,7 @@ pub async fn upload_files(
         };
 
         tracing::info!(
-            "✅ File uploaded successfully: {} ({} bytes, {:.2} Mbps) to {}",
+            "鉁?File uploaded successfully: {} ({} bytes, {:.2} Mbps) to {}",
             decoded_filename,
             file_size,
             speed_mbps,
@@ -566,7 +788,7 @@ pub async fn upload_files(
     };
 
     tracing::info!(
-        "✅ Upload complete: {} files, {} bytes total, {:.2} Mbps average",
+        "鉁?Upload complete: {} files, {} bytes total, {:.2} Mbps average",
         uploaded_files.len(),
         total_size,
         avg_speed_mbps
@@ -589,7 +811,6 @@ pub async fn download_file(
         .as_deref()
         .ok_or_else(|| AppError::BadRequest("Missing file path".to_string()))?;
 
-    // URL-decode the path to handle UTF-8 characters
     let decoded_file_path = urlencoding::decode(file_path)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| file_path.to_string());
@@ -600,8 +821,6 @@ pub async fn download_file(
         return Err(AppError::NotFound("File not found".to_string()));
     }
 
-    // Get the file name and properly encode it for Content-Disposition header
-    // Clone the file name before opening the file to avoid borrow issues
     let file_name = full_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -623,7 +842,6 @@ pub async fn download_file(
 }
 
 pub async fn rename_file(body: web::Json<RenameRequest>) -> Result<impl Responder, AppError> {
-    // URL-decode paths to handle UTF-8 characters
     let decoded_old_path = urlencoding::decode(&body.old_path)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| body.old_path.clone());
@@ -651,7 +869,6 @@ pub async fn rename_file(body: web::Json<RenameRequest>) -> Result<impl Responde
 }
 
 pub async fn move_files(body: web::Json<MoveRequest>) -> Result<impl Responder, AppError> {
-    // URL-decode paths to handle UTF-8 characters
     let decoded_source = urlencoding::decode(&body.source)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| body.source.clone());
@@ -686,7 +903,6 @@ pub async fn move_files(body: web::Json<MoveRequest>) -> Result<impl Responder, 
 }
 
 pub async fn copy_files(body: web::Json<CopyRequest>) -> Result<impl Responder, AppError> {
-    // URL-decode paths to handle UTF-8 characters
     let decoded_source = urlencoding::decode(&body.source)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| body.source.clone());
@@ -724,7 +940,6 @@ pub async fn delete_files(body: web::Json<DeleteRequest>) -> Result<impl Respond
     let mut deleted = Vec::new();
 
     for path_str in &body.paths {
-        // URL-decode path to handle UTF-8 characters
         let decoded_path = urlencoding::decode(path_str)
             .map(|s| s.into_owned())
             .unwrap_or_else(|_| path_str.clone());
@@ -754,7 +969,7 @@ pub async fn delete_files(body: web::Json<DeleteRequest>) -> Result<impl Respond
 pub async fn get_storage_info() -> Result<impl Responder, AppError> {
     let base_path = get_base_directory()?;
 
-    tracing::info!("📊 Getting storage info for: {:?}", base_path);
+    tracing::info!("馃搳 Getting storage info for: {:?}", base_path);
 
     #[cfg(target_os = "linux")]
     {
@@ -792,7 +1007,7 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
                 };
 
                 tracing::info!(
-                    "✅ Storage info (statvfs):\n\
+                    "鉁?Storage info (statvfs):\n\
                      - Path: {:?}\n\
                      - Block size: {} bytes\n\
                      - Raw total: {:.2} GB\n\
@@ -828,13 +1043,11 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
         }
     }
 
-    // Windows 和其他平台使用 sysinfo
     #[cfg(not(target_os = "linux"))]
     {
         use sysinfo::Disks;
         let disks = Disks::new_with_refreshed_list();
 
-        // 查找包含 base_path 的磁盘
         for disk in disks.list() {
             let mount_point = disk.mount_point();
             if base_path.starts_with(mount_point) {
@@ -848,7 +1061,7 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
                 };
 
                 tracing::info!(
-                    "✅ Storage info (sysinfo):\n\
+                    "鉁?Storage info (sysinfo):\n\
                      - Path: {:?}\n\
                      - Mount point: {:?}\n\
                      - Total space: {} bytes ({:.2} GB)\n\
@@ -875,20 +1088,95 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
             }
         }
 
-        tracing::error!("⚠️ Could not find disk for path: {:?}", base_path);
+        tracing::error!("鈿狅笍 Could not find disk for path: {:?}", base_path);
         Err(AppError::InternalServerError(
             "Could not find disk for path".to_string(),
         ))
     }
 }
 
-/// 获取有效的基础目录
+pub async fn write_text_file(
+    body: web::Json<SaveTextFileRequest>,
+) -> Result<impl Responder, AppError> {
+    let decoded_path = decode_path_value(&body.path);
+    let full_path = sanitize_path(&decoded_path)?;
+
+    if body.content.len() > MAX_TEXT_SAVE_SIZE {
+        return Err(AppError::BadRequest(format!(
+            "Text file content exceeds the {} MB editor limit",
+            MAX_TEXT_SAVE_SIZE / (1024 * 1024)
+        )));
+    }
+
+    if full_path.exists() && full_path.is_dir() {
+        return Err(AppError::BadRequest(
+            "Cannot write text content into a directory".to_string(),
+        ));
+    }
+
+    if !is_text_file_supported(&full_path) {
+        return Err(AppError::BadRequest(
+            "Only supported text file types can be edited inline".to_string(),
+        ));
+    }
+
+    let parent = full_path.parent().ok_or_else(|| {
+        AppError::BadRequest("Target file must have a valid parent directory".to_string())
+    })?;
+
+    if !parent.exists() || !parent.is_dir() {
+        return Err(AppError::NotFound(
+            "Parent directory does not exist".to_string(),
+        ));
+    }
+
+    fs::write(&full_path, body.content.as_bytes()).map_err(|e| {
+        AppError::InternalServerError(format!(
+            "Failed to write text file {}: {e}",
+            full_path.display()
+        ))
+    })?;
+
+    let base = get_base_directory()?;
+    let relative_path = full_path
+        .strip_prefix(&base)
+        .unwrap_or(&full_path)
+        .to_string_lossy()
+        .trim_start_matches(['/', '\\'])
+        .replace('\\', "/")
+        .to_string();
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "message": "Text file saved successfully",
+        "path": relative_path,
+        "size": body.content.len(),
+    })))
+}
+
 fn get_base_directory() -> Result<PathBuf, AppError> {
     #[cfg(target_os = "windows")]
     {
-        let fallback = Path::new("./storage");
-        std::fs::create_dir_all(fallback).ok();
-        Ok(fallback.to_path_buf())
+        let binding = load_windows_storage_binding().map_err(|e| {
+            AppError::InternalServerError(format!(
+                "Failed to read Windows storage root configuration: {e}"
+            ))
+        })?;
+
+        let selected_root = binding.ok_or_else(|| {
+            AppError::PreconditionFailed(
+                "Windows storage root is not configured. Select one disk folder before browsing files."
+                    .to_string(),
+            )
+        })?;
+
+        if !selected_root.selected_root.exists() || !selected_root.selected_root.is_dir() {
+            return Err(AppError::PreconditionFailed(format!(
+                "Configured Windows storage root is unavailable: {}",
+                selected_root.selected_root.display()
+            )));
+        }
+
+        Ok(selected_root.selected_root)
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -896,85 +1184,139 @@ fn get_base_directory() -> Result<PathBuf, AppError> {
         for base_dir in BASE_DIRS {
             let path = Path::new(base_dir);
             if path.exists() && path.is_dir() {
-                // 检查是否有读取权限
                 if std::fs::read_dir(path).is_ok() {
                     return Ok(path.to_path_buf());
                 }
             }
         }
 
-        // 如果都不存在，尝试创建 /data 目录
         let data_dir = Path::new("/data");
         if std::fs::create_dir_all(data_dir).is_ok() {
             return Ok(data_dir.to_path_buf());
         }
 
-        // 最后尝试当前目录下的 storage
         let fallback = Path::new("./storage");
         std::fs::create_dir_all(fallback).ok();
         Ok(fallback.to_path_buf())
     }
 }
 
-/// 检查路径是否在允许的基础目录内
-fn is_path_allowed(path: &Path) -> bool {
-    let path_str = path.to_string_lossy();
-
-    // 允许的基础目录
-    for base in BASE_DIRS {
-        if path_str.starts_with(base) {
-            return true;
-        }
-    }
-
-    // 也允许 ./storage (开发环境)
-    if path_str.starts_with("./storage") || path_str.starts_with("storage") {
-        return true;
-    }
-
-    false
+fn is_path_allowed(path: &Path, base: &Path) -> bool {
+    let base_canonical = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    candidate.starts_with(&base_canonical)
+        || path.starts_with(&base_canonical)
+        || path.starts_with(base)
 }
 
 fn sanitize_path(path: &str) -> Result<PathBuf, AppError> {
-    // URL-decode the path first to handle UTF-8 encoded characters
-    let decoded_path = urlencoding::decode(path)
-        .map(|s| s.into_owned())
-        .unwrap_or_else(|_| path.to_string());
-
-    // If path is absolute and in allowed directories, use it directly
-    if decoded_path.starts_with('/') {
-        let abs_path = Path::new(&decoded_path);
-        if is_path_allowed(abs_path) {
-            if abs_path.exists() {
-                return Ok(abs_path.to_path_buf());
-            }
-            // Path doesn't exist but is in allowed range, may be for creating new paths
-            return Ok(abs_path.to_path_buf());
-        }
-    }
-
-    // Get base directory
+    let decoded_path = decode_path_value(path);
     let base = get_base_directory()?;
+    let input_path = Path::new(&decoded_path);
+
+    if path_contains_parent_dir(input_path) {
+        return Err(AppError::Forbidden("Path traversal detected".to_string()));
+    }
 
     let full_path = if decoded_path.is_empty() {
         base.clone()
+    } else if input_path.is_absolute() {
+        input_path.to_path_buf()
     } else {
-        // Remove leading slashes to avoid path issues
-        let clean_path = decoded_path.trim_start_matches('/');
+        let clean_path = decoded_path.trim_start_matches(['/', '\\']);
         base.join(clean_path)
     };
 
-    // Try to canonicalize, but allow non-existent paths for creation
     let canonical = full_path
         .canonicalize()
         .unwrap_or_else(|_| full_path.clone());
 
-    // Security check: ensure path is within allowed directories
-    if !is_path_allowed(&canonical) && !is_path_allowed(&full_path) {
+    if !is_path_allowed(&canonical, &base) && !is_path_allowed(&full_path, &base) {
         return Err(AppError::Forbidden("Path traversal detected".to_string()));
     }
 
     Ok(canonical)
+}
+
+fn decode_path_value(path: &str) -> String {
+    urlencoding::decode(path)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+fn path_contains_parent_dir(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir))
+}
+
+fn is_text_file_supported(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_lowercase())
+        .unwrap_or_default();
+
+    extension.is_empty() || ALLOWED_TEXT_EXTENSIONS.contains(&extension.as_str())
+}
+
+#[cfg(target_os = "windows")]
+fn has_windows_drive_prefix(path: &Path) -> bool {
+    use std::path::Prefix;
+
+    matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)))
+}
+
+#[cfg(target_os = "windows")]
+fn sanitize_windows_storage_selection_path(
+    path: &str,
+    allow_missing: bool,
+) -> Result<PathBuf, AppError> {
+    let candidate = PathBuf::from(path);
+
+    if !candidate.is_absolute() || !has_windows_drive_prefix(&candidate) {
+        return Err(AppError::BadRequest(
+            "Windows storage root must be an absolute local drive path, for example D:\\Media"
+                .to_string(),
+        ));
+    }
+
+    if is_windows_drive_root(&candidate) {
+        return Err(AppError::BadRequest(
+            "Windows storage root must be a folder inside a drive, not the drive root"
+                .to_string(),
+        ));
+    }
+
+    if path_contains_parent_dir(&candidate) {
+        return Err(AppError::Forbidden("Path traversal detected".to_string()));
+    }
+
+    if candidate.exists() {
+        if !candidate.is_dir() {
+            return Err(AppError::BadRequest(
+                "Selected Windows storage root must be a directory".to_string(),
+            ));
+        }
+
+        return Ok(candidate.canonicalize().unwrap_or(candidate));
+    }
+
+    if !allow_missing {
+        return Err(AppError::NotFound(
+            "Selected Windows storage root does not exist".to_string(),
+        ));
+    }
+
+    if let Some(parent) = candidate.parent() {
+        if !parent.exists() || !parent.is_dir() {
+            return Err(AppError::NotFound(
+                "Parent directory for the Windows storage root does not exist"
+                    .to_string(),
+            ));
+        }
+    }
+
+    Ok(candidate)
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), AppError> {
@@ -1012,8 +1354,6 @@ fn format_permissions(metadata: &fs::Metadata) -> String {
     }
 }
 
-// ============ File Preview API ============
-
 pub async fn preview_text_file(
     query: web::Query<ListDirectoryQuery>,
 ) -> Result<impl Responder, AppError> {
@@ -1028,13 +1368,7 @@ pub async fn preview_text_file(
         return Err(AppError::NotFound("File not found".to_string()));
     }
 
-    let extension = full_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
-        .unwrap_or_default();
-
-    if !ALLOWED_TEXT_EXTENSIONS.contains(&extension.as_str()) && !extension.is_empty() {
+    if !is_text_file_supported(&full_path) {
         let mime = mime_guess::from_path(&full_path).first_or_octet_stream();
         if mime.type_() != mime_guess::mime::TEXT {
             return Err(AppError::BadRequest(
@@ -1043,11 +1377,9 @@ pub async fn preview_text_file(
         }
     }
 
-    // Check file size
     let metadata = fs::metadata(&full_path).map_err(|_| AppError::InternalError)?;
 
     if metadata.len() > MAX_TEXT_PREVIEW_SIZE as u64 {
-        // Read only first part
         let mut file = File::open(&full_path).map_err(|_| AppError::InternalError)?;
         let mut buffer = vec![0u8; MAX_TEXT_PREVIEW_SIZE];
         let bytes_read = file
@@ -1066,10 +1398,8 @@ pub async fn preview_text_file(
         }));
     }
 
-    // Read entire file
     let content = fs::read_to_string(&full_path)
         .map_err(|_| {
-            // Try reading as bytes and convert
             fs::read(&full_path)
                 .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
                 .map_err(|_| AppError::InternalError)
@@ -1089,7 +1419,6 @@ pub async fn preview_text_file(
     }))
 }
 
-/// Get media file information
 pub async fn get_media_info(
     query: web::Query<ListDirectoryQuery>,
 ) -> Result<impl Responder, AppError> {
@@ -1116,7 +1445,6 @@ pub async fn get_media_info(
         .unwrap_or("unknown")
         .to_string();
 
-    // Check if it's a media file
     let is_video = mime_type.starts_with("video/");
     let is_audio = mime_type.starts_with("audio/");
 
@@ -1124,7 +1452,6 @@ pub async fn get_media_info(
         return Err(AppError::BadRequest("Not a media file".to_string()));
     }
 
-    // Try to get media info using ffprobe
     let (duration, width, height, video_codec, audio_codec, bitrate) = get_ffprobe_info(&full_path);
 
     Ok(HttpResponse::Ok().json(MediaInfo {
@@ -1141,12 +1468,6 @@ pub async fn get_media_info(
     }))
 }
 
-/// 异步流式文件读取器 - 使用 tokio 异步文件 I/O，不阻塞运行时
-///
-/// 相比旧版同步 StreamingFileReader 的优势：
-/// - 使用 tokio::fs::File 进行真正的异步 I/O，不阻塞 worker 线程
-/// - 根据 seek/sequential 场景自动选择最优 chunk 大小
-/// - 支持任意大文件的流式传输，内存占用恒定
 struct AsyncStreamingReader {
     file: tokio::fs::File,
     remaining: u64,
@@ -1164,9 +1485,6 @@ impl AsyncStreamingReader {
         let mut file = tokio::fs::File::open(path).await?;
         file.seek(std::io::SeekFrom::Start(start)).await?;
 
-        // 根据场景选择最优 chunk 大小：
-        // - seek 操作：小 chunk = 更快的首字节时间
-        // - 顺序读取：大 chunk = 更高吞吐量
         let chunk_size = if is_seek {
             SEEK_CHUNK_SIZE
         } else if length <= INITIAL_CHUNK_SIZE as u64 {
@@ -1196,7 +1514,6 @@ impl futures::Stream for AsyncStreamingReader {
 
         let to_read = std::cmp::min(this.chunk_size as u64, this.remaining) as usize;
 
-        // 使用 tokio 的异步读取 — 不会阻塞 runtime 线程
         let mut read_buf = tokio::io::ReadBuf::new(&mut this.buf[..to_read]);
         match Pin::new(&mut this.file).poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
@@ -1215,7 +1532,6 @@ impl futures::Stream for AsyncStreamingReader {
     }
 }
 
-/// 生成 ETag 用于缓存和条件请求
 fn generate_media_etag(metadata: &std::fs::Metadata) -> String {
     let modified = metadata
         .modified()
@@ -1227,14 +1543,6 @@ fn generate_media_etag(metadata: &std::fs::Metadata) -> String {
     format!("\"{:x}-{:x}\"", modified, size)
 }
 
-/// 流式媒体文件传输 - 完整的 HTTP Range 支持 + 异步 I/O
-///
-/// 优化要点：
-/// - 使用 tokio 异步文件 I/O，不阻塞 runtime
-/// - 不限制 Range 大小（由播放器决定需要多少数据）
-/// - 支持 ETag/条件请求减少重复传输
-/// - 自适应 chunk 大小（seek vs 顺序读取）
-/// - 支持 CORS 头，允许跨域播放
 #[allow(dead_code)]
 pub async fn stream_media(
     req: HttpRequest,
@@ -1255,7 +1563,6 @@ pub async fn stream_media(
         .first_or_octet_stream()
         .to_string();
 
-    // Verify it's a media file
     if !mime_type.starts_with("video/")
         && !mime_type.starts_with("audio/")
         && !mime_type.starts_with("image/")
@@ -1270,7 +1577,6 @@ pub async fn stream_media(
         return Err(AppError::BadRequest("Empty file".to_string()));
     }
 
-    // 优化 Content-Type 映射
     let extension = full_path
         .extension()
         .and_then(|e| e.to_str())
@@ -1298,7 +1604,6 @@ pub async fn stream_media(
         _ => mime_type,
     };
 
-    // ETag 和条件请求支持
     let etag = generate_media_etag(&metadata);
     if let Some(if_none_match) = req
         .headers()
@@ -1313,8 +1618,6 @@ pub async fn stream_media(
     let ct = effective_content_type.clone();
     let etag_clone = etag.clone();
 
-    // Probe media info for duration and codec headers (non-blocking spawn)
-    // This lets clients display duration and codec info without a separate /streaming/info call
     let probe_info = {
         let path = full_path.clone();
         tokio::task::spawn_blocking(move || get_ffprobe_info(&path))
@@ -1323,7 +1626,6 @@ pub async fn stream_media(
     };
     let (media_duration, _, _, video_codec, audio_codec, _) = probe_info;
 
-    // 通用头部 — 包含 duration 和 codec 信息供客户端即时使用
     let apply_headers = move |resp: &mut actix_web::HttpResponseBuilder| {
         resp.insert_header(("Content-Type", ct.as_str()));
         resp.insert_header(("Accept-Ranges", "bytes"));
@@ -1348,7 +1650,6 @@ pub async fn stream_media(
         }
     };
 
-    // Handle HEAD requests — return headers only, no body (for preflight checks)
     if req.method() == actix_web::http::Method::HEAD {
         let mut response = HttpResponse::Ok();
         apply_headers(&mut response);
@@ -1356,13 +1657,10 @@ pub async fn stream_media(
         return Ok(response.finish());
     }
 
-    // Parse Range header
     let range_header = req.headers().get(RANGE).and_then(|v| v.to_str().ok());
 
     if let Some(range_str) = range_header {
         if let Some((start, end)) = parse_range_header(range_str, file_size) {
-            // 不限制 Range 大小 — 播放器知道它需要多少数据
-            // 限制 Range 会导致播放器反复重新缓冲和 seek 卡顿
             let end = std::cmp::min(end, file_size - 1);
             let length = end - start + 1;
             let is_seek = start > 0;
@@ -1386,7 +1684,6 @@ pub async fn stream_media(
         }
     }
 
-    // No Range — 完整文件流式传输
     let stream = AsyncStreamingReader::open(&full_path, 0, file_size, false)
         .await
         .map_err(|e| {
@@ -1401,10 +1698,6 @@ pub async fn stream_media(
     Ok(response.streaming(stream))
 }
 
-/// 图片文件服务 - 支持缓存、条件请求和流式传输大图
-///
-/// 对于小图片（<10MB）直接返回 body，对于大图使用流式传输。
-/// 支持 ETag 和 If-None-Match 条件请求，避免重复传输。
 pub async fn serve_image(
     req: HttpRequest,
     query: web::Query<ListDirectoryQuery>,
@@ -1424,7 +1717,6 @@ pub async fn serve_image(
         .first_or_octet_stream()
         .to_string();
 
-    // Verify it's an image
     if !mime_type.starts_with("image/") {
         return Err(AppError::BadRequest("Not an image file".to_string()));
     }
@@ -1432,7 +1724,6 @@ pub async fn serve_image(
     let metadata = fs::metadata(&full_path).map_err(|_| AppError::InternalError)?;
     let file_size = metadata.len();
 
-    // ETag 和条件请求 — 图片未变化时返回 304
     let etag = generate_media_etag(&metadata);
     if let Some(if_none_match) = req
         .headers()
@@ -1448,7 +1739,6 @@ pub async fn serve_image(
         .parse()
         .unwrap_or(mime_guess::mime::IMAGE_PNG);
 
-    // 10MB 以下直接 body 返回（更高效），以上用流式
     if file_size <= 10 * 1024 * 1024 {
         let file_content = tokio::fs::read(&full_path)
             .await
@@ -1466,7 +1756,6 @@ pub async fn serve_image(
             })
             .body(file_content))
     } else {
-        // 大图片使用流式传输
         let stream = AsyncStreamingReader::open(&full_path, 0, file_size, false)
             .await
             .map_err(|e| {
@@ -1488,7 +1777,6 @@ pub async fn serve_image(
     }
 }
 
-/// Generate thumbnail for media file
 pub async fn get_thumbnail(query: web::Query<StreamQuery>) -> Result<HttpResponse, AppError> {
     let file_path = query
         .path
@@ -1505,7 +1793,6 @@ pub async fn get_thumbnail(query: web::Query<StreamQuery>) -> Result<HttpRespons
         .first_or_octet_stream()
         .to_string();
 
-    // For images, return the image itself (could add resize later)
     if mime_type.starts_with("image/") {
         let file_content = fs::read(&full_path).map_err(|_| AppError::InternalError)?;
 
@@ -1516,7 +1803,6 @@ pub async fn get_thumbnail(query: web::Query<StreamQuery>) -> Result<HttpRespons
             .body(file_content));
     }
 
-    // For videos, try to generate thumbnail using ffmpeg
     if mime_type.starts_with("video/") {
         let timestamp = query.quality.as_deref().unwrap_or("00:00:01");
 
@@ -1527,13 +1813,11 @@ pub async fn get_thumbnail(query: web::Query<StreamQuery>) -> Result<HttpRespons
         }
     }
 
-    // Return placeholder or error
     Err(AppError::BadRequest(
         "Cannot generate thumbnail for this file type".to_string(),
     ))
 }
 
-// ============ Helper Functions ============
 
 #[allow(dead_code)]
 fn parse_range_header(range: &str, file_size: u64) -> Option<(u64, u64)> {
@@ -1629,7 +1913,6 @@ fn get_ffprobe_info(
 fn generate_video_thumbnail(path: &Path, timestamp: &str) -> Option<Vec<u8>> {
     use std::process::Command;
 
-    // Create temp file for thumbnail
     let temp_path = std::env::temp_dir().join(format!("thumb_{}.jpg", uuid::Uuid::new_v4()));
 
     let output = Command::new("ffmpeg")
@@ -1655,4 +1938,263 @@ fn generate_video_thumbnail(path: &Path, timestamp: &str) -> Option<Vec<u8>> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{http::StatusCode, test, web, App};
+    use serde_json::{json, Value};
+    use tokio::sync::Mutex;
+    use uuid::Uuid;
+
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+    const SCOPED_ENV_KEYS: &[&str] = &[
+        "DATA_DIR",
+        "EXTERNAL_STORAGE_PATH",
+        "VIDEO_STORAGE_PATH",
+        "TEMP_STORAGE_PATH",
+        "HLS_CACHE_PATH",
+        "LOG_PATH",
+    ];
+
+    struct FileManagerTestEnv {
+        base_dir: PathBuf,
+        data_dir: PathBuf,
+        scope_root: PathBuf,
+        previous_env: Vec<(String, Option<String>)>,
+    }
+
+    impl FileManagerTestEnv {
+        fn new(name: &str) -> Self {
+            let base_dir = std::env::temp_dir()
+                .join(format!("rockzero-filemanager-{name}-{}", Uuid::new_v4()));
+            let data_dir = base_dir.join("data");
+            let scope_root = base_dir.join("scope-root");
+
+            fs::create_dir_all(&data_dir).unwrap();
+            fs::create_dir_all(&scope_root).unwrap();
+
+            let previous_env = SCOPED_ENV_KEYS
+                .iter()
+                .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+
+            std::env::set_var("DATA_DIR", &data_dir);
+            for key in &SCOPED_ENV_KEYS[1..] {
+                std::env::remove_var(key);
+            }
+
+            Self {
+                base_dir,
+                data_dir,
+                scope_root,
+                previous_env,
+            }
+        }
+
+        fn create_dir(&self, relative: &str) -> PathBuf {
+            let path = self.scope_root.join(relative);
+            fs::create_dir_all(&path).unwrap();
+            path
+        }
+
+        fn read_binding_root(&self) -> String {
+            let raw = fs::read_to_string(
+                self.data_dir.join("storage").join("windows-storage-root.json"),
+            )
+            .unwrap();
+            serde_json::from_str::<Value>(&raw)
+                .unwrap()["selected_root"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    }
+
+    impl Drop for FileManagerTestEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.previous_env.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+
+            let _ = fs::remove_dir_all(&self.base_dir);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[actix_web::test]
+    async fn storage_scope_status_requires_binding_before_windows_file_access() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env = FileManagerTestEnv::new("status");
+
+        let app = test::init_service(
+            App::new().route("/scope/status", web::get().to(get_storage_scope_status)),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/scope/status").to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let payload: Value = test::read_body_json(response).await;
+        assert_eq!(payload["platform"], "windows");
+        assert_eq!(payload["scoped_mode"], true);
+        assert_eq!(payload["configured"], false);
+        assert_eq!(payload["requires_selection"], true);
+        assert!(payload["selected_root"].is_null());
+        assert!(payload["config_path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("windows-storage-root.json"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[actix_web::test]
+    async fn storage_scope_configure_persists_binding_and_browse_lists_directories() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let env = FileManagerTestEnv::new("configure-browse");
+        env.create_dir("Documents");
+        env.create_dir("Media");
+        fs::write(env.scope_root.join("ignore.txt"), b"ignore").unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .route("/scope/status", web::get().to(get_storage_scope_status))
+                .route("/scope/browse", web::get().to(browse_storage_scope))
+                .route("/scope/configure", web::post().to(configure_storage_scope)),
+        )
+        .await;
+
+        let configure_request = test::TestRequest::post()
+            .uri("/scope/configure")
+            .set_json(json!({
+                "path": env.scope_root.to_string_lossy(),
+                "create_if_missing": false,
+            }))
+            .to_request();
+        let configure_response = test::call_service(&app, configure_request).await;
+
+        assert_eq!(configure_response.status(), StatusCode::OK);
+
+        let configure_payload: Value = test::read_body_json(configure_response).await;
+        let expected_root = env.scope_root.canonicalize().unwrap();
+        assert_eq!(
+            configure_payload["selected_root"],
+            Value::String(expected_root.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            env.read_binding_root(),
+            expected_root.to_string_lossy().to_string()
+        );
+
+        let status_response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/scope/status").to_request(),
+        )
+        .await;
+        assert_eq!(status_response.status(), StatusCode::OK);
+
+        let status_payload: Value = test::read_body_json(status_response).await;
+        assert_eq!(status_payload["configured"], true);
+        assert_eq!(status_payload["requires_selection"], false);
+        assert_eq!(
+            status_payload["selected_root"],
+            Value::String(expected_root.to_string_lossy().to_string())
+        );
+
+        let browse_uri = format!(
+            "/scope/browse?path={}",
+            urlencoding::encode(expected_root.to_string_lossy().as_ref())
+        );
+        let browse_response = test::call_service(
+            &app,
+            test::TestRequest::get().uri(&browse_uri).to_request(),
+        )
+        .await;
+        assert_eq!(browse_response.status(), StatusCode::OK);
+
+        let browse_payload: Value = test::read_body_json(browse_response).await;
+        let entry_names = browse_payload["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(browse_payload["current_path"], expected_root.to_string_lossy().to_string());
+        assert!(entry_names.contains(&"Documents"));
+        assert!(entry_names.contains(&"Media"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[actix_web::test]
+    async fn text_save_writes_inside_configured_windows_scope() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let env = FileManagerTestEnv::new("text-save");
+        env.create_dir("notes");
+        persist_windows_storage_binding(&env.scope_root).unwrap();
+
+        let app = test::init_service(
+            App::new().route("/text/save", web::post().to(write_text_file)),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/text/save")
+                .set_json(json!({
+                    "path": "notes/readme.md",
+                    "content": "hello from scoped storage",
+                }))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let payload: Value = test::read_body_json(response).await;
+        let saved_path = env.scope_root.join("notes").join("readme.md");
+        assert_eq!(payload["path"], "notes/readme.md");
+        assert_eq!(payload["size"], 25);
+        assert_eq!(fs::read_to_string(saved_path).unwrap(), "hello from scoped storage");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[actix_web::test]
+    async fn non_windows_scope_endpoints_report_not_required() {
+        let app = test::init_service(
+            App::new()
+                .route("/scope/status", web::get().to(get_storage_scope_status))
+                .route("/scope/browse", web::get().to(browse_storage_scope))
+                .route("/scope/configure", web::post().to(configure_storage_scope)),
+        )
+        .await;
+
+        let status_response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/scope/status").to_request(),
+        )
+        .await;
+        assert_eq!(status_response.status(), StatusCode::OK);
+
+        let status_payload: Value = test::read_body_json(status_response).await;
+        assert_eq!(status_payload["scoped_mode"], false);
+        assert_eq!(status_payload["configured"], true);
+        assert_eq!(status_payload["requires_selection"], false);
+
+        let browse_response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/scope/browse").to_request(),
+        )
+        .await;
+        assert_eq!(browse_response.status(), StatusCode::BAD_REQUEST);
+    }
 }

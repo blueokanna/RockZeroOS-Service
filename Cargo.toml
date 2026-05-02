@@ -82,7 +82,7 @@ symphonia = { version = "0.5", features = ["all"] }
 libc = "0.2.180"
 sysinfo = "0.30"
 nix = { version = "0.27", features = ["mount", "fs"] }
-winapi = { version = "0.3", features = ["fileapi", "winbase"] }
+winapi = { version = "0.3", features = ["fileapi", "winbase", "consoleapi", "errhandlingapi", "minwinbase", "winnt"] }
 
 # Utilities
 uuid = { version = "1.6", features = ["v4", "serde"] }

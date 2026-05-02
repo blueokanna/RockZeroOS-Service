@@ -33,7 +33,7 @@ impl PlaylistGenerator {
         &self,
         segment_count: usize,
         segment_duration: f32,
-        use_encryption: bool,
+        _use_encryption: bool,
     ) -> String {
         let mut playlist = String::from("#EXTM3U\n");
         playlist.push_str("#EXT-X-VERSION:3\n");
@@ -42,10 +42,6 @@ impl PlaylistGenerator {
             segment_duration.ceil() as u32
         ));
         playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
-        if use_encryption {
-            playlist.push_str("# Encryption is handled out-of-band via SAE + ChaCha20-Poly1305\n");
-        }
-
         playlist.push('\n');
 
         for i in 0..segment_count {
@@ -73,9 +69,7 @@ impl PlaylistGenerator {
         ));
         playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n\n");
 
-        // 每个分片使用不同的密钥
         for i in 0..segment_count {
-            playlist.push_str("# Segment encryption key is negotiated out-of-band\n");
             playlist.push_str(&format!("#EXTINF:{:.3},\n", segment_duration));
             playlist.push_str(&format!(
                 "{}/api/v1/hls/{}/segment_{}.ts\n",
@@ -87,7 +81,6 @@ impl PlaylistGenerator {
         playlist
     }
 
-    /// 生成实时流播放列表（不包含 ENDLIST）
     pub fn generate_live_playlist(
         &self,
         segment_count: usize,
@@ -102,10 +95,8 @@ impl PlaylistGenerator {
         ));
         playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", sequence_number));
 
-        // 分片加密通过 SAE 会话密钥在传输层完成
         playlist.push('\n');
 
-        // 添加分片
         for i in 0..segment_count {
             let segment_num = sequence_number + i as u64;
             playlist.push_str(&format!("#EXTINF:{:.3},\n", segment_duration));
@@ -153,7 +144,7 @@ mod tests {
         let playlist = generator.generate_media_playlist(5, 10.0, true);
 
         assert!(playlist.contains("#EXTM3U"));
-        assert!(playlist.contains("#EXT-X-KEY"));
+        assert!(!playlist.contains("#EXT-X-KEY"));
         assert!(playlist.contains("segment_0.ts"));
         assert!(playlist.contains("segment_4.ts"));
         assert!(playlist.contains("#EXT-X-ENDLIST"));

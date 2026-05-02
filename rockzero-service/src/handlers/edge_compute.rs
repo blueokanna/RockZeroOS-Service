@@ -343,8 +343,7 @@ impl EdgeManager {
                     .map(|v| v.get().max(2))
                     .unwrap_or(2)
             })
-            .min(16)
-            .max(1);
+            .clamp(1, 16);
 
         for i in 0..workers {
             let mgr = Arc::clone(self);
@@ -662,17 +661,17 @@ impl EdgeManager {
         let expires_at = auth.as_ref().and_then(|a| a.expires_at);
         let seconds_left = expires_at.map(|exp| exp - checked_at);
 
-        let overall_status = if !gateway
+        let gateway_ok = gateway
             .get("reachable")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            || !field_mapping
-                .get("ok")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
+            .unwrap_or(false);
+        let mapping_ok = field_mapping
+            .get("ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let overall_status = if !gateway_ok || !mapping_ok || (logged_in && !refresh_report.success)
         {
-            "degraded"
-        } else if logged_in && !refresh_report.success {
             "degraded"
         } else {
             "ok"

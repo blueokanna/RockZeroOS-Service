@@ -104,6 +104,7 @@ nix = { workspace = true }
 hyperlocal = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+libc = { workspace = true }
 winapi = { workspace = true }
 
 [dev-dependencies]

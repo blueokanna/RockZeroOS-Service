@@ -15,20 +15,25 @@
   <img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Build Status">
 </p>
 
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
+</p>
+
 ---
 
 ## Overview
 
-RockZeroOS is a high-performance, secure cross-platform private cloud NAS operating system. The backend is built entirely in Rust using Actix-web with military-grade encryption including WPA3-SAE key exchange, EdDSA (Ed25519) JWT authentication, AES-256-GCM encryption, and BLAKE3 integrity verification. The frontend is a Flutter cross-platform client supporting Android, iOS, Windows, macOS, Linux, and Web, with Material Design 3 UI optimized for low-power ARM SoCs (Snapdragon 835 class).
+RockZeroOS is a high-performance, secure cross-platform private cloud NAS operating system. The backend is built entirely in Rust using Actix-web with WPA3-SAE key exchange, EdDSA (Ed25519) JWT authentication, ChaCha20-Poly1305 secure HLS transport encryption, and BLAKE3-based key derivation and integrity tooling. The frontend is a Flutter cross-platform client supporting Android, iOS, Windows, macOS, Linux, and Web, with Material Design 3 UI optimized for low-power ARM SoCs (Snapdragon 835 class).
 
 ## Features
 
 - **Dashboard** — System overview with CPU, memory, disk, network monitoring, and chronograph-style speed test
 - **File Manager** — Browse disks, navigate directories, upload/download files, LAN file transfer, WebDAV, network shares
-- **Video Playback** — SAE-encrypted HLS streaming with session-based authentication and AES-256-GCM segment encryption (PMK → HKDF-BLAKE3 → AES-GCM), codec-aware adaptive timeouts (30s H.264/120s AV1), on-demand seek segment generation for VP9/AV1 transcode, PTS timestamp normalization (`-fflags +genpts+discardcorrupt -avoid_negative_ts make_zero`) + client-side offset detection for MKV sources with non-zero start time
+- **Video Playback** — SAE-protected HLS streaming with session-based authentication, ChaCha20-Poly1305 transport encryption (PMK → HKDF-BLAKE3 → session key), local Flutter proxy playback, proof-ticket / ZKP protected segment access, codec-aware adaptive timeouts (30s H.264/120s AV1), on-demand seek segment generation for VP9/AV1 transcode, and PTS timestamp normalization (`-fflags +genpts+discardcorrupt -avoid_negative_ts make_zero`)
 - **Game Center** — Multi-platform gaming hub with Steam, Epic Games, WeGame, Ubisoft Connect, Xbox native store integration (no WebView), unified game library, daily Top 30 recommendations, and built-in SteamDB viewer
+- **Localization & Motion** — zh-CN / English app-level localization foundation, low-motion route transitions, and reduced heavy list animations for weaker Android, Windows, and Linux devices
 - **WASM Runtime** — Run WebAssembly applications and scripts via Wasmtime, including built-in SteamDB viewer (name + AppID dual search), M3U8 video downloader (custom save directory), and Steam P2P connection analyzer (with NAT type help docs)
-- **Storage Management** — Smart formatting (ext4/XFS/Btrfs/exFAT), auto mount, partition management, SMART monitoring, secure erase
+- **Storage Management** — Linux full disk lifecycle management (format/mount/partition/SMART/secure erase) and Windows scoped single-root file management with disk status visibility
 - **Hardware Transcoding** — Auto-detected FFmpeg hardware acceleration (VAAPI, V4L2 M2M, Rockchip MPP)
 - **Security** — FIDO2/WebAuthn, wallpaper customization with glassmorphic blur (BackdropFilter high-contrast frost), dynamic color (80% wallpaper + 20% system), Reed-Solomon + CRC32 secure storage, Bulletproofs ZKP for authentication
 - **MD3 Expressive Components** — Custom loading indicators (starburst spinner, wavy progress, pulsing dots, segmented spinner), secure connection shield animation for SAE handshake, buffering overlay with rotating dot ring
@@ -47,7 +52,7 @@ flowchart TB
     subgraph Server["Rust Backend"]
         E[JWT Verification] --> F[SAE Key Exchange]
         F --> G[PMK Derivation]
-        G --> H[AES-256-GCM Encryption]
+      G --> H[ChaCha20-Poly1305 Transport]
     end
     
     B --> E
@@ -62,8 +67,9 @@ flowchart TB
 |---------|------------|-------------|
 | JWT Authentication | EdDSA (Ed25519) | Private key derived from BLAKE3 hash of password |
 | Key Exchange | WPA3-SAE (Dragonfly) | Secure key negotiation based on Curve25519 |
-| Video Encryption | AES-256-GCM | HLS segments encrypted at rest, session-authenticated playback |
-| Session Auth | 128-bit UUID + BLAKE3 HMAC | Direct mode session token per HLS stream |
+| Video Transport Encryption | ChaCha20-Poly1305 | Session-derived secure HLS segment transport |
+| HLS Cache Protection | Optional at-rest segment encryption | Non-Windows default: enabled; Windows default: disabled for stable playback |
+| Session Auth | 128-bit UUID + BLAKE3 HMAC | Session-bound playback token and proof-ticket chain |
 | Replay Protection | Timestamp + Nonce + HMAC | Multi-layer protection mechanism |
 | Zero-Knowledge Proof | Bulletproofs RangeProof | Prove password knowledge without revealing it (auth only) |
 | Hardware Auth | FIDO2/WebAuthn | Support for YubiKey, TouchID, FaceID |
@@ -71,7 +77,7 @@ flowchart TB
 
 ## Video Playback Architecture
 
-RockZeroOS uses SAE-encrypted HLS streaming for all video playback. The client performs an SAE handshake, creates a session with `direct_mode: true`, and accesses the playlist URL directly via media_kit without an intermediate proxy. Bulletproofs ZKP is **not** used for video playback; authentication is handled by session tokens.
+RockZeroOS uses SAE-protected HLS streaming for all video playback. The client performs an SAE handshake, creates a secure HLS session with `direct_mode: false`, serves playback through a local Flutter proxy, and uses session-bound proof tickets or ZKP material for segment access. Segment transport is ChaCha20-Poly1305 encrypted with a session key derived from PMK via HKDF-BLAKE3.
 
 ```mermaid
 sequenceDiagram
@@ -90,20 +96,18 @@ sequenceDiagram
     C->>S: 4. SAE Confirm
     S-->>C: Server Confirm + PMK
     
-    C->>S: 5. Create HLS Session (direct_mode=true)
+    C->>S: 5. Create HLS Session (direct_mode=false)
     S-->>C: Session ID + Playlist URL
-    
-    Note over C,S: No per-segment ZKP — session token authenticates all requests
-    
-    C->>S: 6. GET playlist.m3u8 (via media_kit)
+    C->>C: 6. Start local secure HLS proxy
+    C->>S: 7. GET playlist.m3u8
     S-->>C: M3U8 playlist
     
     loop Each Video Segment
-        C->>S: 7. GET segment_N.ts (session token in URL)
-        Note over S: Verify session token
+      C->>S: 8. POST segment_N.ts with proof ticket / ZKP
+      Note over S: Verify session + proof ticket / ZKP
         Note over S: Stream copy ≤1080p / HW transcode >1080p
-        S-->>C: AES-256-GCM encrypted segment (at-rest)
-        Note over C: Decrypt and play via hardware decoder
+      S-->>C: ChaCha20-Poly1305 encrypted segment
+      Note over C: Proxy decrypts and forwards TS bytes to player
     end
 ```
 
@@ -140,10 +144,10 @@ The **back button** on the full-screen audio player minimizes playback to the ba
 ```
 PMK (from SAE handshake)
   → HKDF-BLAKE3(salt="hls-session-salt:{session_id}", info="hls-master-key")
-  → 256-bit AES-GCM encryption key
+  → 256-bit ChaCha20-Poly1305 transport key
 ```
 
-Each segment is encrypted as: `nonce(12B) ‖ AES-256-GCM(plaintext, key, nonce) ‖ tag(16B)`
+Each segment is encrypted as: `nonce(12B) ‖ ChaCha20-Poly1305(plaintext, key, nonce)`
 
 ## Storage Management
 
@@ -157,6 +161,47 @@ Each segment is encrypted as: `nonce(12B) ‖ AES-256-GCM(plaintext, key, nonce)
 - **Partition Management** — GPT/MBR partition table creation
 - **Disk Health** — SMART data monitoring, temperature detection
 - **Secure Erase** — Multi-pass overwrite for data destruction
+
+## Windows Scoped Storage Mode
+
+Windows runs in a different production mode from Linux.
+
+- RockZeroOS does **not** format, partition, wipe, or auto-mount disks on Windows.
+- The backend exposes disk status and capacity information, but file operations are limited to **one explicitly selected storage root**.
+- On first use, the Windows server must bind to **one folder on one Windows disk** before file browsing is enabled.
+- The selected folder is persisted in `DATA_DIR/storage/windows-storage-root.json`.
+- Flutter clients on Windows and Android use the same backend scope endpoints, so the selected root is enforced consistently across frontend platforms.
+- Windows secure HLS playback uses the same scoped root guard and is verified by the Flutter smoke chain (`secure_hls_playlist_only_smoke_test.dart` and `secure_hls_smoke_test.dart`).
+- `ROCKZERO_HLS_CACHE_AT_REST_ENCRYPTION` defaults to `false` on Windows and `true` on non-Windows builds. This keeps Windows playback stable while preserving at-rest protection by default on Linux/macOS.
+
+### First Windows Startup Flow
+
+1. Open the Files page.
+2. If the backend is running on Windows and no storage root has been selected yet, the client enters **Storage Setup** instead of showing all disks.
+3. Browse the server-side Windows drive list and choose exactly one folder.
+4. Confirm the folder. RockZeroOS writes the scope binding and initializes managed subdirectories (`videos`, `temp`, `cache/hls`, `logs`).
+5. After that, all file operations are restricted to that root and its subdirectories only.
+
+### Supported Windows File Operations
+
+- Browse directories inside the selected root
+- Upload and download files
+- Create directories
+- Rename files and folders
+- Copy and move files and folders
+- Delete files and folders
+- Preview text files
+- Save inline edits for supported text files
+- Stream media and read disk/storage status
+
+### Windows Scope API
+
+- `GET /api/v1/filemanager/scope/status` — Returns whether Windows storage has already been bound
+- `GET /api/v1/filemanager/scope/browse` — Returns server-side drives or subdirectories for setup browsing
+- `POST /api/v1/filemanager/scope/configure` — Persists the selected Windows storage root
+- `POST /api/v1/filemanager/text/save` — Saves supported text-file edits inside the scoped root
+
+Any request outside the selected Windows root is rejected by the backend path guard.
 
 ## Hardware Accelerated Transcoding
 
@@ -175,9 +220,13 @@ For ≤1080p content, the server uses stream copy (`-c:v copy -c:a copy -map 0:v
 
 **Codec-aware timeouts**: Before spawning ffmpeg, the server probes the video codec via ffprobe. H.264/HEVC videos get a 30-second first-segment timeout (stream copy is fast). AV1/VP9/other codecs get 120 seconds since software transcode is slower.
 
-**On-demand seek**: When a player seeks to a distant segment during transcode (>5 segments ahead of current progress), the server generates the requested segment on-demand using `-ss` + hardware/software encode, bypassing the need to wait for all preceding segments. The on-demand segment is encrypted at rest with the same AES-256-GCM storage key.
+**On-demand seek**: When a player seeks to a distant segment during transcode (>5 segments ahead of current progress), the server generates the requested segment on-demand using `-ss` + hardware/software encode, bypassing the need to wait for all preceding segments. The on-demand segment uses the same ChaCha20-Poly1305 cache protection path as the rest of the secure HLS cache when at-rest cache encryption is enabled.
 
 **HLS cache defaults**: Max 1 GB HLS cache, 1-day retention, 5-minute idle cleanup interval. Auto-cleanup triggers when total cache exceeds 1 GB threshold.
+
+**Windows playback note**: temporary HLS cache at-rest encryption is disabled by default on Windows. Transport encryption for served segments remains enabled. If you explicitly want encrypted temporary cache files on Windows, set `ROCKZERO_HLS_CACHE_AT_REST_ENCRYPTION=true` and validate playback in your environment.
+
+**Windows diagnostics**: use `scripts/secure_hls_playlist_only_diag.ps1` to reproduce playlist-only failures. When ProcDump and `minidump-stackwalk` are available, the script writes `summary.json`, `procdump.stackwalk.txt`, `procdump.stackwalk.summary.txt`, and `suspicious_threads.json` under `storage/smoke/playlist_only_diag/<timestamp>/`.
 
 ### Adaptive Hybrid Transport (UDP/TCP)
 
@@ -277,7 +326,7 @@ RockZeroOS-Service/
 │   │   ├── ed25519.rs            # Ed25519 signature operations
 │   │   ├── bulletproofs_ffi.rs   # Bulletproofs RangeProof FFI
 │   │   ├── zkp.rs                # ZKP authentication logic
-│   │   ├── aes.rs                # AES-256-GCM encryption/decryption
+│   │   ├── aes.rs                # AES helpers for non-HLS crypto paths
 │   │   ├── hash.rs               # BLAKE3, SHA3-256 hashing
 │   │   ├── signature.rs          # Digital signatures
 │   │   ├── tls.rs                # Rustls TLS configuration
@@ -293,7 +342,7 @@ RockZeroOS-Service/
 ├── rockzero-media/               # Media processing
 │   ├── src/
 │   │   ├── session.rs            # HLS session management
-│   │   ├── encryptor.rs          # AES-256-GCM video segment encryption
+│   │   ├── encryptor.rs          # Media encryption helpers and cache protection
 │   │   ├── bulletproof_auth.rs   # Per-segment authentication
 │   │   ├── media_processor.rs    # FFmpeg detection & HW capabilities
 │   │   ├── chunk_manager.rs      # Progressive chunk management
@@ -431,7 +480,7 @@ sequenceDiagram
     S-->>C: {tokens, user}
 ```
 
-### Secure HLS (SAE + AES-256-GCM)
+### Secure HLS (SAE + ChaCha20-Poly1305)
 
 ```http
 POST /api/v1/secure-hls/sae/init
@@ -563,7 +612,7 @@ POST /api/v1/invite/remaining                        # Check remaining time
 | EdDSA JWT Verify | ~0.2ms | Ed25519 via dalek |
 | SAE Handshake (full) | ~5-10ms | Curve25519 Dragonfly |
 | Bulletproofs RangeProof | ~50ms | 64-bit range proof (auth only, not video playback) |
-| AES-256-GCM Encrypt/Decrypt | ~500 MB/s | Per-segment encryption |
+| ChaCha20-Poly1305 Encrypt/Decrypt | ~500 MB/s | Secure HLS transport and optional cache protection |
 | BLAKE3 Hash | ~1 GB/s | Used for HKDF, HMAC, signatures |
 | HLS Segment (stream copy) | <100ms | ≤1080p, no re-encoding |
 | HLS Segment (hw transcode) | ~200-500ms | >1080p, VAAPI/V4L2 |
@@ -576,7 +625,7 @@ POST /api/v1/invite/remaining                        # Check remaining time
 - [x] EdDSA (Ed25519) JWT authentication
 - [x] WPA3-SAE key exchange (Curve25519 Dragonfly)
 - [x] Bulletproofs RangeProof ZKP (authentication only)
-- [x] SAE session-authenticated HLS streaming with AES-256-GCM
+- [x] SAE session-authenticated HLS streaming with ChaCha20-Poly1305 transport encryption
 - [x] FIDO2/WebAuthn hardware authentication
 - [x] Professional storage management
 - [x] Hardware accelerated video transcoding (VAAPI / Rockchip MPP / V4L2 M2M)
@@ -612,7 +661,7 @@ POST /api/v1/invite/remaining                        # Check remaining time
 - [curve25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) — Curve25519 operations
 - [bulletproofs](https://github.com/dalek-cryptography/bulletproofs) — Zero-knowledge proofs
 - [blake3](https://github.com/BLAKE3-team/BLAKE3) — Fast cryptographic hashing
-- [aes-gcm](https://github.com/RustCrypto/AEADs) — AES-256-GCM encryption
+- [chacha20poly1305](https://github.com/RustCrypto/AEADs) — ChaCha20-Poly1305 transport encryption
 - [Wasmtime](https://wasmtime.dev/) — WebAssembly runtime
 - [Rustls](https://github.com/rustls/rustls) — TLS implementation
 - [FFmpeg](https://ffmpeg.org/) — Media transcoding (external binary)
@@ -644,5 +693,5 @@ See [LICENSE](LICENSE) for the full license text.
 </p>
 
 <p align="center">
-  Powered by Rust 🦀 | Secured by EdDSA + SAE + AES-256-GCM 🔐 | Accelerated by Hardware 🚀
+  Powered by Rust 🦀 | Secured by EdDSA + SAE + ChaCha20-Poly1305 🔐 | Accelerated by Hardware 🚀
 </p>
