@@ -347,29 +347,133 @@ pub async fn use_invite_code(pool: &SqlitePool, code: &str) -> Result<(), AppErr
     Ok(())
 }
 
+pub async fn create_invite_code(
+    pool: &SqlitePool,
+    code: &str,
+    created_by: &str,
+    max_uses: i32,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), AppError> {
+    let expires_at_str = expires_at.map(|ts| ts.to_rfc3339());
+    sqlx::query(
+        r#"
+        INSERT INTO invite_codes (code, created_by, max_uses, current_uses, expires_at, created_at)
+        VALUES (?, ?, ?, 0, ?, datetime('now'))
+        "#,
+    )
+    .bind(code)
+    .bind(created_by)
+    .bind(max_uses)
+    .bind(expires_at_str)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    Ok(())
+}
+
+pub async fn get_invite_remaining_seconds(
+    pool: &SqlitePool,
+    code: &str,
+) -> Result<Option<i64>, AppError> {
+    let row = sqlx::query(
+        r#"
+        SELECT expires_at FROM invite_codes WHERE code = ?
+        "#,
+    )
+    .bind(code)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    if let Some(row) = row {
+        let expires_at: Option<String> = row
+            .try_get("expires_at")
+            .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+        if let Some(expires_at) = expires_at {
+            let expires = chrono::DateTime::parse_from_rfc3339(&expires_at)
+                .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+            let remaining = expires.with_timezone(&chrono::Utc)
+                .signed_duration_since(chrono::Utc::now())
+                .num_seconds();
+            return Ok(Some(remaining.max(0)));
+        }
+
+        Ok(Some(-1))
+    } else {
+        Ok(None)
+    }
+}
 
 pub async fn create_file_metadata(
-    _pool: &SqlitePool,
-    _metadata: &FileMetadata,
+    pool: &SqlitePool,
+    metadata: &FileMetadata,
 ) -> Result<(), AppError> {
-    // Placeholder - implement when database tables are created
+    sqlx::query(
+        r#"
+        INSERT INTO files
+            (id, user_id, filename, original_filename, file_path, mime_type, file_size, checksum, is_public, created_at, updated_at)
+        VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&metadata.id)
+    .bind(&metadata.user_id)
+    .bind(&metadata.filename)
+    .bind(&metadata.original_filename)
+    .bind(&metadata.file_path)
+    .bind(&metadata.mime_type)
+    .bind(metadata.file_size)
+    .bind(&metadata.checksum)
+    .bind(metadata.is_public as i32)
+    .bind(metadata.created_at)
+    .bind(metadata.updated_at)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
     Ok(())
 }
 
 pub async fn list_files_by_user(
-    _pool: &SqlitePool,
-    _user_id: &str,
+    pool: &SqlitePool,
+    user_id: &str,
 ) -> Result<Vec<FileMetadata>, AppError> {
-    // Placeholder - implement when database tables are created
-    Ok(Vec::new())
+    let files = sqlx::query_as::<_, FileMetadata>(
+        r#"
+        SELECT id, user_id, filename, original_filename, file_path, mime_type, file_size, checksum, is_public, created_at, updated_at
+        FROM files
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    Ok(files)
 }
 
+#[allow(dead_code)]
 pub async fn get_file_by_id(
-    _pool: &SqlitePool,
-    _file_id: &str,
+    pool: &SqlitePool,
+    file_id: &str,
 ) -> Result<Option<FileMetadata>, AppError> {
-    // Placeholder - implement when database tables are created
-    Ok(None)
+    let file = sqlx::query_as::<_, FileMetadata>(
+        r#"
+        SELECT id, user_id, filename, original_filename, file_path, mime_type, file_size, checksum, is_public, created_at, updated_at
+        FROM files
+        WHERE id = ?
+        "#,
+    )
+    .bind(file_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    Ok(file)
 }
 
 /// Find file by ID and verify user ownership
@@ -412,8 +516,21 @@ pub async fn find_file_by_id(
     }
 }
 
-pub async fn delete_file(_pool: &SqlitePool, _file_id: &str) -> Result<(), AppError> {
-    // Placeholder - implement when database tables are created
+pub async fn delete_file(pool: &SqlitePool, file_id: &str) -> Result<(), AppError> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM files WHERE id = ?
+        "#,
+    )
+    .bind(file_id)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound("File not found".to_string()));
+    }
+
     Ok(())
 }
 
@@ -450,43 +567,39 @@ pub async fn delete_widget(
 }
 
 /// Update user's SAE secret
-pub async fn update_user_sae_secret(
+pub async fn sync_user_sae_and_zkp_registration(
     pool: &SqlitePool,
     user_id: &str,
     sae_secret: &str,
+    zkp_registration: &str,
 ) -> Result<(), AppError> {
-    sqlx::query(
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    let result = sqlx::query(
         r#"
-        UPDATE users SET sae_secret = ?, updated_at = datetime('now')
+        UPDATE users
+        SET sae_secret = ?, zkp_registration = ?, updated_at = datetime('now')
         WHERE id = ?
         "#,
     )
     .bind(sae_secret)
-    .bind(user_id)
-    .execute(pool)
-    .await
-    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
-
-    Ok(())
-}
-
-/// Update user's ZKP registration payload
-pub async fn update_user_zkp_registration(
-    pool: &SqlitePool,
-    user_id: &str,
-    zkp_registration: &str,
-) -> Result<(), AppError> {
-    sqlx::query(
-        r#"
-        UPDATE users SET zkp_registration = ?, updated_at = datetime('now')
-        WHERE id = ?
-        "#,
-    )
     .bind(zkp_registration)
     .bind(user_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound(format!("User {} not found", user_id)));
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
     Ok(())
 }
+

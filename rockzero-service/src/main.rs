@@ -26,7 +26,6 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::handlers::secure_storage::SecureStorageManager;
-use crate::invite::InviteCodeManager;
 use crate::media_processor::MediaProcessor;
 use crate::storage_manager::{StorageConfig, StorageManager};
 
@@ -318,8 +317,6 @@ async fn main() -> std::io::Result<()> {
     storage_manager.clone().start_cleanup_tasks();
     info!("Storage cleanup tasks started");
 
-    let invite_manager = Arc::new(InviteCodeManager::new());
-
     let app_config = Arc::new(AppConfig::from_env());
     info!("App configuration loaded");
 
@@ -351,7 +348,6 @@ async fn main() -> std::io::Result<()> {
     let server = HttpServer::new(move || {
         let pool = pool.clone();
         let secure_storage = secure_storage.clone();
-        let invite_manager = invite_manager.clone();
         let media_processor_data = media_processor.clone();
         let secure_hls_manager_data = secure_hls_manager.clone();
         let storage_manager_data = storage_manager.clone();
@@ -415,7 +411,6 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::PayloadConfig::default().limit(100 * 1024 * 1024)) // 100 MB max payload for ARM devices
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(secure_storage.clone()))
-            .app_data(web::Data::new(invite_manager.clone()))
             .app_data(web::Data::new(media_processor_data))
             .app_data(web::Data::new(secure_hls_manager_data))
             .app_data(web::Data::new(storage_manager_data))
@@ -597,8 +592,11 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(
                         web::scope("/invite")
-                            .wrap(middleware::JwtAuth)
-                            .route("/create", web::post().to(invite::create_invite))
+                            .service(
+                                web::scope("")
+                                    .wrap(middleware::JwtAuth)
+                                    .route("/create", web::post().to(invite::create_invite)),
+                            )
                             .route("/validate/{code}", web::get().to(invite::validate_invite))
                             .route("/remaining", web::post().to(invite::invite_remaining_time)),
                     )
@@ -1190,21 +1188,25 @@ async fn main() -> std::io::Result<()> {
                                             .to(handlers::secure_hls::create_session_proof_ticket),
                                     ),
                             )
-                            .route(
-                                "/{session_id}/playlist.m3u8",
-                                web::get().to(handlers::secure_hls::get_secure_playlist),
-                            )
-                            .route(
-                                "/{session_id}/stop",
-                                web::post().to(handlers::secure_hls::stop_session),
-                            )
-                            .route(
-                                "/{session_id}/{segment}",
-                                web::get().to(handlers::secure_hls::get_segment_direct),
-                            )
-                            .route(
-                                "/{session_id}/{segment}",
-                                web::post().to(handlers::secure_hls::get_secure_segment),
+                            .service(
+                                web::scope("")
+                                    .wrap(middleware::JwtAuth)
+                                    .route(
+                                        "/{session_id}/playlist.m3u8",
+                                        web::get().to(handlers::secure_hls::get_secure_playlist),
+                                    )
+                                    .route(
+                                        "/{session_id}/stop",
+                                        web::post().to(handlers::secure_hls::stop_session),
+                                    )
+                                    .route(
+                                        "/{session_id}/{segment}",
+                                        web::get().to(handlers::secure_hls::get_segment_direct),
+                                    )
+                                    .route(
+                                        "/{session_id}/{segment}",
+                                        web::post().to(handlers::secure_hls::get_secure_segment),
+                                    ),
                             ),
                     )
                     .service(

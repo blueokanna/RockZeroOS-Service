@@ -1093,7 +1093,7 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
                         let size_str = child.get("size").and_then(|v| v.as_str()).unwrap_or("0");
                         let total_space = parse_size_string(size_str);
 
-                        let partition_disk_type = format!("{} 鍒嗗尯", disk_type);
+                        let partition_disk_type = format!("{} partition", disk_type);
 
                         disks.push(DiskDetail {
                             name: name.clone(),
@@ -2052,7 +2052,6 @@ pub async fn initialize_disk(
             "ext4" => {
                 format_cmd.arg("-F");
                 format_cmd.arg("-m").arg("1");
-                format_cmd.arg("-O").arg("^has_journal");
             }
             "ext3" | "ext2" => {
                 format_cmd.arg("-F");
@@ -2465,11 +2464,17 @@ pub async fn create_zfs_pool(
         cmd.arg(&body.name);
         
         match body.vdev_type.as_str() {
+            "" | "stripe" => {}
             "mirror" => { cmd.arg("mirror"); }
             "raidz1" => { cmd.arg("raidz1"); }
             "raidz2" => { cmd.arg("raidz2"); }
             "raidz3" => { cmd.arg("raidz3"); }
-            _ => {}
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "Unsupported ZFS vdev type: {}",
+                    other
+                )));
+            }
         }
         
         for device in &body.devices {

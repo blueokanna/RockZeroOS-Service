@@ -135,7 +135,7 @@ pub async fn download_file(
     claims: web::ReqData<crate::handlers::auth::Claims>,
     file_id: web::Path<String>,
 ) -> Result<actix_files::NamedFile, AppError> {
-    let file = db::get_file_by_id(&pool, &file_id)
+    let file = db::find_file_by_id(&pool, &file_id, &claims.sub)
         .await?
         .ok_or_else(|| AppError::NotFound("File not found".to_string()))?;
 
@@ -162,7 +162,7 @@ pub async fn delete_file(
     claims: web::ReqData<crate::handlers::auth::Claims>,
     file_id: web::Path<String>,
 ) -> Result<impl Responder, AppError> {
-    let file = db::get_file_by_id(&pool, &file_id)
+    let file = db::find_file_by_id(&pool, &file_id, &claims.sub)
         .await?
         .ok_or_else(|| AppError::NotFound("File not found".to_string()))?;
 

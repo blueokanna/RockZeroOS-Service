@@ -1,4 +1,4 @@
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
@@ -374,7 +374,11 @@ pub async fn wipe_disk(
     }
 }
 
-pub async fn eject_storage(path: web::Path<String>) -> Result<HttpResponse, AppError> {
+pub async fn eject_storage(
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
     let device = path.into_inner();
 
     #[cfg(target_os = "windows")]
@@ -1358,6 +1362,7 @@ fn partition_and_format_linux(opts: &PartitionOptions) -> Result<PartitionResult
     create_partition_table(&opts.device, &opts.partition_type)?;
 
     let mut created_partitions = Vec::new();
+    let mut partition_start = "1MiB".to_string();
     for (idx, partition_spec) in opts.partitions.iter().enumerate() {
         let partition_num = idx + 1;
         info!(
@@ -1365,7 +1370,9 @@ fn partition_and_format_linux(opts: &PartitionOptions) -> Result<PartitionResult
             partition_num, partition_spec.size
         );
 
-        create_partition(&opts.device, partition_num, &partition_spec.size)?;
+        let partition_end = next_partition_boundary(&partition_start, &partition_spec.size)?;
+        create_partition(&opts.device, partition_num, &partition_start, &partition_end)?;
+        partition_start = partition_end;
 
         std::thread::sleep(std::time::Duration::from_millis(1000));
 
@@ -1515,17 +1522,14 @@ fn create_partition_table(device: &str, partition_type: &str) -> Result<(), AppE
 }
 
 #[cfg(target_os = "linux")]
-fn create_partition(device: &str, _partition_num: usize, size: &str) -> Result<(), AppError> {
-    let end_pos = if size.ends_with('%') {
-        size.to_string()
-    } else if size == "100%" || size.to_lowercase() == "all" {
-        "100%".to_string()
-    } else {
-        size.to_string()
-    };
-
+fn create_partition(
+    device: &str,
+    _partition_num: usize,
+    start: &str,
+    end: &str,
+) -> Result<(), AppError> {
     let output = Command::new("parted")
-        .args(["-s", device, "mkpart", "primary", "0%", &end_pos])
+        .args(["-s", device, "mkpart", "primary", start, end])
         .output()
         .map_err(|e| AppError::BadRequest(format!("Failed to create partition: {}", e)))?;
 
@@ -1539,6 +1543,41 @@ fn create_partition(device: &str, _partition_num: usize, size: &str) -> Result<(
 
     let _ = Command::new("sync").output();
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn next_partition_boundary(start: &str, size: &str) -> Result<String, AppError> {
+    if size.eq_ignore_ascii_case("all") || size == "100%" {
+        return Ok("100%".to_string());
+    }
+
+    if let Some(value) = size.strip_suffix('%') {
+        let start_value = start
+            .strip_suffix('%')
+            .ok_or_else(|| AppError::BadRequest("Partition size units must match".to_string()))?
+            .parse::<f64>()
+            .map_err(|_| AppError::BadRequest(format!("Invalid partition start: {}", start)))?;
+        let size_value = value
+            .parse::<f64>()
+            .map_err(|_| AppError::BadRequest(format!("Invalid partition size: {}", size)))?;
+        return Ok(format!("{}%", (start_value + size_value).min(100.0)));
+    }
+
+    if start.eq_ignore_ascii_case("1MiB") {
+        return Ok(size.to_string());
+    }
+
+    if start.eq_ignore_ascii_case(size) {
+        return Err(AppError::BadRequest(format!(
+            "Partition size {} would create an empty range",
+            size
+        )));
+    }
+
+    Err(AppError::BadRequest(format!(
+        "Partition size {} requires explicit compatible boundaries",
+        size
+    )))
 }
 
 #[cfg(target_os = "linux")]
@@ -1581,9 +1620,22 @@ fn wipe_disk_linux(device: &str) -> Result<(), AppError> {
 }
 
 
-pub async fn read_file(path: web::Path<String>) -> Result<HttpResponse, AppError> {
+pub async fn read_file(
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
     let file_path = path.into_inner();
     let full_path = PathBuf::from(&file_path);
+
+    #[cfg(target_os = "linux")]
+    {
+        validate_external_storage_path(
+            full_path
+                .to_str()
+                .ok_or_else(|| AppError::BadRequest("Invalid file path".to_string()))?,
+        )?;
+    }
 
     if !full_path.exists() {
         return Err(AppError::NotFound("File not found".to_string()));
@@ -1607,18 +1659,31 @@ pub struct WriteFileRequest {
     pub append: Option<bool>,
 }
 
-pub async fn write_file(body: web::Json<WriteFileRequest>) -> Result<HttpResponse, AppError> {
-    let req = body.into_inner();
-    let full_path = PathBuf::from(&req.path);
+pub async fn write_file(
+    req: HttpRequest,
+    body: web::Json<WriteFileRequest>,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+    let req_body = body.into_inner();
+    let full_path = PathBuf::from(&req_body.path);
 
-    if req.create_dirs.unwrap_or(true) {
+    #[cfg(target_os = "linux")]
+    {
+        validate_external_storage_path(
+            full_path
+                .to_str()
+                .ok_or_else(|| AppError::BadRequest("Invalid file path".to_string()))?,
+        )?;
+    }
+
+    if req_body.create_dirs.unwrap_or(true) {
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| AppError::IoError(format!("Failed to create directories: {}", e)))?;
         }
     }
 
-    if req.append.unwrap_or(false) {
+    if req_body.append.unwrap_or(false) {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -1626,24 +1691,37 @@ pub async fn write_file(body: web::Json<WriteFileRequest>) -> Result<HttpRespons
             .open(&full_path)
             .map_err(|e| AppError::IoError(format!("Failed to open file: {}", e)))?;
 
-        file.write_all(req.content.as_bytes())
+        file.write_all(req_body.content.as_bytes())
             .map_err(|e| AppError::IoError(format!("Failed to write file: {}", e)))?;
     } else {
-        std::fs::write(&full_path, &req.content)
+        std::fs::write(&full_path, &req_body.content)
             .map_err(|e| AppError::IoError(format!("Failed to write file: {}", e)))?;
     }
 
-    info!("File written: {}", req.path);
+    info!("File written: {}", req_body.path);
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
-        "path": req.path
+        "path": req_body.path
     })))
 }
 
-pub async fn delete_path(path: web::Path<String>) -> Result<HttpResponse, AppError> {
+pub async fn delete_path(
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
     let file_path = path.into_inner();
     let full_path = PathBuf::from(&file_path);
+
+    #[cfg(target_os = "linux")]
+    {
+        validate_external_storage_path(
+            full_path
+                .to_str()
+                .ok_or_else(|| AppError::BadRequest("Invalid path".to_string()))?,
+        )?;
+    }
 
     if !full_path.exists() {
         return Err(AppError::NotFound("Path not found".to_string()));
@@ -1664,7 +1742,6 @@ pub async fn delete_path(path: web::Path<String>) -> Result<HttpResponse, AppErr
         "deleted": file_path
     })))
 }
-
 
 pub async fn smart_format(
     body: web::Json<SmartFormatRequest>,

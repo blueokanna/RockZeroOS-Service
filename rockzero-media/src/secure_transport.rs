@@ -1,5 +1,5 @@
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, KeyInit, OsRng, Payload},
     ChaCha20Poly1305, Nonce,
 };
 use rand::RngCore;
@@ -14,6 +14,46 @@ fn blake3_hash_bytes(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(digest.as_bytes());
     out
+}
+
+fn chunk_type_name(chunk_type: ChunkType) -> &'static str {
+    match chunk_type {
+        ChunkType::KeyFrame => "KeyFrame",
+        ChunkType::NormalFrame => "NormalFrame",
+        ChunkType::Audio => "Audio",
+        ChunkType::Subtitle => "Subtitle",
+    }
+}
+
+fn chunk_aad(sequence: u64, chunk_type: &str, timestamp: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(24 + chunk_type.len());
+    aad.extend_from_slice(&sequence.to_le_bytes());
+    aad.extend_from_slice(&timestamp.to_le_bytes());
+    aad.extend_from_slice(chunk_type.as_bytes());
+    aad
+}
+
+fn derive_mac_key(shared_secret: &[u8]) -> [u8; 32] {
+    let mut input = Vec::with_capacity(32 + shared_secret.len());
+    input.extend_from_slice(b"rockzero-secure-stream-mac-v1");
+    input.extend_from_slice(shared_secret);
+    blake3_hash_bytes(&input)
+}
+
+fn compute_chunk_mac(
+    shared_secret: &[u8],
+    sequence: u64,
+    chunk_type: &str,
+    timestamp: u64,
+    nonce: &[u8],
+    data: &[u8],
+) -> Vec<u8> {
+    let mut mac_input = chunk_aad(sequence, chunk_type, timestamp);
+    mac_input.extend_from_slice(nonce);
+    mac_input.extend_from_slice(data);
+    blake3::keyed_hash(&derive_mac_key(shared_secret), &mac_input)
+        .as_bytes()
+        .to_vec()
 }
 
 #[derive(Debug, Clone)]
@@ -109,7 +149,6 @@ impl SecureStreamTransport {
         OsRng.fill_bytes(&mut commit_scalar);
         OsRng.fill_bytes(&mut commit_element);
 
-        // 使用 BLAKE3 计算共享密钥
         let mut secret_input = Vec::with_capacity(commit_scalar.len() + commit_element.len() + peer_id.len());
         secret_input.extend_from_slice(&commit_scalar);
         secret_input.extend_from_slice(&commit_element);
@@ -134,13 +173,23 @@ impl SecureStreamTransport {
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let mut auth = self.auth_state.write().await;
         if let Some(ref mut state) = *auth {
-            // 验证peer的commit（简化版，使用 BLAKE3）
+            let mut expected_commit_input = Vec::with_capacity(
+                state.shared_secret.len() + state.commit_scalar.len() + state.commit_element.len(),
+            );
+            expected_commit_input.extend_from_slice(&state.shared_secret);
+            expected_commit_input.extend_from_slice(&state.commit_scalar);
+            expected_commit_input.extend_from_slice(&state.commit_element);
+            let expected_peer_commit = blake3_hash_bytes(&expected_commit_input);
+
+            if peer_commit != expected_peer_commit.as_slice() {
+                return Ok(false);
+            }
+
             let mut confirm_input = Vec::with_capacity(state.commit_scalar.len() + peer_commit.len());
             confirm_input.extend_from_slice(&state.commit_scalar);
             confirm_input.extend_from_slice(peer_commit);
             let confirm_hash = blake3_hash_bytes(&confirm_input);
 
-            // SAE 认证成功后，派生会话 ChaCha20-Poly1305 密钥并重置 cipher。
             let mut key_input = Vec::with_capacity(64 + state.shared_secret.len());
             key_input.extend_from_slice(b"rockzero-secure-stream-chacha-key-v1");
             key_input.extend_from_slice(&state.shared_secret);
@@ -162,36 +211,47 @@ impl SecureStreamTransport {
         chunk_type: ChunkType,
     ) -> Result<EncryptedChunk, Box<dyn std::error::Error>> {
         let auth = self.auth_state.read().await;
-        if auth.is_none() || !auth.as_ref().unwrap().confirmed {
+        let auth_state = auth.as_ref().ok_or("Not authenticated")?;
+        if !auth_state.confirmed {
             return Err("Not authenticated".into());
         }
 
-        // 生成nonce
-        let mut nonce_bytes = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        // 加密数据
-        let encrypted = self
-            .cipher
-            .read()
-            .await
-            .encrypt(nonce, data)
-            .map_err(|e| format!("Encryption failed: {}", e))?;
-
-        // 获取序列号
         let mut seq = self.sequence_counter.write().await;
         let sequence = *seq;
         *seq += 1;
 
-        // 生成 MAC（使用 BLAKE3，与加密标签分层）
-        let mut mac_input = Vec::with_capacity(8 + encrypted.len() + nonce_bytes.len());
-        mac_input.extend_from_slice(&sequence.to_le_bytes());
-        mac_input.extend_from_slice(&encrypted);
-        mac_input.extend_from_slice(&nonce_bytes);
-        let mac = blake3_hash_bytes(&mac_input).to_vec();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as u64;
+        let chunk_type_name = chunk_type_name(chunk_type).to_string();
+        let aad = chunk_aad(sequence, &chunk_type_name, timestamp);
 
-        // 视频播放链路默认不使用 ZKP，保持字段兼容仅做空值返回。
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let encrypted = self
+            .cipher
+            .read()
+            .await
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: data,
+                    aad: &aad,
+                },
+            )
+            .map_err(|e| format!("Encryption failed: {}", e))?;
+
+        let mac = compute_chunk_mac(
+            &auth_state.shared_secret,
+            sequence,
+            &chunk_type_name,
+            timestamp,
+            &nonce_bytes,
+            &encrypted,
+        );
+
         let zkp_proof = if self.config.enable_zkp {
             Some(self.generate_zkp_proof(sequence).await?)
         } else {
@@ -200,13 +260,11 @@ impl SecureStreamTransport {
 
         Ok(EncryptedChunk {
             sequence,
-            chunk_type: format!("{:?}", chunk_type),
+            chunk_type: chunk_type_name,
             data: encrypted,
             nonce: nonce_bytes.to_vec(),
             mac,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_millis() as u64,
+            timestamp,
             zkp_proof,
         })
     }
@@ -232,6 +290,24 @@ impl SecureStreamTransport {
         &self,
         chunk: &EncryptedChunk,
     ) -> Result<bool, Box<dyn std::error::Error>> {
+        let auth = self.auth_state.read().await;
+        let auth_state = auth.as_ref().ok_or("Missing auth state")?;
+        if !auth_state.confirmed {
+            return Err("Not authenticated".into());
+        }
+
+        let computed_mac = compute_chunk_mac(
+            &auth_state.shared_secret,
+            chunk.sequence,
+            &chunk.chunk_type,
+            chunk.timestamp,
+            &chunk.nonce,
+            &chunk.data,
+        );
+        if computed_mac != chunk.mac {
+            return Ok(false);
+        }
+
         if self.config.enable_zkp {
             let proof = chunk
                 .zkp_proof
@@ -254,47 +330,40 @@ impl SecureStreamTransport {
                 .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) });
         }
 
-        let mut mac_input = Vec::with_capacity(8 + chunk.data.len() + chunk.nonce.len());
-        mac_input.extend_from_slice(&chunk.sequence.to_le_bytes());
-        mac_input.extend_from_slice(&chunk.data);
-        mac_input.extend_from_slice(&chunk.nonce);
-        let computed_mac = blake3_hash_bytes(&mac_input).to_vec();
-
-        Ok(computed_mac == chunk.mac)
+        Ok(true)
     }
 
-    /// 解密数据块
     pub async fn decrypt_chunk(
         &self,
         chunk: &EncryptedChunk,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        // 验证ZKP
         if !self.verify_zkp_proof(chunk).await? {
             return Err("ZKP verification failed".into());
         }
 
-        // 解密
         let nonce = Nonce::from_slice(&chunk.nonce);
+        let aad = chunk_aad(chunk.sequence, &chunk.chunk_type, chunk.timestamp);
         let decrypted = self
             .cipher
             .read()
             .await
-            .decrypt(nonce, chunk.data.as_ref())
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: chunk.data.as_ref(),
+                    aad: &aad,
+                },
+            )
             .map_err(|e| format!("Decryption failed: {}", e))?;
 
         Ok(decrypted)
     }
 
-    /// 决定使用UDP还是TCP传输
     pub fn should_use_udp(&self, chunk_type: ChunkType, chunk_index: usize) -> bool {
         match chunk_type {
-            // 关键帧必须用TCP
             ChunkType::KeyFrame => false,
-            // 音频优先TCP
-            ChunkType::Audio => chunk_index % 10 >= 7, // 30% TCP
-            // 字幕必须TCP
+            ChunkType::Audio => chunk_index % 10 >= 7,
             ChunkType::Subtitle => false,
-            // 普通帧按比例分配
             ChunkType::NormalFrame => {
                 let ratio = (chunk_index % 100) as f32 / 100.0;
                 ratio < self.config.udp_ratio
@@ -318,8 +387,13 @@ mod tests {
             ..StreamConfig::default()
         };
         let transport = SecureStreamTransport::new(config).unwrap();
-        transport.initiate_sae_auth("peer1").await.unwrap();
-        transport.confirm_sae_auth(&[0u8; 32]).await.unwrap();
+        let auth_state = transport.initiate_sae_auth("peer1").await.unwrap();
+        let mut expected_commit_input = Vec::new();
+        expected_commit_input.extend_from_slice(&auth_state.shared_secret);
+        expected_commit_input.extend_from_slice(&auth_state.commit_scalar);
+        expected_commit_input.extend_from_slice(&auth_state.commit_element);
+        let expected_commit = blake3_hash_bytes(&expected_commit_input);
+        transport.confirm_sae_auth(&expected_commit).await.unwrap();
         transport
     }
 
@@ -343,7 +417,14 @@ mod tests {
         assert!(!auth_state.confirmed);
 
         let confirmed = transport
-            .confirm_sae_auth(&auth_state.commit_element)
+            .confirm_sae_auth(&blake3_hash_bytes(
+                &[
+                    auth_state.shared_secret.as_slice(),
+                    auth_state.commit_scalar.as_slice(),
+                    auth_state.commit_element.as_slice(),
+                ]
+                .concat(),
+            ))
             .await
             .unwrap();
         assert!(confirmed);

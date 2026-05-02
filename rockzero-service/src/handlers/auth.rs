@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
 use rockzero_common::{AppConfig, AppError, TokenResponse};
 use rockzero_crypto::{blake3_hash, constant_time_compare};
@@ -289,7 +289,6 @@ fn derive_key_with_salt(password: &[u8], salt: &[u8]) -> Vec<u8> {
 }
 
 pub fn compute_sae_secret(password: &str) -> String {
-    // Use Blake3 for SAE secret computation
     let hash = blake3::hash(password.as_bytes());
     hex::encode(hash.as_bytes())
 }
@@ -519,7 +518,6 @@ pub async fn register(
 
     let sae_secret = compute_sae_secret(&body.password);
 
-    // Unify ZKP credential source with SAE secret so client never needs to persist raw password.
     let zkp_ctx = ZkpContext::new();
     let sae_based_registration = zkp_ctx.register_password(&sae_secret)?;
 
@@ -579,29 +577,27 @@ pub async fn login(
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     }
 
-    // Update sae_secret if not set or different from current password hash
     let sae_secret = compute_sae_secret(&body.password);
-    if user.sae_secret.as_ref() != Some(&sae_secret) {
-        if let Err(e) = crate::db::update_user_sae_secret(&pool, &user.id, &sae_secret).await {
-            warn!("Failed to update sae_secret for user {}: {}", user.id, e);
-        } else {
-            info!("Updated sae_secret for user {}", user.id);
-        }
-    }
-
-    // Keep ZKP registration aligned with SAE secret representation for HLS proof generation.
     let zkp_ctx = ZkpContext::new();
-    match zkp_ctx.register_password(&sae_secret) {
-        Ok(registration) => {
-            if let Ok(reg_json) = serde_json::to_string(&registration) {
-                if let Err(e) = crate::db::update_user_zkp_registration(&pool, &user.id, &reg_json).await {
-                    warn!("Failed to update zkp_registration for user {}: {}", user.id, e);
-                }
-            }
-        }
-        Err(e) => {
-            warn!("Failed to regenerate ZKP registration for user {}: {}", user.id, e);
-        }
+    let registration = zkp_ctx.register_password(&sae_secret).map_err(|e| {
+        AppError::InternalServerError(format!(
+            "Failed to regenerate synchronized ZKP registration: {}",
+            e
+        ))
+    })?;
+    let reg_json = serde_json::to_string(&registration).map_err(|e| {
+        AppError::InternalServerError(format!(
+            "Failed to serialize synchronized ZKP registration: {}",
+            e
+        ))
+    })?;
+
+    if user.sae_secret.as_ref() != Some(&sae_secret)
+        || user.zkp_registration.as_deref() != Some(reg_json.as_str())
+    {
+        crate::db::sync_user_sae_and_zkp_registration(&pool, &user.id, &sae_secret, &reg_json)
+            .await?;
+        info!("Synchronized SAE and ZKP credentials for user {}", user.id);
     }
 
     let jwt_config = AppConfig::from_env();

@@ -1921,8 +1921,17 @@ pub async fn run_builtin_app(
         "steamdb-viewer" => run_steamdb_viewer(&query).await,
         "m3u8-downloader" => run_m3u8_downloader(&query).await,
         "steam-p2p-info" => run_steam_p2p_info(&query).await,
+        "wxy-edge-node" => run_wxy_edge_node().await,
         _ => Err(AppError::NotFound(format!("未知内置应用: {}", app_id))),
     }
+}
+
+async fn run_wxy_edge_node() -> Result<HttpResponse, AppError> {
+    let snapshot = crate::handlers::edge_compute::builtin_wxy_edge_node_status().await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "source": "wxy-edge-node",
+        "snapshot": snapshot,
+    })))
 }
 
 /// SteamDB 数据查看器 — 查询 Steam API 获取游戏详情
@@ -3342,10 +3351,10 @@ pub async fn get_platform_games(
         }
     };
 
+    let fetch_failed = games.is_err();
     let mut items = games.unwrap_or_default();
 
-    // Live fetch failed or returned empty: fallback to stale cache to keep UI consistent.
-    if items.is_empty() {
+    if fetch_failed {
         if let Some(stale) = cache_get_stale(&cache_key).await {
             let total = stale.len();
             let start = ((page - 1) * page_size) as usize;
@@ -3364,7 +3373,6 @@ pub async fn get_platform_games(
         }
     }
 
-    // Keep deterministic ordering for pagination.
     items.sort_by(|a, b| {
         let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let bn = b.get("name").and_then(|v| v.as_str()).unwrap_or("");

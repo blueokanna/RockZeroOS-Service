@@ -26,35 +26,21 @@ pub struct HlsSession {
     pub encryption_key: [u8; 32],
     pub encryptor: HlsEncryptor,
     pub segment_keys: Vec<[u8; 32]>,
-    /// Max segments this session supports (keys generated lazily)
     max_segments: usize,
-    /// HKDF instance for lazy key derivation
     hkdf: HkdfBlake3,
     pub zkp_registration: Option<PasswordRegistration>,
-    /// When true, GET segment requests return plaintext (no ChaCha20-Poly1305 transport encryption).
-    /// Security is still guaranteed by session UUID + SAE handshake requirement.
-    /// Designed for ARM / low-performance devices where per-segment
-    /// encryption/decryption overhead is prohibitive.
-    pub direct_mode: bool,
 }
 
-/// HKDF-BLAKE3 key derivation
-/// 
-/// This implementation uses BLAKE3 for both extract and expand phases.
-/// Salt is derived from session_id for per-session uniqueness.
 struct HkdfBlake3 {
     prk: [u8; 32],
 }
 
 impl HkdfBlake3 {
-    /// Create HKDF instance with salt derived from session_id
     fn new_with_session_salt(session_id: &str, ikm: &[u8]) -> Self {
-        // Derive salt from session_id: blake3("hls-session-salt:" + session_id)
         let salt_input = format!("hls-session-salt:{}", session_id);
         let salt_input_bytes = salt_input.as_bytes();
         let salt = blake3_hash_bytes(salt_input_bytes);
 
-        // PRK = blake3(salt + ikm)
         let mut input = Vec::with_capacity(32 + ikm.len());
         input.extend_from_slice(&salt);
         input.extend_from_slice(ikm);
@@ -63,7 +49,6 @@ impl HkdfBlake3 {
         Self { prk }
     }
 
-    /// Legacy constructor for backward compatibility (uses zero salt or provided salt)
     #[allow(dead_code)]
     fn new(salt: Option<&[u8]>, ikm: &[u8]) -> Self {
         let salt_key: [u8; 32] = match salt {
@@ -84,9 +69,6 @@ impl HkdfBlake3 {
         Self { prk }
     }
 
-    /// Expand PRK to derive output key material
-    /// 
-    /// T(i) = blake3(PRK + T(i-1) + info + counter)
     fn expand(&self, info: &[u8], okm: &mut [u8]) -> std::result::Result<(), &'static str> {
         if okm.is_empty() {
             return Ok(());
@@ -142,7 +124,6 @@ impl HlsSession {
 
         tracing::info!("[HlsSession] Creating session: {}", session_id);
 
-        // Use session-derived salt for HKDF
         let hk = HkdfBlake3::new_with_session_salt(&session_id, &pmk);
 
         let mut encryption_key = [0u8; 32];
@@ -151,7 +132,6 @@ impl HlsSession {
 
         tracing::debug!("[HlsSession] Encryption key derived");
 
-        // Pre-generate only a small batch of segment keys (lazy generation for the rest)
         let initial_batch = max_segments.min(16);
         let mut segment_keys = Vec::with_capacity(max_segments);
         for i in 0..initial_batch {
@@ -177,7 +157,6 @@ impl HlsSession {
             max_segments,
             hkdf: hk,
             zkp_registration,
-            direct_mode: false,
         })
     }
 
@@ -189,13 +168,6 @@ impl HlsSession {
         self.zkp_registration.as_ref()
     }
 
-    /// Enable direct (plaintext) segment delivery mode.
-    /// When enabled, `get_segment_direct` returns raw TS data instead of
-    /// ChaCha20-Poly1305 encrypted data. Session UUID + SAE handshake still guard access.
-    pub fn set_direct_mode(&mut self, enabled: bool) {
-        self.direct_mode = enabled;
-    }
-
     pub fn is_expired(&self) -> bool {
         Utc::now() > self.expires_at
     }
@@ -204,7 +176,6 @@ impl HlsSession {
         if segment_index >= self.max_segments {
             return None;
         }
-        // Lazily generate keys up to the requested index
         while self.segment_keys.len() <= segment_index {
             let mut key = [0u8; 32];
             let info = format!("hls-segment-{}", self.segment_keys.len());
@@ -314,20 +285,6 @@ impl HlsSessionManager {
         Ok(())
     }
 
-    /// Enable or disable direct (plaintext) segment delivery for a session.
-    pub fn set_session_direct_mode(&self, session_id: &str, enabled: bool) -> Result<()> {
-        let mut sessions = self.sessions.lock().unwrap();
-        let session = sessions
-            .get_mut(session_id)
-            .ok_or_else(|| HlsError::SessionNotFound(session_id.to_string()))?;
-
-        session.set_direct_mode(enabled);
-        Ok(())
-    }
-
-    /// Invalidate existing sessions for the same user + file pair.
-    ///
-    /// This prevents stale/dirty historical sessions from affecting new playback chains.
     pub fn invalidate_sessions_for_user_file(&self, user_id: &str, file_path: &str) -> usize {
         let mut sessions = self.sessions.lock().unwrap();
         let before = sessions.len();
@@ -360,7 +317,6 @@ impl HlsSessionManager {
             max_segments: session.max_segments,
             hkdf: HkdfBlake3::new_with_session_salt(&session.session_id, &session.pmk),
             zkp_registration: session.zkp_registration.clone(),
-            direct_mode: session.direct_mode,
         })
     }
 
@@ -443,7 +399,6 @@ mod tests {
 
     #[test]
     fn test_hkdf_blake3_with_session_salt() {
-        // Test that HKDF-BLAKE3 with session salt produces consistent results
         let pmk = [0x42u8; 32];
         let session_id = "test-session-123";
 
@@ -455,21 +410,17 @@ mod tests {
         let mut key2 = [0u8; 32];
         hk.expand(b"hls-master-key", &mut key2).unwrap();
 
-        // Same input should produce same output
         assert_eq!(key1, key2);
 
-        // Test with different session_id
         let hk2 = HkdfBlake3::new_with_session_salt("different-session", &pmk);
         let mut key3 = [0u8; 32];
         hk2.expand(b"hls-master-key", &mut key3).unwrap();
 
-        // Different session_id should produce different key
         assert_ne!(key1, key3);
     }
 
     #[test]
     fn test_hkdf_blake3_legacy() {
-        // Test legacy HKDF-BLAKE3 with zero salt
         let pmk = [0x42u8; 32];
 
         let hk = HkdfBlake3::new(None, &pmk);
@@ -480,7 +431,6 @@ mod tests {
         let mut key2 = [0u8; 32];
         hk.expand(b"hls-master-key", &mut key2).unwrap();
 
-        // Same input should produce same output
         assert_eq!(key1, key2);
     }
 

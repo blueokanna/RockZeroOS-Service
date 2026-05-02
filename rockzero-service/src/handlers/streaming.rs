@@ -805,7 +805,8 @@ fn parse_seek(req: &HttpRequest) -> Option<f64> {
         q.split('&')
             .find(|p| p.starts_with("seek="))
             .and_then(|p| p.strip_prefix("seek="))
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
     })
 }
 

@@ -33,6 +33,7 @@ impl std::fmt::Display for CachePressureLevel {
 const WINDOWS_UNCONFIGURED_STORAGE_ROOT: &str = "./storage/unconfigured";
 const WINDOWS_PORTABLE_STORAGE_ROOT: &str = "./storage";
 const WINDOWS_STORAGE_BINDING_FILE: &str = "windows-storage-root.json";
+const HLS_CACHE_PROTECTION_SECS: u64 = 600;
 const WINDOWS_STORAGE_ROOT_ENV_KEYS: &[&str] = &[
     "ROCKZERO_WINDOWS_STORAGE_ROOT",
     "EXTERNAL_STORAGE_PATH",
@@ -133,12 +134,11 @@ fn try_initialize_windows_storage_binding() -> std::io::Result<Option<WindowsSto
     if let Some(candidate) =
         prepare_windows_storage_root_candidate(portable_root, true, "portable storage root")?
     {
-        let binding = persist_windows_storage_binding(&candidate)?;
         info!(
-            "Auto-configured Windows storage root from portable app storage: {}",
-            binding.selected_root.display()
+            "Detected portable Windows storage root candidate but leaving selection explicit: {}",
+            candidate.display()
         );
-        return Ok(Some(binding));
+        return Ok(None);
     }
 
     Ok(None)
@@ -173,10 +173,20 @@ pub fn load_windows_storage_binding() -> std::io::Result<Option<WindowsStorageBi
     }
 
     let raw = std::fs::read_to_string(&binding_path)?;
-    let binding: WindowsStorageBinding = serde_json::from_str(&raw)
+    let mut binding: WindowsStorageBinding = serde_json::from_str(&raw)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    Ok(Some(binding))
+    match prepare_windows_storage_root_candidate(
+        binding.selected_root.clone(),
+        false,
+        "persisted binding",
+    )? {
+        Some(validated_root) => {
+            binding.selected_root = validated_root;
+            Ok(Some(binding))
+        }
+        None => try_initialize_windows_storage_binding(),
+    }
 }
 
 pub fn apply_storage_root_environment(root: &Path) {
@@ -879,7 +889,12 @@ impl StorageManager {
         let _guard = self.cleanup_lock.lock().await;
 
         if dir_exists(&self.config.hls_cache_path).await {
-            let _ = cleanup_old_entries_bytes(&self.config.hls_cache_path, 3600).await;
+            let _ = cleanup_old_entries_bytes(
+                &self.config.hls_cache_path,
+                3600,
+                HLS_CACHE_PROTECTION_SECS,
+            )
+            .await;
         }
 
         if dir_exists(&self.config.temp_storage_path).await {
@@ -899,7 +914,12 @@ impl StorageManager {
 
         if dir_exists(&self.config.hls_cache_path).await {
             let retention = self.config.hls_cache_retention_days * 24 * 3600;
-            let freed = cleanup_old_entries_bytes(&self.config.hls_cache_path, retention).await?;
+            let freed = cleanup_old_entries_bytes(
+                &self.config.hls_cache_path,
+                retention,
+                HLS_CACHE_PROTECTION_SECS,
+            )
+            .await?;
             if freed > 0 {
                 info!(
                     "Cleaned {} from HLS cache (retention: {}d)",
@@ -947,9 +967,13 @@ impl StorageManager {
             let log_short = (self.config.log_retention_days * 24 * 3600) / 4;
 
             if dir_exists(&self.config.hls_cache_path).await {
-                let freed = cleanup_old_entries_bytes(&self.config.hls_cache_path, hls_short)
-                    .await
-                    .unwrap_or(0);
+                let freed = cleanup_old_entries_bytes(
+                    &self.config.hls_cache_path,
+                    hls_short,
+                    HLS_CACHE_PROTECTION_SECS,
+                )
+                .await
+                .unwrap_or(0);
                 if freed > 0 {
                     info!("Escalated HLS cleanup freed {}", format_bytes(freed));
                 }
@@ -1075,7 +1099,12 @@ impl StorageManager {
             return Ok(());
         }
         let retention = self.config.hls_cache_retention_days * 24 * 3600;
-        let freed = cleanup_old_entries_bytes(&self.config.hls_cache_path, retention).await?;
+        let freed = cleanup_old_entries_bytes(
+            &self.config.hls_cache_path,
+            retention,
+            HLS_CACHE_PROTECTION_SECS,
+        )
+        .await?;
         if freed > 0 {
             info!("Cleaned {} from old HLS cache", format_bytes(freed));
         }
@@ -1104,25 +1133,35 @@ impl StorageManager {
                 continue;
             }
 
-            if is_cache_entry_protected(&entry.path(), max_idle_secs).await {
+            let entry_path = entry.path();
+
+            if fs::metadata(entry_path.join(".lock")).await.is_ok() {
                 continue;
             }
+
             let last_activity = {
-                let access_file = entry.path().join(".last_access");
+                let access_file = entry_path.join(".last_access");
                 if let Ok(amd) = fs::metadata(&access_file).await {
-                    amd.modified()
+                    let modified = amd
+                        .modified()
                         .ok()
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs())
-                        .unwrap_or(0)
+                        .unwrap_or(0);
+
+                    if now.saturating_sub(modified) <= max_idle_secs {
+                        continue;
+                    }
+
+                    modified
                 } else {
-                    most_recent_access_in_dir(&entry.path()).await
+                    most_recent_access_in_dir(&entry_path).await
                 }
             };
 
             if now.saturating_sub(last_activity) > max_idle_secs {
-                let sz = get_directory_size(&entry.path()).await.unwrap_or(0);
-                if fs::remove_dir_all(entry.path()).await.is_ok() {
+                let sz = get_directory_size(&entry_path).await.unwrap_or(0);
+                if fs::remove_dir_all(entry_path).await.is_ok() {
                     freed += sz;
                     deleted += 1;
                 }
@@ -1497,7 +1536,11 @@ async fn cleanup_old_files_bytes(path: &Path, retention_secs: u64) -> std::io::R
     Ok(freed)
 }
 
-async fn cleanup_old_entries_bytes(path: &Path, retention_secs: u64) -> std::io::Result<u64> {
+async fn cleanup_old_entries_bytes(
+    path: &Path,
+    retention_secs: u64,
+    protection_secs: u64,
+) -> std::io::Result<u64> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -1511,6 +1554,9 @@ async fn cleanup_old_entries_bytes(path: &Path, retention_secs: u64) -> std::io:
             Err(_) => continue,
         };
         if md.is_dir() {
+            if is_cache_entry_protected(&entry.path(), protection_secs).await {
+                continue;
+            }
             let recent = most_recent_access_in_dir(&entry.path()).await;
             if now.saturating_sub(recent) > retention_secs {
                 let sz = get_directory_size(&entry.path()).await.unwrap_or(0);
@@ -1519,6 +1565,9 @@ async fn cleanup_old_entries_bytes(path: &Path, retention_secs: u64) -> std::io:
                 }
             }
         } else if md.is_file() {
+            if is_cache_entry_protected(path, protection_secs).await {
+                continue;
+            }
             let modified = md
                 .modified()
                 .ok()
@@ -1565,7 +1614,7 @@ async fn lru_evict_from_directory(path: &Path, target_bytes: u64) -> std::io::Re
             Err(_) => continue,
         };
 
-        if md.is_dir() && is_cache_entry_protected(&entry.path(), 600).await {
+        if md.is_dir() && is_cache_entry_protected(&entry.path(), HLS_CACHE_PROTECTION_SECS).await {
             continue;
         }
 

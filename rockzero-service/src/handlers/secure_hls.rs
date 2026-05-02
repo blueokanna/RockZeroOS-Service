@@ -1143,8 +1143,8 @@ pub struct CreateSessionRequest {
     pub file_path: Option<String>,
     pub zkp_registration: Option<String>,
 
-    #[serde(default)]
-    pub direct_mode: bool,
+    #[serde(default, alias = "direct_mode")]
+    pub legacy_direct_mode_requested: bool,
 }
 
 pub async fn create_hls_session(
@@ -1240,7 +1240,7 @@ pub async fn create_hls_session(
         )
         .map_err(convert_hls_error)?;
 
-    if body.direct_mode {
+    if body.legacy_direct_mode_requested {
         warn!(
             "Client requested direct_mode for session {}, but it is disabled by security policy. \
              All segments will be ChaCha20-Poly1305 encrypted.",
@@ -1339,6 +1339,16 @@ async fn get_user_zkp_registration(
         }
         None => Ok(None),
     }
+}
+
+fn ensure_session_belongs_to_user(session: &HlsSession, user_id: &str) -> Result<(), AppError> {
+    if session.user_id != user_id {
+        return Err(AppError::Unauthorized(
+            "Session does not belong to current user".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 async fn ensure_hls_segments(
@@ -1873,9 +1883,9 @@ async fn run_ffmpeg_progressive(
         "-i".into(),
         file_path.into(),
         "-map".into(),
-        "0:v?".into(), // 视频流（如果有）
+        "0:v?".into(),
         "-map".into(),
-        "0:a?".into(), // 音频流（如果有）
+        "0:a?".into(),
         "-c".into(),
         "copy".into(),
     ];
@@ -2201,11 +2211,19 @@ async fn generate_segment_on_demand(
 
     let start_time = segment_index as f64 * segment_duration;
     let seg_path_str = segment_path.to_string_lossy().to_string();
+    let source_start_time = detect_video_start_time(&ffmpeg_path, file_path).await;
 
     info!(
         "🎯 On-demand segment generation: segment_{}.ts (seek to {:.1}s)",
         segment_index, start_time
     );
+
+    if source_start_time > 1.0 {
+        info!(
+            "Detected video start_time: {:.3}s for on-demand segment generation, applying -output_ts_offset",
+            source_start_time
+        );
+    }
 
     let video_codec = detect_video_codec(&ffmpeg_path, file_path).await;
     let _ = video_codec;
@@ -2251,6 +2269,13 @@ async fn generate_segment_on_demand(
             "-t".into(),
             format!("{:.3}", segment_duration),
         ]);
+
+        if source_start_time > 1.0 {
+            args.extend([
+                "-output_ts_offset".into(),
+                format!("{:.6}", -source_start_time),
+            ]);
+        }
 
         match accel {
             HardwareAccel::Rkmpp => {
@@ -2383,7 +2408,7 @@ async fn generate_segment_on_demand(
         }
     }
 
-    encrypt_on_demand_segment(&segment_path, file_path).await;
+    encrypt_on_demand_segment(&segment_path, file_path).await?;
 
     info!(
         "�?On-demand segment_{}.ts generated (transcode) and encrypted",
@@ -2392,16 +2417,44 @@ async fn generate_segment_on_demand(
     Ok(())
 }
 
-async fn encrypt_on_demand_segment(segment_path: &std::path::Path, file_path: &str) {
+async fn encrypt_on_demand_segment(
+    segment_path: &std::path::Path,
+    file_path: &str,
+) -> Result<(), String> {
     let storage_key = derive_segment_storage_key(file_path);
-    if let Ok(data) = tokio::fs::read(segment_path).await {
-        if let Ok(encrypted) = chacha_encrypt(&storage_key, &data) {
-            let enc_path = segment_path.with_extension("ts.enc");
-            if write_file_best_effort(&enc_path, &encrypted).await.is_ok() {
-                let _ = remove_file_best_effort(segment_path).await;
-            }
+    let enc_path = segment_path.with_extension("ts.enc");
+
+    let data = match tokio::fs::read(segment_path).await {
+        Ok(data) => data,
+        Err(e) => {
+            let _ = remove_file_best_effort(&enc_path).await;
+            let _ = remove_file_best_effort(segment_path).await;
+            return Err(format!("Failed to read on-demand segment for encryption: {}", e));
         }
+    };
+
+    let encrypted = match chacha_encrypt(&storage_key, &data) {
+        Ok(encrypted) => encrypted,
+        Err(e) => {
+            let _ = remove_file_best_effort(&enc_path).await;
+            let _ = remove_file_best_effort(segment_path).await;
+            return Err(format!("Failed to encrypt on-demand segment: {}", e));
+        }
+    };
+
+    if let Err(e) = write_file_best_effort(&enc_path, &encrypted).await {
+        let _ = remove_file_best_effort(&enc_path).await;
+        let _ = remove_file_best_effort(segment_path).await;
+        return Err(format!("Failed to write encrypted on-demand segment: {}", e));
     }
+
+    if let Err(e) = remove_file_best_effort(segment_path).await {
+        let _ = remove_file_best_effort(&enc_path).await;
+        let _ = remove_file_best_effort(segment_path).await;
+        return Err(format!("Failed to remove plaintext on-demand segment: {}", e));
+    }
+
+    Ok(())
 }
 
 async fn get_video_duration(ffmpeg_path: &str, file_path: &str) -> Option<f64> {
@@ -2462,9 +2515,11 @@ fn generate_complete_vod_playlist(total_duration: f64, segment_duration: f64) ->
 
 pub async fn get_secure_playlist(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     path: web::Path<String>,
 ) -> Result<impl Responder, AppError> {
     let session_id = path.into_inner();
+    let user_id = claims.sub.clone();
 
     info!(
         "📋 Playlist request for session: {} (len={})",
@@ -2486,15 +2541,14 @@ pub async fn get_secure_playlist(
             session_id, found, active_count, known_ids
         );
 
-        let session = manager
-            .get_session(&session_id)
-            .map_err(convert_hls_error)?;
+        let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+        ensure_session_belongs_to_user(&session, &user_id)?;
         session.file_path.clone()
     };
 
     let ensured = ensure_hls_segments(&file_path, Some(&session_id)).await;
 
-    let (_cache_dir, playlist_content, no_disk_mode) = match ensured {
+    let (cache_dir, playlist_content, no_disk_mode) = match ensured {
         Ok((cache_dir, content)) => (Some(cache_dir), content, false),
         Err(AppError::PreconditionFailed(msg)) => {
             warn!(
@@ -2509,7 +2563,7 @@ pub async fn get_secure_playlist(
     let final_content = if !no_disk_mode && playlist_content.contains("#EXT-X-ENDLIST") {
         playlist_content
     } else {
-        let duration_file = _cache_dir.as_ref().map(|d| d.join(".duration"));
+        let duration_file = cache_dir.as_ref().map(|d| d.join(".duration"));
         let duration = if duration_file.as_ref().is_some_and(|p| p.exists()) {
             tokio::fs::read_to_string(duration_file.as_ref().unwrap())
                 .await
@@ -2548,7 +2602,7 @@ pub async fn get_secure_playlist(
         }
     };
 
-    if let Some(cache_dir) = _cache_dir.as_ref() {
+    if let Some(cache_dir) = cache_dir.as_ref() {
         touch_cache_access(cache_dir).await;
     }
 
@@ -2651,9 +2705,11 @@ async fn wait_for_segment_ready(
 
 pub async fn get_segment_direct(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     path: web::Path<(String, String)>,
 ) -> Result<impl Responder, AppError> {
     let (session_id, segment_name) = path.into_inner();
+    let user_id = claims.sub.clone();
 
     if !segment_name.ends_with(".ts") {
         return Err(AppError::BadRequest(format!(
@@ -2664,9 +2720,8 @@ pub async fn get_segment_direct(
 
     let file_path = {
         let manager = hls_manager.read().await;
-        let session = manager
-            .get_session(&session_id)
-            .map_err(convert_hls_error)?;
+        let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+        ensure_session_belongs_to_user(&session, &user_id)?;
         session.file_path.clone()
     };
 
@@ -2696,9 +2751,8 @@ pub async fn get_segment_direct(
             read_video_segment_from_ffmpeg(&file_path, &segment_name, Some(&session_id)).await?;
 
         let manager = hls_manager.read().await;
-        let session = manager
-            .get_session(&session_id)
-            .map_err(convert_hls_error)?;
+        let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+        ensure_session_belongs_to_user(&session, &user_id)?;
         let encrypted_data = session
             .encrypt_segment(&segment_data)
             .map_err(convert_hls_error)?;
@@ -2767,9 +2821,8 @@ pub async fn get_segment_direct(
     touch_cache_access(&cache_dir).await;
 
     let manager = hls_manager.read().await;
-    let session = manager
-        .get_session(&session_id)
-        .map_err(convert_hls_error)?;
+    let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+    ensure_session_belongs_to_user(&session, &user_id)?;
     let encrypted_data = session
         .encrypt_segment(&segment_data)
         .map_err(convert_hls_error)?;
@@ -2797,11 +2850,13 @@ pub async fn get_segment_direct(
 
 pub async fn get_secure_segment(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     path: web::Path<(String, String)>,
     req: actix_web::HttpRequest,
     body: web::Bytes,
 ) -> Result<impl Responder, AppError> {
     let (session_id, segment_name) = path.into_inner();
+    let user_id = claims.sub.clone();
 
     if req.method() != actix_web::http::Method::POST {
         warn!(
@@ -2831,9 +2886,8 @@ pub async fn get_secure_segment(
     );
 
     let manager = hls_manager.read().await;
-    let session = manager
-        .get_session(&session_id)
-        .map_err(convert_hls_error)?;
+    let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+    ensure_session_belongs_to_user(&session, &user_id)?;
 
     let ticket_verified = if let Some(ticket) = segment_request.zkp_ticket.as_ref() {
         if ticket.is_empty() {
@@ -2946,15 +3000,20 @@ pub async fn get_secure_segment(
 
 pub async fn stop_session(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     path: web::Path<String>,
 ) -> Result<impl Responder, AppError> {
     let session_id = path.into_inner();
+    let user_id = claims.sub.clone();
 
     clear_session_no_disk_mode(&session_id);
     clear_no_disk_segment_cache_for_session(&session_id);
 
     info!("Stopping HLS session: {}", session_id);
     let manager = hls_manager.read().await;
+
+    let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+    ensure_session_belongs_to_user(&session, &user_id)?;
 
     match manager.remove_session(&session_id) {
         Ok(_) => {
@@ -3844,6 +3903,8 @@ mod tests {
     use actix_web::{
         body::to_bytes,
         http::StatusCode,
+        FromRequest,
+        HttpMessage,
         Responder,
     };
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -3934,6 +3995,23 @@ mod tests {
         session_id
     }
 
+    async fn test_claims() -> web::ReqData<crate::handlers::auth::Claims> {
+        let req = actix_web::test::TestRequest::default().to_http_request();
+        req.extensions_mut().insert(crate::handlers::auth::Claims {
+            sub: "test-user".to_string(),
+            email: "test-user@example.com".to_string(),
+            role: "user".to_string(),
+            token_type: "access".to_string(),
+            exp: i64::MAX,
+            iat: 0,
+            jti: None,
+        });
+
+        web::ReqData::<crate::handlers::auth::Claims>::extract(&req)
+            .await
+            .unwrap()
+    }
+
     fn build_zkp_proof_base64(
         password: &str,
         registration: &PasswordRegistration,
@@ -3968,7 +4046,11 @@ mod tests {
         std::fs::write(cache_dir.join(".lock"), b"in-progress").unwrap();
 
         let req = actix_web::test::TestRequest::default().to_http_request();
-        let playlist_resp = get_secure_playlist(data.clone(), web::Path::from(session_id.clone()))
+        let playlist_resp = get_secure_playlist(
+            data.clone(),
+            test_claims().await,
+            web::Path::from(session_id.clone()),
+        )
             .await
             .unwrap()
             .respond_to(&req);
@@ -3976,6 +4058,7 @@ mod tests {
 
         let play_resp = get_segment_direct(
             data.clone(),
+            test_claims().await,
             web::Path::from((session_id.clone(), "segment_0.ts".to_string())),
         )
         .await
@@ -3995,6 +4078,7 @@ mod tests {
         let started = Instant::now();
         let far_resp = get_segment_direct(
             data.clone(),
+            test_claims().await,
             web::Path::from((session_id.clone(), far_segment_name)),
         )
         .await
@@ -4051,6 +4135,7 @@ mod tests {
         let started = Instant::now();
         let resp = get_segment_direct(
             data.clone(),
+            test_claims().await,
             web::Path::from((session_id, far_segment_name)),
         )
         .await
@@ -4088,6 +4173,7 @@ mod tests {
 
         let bad_result = get_secure_segment(
             data.clone(),
+            test_claims().await,
             web::Path::from((session_id_bad, "segment_0.ts".to_string())),
             bad_req,
             web::Bytes::from(serde_json::to_vec(&bad_body).unwrap()),
@@ -4106,6 +4192,7 @@ mod tests {
 
         let good_resp = get_secure_segment(
             data.clone(),
+            test_claims().await,
             web::Path::from((session_id_good.clone(), "segment_0.ts".to_string())),
             good_req,
             web::Bytes::from(serde_json::to_vec(&good_body).unwrap()),

@@ -207,7 +207,9 @@ pub struct SaveTextFileRequest {
     pub content: String,
 }
 
-pub async fn get_storage_scope_status() -> Result<impl Responder, AppError> {
+pub async fn get_storage_scope_status(req: HttpRequest) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+
     let binding = load_windows_storage_binding()
         .map_err(|e| AppError::InternalServerError(format!("Failed to read Windows storage binding: {e}")))?;
 
@@ -229,9 +231,13 @@ pub async fn get_storage_scope_status() -> Result<impl Responder, AppError> {
 
 pub async fn browse_storage_scope(
     query: web::Query<StorageRootBrowseQuery>,
-) -> Result<impl Responder, AppError> {
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = req;
         let _ = query;
         return Err(AppError::BadRequest(
             "Storage root browsing is only required on Windows".to_string(),
@@ -330,9 +336,13 @@ pub async fn browse_storage_scope(
 
 pub async fn configure_storage_scope(
     body: web::Json<ConfigureStorageRootRequest>,
-) -> Result<impl Responder, AppError> {
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = req;
         let _ = body;
         return Err(AppError::BadRequest(
             "Storage root configuration is only required on Windows".to_string(),
@@ -580,8 +590,8 @@ pub async fn upload_files(
 ) -> Result<impl Responder, AppError> {
     tracing::info!("馃摛 Upload request received");
     tracing::info!(
-        "  - Authorization header: {:?}",
-        req.headers().get("authorization")
+        "  - Authorization header present: {}",
+        req.headers().contains_key("authorization")
     );
     tracing::info!("  - Content-Type: {:?}", req.headers().get("content-type"));
 
@@ -1097,7 +1107,10 @@ pub async fn get_storage_info() -> Result<impl Responder, AppError> {
 
 pub async fn write_text_file(
     body: web::Json<SaveTextFileRequest>,
-) -> Result<impl Responder, AppError> {
+    req: HttpRequest,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+
     let decoded_path = decode_path_value(&body.path);
     let full_path = sanitize_path(&decoded_path)?;
 
@@ -1204,9 +1217,7 @@ fn get_base_directory() -> Result<PathBuf, AppError> {
 fn is_path_allowed(path: &Path, base: &Path) -> bool {
     let base_canonical = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
     let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    candidate.starts_with(&base_canonical)
-        || path.starts_with(&base_canonical)
-        || path.starts_with(base)
+    candidate.starts_with(&base_canonical) || path.starts_with(&base_canonical)
 }
 
 fn sanitize_path(path: &str) -> Result<PathBuf, AppError> {
@@ -1227,15 +1238,52 @@ fn sanitize_path(path: &str) -> Result<PathBuf, AppError> {
         base.join(clean_path)
     };
 
-    let canonical = full_path
-        .canonicalize()
-        .unwrap_or_else(|_| full_path.clone());
+    let canonical = if full_path.exists() {
+        full_path
+            .canonicalize()
+            .map_err(|e| AppError::Forbidden(format!("Failed to resolve path: {e}")))?
+    } else {
+        resolve_path_from_existing_parent(&full_path, &base)?
+    };
 
     if !is_path_allowed(&canonical, &base) && !is_path_allowed(&full_path, &base) {
         return Err(AppError::Forbidden("Path traversal detected".to_string()));
     }
 
     Ok(canonical)
+}
+
+fn resolve_path_from_existing_parent(full_path: &Path, base: &Path) -> Result<PathBuf, AppError> {
+    let mut existing_parent = full_path;
+    let mut suffix = Vec::new();
+
+    while !existing_parent.exists() {
+        let file_name = existing_parent.file_name().ok_or_else(|| {
+            AppError::Forbidden("Path traversal detected".to_string())
+        })?;
+        suffix.push(file_name.to_os_string());
+        existing_parent = existing_parent.parent().ok_or_else(|| {
+            AppError::Forbidden("Path traversal detected".to_string())
+        })?;
+    }
+
+    let resolved_parent = existing_parent
+        .canonicalize()
+        .map_err(|e| AppError::Forbidden(format!("Failed to resolve parent path: {e}")))?;
+    let base_canonical = base
+        .canonicalize()
+        .map_err(|e| AppError::Forbidden(format!("Failed to resolve base path: {e}")))?;
+
+    if !resolved_parent.starts_with(&base_canonical) {
+        return Err(AppError::Forbidden("Path traversal detected".to_string()));
+    }
+
+    let mut resolved = resolved_parent;
+    for component in suffix.iter().rev() {
+        resolved.push(component);
+    }
+
+    Ok(resolved)
 }
 
 fn decode_path_value(path: &str) -> String {

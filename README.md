@@ -1,23 +1,15 @@
-<p align="center">
-  <img src="RockZero.png" alt="RockZeroOS Logo" width="200"/>
-</p>
+# RockZeroOS
 
-<h1 align="center">RockZeroOS</h1>
+![RockZeroOS Logo](RockZero.png)
 
-<p align="center">
-  <strong>Secure Private Cloud NAS Operating System</strong>
-</p>
+Secure Private Cloud NAS Operating System
 
-<p align="center">
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.75%2B-orange.svg" alt="Rust"></a>
-  <a href="https://flutter.dev/"><img src="https://img.shields.io/badge/flutter-3.19%2B-blue.svg" alt="Flutter"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Build Status">
-</p>
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Flutter](https://img.shields.io/badge/flutter-3.19%2B-blue.svg)](https://flutter.dev/)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)
 
-<p align="center">
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
-</p>
+English · [简体中文](README.zh-CN.md)
 
 ---
 
@@ -64,7 +56,7 @@ flowchart TB
 ```
 
 | Feature | Technology | Description |
-|---------|------------|-------------|
+| ------- | ---------- | ----------- |
 | JWT Authentication | EdDSA (Ed25519) | Private key derived from BLAKE3 hash of password |
 | Key Exchange | WPA3-SAE (Dragonfly) | Secure key negotiation based on Curve25519 |
 | Video Transport Encryption | ChaCha20-Poly1305 | Session-derived secure HLS segment transport |
@@ -122,7 +114,7 @@ The Flutter client uses media_kit (libmpv) with hardware decoding enabled by def
 - `stream-buffer-size=2MiB` — Optimized for network streaming
 
 | Platform | API | Configuration |
-|----------|-----|---------------|
+| ---------- | ----- | --------------- |
 | Android | MediaCodec | `hwdec=mediacodec` via libmpv |
 | iOS | VideoToolbox | `hwdec=videotoolbox` via libmpv |
 | Windows/Linux/macOS | Auto-detect | `hwdec=auto-safe` via libmpv |
@@ -141,7 +133,7 @@ The **back button** on the full-screen audio player minimizes playback to the ba
 
 ### Key Derivation
 
-```
+```text
 PMK (from SAE handshake)
   → HKDF-BLAKE3(salt="hls-session-salt:{session_id}", info="hls-master-key")
   → 256-bit ChaCha20-Poly1305 transport key
@@ -208,7 +200,7 @@ Any request outside the selected Windows root is rejected by the backend path gu
 The server auto-detects available hardware at startup and selects the optimal encoding pipeline. On ARM architectures, VAAPI is **explicitly skipped** (Mali/Panfrost GPUs expose `/dev/dri/renderD128` but do not support video encoding), and the detection order is: **Rockchip MPP → V4L2 M2M → Software fallback**. A test encode is performed to verify each candidate actually works before committing to it.
 
 | Platform | Detection Method | Encoder | Decoder | Notes |
-|----------|-----------------|---------|---------|-------|
+| ---------- | ----------------- | --------- | --------- | ------- |
 | Intel | VAAPI device + vendor ID `0x8086` | h264_vaapi | hwaccel vaapi | Verified via FFmpeg test encode |
 | AMD | VAAPI device + vendor ID `0x1002` | h264_vaapi | hwaccel vaapi | Verified via FFmpeg test encode |
 | Rockchip (RK3588/RK3399) | `/proc/cpuinfo`, device tree | h264_rkmpp | rkmpp | Requires MPP libraries; priority 1 on ARM |
@@ -258,7 +250,7 @@ This design keeps startup latency low while retaining playback continuity under 
 Multi-platform gaming hub with **fully native** UI integration (no WebView). Each platform tab fetches **real-time data from official APIs** with built-in catalog fallback:
 
 | Platform | Official API Source | Features |
-|----------|---------------------|----------|
+| ---------- | --------------------- | ---------- |
 | Steam | Steam Web API (`store.steampowered.com`) | Game library, play time stats, profile, API key binding, SteamDB viewer |
 | Epic Games | Epic GraphQL API (`graphql.epicgames.com`) | Live catalog, free game highlights, featured carousel, category browsing, search |
 | WeGame | WeGame Internal API (`wegame.com.cn/api/v1/`) | Live catalog, hot games ranking, featured carousel, search, save to library |
@@ -278,7 +270,7 @@ The **Daily Top 30** tab shows curated recommendations with 30 games per platfor
 ### Built-in WASM Applications
 
 | App | Description |
-|-----|-------------|
+| ----- | ------------- |
 | SteamDB Viewer | Query Steam API for game details by **name search** (Steam Store storesearch + suggest fallback) or AppID: price, online players, reviews, DLC, system requirements |
 | M3U8 Downloader | Parse M3U8 playlists, download TS segments, auto-merge with AES decryption support. Supports **custom save directory** (NAS default / Downloads / custom path) with path sanitization and security checks |
 | Steam P2P Info | View Steam player profiles, friends list, recent games, and P2P connection details. Includes **collapsible help documentation** with NAT type explanations (Open/Moderate/Strict) and troubleshooting guide |
@@ -317,7 +309,7 @@ graph LR
     style Frontend fill:#e8f5e9
 ```
 
-```
+```text
 RockZeroOS-Service/
 ├── rockzero-common/              # Common library (error handling, config, types)
 ├── rockzero-crypto/              # Cryptography library
@@ -487,8 +479,10 @@ POST /api/v1/secure-hls/sae/init
 POST /api/v1/secure-hls/sae/commit
 POST /api/v1/secure-hls/sae/confirm
 POST /api/v1/secure-hls/session/create
+POST /api/v1/secure-hls/session/{session_id}/proof-ticket
 GET  /api/v1/secure-hls/{session_id}/playlist.m3u8
-GET  /api/v1/secure-hls/{session_id}/segment_{n}.ts
+GET  /api/v1/secure-hls/{session_id}/{segment}
+POST /api/v1/secure-hls/{session_id}/{segment}
 ```
 
 ### Media Info & Streaming Utilities
@@ -562,7 +556,7 @@ POST /api/v1/storage/unmount
 POST /api/v1/storage/file                            # Write file to storage
 ```
 
-### Storage Management
+### Storage Management API
 
 ```http
 GET  /api/v1/storage-management/overview             # Storage overview
@@ -607,7 +601,7 @@ POST /api/v1/invite/remaining                        # Check remaining time
 ## Performance
 
 | Operation | Performance | Notes |
-|-----------|-------------|-------|
+| ----------- | ------------- | ------- |
 | EdDSA JWT Sign | ~0.1ms | Ed25519 via dalek |
 | EdDSA JWT Verify | ~0.2ms | Ed25519 via dalek |
 | SAE Handshake (full) | ~5-10ms | Curve25519 Dragonfly |
@@ -683,15 +677,11 @@ See [LICENSE](LICENSE) for the full license text.
 ## Contact
 
 - **Author**: blueokanna
-- **Email**: blueokanna@gmail.com
+- **Email**: [blueokanna@gmail.com](mailto:blueokanna@gmail.com)
 - **GitHub**: [https://github.com/blueokanna/rockzero-service](https://github.com/blueokanna/rockzero-service)
 
 ---
 
-<p align="center">
-  <strong>Made with ❤️ by blueokanna</strong>
-</p>
+Made with care by blueokanna
 
-<p align="center">
-  Powered by Rust 🦀 | Secured by EdDSA + SAE + ChaCha20-Poly1305 🔐 | Accelerated by Hardware 🚀
-</p>
+Powered by Rust | Secured by EdDSA + SAE + ChaCha20-Poly1305 | Accelerated by Hardware

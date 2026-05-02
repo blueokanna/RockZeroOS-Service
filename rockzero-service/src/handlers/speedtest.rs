@@ -1,6 +1,7 @@
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -40,13 +41,14 @@ pub struct PingQuery {
 pub struct PingStatsResponse {
     pub sent: u32,
     pub results: Vec<PingResponse>,
-    pub min_ms: f64,
-    pub max_ms: f64,
-    pub avg_ms: f64,
-    pub jitter_ms: f64,
+    pub server_processing_min_ms: f64,
+    pub server_processing_max_ms: f64,
+    pub server_processing_avg_ms: f64,
+    pub server_processing_jitter_ms: f64,
 }
 
 static DOWNLOAD_BLOCK: OnceLock<Vec<u8>> = OnceLock::new();
+static DOWNLOAD_ARC: OnceLock<Arc<[u8]>> = OnceLock::new();
 static START_INSTANT: OnceLock<Instant> = OnceLock::new();
 
 fn get_download_block() -> &'static [u8] {
@@ -66,6 +68,12 @@ fn get_download_block() -> &'static [u8] {
         })
         .as_slice()
 }
+
+    fn get_download_arc() -> Arc<[u8]> {
+        DOWNLOAD_ARC
+        .get_or_init(|| Arc::from(get_download_block()))
+        .clone()
+    }
 
 fn monotonic_now_ns() -> u128 {
     START_INSTANT
@@ -94,7 +102,7 @@ pub async fn download_test(req: HttpRequest) -> Result<impl Responder, AppError>
         .chunk_kb
         .map(|v| v.clamp(64, 2048) as usize * 1024)
         .unwrap_or(512 * 1024); // default 512KB
-    let source = get_download_block().to_vec();
+    let source = get_download_arc();
     let source_len = source.len();
     
     // 创建一个简单的流，使用 futures::stream::unfold
@@ -117,7 +125,7 @@ pub async fn download_test(req: HttpRequest) -> Result<impl Responder, AppError>
             let new_remaining = remaining - current_chunk;
             Some((
                 Ok::<_, actix_web::error::Error>(web::Bytes::from(buffer)),
-                (new_remaining, chunk_size, source, source_len),
+                (new_remaining, chunk_size, Arc::clone(&source), source_len),
             ))
         },
     );
@@ -206,25 +214,25 @@ pub async fn ping_test(req: HttpRequest) -> Result<impl Responder, AppError> {
     }
 
     let mut prev: Option<f64> = None;
-    let mut min_ms: f64 = f64::MAX;
-    let mut max_ms: f64 = 0.0;
-    let mut sum_ms: f64 = 0.0;
-    let mut jitter_acc: f64 = 0.0;
+    let mut server_processing_min_ms: f64 = f64::MAX;
+    let mut server_processing_max_ms: f64 = 0.0;
+    let mut server_processing_sum_ms: f64 = 0.0;
+    let mut server_processing_jitter_acc: f64 = 0.0;
 
     for sample in &samples {
         let ms = sample.processing_ns as f64 / 1_000_000.0;
-        min_ms = min_ms.min(ms);
-        max_ms = max_ms.max(ms);
-        sum_ms += ms;
+        server_processing_min_ms = server_processing_min_ms.min(ms);
+        server_processing_max_ms = server_processing_max_ms.max(ms);
+        server_processing_sum_ms += ms;
         if let Some(p) = prev {
-            jitter_acc += (ms - p).abs();
+            server_processing_jitter_acc += (ms - p).abs();
         }
         prev = Some(ms);
     }
 
-    let avg_ms = sum_ms / samples.len() as f64;
-    let jitter_ms = if samples.len() > 1 {
-        jitter_acc / (samples.len() as f64 - 1.0)
+    let server_processing_avg_ms = server_processing_sum_ms / samples.len() as f64;
+    let server_processing_jitter_ms = if samples.len() > 1 {
+        server_processing_jitter_acc / (samples.len() as f64 - 1.0)
     } else {
         0.0
     };
@@ -236,10 +244,10 @@ pub async fn ping_test(req: HttpRequest) -> Result<impl Responder, AppError> {
         .json(PingStatsResponse {
             sent: count,
             results: samples,
-            min_ms,
-            max_ms,
-            avg_ms,
-            jitter_ms,
+            server_processing_min_ms,
+            server_processing_max_ms,
+            server_processing_avg_ms,
+            server_processing_jitter_ms,
         }))
 }
 

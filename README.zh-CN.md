@@ -1,23 +1,15 @@
-<p align="center">
-  <img src="RockZero.png" alt="RockZeroOS Logo" width="200"/>
-</p>
+# RockZeroOS
 
-<h1 align="center">RockZeroOS</h1>
+![RockZeroOS Logo](RockZero.png)
 
-<p align="center">
-  <strong>安全的私有云 NAS 操作系统</strong>
-</p>
+安全的私有云 NAS 操作系统
 
-<p align="center">
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.75%2B-orange.svg" alt="Rust"></a>
-  <a href="https://flutter.dev/"><img src="https://img.shields.io/badge/flutter-3.19%2B-blue.svg" alt="Flutter"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Build Status">
-</p>
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Flutter](https://img.shields.io/badge/flutter-3.19%2B-blue.svg)](https://flutter.dev/)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)
 
-<p align="center">
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
-</p>
+[English](README.md) · 简体中文
 
 ---
 
@@ -56,7 +48,7 @@ RockZeroOS 的安全链路以用户认证、密钥协商、会话授权和传输
 - Bulletproofs ZKP 仅用于认证链路，不用于媒体播放。
 
 | 能力 | 技术 | 说明 |
-|------|------|------|
+| ------ | ------ | ------ |
 | 用户认证 | EdDSA / Ed25519 | 密码派生私钥，JWT 走非对称签名 |
 | 密钥协商 | WPA3-SAE | 基于 Curve25519 的安全协商 |
 | 视频传输加密 | ChaCha20-Poly1305 | HLS 分段走会话密钥传输加密 |
@@ -211,7 +203,7 @@ Windows 诊断脚本：可使用 `scripts/secure_hls_playlist_only_diag.ps1` 做
 游戏中心采用原生 Flutter UI，不依赖 WebView。每个平台优先请求官方或公开数据源，失败时回退到内置目录，保证在离线、限网或接口波动时仍能正确展示内容。
 
 | 平台 | 数据源 | 当前能力 |
-|------|--------|----------|
+| ------ | -------- | ---------- |
 | Steam | Steam Web API | 游戏库、游玩时长、资料、API Key 绑定、SteamDB 查看 |
 | Epic Games | Epic GraphQL API | 实时目录、免费游戏、精选、分类、搜索 |
 | WeGame | WeGame API | 热门游戏、精选、分类、收藏 |
@@ -320,8 +312,20 @@ flutter run -d android
 
 - SAE 初始化、提交、确认
 - 创建 HLS 播放会话
+- 创建 proof-ticket
 - 拉取 `playlist.m3u8`
-- 拉取加密视频分段
+- 通过 GET / POST 拉取会话分段
+
+```http
+POST /api/v1/secure-hls/sae/init
+POST /api/v1/secure-hls/sae/commit
+POST /api/v1/secure-hls/sae/confirm
+POST /api/v1/secure-hls/session/create
+POST /api/v1/secure-hls/session/{session_id}/proof-ticket
+GET  /api/v1/secure-hls/{session_id}/playlist.m3u8
+GET  /api/v1/secure-hls/{session_id}/{segment}
+POST /api/v1/secure-hls/{session_id}/{segment}
+```
 
 ### 文件管理
 

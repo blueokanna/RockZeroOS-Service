@@ -180,6 +180,47 @@ fn generate_random_id() -> Result<String, AppError> {
     Ok(hex::encode(bytes))
 }
 
+async fn load_or_repair_user_registration(
+    pool: &SqlitePool,
+    user: &crate::db::User,
+) -> Result<PasswordRegistration, AppError> {
+    if let Some(zkp_registration_json) = &user.zkp_registration {
+        if let Ok(registration) = serde_json::from_str::<PasswordRegistration>(zkp_registration_json)
+        {
+            return Ok(registration);
+        }
+
+        warn!("Invalid stored ZKP registration for user {}, rebuilding from SAE secret", user.id);
+    }
+
+    let sae_secret = user.sae_secret.as_ref().ok_or_else(|| {
+        AppError::Unauthorized(
+            "Synchronized SAE/ZKP credentials are missing; please log in with password again"
+                .to_string(),
+        )
+    })?;
+
+    let registration = ZkpContext::new()
+        .register_password(sae_secret)
+        .map_err(|e| {
+            AppError::InternalServerError(format!(
+                "Failed to regenerate ZKP registration from SAE secret: {}",
+                e
+            ))
+        })?;
+    let reg_json = serde_json::to_string(&registration).map_err(|e| {
+        AppError::InternalServerError(format!(
+            "Failed to serialize regenerated ZKP registration: {}",
+            e
+        ))
+    })?;
+
+    crate::db::sync_user_sae_and_zkp_registration(pool, &user.id, sae_secret, &reg_json).await?;
+    info!("Repaired synchronized SAE/ZKP credentials for user {}", user.id);
+
+    Ok(registration)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ZkpLoginRequest {
     pub username: String,
@@ -261,16 +302,13 @@ pub async fn zkp_login(
         AppError::Unauthorized("Authentication failed".to_string())
     })?;
 
-    let zkp_registration_json = user.zkp_registration.as_ref().ok_or_else(|| {
-        warn!("ZKP login failed: user not registered for ZKP - {}", username);
-        AppError::Unauthorized("Authentication failed".to_string())
+    let registration = load_or_repair_user_registration(&pool, &user).await.map_err(|e| {
+        warn!("ZKP login failed: registration load error - {}: {}", username, e);
+        match e {
+            AppError::Unauthorized(_) => AppError::Unauthorized("Authentication failed".to_string()),
+            _ => AppError::InternalServerError("Authentication configuration error".to_string()),
+        }
     })?;
-
-    let registration: PasswordRegistration =
-        serde_json::from_str(zkp_registration_json).map_err(|e| {
-            warn!("ZKP login failed: ZKP registration parse error - {}: {}", username, e);
-            AppError::InternalServerError("Authentication configuration error".to_string())
-        })?;
 
     let is_valid = zkp_manager
         .verify_password_proof(&body.proof, &registration, "login")
@@ -529,14 +567,7 @@ pub async fn get_zkp_registration(
 
     let user = user.ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    let zkp_registration = user
-        .zkp_registration
-        .ok_or_else(|| AppError::NotFound("User not registered for ZKP authentication".to_string()))?;
-
-    let registration: PasswordRegistration =
-        serde_json::from_str(&zkp_registration).map_err(|_| {
-            AppError::InternalServerError("ZKP registration parse error".to_string())
-        })?;
+    let registration = load_or_repair_user_registration(&pool, &user).await?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
@@ -587,9 +618,9 @@ pub struct GenerateBatchProofRequest {
     pub count: usize,
 }
 
-fn resolve_registration_and_password(
-    stored_registration_json: Option<String>,
-    stored_sae_secret: Option<String>,
+async fn resolve_registration_and_password(
+    pool: &SqlitePool,
+    user: &crate::db::User,
     body_registration: Option<PasswordRegistration>,
     body_password: Option<String>,
     context: &str,
@@ -597,23 +628,11 @@ fn resolve_registration_and_password(
     let registration = if let Some(registration) = body_registration {
         registration
     } else {
-        let zkp_registration_json = stored_registration_json.ok_or_else(|| {
-            AppError::BadRequest(
-                "User does not have ZKP registration data; please re-login or re-register"
-                    .to_string(),
-            )
-        })?;
-
-        serde_json::from_str::<PasswordRegistration>(&zkp_registration_json).map_err(|e| {
-            AppError::InternalServerError(format!(
-                "Invalid ZKP registration data in database: {}",
-                e
-            ))
-        })?
+        load_or_repair_user_registration(pool, user).await?
     };
 
     let proof_password = if context == "hls_segment_access" {
-        stored_sae_secret.ok_or_else(|| {
+        user.sae_secret.clone().ok_or_else(|| {
             AppError::BadRequest(
                 "User does not have SAE secret; please re-login to refresh credentials"
                     .to_string(),
@@ -641,12 +660,13 @@ pub async fn generate_zkp_proof(
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
     let (registration, proof_password) = resolve_registration_and_password(
-        user.zkp_registration.clone(),
-        user.sae_secret.clone(),
+        &pool,
+        &user,
         body.registration.clone(),
         body.password.clone(),
         &body.context,
-    )?;
+    )
+    .await?;
 
     match zkp_context.generate_enhanced_proof(&proof_password, &registration, &body.context) {
         Ok(proof) => Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -673,12 +693,13 @@ pub async fn generate_zkp_proof_batch(
     let count = body.count.clamp(1, 12);
     let zkp_context = ZkpContext::new();
     let (registration, proof_password) = resolve_registration_and_password(
-        user.zkp_registration.clone(),
-        user.sae_secret.clone(),
+        &pool,
+        &user,
         None,
         None,
         &body.context,
-    )?;
+    )
+    .await?;
 
     let mut proofs = Vec::with_capacity(count);
     for _ in 0..count {

@@ -5,7 +5,9 @@ use rockzero_common::AppError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -137,6 +139,8 @@ pub enum JobStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeJob {
     pub job_id: String,
+    #[serde(default)]
+    pub owner_user_id: Option<String>,
     pub priority: i32,
     pub wasm_url: Option<String>,
     pub wasm_path: Option<String>,
@@ -213,11 +217,18 @@ pub struct SubmitJobResponse {
     pub status: String,
 }
 
+#[derive(Clone)]
+struct RunningJobControl {
+    engine: wasmtime::Engine,
+    cancel_requested: Arc<AtomicBool>,
+}
+
 struct EdgeManager {
     root: PathBuf,
     local_node_id: String,
     nodes: RwLock<HashMap<String, EdgeNode>>,
     jobs: RwLock<HashMap<String, EdgeJob>>,
+    running_jobs: RwLock<HashMap<String, RunningJobControl>>,
     wxy_auth: RwLock<Option<WxyAuthToken>>,
     wxy_qr_sessions: RwLock<HashMap<String, WxyQrSession>>,
     last_wxy_refresh: RwLock<Option<WxyRefreshReport>>,
@@ -239,6 +250,24 @@ fn edge_root() -> PathBuf {
     std::env::var("EDGE_COMPUTE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(EDGE_ROOT_DEFAULT))
+}
+
+fn is_admin_claims(claims: &crate::handlers::auth::Claims) -> bool {
+    claims.role.eq_ignore_ascii_case("admin")
+}
+
+fn can_access_job(job: &EdgeJob, claims: &crate::handlers::auth::Claims) -> bool {
+    is_admin_claims(claims) || job.owner_user_id.as_deref() == Some(claims.sub.as_str())
+}
+
+fn ensure_admin(claims: &crate::handlers::auth::Claims) -> Result<(), AppError> {
+    if is_admin_claims(claims) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "Administrator access is required for this operation".to_string(),
+        ))
+    }
 }
 
 fn node_is_online(node: &EdgeNode) -> bool {
@@ -318,6 +347,7 @@ impl EdgeManager {
             local_node_id,
             nodes: RwLock::new(HashMap::new()),
             jobs: RwLock::new(HashMap::new()),
+            running_jobs: RwLock::new(HashMap::new()),
             wxy_auth: RwLock::new(None),
             wxy_qr_sessions: RwLock::new(HashMap::new()),
             last_wxy_refresh: RwLock::new(None),
@@ -352,6 +382,7 @@ impl EdgeManager {
                     let run_mgr = Arc::clone(&mgr);
                     let handle = tokio::spawn(async move {
                         loop {
+                            let notified = run_mgr.wakeup.notified();
                             if let Some(job) = run_mgr.take_next_job().await {
                                 let _ = run_mgr.execute_job(job.job_id.clone()).await;
                                 continue;
@@ -359,7 +390,7 @@ impl EdgeManager {
                             if i == 0 {
                                 let _ = run_mgr.mark_stale_nodes().await;
                             }
-                            run_mgr.wakeup.notified().await;
+                            notified.await;
                         }
                     });
 
@@ -891,7 +922,11 @@ impl EdgeManager {
         self.persist_nodes().await
     }
 
-    async fn submit_job(&self, body: SubmitJobRequest) -> Result<String, AppError> {
+    async fn submit_job(
+        &self,
+        owner_user_id: String,
+        body: SubmitJobRequest,
+    ) -> Result<String, AppError> {
         if body.wasm_url.is_none() && body.wasm_path.is_none() && body.app_id.is_none() {
             return Err(AppError::BadRequest(
                 "One of wasm_url / wasm_path / app_id is required".to_string(),
@@ -933,23 +968,12 @@ impl EdgeManager {
             )));
         }
 
-        let mut env = body.env.unwrap_or_default();
-        if let Some(token) = auth {
-            env.insert("WXY_ACCESS_TOKEN".to_string(), token.access_token);
-            if let Some(refresh) = token.refresh_token {
-                env.insert("WXY_REFRESH_TOKEN".to_string(), refresh);
-            }
-            if let Some(account_id) = token.account_id {
-                env.insert("WXY_ACCOUNT_ID".to_string(), account_id);
-            }
-            if let Some(expires_at) = token.expires_at {
-                env.insert("WXY_EXPIRES_AT".to_string(), expires_at.to_string());
-            }
-        }
+        let env = body.env.unwrap_or_default();
 
         let job_id = Uuid::new_v4().to_string();
         let job = EdgeJob {
             job_id: job_id.clone(),
+            owner_user_id: Some(owner_user_id),
             priority,
             wasm_url: body.wasm_url,
             wasm_path: body.wasm_path,
@@ -1038,15 +1062,45 @@ impl EdgeManager {
 
         let wasm_bytes = self.resolve_wasm_bytes(&snapshot).await?;
 
+        let mut config = wasmtime::Config::new();
+        config.epoch_interruption(true);
+        let engine = wasmtime::Engine::new(&config).map_err(|e| {
+            AppError::InternalServerError(format!("Failed to initialize WASM engine: {}", e))
+        })?;
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+
+        self.running_jobs.write().await.insert(
+            job_id.clone(),
+            RunningJobControl {
+                engine: engine.clone(),
+                cancel_requested: Arc::clone(&cancel_requested),
+            },
+        );
+
         let function = snapshot.function.clone();
         let args = snapshot.args.clone();
-        let env = snapshot.env.clone();
+        let mut env = snapshot.env.clone();
+        if let Some(token) = self.wxy_auth.read().await.clone() {
+            env.insert("WXY_ACCESS_TOKEN".to_string(), token.access_token);
+            if let Some(refresh) = token.refresh_token {
+                env.insert("WXY_REFRESH_TOKEN".to_string(), refresh);
+            }
+            if let Some(account_id) = token.account_id {
+                env.insert("WXY_ACCOUNT_ID".to_string(), account_id);
+            }
+            if let Some(expires_at) = token.expires_at {
+                env.insert("WXY_EXPIRES_AT".to_string(), expires_at.to_string());
+            }
+        }
         let stdio_max = env_usize("EDGE_JOB_STDIO_MAX_BYTES", DEFAULT_MAX_STDIO_BYTES).max(4096);
 
         let run = tokio::time::timeout(
             Duration::from_millis(snapshot.timeout_ms),
             tokio::task::spawn_blocking(move || -> Result<(String, String), AppError> {
-                let engine = wasmtime::Engine::default();
+                if cancel_requested.load(Ordering::SeqCst) {
+                    return Err(AppError::Conflict("Job cancelled".to_string()));
+                }
+
                 let module = wasmtime::Module::new(&engine, &wasm_bytes)
                     .map_err(|e| AppError::BadRequest(format!("Invalid WASM module: {}", e)))?;
 
@@ -1075,6 +1129,12 @@ impl EdgeManager {
                 }
 
                 let mut store = wasmtime::Store::new(&engine, builder.build());
+                store.set_epoch_deadline(1);
+
+                if cancel_requested.load(Ordering::SeqCst) {
+                    return Err(AppError::Conflict("Job cancelled".to_string()));
+                }
+
                 let instance = linker
                     .instantiate(&mut store, &module)
                     .map_err(|e| AppError::BadRequest(format!("WASM instantiate failed: {}", e)))?;
@@ -1106,11 +1166,28 @@ impl EdgeManager {
         )
         .await;
 
+        let control = self.running_jobs.write().await.remove(&job_id);
+
         let mut jobs = self.jobs.write().await;
         let j = match jobs.get_mut(&job_id) {
             Some(v) => v,
             None => return Ok(()),
         };
+
+        let cancelled = control
+            .as_ref()
+            .map(|c| c.cancel_requested.load(Ordering::SeqCst))
+            .unwrap_or(false)
+            || j.status == JobStatus::Cancelled;
+
+        if cancelled {
+            j.status = JobStatus::Cancelled;
+            j.assigned_node = None;
+            j.finished_at = Some(now_epoch());
+            j.error = Some("Cancelled by user".to_string());
+            drop(jobs);
+            return self.persist_jobs().await;
+        }
 
         match run {
             Ok(Ok(Ok((stdout, stderr)))) => {
@@ -1119,6 +1196,7 @@ impl EdgeManager {
                 j.stderr = Some(stderr);
                 j.error = None;
                 j.finished_at = Some(now_epoch());
+                j.assigned_node = None;
             }
             Ok(Ok(Err(e))) => {
                 let should_retry = j.retry_count < j.max_retries;
@@ -1131,12 +1209,14 @@ impl EdgeManager {
                     self.wakeup.notify_waiters();
                 } else {
                     j.status = JobStatus::Failed;
+                    j.assigned_node = None;
                     j.error = Some(e.to_string());
                     j.finished_at = Some(now_epoch());
                 }
             }
             Ok(Err(join_err)) => {
                 j.status = JobStatus::Failed;
+                j.assigned_node = None;
                 j.error = Some(format!("Worker panic: {}", join_err));
                 j.finished_at = Some(now_epoch());
             }
@@ -1151,6 +1231,7 @@ impl EdgeManager {
                     self.wakeup.notify_waiters();
                 } else {
                     j.status = JobStatus::Failed;
+                    j.assigned_node = None;
                     j.error = Some("Job timeout".to_string());
                     j.finished_at = Some(now_epoch());
                 }
@@ -1204,6 +1285,7 @@ impl EdgeManager {
         }
 
         if let Some(url) = &job.wasm_url {
+            validate_wasm_url(url).await?;
             let client = Client::builder()
                 .timeout(Duration::from_secs(60))
                 .build()
@@ -1248,18 +1330,32 @@ impl EdgeManager {
         Err(AppError::BadRequest("No wasm source provided".to_string()))
     }
 
-    async fn cancel_job(&self, job_id: &str) -> Result<(), AppError> {
+    async fn cancel_job(
+        &self,
+        job_id: &str,
+        claims: &crate::handlers::auth::Claims,
+    ) -> Result<(), AppError> {
         let mut jobs = self.jobs.write().await;
         let j = jobs
             .get_mut(job_id)
             .ok_or_else(|| AppError::NotFound(format!("Job {} not found", job_id)))?;
+        if !can_access_job(j, claims) {
+            return Err(AppError::Forbidden("Job access denied".to_string()));
+        }
         if j.status == JobStatus::Completed || j.status == JobStatus::Failed {
             return Err(AppError::Conflict("Finished job cannot be cancelled".to_string()));
         }
         j.status = JobStatus::Cancelled;
+        j.assigned_node = None;
         j.finished_at = Some(now_epoch());
         j.error = Some("Cancelled by user".to_string());
         drop(jobs);
+
+        if let Some(control) = self.running_jobs.read().await.get(job_id).cloned() {
+            control.cancel_requested.store(true, Ordering::SeqCst);
+            control.engine.increment_epoch();
+        }
+
         self.persist_jobs().await
     }
 
@@ -1283,6 +1379,67 @@ impl EdgeManager {
             jobs_completed,
             jobs_failed,
             jobs_cancelled,
+        }
+    }
+}
+
+async fn validate_wasm_url(url: &str) -> Result<(), AppError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| AppError::BadRequest(format!("Invalid wasm_url: {}", e)))?;
+
+    if parsed.scheme() != "https" {
+        return Err(AppError::BadRequest(
+            "wasm_url must use https".to_string(),
+        ));
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AppError::BadRequest("wasm_url must include a host".to_string()))?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_internal_address(ip) {
+            return Err(AppError::BadRequest(format!(
+                "wasm_url host {} resolves to a blocked address",
+                host
+            )));
+        }
+        return Ok(());
+    }
+
+    let resolved = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Failed to resolve wasm_url host: {}", e)))?;
+
+    for socket in resolved {
+        if is_internal_address(socket.ip()) {
+            return Err(AppError::BadRequest(format!(
+                "wasm_url host {} resolves to a blocked address",
+                host
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_internal_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.octets()[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_multicast()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
     }
 }
@@ -1341,9 +1498,11 @@ async fn manager() -> Result<Arc<EdgeManager>, AppError> {
 
 pub async fn inspect_wxy_adapter(
     req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<AdapterInspectRequest>,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
+    ensure_admin(&claims)?;
     let payload = body.into_inner();
     let mode = payload.mode.to_lowercase();
     let json = payload.raw;
@@ -1820,9 +1979,11 @@ fn extract_auth_from_poll_json(json: &Value) -> Option<WxyAuthToken> {
 
 pub async fn register_node(
     req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<RegisterNodeRequest>,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
+    ensure_admin(&claims)?;
     let mgr = manager().await?;
     let node_id = mgr.register_node(body.into_inner()).await?;
     Ok(HttpResponse::Created().json(RegisterNodeResponse {
@@ -1833,9 +1994,11 @@ pub async fn register_node(
 
 pub async fn start_wxy_qr_login(
     req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<StartWxyQrLoginRequest>,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
+    ensure_admin(&claims)?;
     let mgr = manager().await?;
 
     let session = call_wxy_start_qr(&body.into_inner()).await?;
@@ -1854,9 +2017,11 @@ pub async fn start_wxy_qr_login(
 
 pub async fn poll_wxy_qr_login(
     req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     path: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
+    ensure_admin(&claims)?;
     let mgr = manager().await?;
     let session_id = path.into_inner();
 
@@ -1898,9 +2063,11 @@ pub async fn poll_wxy_qr_login(
 
 pub async fn bind_wxy_token(
     req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<BindWxyTokenRequest>,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
+    ensure_admin(&claims)?;
     let mgr = manager().await?;
     let b = body.into_inner();
 
@@ -1923,8 +2090,12 @@ pub async fn bind_wxy_token(
     })))
 }
 
-pub async fn wxy_auth_status(req: HttpRequest) -> Result<HttpResponse, AppError> {
+pub async fn wxy_auth_status(
+    req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
+) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
+    ensure_admin(&claims)?;
     let mgr = manager().await?;
     let refresh_report = mgr.ensure_wxy_auth_valid(false).await;
     let auth = mgr.wxy_auth.read().await.clone();
@@ -1943,9 +2114,11 @@ pub async fn wxy_auth_status(req: HttpRequest) -> Result<HttpResponse, AppError>
 
 pub async fn refresh_wxy_auth_token(
     req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     body: Option<web::Json<RefreshWxyTokenRequest>>,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
+    ensure_admin(&claims)?;
     let mgr = manager().await?;
     let force = body
         .as_ref()
@@ -1960,8 +2133,12 @@ pub async fn refresh_wxy_auth_token(
     })))
 }
 
-pub async fn wxy_logout(req: HttpRequest) -> Result<HttpResponse, AppError> {
+pub async fn wxy_logout(
+    req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
+) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
+    ensure_admin(&claims)?;
     let mgr = manager().await?;
     *mgr.wxy_auth.write().await = None;
     *mgr.last_wxy_refresh.write().await = None;
@@ -1986,8 +2163,12 @@ pub async fn node_heartbeat(
     })))
 }
 
-pub async fn list_nodes(req: HttpRequest) -> Result<HttpResponse, AppError> {
+pub async fn list_nodes(
+    req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
+) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
+    ensure_admin(&claims)?;
     let mgr = manager().await?;
     let nodes = mgr.nodes.read().await;
     let mut result: Vec<EdgeNode> = nodes.values().cloned().collect();
@@ -2004,29 +2185,38 @@ pub async fn list_nodes(req: HttpRequest) -> Result<HttpResponse, AppError> {
 
 pub async fn submit_job(
     req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     body: web::Json<SubmitJobRequest>,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
     let mgr = manager().await?;
-    let job_id = mgr.submit_job(body.into_inner()).await?;
+    let job_id = mgr.submit_job(claims.sub.clone(), body.into_inner()).await?;
     Ok(HttpResponse::Accepted().json(SubmitJobResponse {
         job_id,
         status: "queued".to_string(),
     }))
 }
 
-pub async fn get_job(req: HttpRequest, path: web::Path<String>) -> Result<HttpResponse, AppError> {
+pub async fn get_job(
+    req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
     let mgr = manager().await?;
     let jobs = mgr.jobs.read().await;
     let job = jobs
         .get(&path.into_inner())
         .ok_or_else(|| AppError::NotFound("Job not found".to_string()))?;
+    if !can_access_job(job, &claims) {
+        return Err(AppError::Forbidden("Job access denied".to_string()));
+    }
     Ok(HttpResponse::Ok().json(job))
 }
 
 pub async fn list_jobs(
     req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     query: web::Query<JobsQuery>,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
@@ -2038,6 +2228,7 @@ pub async fn list_jobs(
         .read()
         .await
         .values()
+        .filter(|j| can_access_job(j, &claims))
         .filter(|j| query.status.as_ref().is_none_or(|s| j.status == *s))
         .cloned()
         .collect();
@@ -2055,11 +2246,12 @@ pub async fn list_jobs(
 
 pub async fn cancel_job(
     req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     path: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
     let mgr = manager().await?;
-    mgr.cancel_job(&path.into_inner()).await?;
+    mgr.cancel_job(&path.into_inner(), &claims).await?;
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "status": "cancelled",
     })))
@@ -2067,6 +2259,7 @@ pub async fn cancel_job(
 
 pub async fn retry_job(
     req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     path: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
@@ -2076,6 +2269,9 @@ pub async fn retry_job(
     let job = jobs
         .get_mut(&path.into_inner())
         .ok_or_else(|| AppError::NotFound("Job not found".to_string()))?;
+    if !can_access_job(job, &claims) {
+        return Err(AppError::Forbidden("Job access denied".to_string()));
+    }
 
     if job.status != JobStatus::Failed && job.status != JobStatus::Cancelled {
         return Err(AppError::Conflict(
@@ -2098,15 +2294,23 @@ pub async fn retry_job(
     })))
 }
 
-pub async fn edge_stats(req: HttpRequest) -> Result<HttpResponse, AppError> {
+pub async fn edge_stats(
+    req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
+) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
+    ensure_admin(&claims)?;
     let mgr = manager().await?;
     let stats = mgr.stats().await;
     Ok(HttpResponse::Ok().json(stats))
 }
 
-pub async fn get_startup_self_check(req: HttpRequest) -> Result<HttpResponse, AppError> {
+pub async fn get_startup_self_check(
+    req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
+) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
+    ensure_admin(&claims)?;
     let mgr = manager().await?;
     let existing = mgr.startup_self_check.read().await.clone();
 
@@ -2119,8 +2323,12 @@ pub async fn get_startup_self_check(req: HttpRequest) -> Result<HttpResponse, Ap
     Ok(HttpResponse::Ok().json(report))
 }
 
-pub async fn run_startup_self_check_now(req: HttpRequest) -> Result<HttpResponse, AppError> {
+pub async fn run_startup_self_check_now(
+    req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
+) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
+    ensure_admin(&claims)?;
     let mgr = manager().await?;
     let report = mgr.run_startup_self_check("manual").await;
     *mgr.startup_self_check.write().await = Some(report.clone());
@@ -2142,4 +2350,22 @@ pub async fn health() -> Result<HttpResponse, AppError> {
         "startup_self_check": startup_report,
         "now": now_epoch(),
     })))
+}
+
+pub async fn builtin_wxy_edge_node_status() -> Result<Value, AppError> {
+    let mgr = manager().await?;
+    let stats = mgr.stats().await;
+    let logged_in = mgr.wxy_auth.read().await.is_some();
+    let startup_report = mgr.startup_self_check.read().await.clone();
+    let last_refresh = mgr.last_wxy_refresh.read().await.clone();
+
+    Ok(serde_json::json!({
+        "service": "edge-compute",
+        "status": "ok",
+        "stats": stats,
+        "wxy_logged_in": logged_in,
+        "wxy_last_refresh": last_refresh,
+        "startup_self_check": startup_report,
+        "now": now_epoch(),
+    }))
 }
