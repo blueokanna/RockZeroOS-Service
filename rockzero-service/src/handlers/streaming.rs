@@ -13,13 +13,12 @@ use crate::media_processor::needs_audio_transcode;
 
 const MEDIA_BASE: &str = "./media";
 
-/// Chunk sizes for different streaming scenarios
 #[allow(dead_code)]
-const INITIAL_CHUNK_SIZE: usize = 256 * 1024; // 256KB for initial probe
+const INITIAL_CHUNK_SIZE: usize = 256 * 1024;
 #[allow(dead_code)]
-const STREAMING_CHUNK_SIZE: usize = 2 * 1024 * 1024; // 2MB for sequential streaming
+const STREAMING_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 #[allow(dead_code)]
-const SEEK_CHUNK_SIZE: usize = 512 * 1024; // 512KB for seek (smaller = faster first-byte)
+const SEEK_CHUNK_SIZE: usize = 512 * 1024;
 
 #[derive(Debug, Serialize)]
 pub struct MediaStreamInfo {
@@ -148,7 +147,10 @@ pub async fn get_media_info(path: web::Path<String>) -> Result<HttpResponse, App
         None
     };
     let video_transcode_url = if needs_video_transcode {
-        Some(format!("/api/v1/streaming/transcode-video/{}", relative_path))
+        Some(format!(
+            "/api/v1/streaming/transcode-video/{}",
+            relative_path
+        ))
     } else {
         None
     };
@@ -244,11 +246,6 @@ pub async fn get_extended_media_info(path: web::Path<String>) -> Result<HttpResp
     Ok(HttpResponse::Ok().json(info))
 }
 
-// ============ Async file streaming with proper tokio I/O ============
-
-/// Async file stream that uses tokio::fs for non-blocking I/O.
-/// This prevents blocking the async runtime when reading large files,
-/// which was the root cause of seek hangs and slow loading for big videos.
 #[allow(dead_code)]
 struct AsyncFileStream {
     file: tokio::fs::File,
@@ -267,8 +264,6 @@ impl AsyncFileStream {
         let mut file = tokio::fs::File::open(path).await?;
         file.seek(std::io::SeekFrom::Start(start)).await?;
 
-        // Use smaller chunks for seek operations to minimize time-to-first-byte,
-        // and larger chunks for sequential streaming for throughput.
         let chunk_size = if is_seek {
             SEEK_CHUNK_SIZE
         } else if length <= INITIAL_CHUNK_SIZE as u64 {
@@ -298,8 +293,6 @@ impl futures::Stream for AsyncFileStream {
 
         let to_read = std::cmp::min(this.chunk_size as u64, this.remaining) as usize;
 
-        // Use tokio's async read which integrates with the runtime's I/O driver.
-        // This does NOT block the runtime thread — it yields Pending until data is ready.
         let mut read_buf = tokio::io::ReadBuf::new(&mut this.buf[..to_read]);
         match Pin::new(&mut this.file).poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
@@ -318,7 +311,6 @@ impl futures::Stream for AsyncFileStream {
     }
 }
 
-/// Generate an ETag from file metadata for caching and conditional requests.
 #[allow(dead_code)]
 fn generate_etag(metadata: &std::fs::Metadata) -> String {
     let modified = metadata
@@ -331,7 +323,6 @@ fn generate_etag(metadata: &std::fs::Metadata) -> String {
     format!("\"{:x}-{:x}\"", modified, size)
 }
 
-/// Format a SystemTime as an HTTP date string for Last-Modified header.
 #[allow(dead_code)]
 fn format_http_date(time: std::time::SystemTime) -> String {
     let duration = time
@@ -388,12 +379,14 @@ pub async fn stream_media(
         _ => content_type,
     };
 
-    // Generate ETag and Last-Modified for caching / conditional requests
     let etag = generate_etag(&metadata);
     let last_modified = metadata.modified().ok();
 
-    // Handle conditional requests (If-None-Match)
-    if let Some(if_none_match) = req.headers().get("If-None-Match").and_then(|v| v.to_str().ok()) {
+    if let Some(if_none_match) = req
+        .headers()
+        .get("If-None-Match")
+        .and_then(|v| v.to_str().ok())
+    {
         if if_none_match.trim() == etag || if_none_match.trim() == "*" {
             return Ok(HttpResponse::NotModified().finish());
         }
@@ -402,7 +395,6 @@ pub async fn stream_media(
     let effective_content_type_clone = effective_content_type.clone();
     let etag_clone = etag.clone();
 
-    // Standard CORS and cache headers applied to all responses
     let apply_common_headers = move |resp: &mut actix_web::HttpResponseBuilder| {
         resp.insert_header(("Content-Type", effective_content_type_clone.as_str()));
         resp.insert_header(("Accept-Ranges", "bytes"));
@@ -424,13 +416,8 @@ pub async fn stream_media(
     if let Some(range) = range_header {
         let (start, end) = parse_range(range, file_size)?;
 
-        // Clamp end to file boundary
         let end = std::cmp::min(end, file_size - 1);
         let length = end - start + 1;
-
-        // Do NOT cap the range size. The player knows what it needs; capping causes
-        // re-buffering or stalls when seeking. The async streaming delivers data
-        // progressively without blocking the runtime.
 
         let is_seek = start > 0;
         let stream = AsyncFileStream::open(&file_path, start, length, is_seek)
@@ -450,7 +437,6 @@ pub async fn stream_media(
 
         Ok(response.streaming(stream))
     } else {
-        // Full file request (no Range header)
         let stream = AsyncFileStream::open(&file_path, 0, file_size, false)
             .await
             .map_err(|e| {
@@ -597,12 +583,6 @@ pub async fn get_thumbnail(
     }
 }
 
-/// Audio transcode endpoint — converts DTS/AC3/TrueHD/EAC3 audio to AAC for browser/mobile playback.
-///
-/// Uses ffmpeg to transcode audio on-the-fly with fragmented MP4 output (frag_keyframe+empty_moov)
-/// for instant streaming start. Video stream is copied without re-encoding.
-///
-/// The client discovers this URL via the `transcode_url` field in `/streaming/info/{path}`.
 pub async fn transcode_audio(
     req: HttpRequest,
     path: web::Path<String>,
@@ -619,7 +599,6 @@ pub async fn transcode_audio(
         return Err(AppError::BadRequest("Empty file".to_string()));
     }
 
-    // Verify the file actually needs transcoding
     let media_details = get_detailed_ffprobe_info(&file_path);
     let needs_transcode = media_details
         .audio_codec
@@ -628,28 +607,23 @@ pub async fn transcode_audio(
         .unwrap_or(false);
 
     if !needs_transcode {
-        // No transcoding needed — redirect to direct stream
         let redirect_path = file_path
             .strip_prefix(MEDIA_BASE)
             .unwrap_or(&file_path)
             .to_string_lossy();
         return Ok(HttpResponse::TemporaryRedirect()
-            .insert_header(("Location", format!("/api/v1/streaming/play/{}", redirect_path)))
+            .insert_header((
+                "Location",
+                format!("/api/v1/streaming/play/{}", redirect_path),
+            ))
             .finish());
     }
 
-    // Parse seek parameter from query string
     let seek = parse_seek(&req);
 
-    // Start ffmpeg transcode process
     let transcoder = crate::media_processor::StreamingTranscoder::new();
     let child = transcoder
-        .start_audio_transcode(
-            file_path.to_str().unwrap_or(""),
-            seek,
-            Some("192k"),
-            None,
-        )
+        .start_audio_transcode(file_path.to_str().unwrap_or(""), seek, Some("192k"), None)
         .map_err(|e| {
             warn!("Failed to start audio transcode: {}", e);
             AppError::InternalError
@@ -680,9 +654,10 @@ pub async fn transcode_audio(
     Ok(response.streaming(stream))
 }
 
-/// Unified playback endpoint: choose direct stream or on-the-fly transcode.
-/// Priority: unsupported video codec -> full transcode, unsupported audio -> audio transcode.
-pub async fn smart_play(req: HttpRequest, path: web::Path<String>) -> Result<HttpResponse, AppError> {
+pub async fn smart_play(
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, AppError> {
     let media_path = path.into_inner();
     let file_path = get_media_path(&media_path)?;
     if !file_path.exists() {
@@ -713,8 +688,6 @@ pub async fn smart_play(req: HttpRequest, path: web::Path<String>) -> Result<Htt
     stream_media(req, web::Path::from(media_path)).await
 }
 
-/// Video+audio transcode endpoint for maximum browser compatibility.
-/// Converts to H.264 + AAC fragmented MP4 to ensure playback across browsers/devices.
 pub async fn transcode_video(
     req: HttpRequest,
     path: web::Path<String>,
@@ -730,8 +703,8 @@ pub async fn transcode_video(
         return Err(AppError::BadRequest("Empty file".to_string()));
     }
 
-    let ffmpeg_cmd = crate::ffmpeg_manager::get_global_ffmpeg_path()
-        .unwrap_or_else(|| "ffmpeg".to_string());
+    let ffmpeg_cmd =
+        crate::ffmpeg_manager::get_global_ffmpeg_path().unwrap_or_else(|| "ffmpeg".to_string());
     let seek = parse_seek(&req);
 
     let mut args = vec![
@@ -812,7 +785,7 @@ fn parse_seek(req: &HttpRequest) -> Option<f64> {
 
 fn needs_video_transcode(codec: &str) -> bool {
     let c = codec.to_lowercase();
-    // Baseline compatibility list for browser/mobile playback.
+
     !(c.contains("h264")
         || c.contains("avc")
         || c.contains("hevc")
@@ -869,7 +842,6 @@ fn parse_range(range: &str, file_size: u64) -> Result<(u64, u64), AppError> {
         .strip_prefix("bytes=")
         .ok_or_else(|| AppError::BadRequest("Invalid range header".to_string()))?;
 
-    // Handle multiple ranges — only use the first one
     let first_range = range.split(',').next().unwrap_or(range).trim();
 
     let parts: Vec<&str> = first_range.splitn(2, '-').collect();
@@ -878,7 +850,6 @@ fn parse_range(range: &str, file_size: u64) -> Result<(u64, u64), AppError> {
     }
 
     let start: u64 = if parts[0].is_empty() {
-        // Suffix range: bytes=-500 means last 500 bytes
         if parts[1].is_empty() {
             return Err(AppError::BadRequest("Invalid range".to_string()));
         }
@@ -893,7 +864,6 @@ fn parse_range(range: &str, file_size: u64) -> Result<(u64, u64), AppError> {
     };
 
     let end: u64 = if parts[1].is_empty() {
-        // Open-ended range: bytes=500- means from 500 to end
         file_size - 1
     } else {
         parts[1]
@@ -1023,8 +993,7 @@ fn get_detailed_ffprobe_info(path: &Path) -> DetailedMediaInfo {
                                 stream.get("r_frame_rate").and_then(|r| r.as_str())
                             {
                                 if let Some((num, den)) = r_frame_rate.split_once('/') {
-                                    if let (Ok(n), Ok(d)) =
-                                        (num.parse::<f64>(), den.parse::<f64>())
+                                    if let (Ok(n), Ok(d)) = (num.parse::<f64>(), den.parse::<f64>())
                                     {
                                         if d != 0.0 {
                                             info.frame_rate = Some(n / d);
@@ -1109,10 +1078,7 @@ fn extract_exif_data(path: &Path) -> Option<ExifData> {
 
     Some(ExifData {
         camera_make: data.get("Make").and_then(|v| v.as_str()).map(String::from),
-        camera_model: data
-            .get("Model")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        camera_model: data.get("Model").and_then(|v| v.as_str()).map(String::from),
         lens_model: data
             .get("LensModel")
             .and_then(|v| v.as_str())

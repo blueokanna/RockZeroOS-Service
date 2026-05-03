@@ -7,7 +7,6 @@ use std::time::Instant;
 
 use rockzero_common::AppError;
 
-/// 测速结果
 #[derive(Debug, Serialize)]
 #[allow(dead_code)]
 pub struct SpeedTestResult {
@@ -17,7 +16,6 @@ pub struct SpeedTestResult {
     pub jitter_ms: f64,
 }
 
-/// Ping 测试响应
 #[derive(Debug, Serialize)]
 pub struct PingResponse {
     pub timestamp: u64,
@@ -54,8 +52,6 @@ static START_INSTANT: OnceLock<Instant> = OnceLock::new();
 fn get_download_block() -> &'static [u8] {
     DOWNLOAD_BLOCK
         .get_or_init(|| {
-            // Build once and reuse. Avoid per-request random generation CPU overhead.
-            // 1 MiB repeated pattern is enough to saturate network throughput tests.
             let mut block = vec![0u8; 1024 * 1024];
             let mut x: u64 = 0x9E3779B97F4A7C15;
             for byte in &mut block {
@@ -69,50 +65,37 @@ fn get_download_block() -> &'static [u8] {
         .as_slice()
 }
 
-    fn get_download_arc() -> Arc<[u8]> {
-        DOWNLOAD_ARC
+fn get_download_arc() -> Arc<[u8]> {
+    DOWNLOAD_ARC
         .get_or_init(|| Arc::from(get_download_block()))
         .clone()
-    }
-
-fn monotonic_now_ns() -> u128 {
-    START_INSTANT
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_nanos()
 }
 
-/// 下载测试 - 生成随机数据流
-/// 参考 OpenSpeedTest 的实现，使用流式传输大量随机数据
+fn monotonic_now_ns() -> u128 {
+    START_INSTANT.get_or_init(Instant::now).elapsed().as_nanos()
+}
+
 pub async fn download_test(req: HttpRequest) -> Result<impl Responder, AppError> {
-    // 从查询参数获取请求的数据大小，默认 100MB
-    let query = web::Query::<DownloadQuery>::from_query(req.query_string()).unwrap_or(web::Query(
-        DownloadQuery {
-            size: None,
-            chunk_kb: None,
-        },
-    ));
-    
-    // 限制最大 500MB，防止滥用
+    let query = web::Query::<DownloadQuery>::from_query(req.query_string())
+        .map_err(|e| AppError::BadRequest(format!("Invalid query parameters: {}", e)))?;
+
     let size_mb = query.size.unwrap_or(100).min(500);
     let total_bytes = size_mb as usize * 1024 * 1024;
-    
-    // Tune chunk size for fewer syscalls and better throughput.
+
     let chunk_size = query
         .chunk_kb
         .map(|v| v.clamp(64, 2048) as usize * 1024)
-        .unwrap_or(512 * 1024); // default 512KB
+        .unwrap_or(512 * 1024);
     let source = get_download_arc();
     let source_len = source.len();
-    
-    // 创建一个简单的流，使用 futures::stream::unfold
+
     let stream = futures::stream::unfold(
         (total_bytes, chunk_size, source, source_len),
         |(remaining, chunk_size, source, source_len)| async move {
             if remaining == 0 {
                 return None;
             }
-            
+
             let current_chunk = remaining.min(chunk_size);
             let mut buffer = Vec::with_capacity(current_chunk);
             let mut copied = 0;
@@ -121,7 +104,7 @@ pub async fn download_test(req: HttpRequest) -> Result<impl Responder, AppError>
                 buffer.extend_from_slice(&source[..take]);
                 copied += take;
             }
-            
+
             let new_remaining = remaining - current_chunk;
             Some((
                 Ok::<_, actix_web::error::Error>(web::Bytes::from(buffer)),
@@ -129,11 +112,14 @@ pub async fn download_test(req: HttpRequest) -> Result<impl Responder, AppError>
             ))
         },
     );
-    
+
     Ok(HttpResponse::Ok()
         .content_type("application/octet-stream")
         .insert_header(("Content-Length", total_bytes.to_string()))
-        .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate, private"))
+        .insert_header((
+            "Cache-Control",
+            "no-cache, no-store, must-revalidate, private",
+        ))
         .insert_header(("Pragma", "no-cache"))
         .insert_header(("Expires", "0"))
         .insert_header(("Content-Encoding", "identity"))
@@ -143,12 +129,10 @@ pub async fn download_test(req: HttpRequest) -> Result<impl Responder, AppError>
         .streaming(stream))
 }
 
-/// 上传测试 - 接收并丢弃上传的数据，返回速度统计
 pub async fn upload_test(mut payload: web::Payload) -> Result<impl Responder, AppError> {
     let start = Instant::now();
     let mut total_bytes: usize = 0;
-    
-    // 读取并丢弃所有上传的数据
+
     while let Some(chunk) = payload.next().await {
         match chunk {
             Ok(data) => {
@@ -159,17 +143,16 @@ pub async fn upload_test(mut payload: web::Payload) -> Result<impl Responder, Ap
             }
         }
     }
-    
+
     let elapsed = start.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
-    
-    // 计算上传速度 (Mbps)
+
     let speed_mbps = if elapsed_secs > 0.0 {
         (total_bytes as f64 * 8.0) / (elapsed_secs * 1_000_000.0)
     } else {
         0.0
     };
-    
+
     Ok(HttpResponse::Ok().json(UploadResult {
         bytes_received: total_bytes,
         elapsed_ms: elapsed.as_millis() as u64,
@@ -184,10 +167,9 @@ pub struct UploadResult {
     pub speed_mbps: f64,
 }
 
-/// Ping 测试 - 返回服务器时间戳用于计算延迟
 pub async fn ping_test(req: HttpRequest) -> Result<impl Responder, AppError> {
     let q = web::Query::<PingQuery>::from_query(req.query_string())
-        .unwrap_or(web::Query(PingQuery { count: None }));
+        .map_err(|e| AppError::BadRequest(format!("Invalid query parameters: {}", e)))?;
     let count = q.count.unwrap_or(1).clamp(1, 16);
 
     let mut samples = Vec::with_capacity(count as usize);
@@ -251,10 +233,9 @@ pub async fn ping_test(req: HttpRequest) -> Result<impl Responder, AppError> {
         }))
 }
 
-/// 获取测速服务器信息
 pub async fn server_info() -> Result<impl Responder, AppError> {
     let hostname = sysinfo::System::host_name().unwrap_or_else(|| "NAS".to_string());
-    
+
     Ok(HttpResponse::Ok().json(ServerInfo {
         name: hostname,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -278,7 +259,6 @@ pub struct ServerInfo {
     pub supported_tests: Vec<String>,
 }
 
-/// 空响应 - 用于最小延迟测试
 pub async fn empty_response() -> Result<impl Responder, AppError> {
     Ok(HttpResponse::Ok()
         .insert_header(("Cache-Control", "no-cache"))

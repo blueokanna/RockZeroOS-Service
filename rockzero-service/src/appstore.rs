@@ -131,7 +131,7 @@ async fn fetch_manifest(client: &Client, url: &str) -> Result<Option<Value>, App
     Ok(Some(manifest))
 }
 
-/// Shared HTTP client — avoids TLS handshake + connection overhead per request
+
 static HTTP_CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
 
 fn get_http_client() -> &'static Client {
@@ -144,20 +144,20 @@ fn get_http_client() -> &'static Client {
     })
 }
 
-/// Shared WASM engine — creating Engine is expensive (~50-100ms), reuse it
+
 static WASM_ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
 
 fn get_wasm_engine() -> &'static Engine {
     WASM_ENGINE.get_or_init(|| {
         let mut config = wasmtime::Config::new();
-        // Limit memory usage for ARM devices
-        config.max_wasm_stack(1024 * 1024); // 1 MB stack limit
+
+        config.max_wasm_stack(1024 * 1024);
         config.allocation_strategy(wasmtime::InstanceAllocationStrategy::OnDemand);
         Engine::new(&config).unwrap_or_else(|_| Engine::default())
     })
 }
 
-/// Execute a WASM module in a blocking thread with a 30-second timeout.
+
 async fn execute_wasm_module(
     wasm_path: &str,
     function: Option<String>,
@@ -279,7 +279,7 @@ pub async fn install_package(
         }
     }
 
-    // Validate that the downloaded bytes are a valid WASM module
+
     let engine = get_wasm_engine();
     Module::new(engine, &bytes)
         .map_err(|e| AppError::BadRequest(format!("Invalid WASM module: {}", e)))?;

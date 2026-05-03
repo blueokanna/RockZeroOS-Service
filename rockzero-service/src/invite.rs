@@ -5,10 +5,8 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
 
-use rockzero_common::AppError;
 use crate::handlers::auth::Claims;
-
-// ============ Actix handlers ============
+use rockzero_common::AppError;
 
 #[derive(Debug, Deserialize)]
 pub struct InviteCodePayload {

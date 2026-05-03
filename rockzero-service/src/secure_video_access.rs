@@ -1,5 +1,5 @@
-//! Secure video access module with ZKP-based authentication
-//! This module provides secure video token management for protected content.
+
+
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -41,7 +41,7 @@ pub enum VideoPermission {
 }
 
 impl VideoAccessToken {
-    /// Create a new access token
+
     pub fn new(
         user_id: String,
         file_path: PathBuf,
@@ -53,7 +53,7 @@ impl VideoAccessToken {
         let created_at = Instant::now();
         let expires_at = created_at + Duration::from_secs(ttl_seconds);
         
-        // Simplified key derivation (based on password and context) using Blake3
+
         let mut hasher = blake3::Hasher::new();
         hasher.update(password.as_bytes());
         hasher.update(user_id.as_bytes());
@@ -62,7 +62,7 @@ impl VideoAccessToken {
         let key_hash = hasher.finalize();
         let sae_key = key_hash.as_bytes().to_vec();
         
-        // Use ZkpContext to register password and generate Bulletproofs proof
+
         let zkp_ctx = ZkpContext::new();
         let registration = zkp_ctx.register_password(password)
             .map_err(|e| format!("Password registration failed: {}", e))?;
@@ -71,7 +71,7 @@ impl VideoAccessToken {
         let proof = serde_json::to_vec(&enhanced_proof)
             .map_err(|e| format!("Proof serialization failed: {}", e))?;
         
-        // Generate signature using Blake3
+
         let mut hasher = blake3::Hasher::new();
         hasher.update(token_id.as_bytes());
         hasher.update(user_id.as_bytes());
@@ -93,15 +93,15 @@ impl VideoAccessToken {
         })
     }
     
-    /// Verify the token
+
     pub fn verify(&self, password: &str) -> bool {
-        // Check if expired
+
         if Instant::now() > self.expires_at {
             warn!("Token expired: {}", self.token_id);
             return false;
         }
         
-        // Verify key (using same derivation method with Blake3)
+
         let mut hasher = blake3::Hasher::new();
         hasher.update(password.as_bytes());
         hasher.update(self.user_id.as_bytes());
@@ -115,13 +115,13 @@ impl VideoAccessToken {
             return false;
         }
         
-        // Generate new proof to verify password correctness
+
         let zkp_ctx = ZkpContext::new();
         
-        // Try to generate proof with given password - succeeds if password is correct
+
         match zkp_ctx.generate_enhanced_proof(password, &self.registration, "video_access") {
             Ok(_) => {
-                // Password correct, can generate valid proof
+
             }
             Err(e) => {
                 warn!("Password verification failed: {}", e);
@@ -129,7 +129,7 @@ impl VideoAccessToken {
             }
         }
         
-        // Verify signature using Blake3
+
         let mut hasher = blake3::Hasher::new();
         hasher.update(self.token_id.as_bytes());
         hasher.update(self.user_id.as_bytes());
@@ -145,22 +145,22 @@ impl VideoAccessToken {
         true
     }
     
-    /// Check if has specific permission
+
     pub fn has_permission(&self, permission: &VideoPermission) -> bool {
         self.permissions.contains(permission)
     }
     
-    /// Check if can access specific file
+
     pub fn can_access_file(&self, file_path: &Path) -> bool {
         self.file_path == file_path
     }
 }
 
-/// Video access manager
+
 pub struct VideoAccessManager {
-    /// Active access tokens
+
     tokens: Arc<RwLock<HashMap<String, VideoAccessToken>>>,
-    /// User file access permissions
+
     user_permissions: Arc<RwLock<HashMap<String, Vec<PathBuf>>>>,
 }
 
@@ -172,7 +172,7 @@ impl VideoAccessManager {
         }
     }
     
-    /// Create access token
+
     pub async fn create_token(
         &self,
         user_id: String,
@@ -181,12 +181,12 @@ impl VideoAccessManager {
         permissions: Vec<VideoPermission>,
         ttl_seconds: u64,
     ) -> Result<String, String> {
-        // Check if user has permission to access the file
+
         if !self.check_user_permission(&user_id, &file_path).await {
             return Err("User does not have permission to access this file".to_string());
         }
         
-        // Create token in blocking context (ZKP operations are CPU-intensive)
+
         let password = password.to_string();
         let user_id_clone = user_id.clone();
         let file_path_clone = file_path.clone();
@@ -204,7 +204,7 @@ impl VideoAccessManager {
         
         let token_id = token.token_id.clone();
         
-        // Store token
+
         let mut tokens = self.tokens.write().await;
         tokens.insert(token_id.clone(), token);
         
@@ -214,7 +214,7 @@ impl VideoAccessManager {
         Ok(token_id)
     }
     
-    /// Verify access token
+
     pub async fn verify_token(
         &self,
         token_id: &str,
@@ -228,7 +228,7 @@ impl VideoAccessManager {
             .ok_or_else(|| "Invalid token".to_string())?
             .clone();
         
-        // 验证令牌 (ZKP verification is CPU-intensive, run in blocking context)
+
         let password = password.to_string();
         let verified = tokio::task::spawn_blocking(move || {
             token.verify(&password)
@@ -240,17 +240,17 @@ impl VideoAccessManager {
             return Err("Token verification failed".to_string());
         }
         
-        // Re-read token for permission checks
+
         let tokens = self.tokens.read().await;
         let token = tokens.get(token_id)
             .ok_or_else(|| "Invalid token".to_string())?;
         
-        // 检查文件访问权限
+
         if !token.can_access_file(file_path) {
             return Err("Token does not grant access to this file".to_string());
         }
         
-        // 检查操作权限
+
         if !token.has_permission(required_permission) {
             return Err(format!("Token does not have {:?} permission", required_permission));
         }
@@ -258,14 +258,14 @@ impl VideoAccessManager {
         Ok(())
     }
     
-    /// 撤销令牌
+
     pub async fn revoke_token(&self, token_id: &str) {
         let mut tokens = self.tokens.write().await;
         tokens.remove(token_id);
         info!("Revoked video access token: {}", token_id);
     }
     
-    /// 授予用户文件访问权限
+
     pub async fn grant_permission(&self, user_id: String, file_path: PathBuf) {
         let mut perms = self.user_permissions.write().await;
         perms.entry(user_id.clone())
@@ -274,7 +274,7 @@ impl VideoAccessManager {
         info!("Granted permission to user {} for file {:?}", user_id, file_path);
     }
     
-    /// 撤销用户文件访问权限
+
     pub async fn revoke_permission(&self, user_id: &str, file_path: &Path) {
         let mut perms = self.user_permissions.write().await;
         if let Some(files) = perms.get_mut(user_id) {
@@ -283,7 +283,7 @@ impl VideoAccessManager {
         info!("Revoked permission from user {} for file {:?}", user_id, file_path);
     }
     
-    /// 检查用户权限
+
     pub async fn check_user_permission(&self, user_id: &str, file_path: &Path) -> bool {
         let perms = self.user_permissions.read().await;
         if let Some(files) = perms.get(user_id) {
@@ -293,7 +293,7 @@ impl VideoAccessManager {
         }
     }
     
-    /// 清理过期令牌
+
     pub async fn cleanup_expired_tokens(&self) {
         let mut tokens = self.tokens.write().await;
         let now = Instant::now();
@@ -307,7 +307,7 @@ impl VideoAccessManager {
         }
     }
     
-    /// 启动后台清理任务
+
     pub fn start_cleanup_task(self: Arc<Self>) {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -318,7 +318,7 @@ impl VideoAccessManager {
         });
     }
     
-    /// 获取用户的所有令牌
+
     pub async fn get_user_tokens(&self, user_id: &str) -> Vec<VideoAccessToken> {
         let tokens = self.tokens.read().await;
         tokens.values()
@@ -334,7 +334,7 @@ impl Default for VideoAccessManager {
     }
 }
 
-/// 全局视频访问管理器 (使用 OnceLock 确保线程安全)
+
 static GLOBAL_VIDEO_ACCESS_MANAGER: OnceLock<Arc<VideoAccessManager>> = OnceLock::new();
 
 pub fn init_global_video_access_manager() -> Arc<VideoAccessManager> {
@@ -358,7 +358,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_video_access_token() {
-        // Use a strong password that meets entropy requirements
+
         let password = "SecureTestPassword123!@#";
         
         let token = VideoAccessToken::new(
@@ -379,13 +379,13 @@ mod tests {
     async fn test_video_access_manager() {
         let manager = Arc::new(VideoAccessManager::new());
         let file_path = PathBuf::from("/videos/test.mp4");
-        // Use a strong password that meets entropy requirements
+
         let password = "SecureTestPassword123!@#";
         
-        // 授予权限
+
         manager.grant_permission("user123".to_string(), file_path.clone()).await;
         
-        // 创建令牌
+
         let token_id = manager.create_token(
             "user123".to_string(),
             file_path.clone(),
@@ -394,7 +394,7 @@ mod tests {
             3600,
         ).await.unwrap();
         
-        // 验证令牌
+
         let result = manager.verify_token(
             &token_id,
             password,
@@ -403,10 +403,10 @@ mod tests {
         ).await;
         assert!(result.is_ok());
         
-        // 撤销令牌
+
         manager.revoke_token(&token_id).await;
         
-        // 验证应该失败
+
         let result = manager.verify_token(
             &token_id,
             password,

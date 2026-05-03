@@ -25,11 +25,10 @@ pub struct FidoManager {
 impl FidoManager {
     pub fn new(rp_id: &str, rp_origin: &str) -> Result<Self, AppError> {
         let rp_id = rp_id.to_string();
-        let rp_origin = Url::parse(rp_origin)
-            .map_err(|_| AppError::InternalError)?;
+        let rp_origin = Url::parse(rp_origin).map_err(|_| AppError::InternalError)?;
 
-        let builder = WebauthnBuilder::new(&rp_id, &rp_origin)
-            .map_err(|_| AppError::InternalError)?;
+        let builder =
+            WebauthnBuilder::new(&rp_id, &rp_origin).map_err(|_| AppError::InternalError)?;
 
         let webauthn = builder
             .rp_name("RockZero Secure Service")
@@ -50,14 +49,9 @@ impl FidoManager {
             .map_err(|_| AppError::BadRequest("Invalid user ID".to_string()))?;
 
         let webauthn = self.webauthn.read().await;
-        
+
         let (ccr, reg_state) = webauthn
-            .start_passkey_registration(
-                user_unique_id,
-                username,
-                username,
-                None,
-            )
+            .start_passkey_registration(user_unique_id, username, username, None)
             .map_err(|_| AppError::InternalError)?;
 
         Ok((ccr, reg_state))
@@ -69,7 +63,7 @@ impl FidoManager {
         state: &PasskeyRegistration,
     ) -> Result<Passkey, AppError> {
         let webauthn = self.webauthn.read().await;
-        
+
         let passkey = webauthn
             .finish_passkey_registration(reg, state)
             .map_err(|_| AppError::BadRequest("Registration failed".to_string()))?;
@@ -82,7 +76,7 @@ impl FidoManager {
         passkeys: Vec<Passkey>,
     ) -> Result<(RequestChallengeResponse, PasskeyAuthentication), AppError> {
         let webauthn = self.webauthn.read().await;
-        
+
         let (rcr, auth_state) = webauthn
             .start_passkey_authentication(&passkeys)
             .map_err(|_| AppError::InternalError)?;
@@ -96,7 +90,7 @@ impl FidoManager {
         state: &PasskeyAuthentication,
     ) -> Result<AuthenticationResult, AppError> {
         let webauthn = self.webauthn.read().await;
-        
+
         let auth_result = webauthn
             .finish_passkey_authentication(auth, state)
             .map_err(|_| AppError::BadRequest("Authentication failed".to_string()))?;
@@ -167,15 +161,12 @@ pub async fn start_fido_registration(
         .await?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    let (ccr, reg_state) = fido
-        .start_registration(&user.id, &body.username)
-        .await?;
+    let (ccr, reg_state) = fido.start_registration(&user.id, &body.username).await?;
 
     let session_id = Uuid::new_v4().to_string();
-    
-    let state_json = serde_json::to_string(&reg_state)
-        .map_err(|_| AppError::InternalError)?;
-    
+
+    let state_json = serde_json::to_string(&reg_state).map_err(|_| AppError::InternalError)?;
+
     sqlx::query!(
         "INSERT INTO fido_sessions (id, user_id, session_type, state_json, expires_at) VALUES (?, ?, ?, ?, ?)",
         session_id,
@@ -212,17 +203,18 @@ pub async fn finish_fido_registration(
     .map_err(|_| AppError::InternalError)?
     .ok_or_else(|| AppError::BadRequest("Invalid or expired session".to_string()))?;
 
-    let reg_state: PasskeyRegistration = serde_json::from_str(&session.state_json)
-        .map_err(|_| AppError::InternalError)?;
+    let reg_state: PasskeyRegistration =
+        serde_json::from_str(&session.state_json).map_err(|_| AppError::InternalError)?;
 
-    let passkey = fido.finish_registration(&body.credential, &reg_state).await?;
+    let passkey = fido
+        .finish_registration(&body.credential, &reg_state)
+        .await?;
 
     let credential_id = passkey.cred_id().to_vec();
-    let public_key = serde_json::to_vec(&passkey)
-        .map_err(|_| AppError::InternalError)?;
+    let public_key = serde_json::to_vec(&passkey).map_err(|_| AppError::InternalError)?;
 
     let cred_id = Uuid::new_v4().to_string();
-    
+
     sqlx::query!(
         "INSERT INTO fido_credentials (id, user_id, credential_id, public_key, counter, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         cred_id,
@@ -266,7 +258,9 @@ pub async fn start_fido_authentication(
     .map_err(|_| AppError::InternalError)?;
 
     if credentials.is_empty() {
-        return Err(AppError::BadRequest("No FIDO2 credentials registered".to_string()));
+        return Err(AppError::BadRequest(
+            "No FIDO2 credentials registered".to_string(),
+        ));
     }
 
     let passkeys: Vec<Passkey> = credentials
@@ -277,10 +271,9 @@ pub async fn start_fido_authentication(
     let (rcr, auth_state) = fido.start_authentication(passkeys).await?;
 
     let session_id = Uuid::new_v4().to_string();
-    
-    let state_json = serde_json::to_string(&auth_state)
-        .map_err(|_| AppError::InternalError)?;
-    
+
+    let state_json = serde_json::to_string(&auth_state).map_err(|_| AppError::InternalError)?;
+
     sqlx::query!(
         "INSERT INTO fido_sessions (id, user_id, session_type, state_json, expires_at) VALUES (?, ?, ?, ?, ?)",
         session_id,
@@ -315,10 +308,12 @@ pub async fn finish_fido_authentication(
     .map_err(|_| AppError::InternalError)?
     .ok_or_else(|| AppError::BadRequest("Invalid or expired session".to_string()))?;
 
-    let auth_state: PasskeyAuthentication = serde_json::from_str(&session.state_json)
-        .map_err(|_| AppError::InternalError)?;
+    let auth_state: PasskeyAuthentication =
+        serde_json::from_str(&session.state_json).map_err(|_| AppError::InternalError)?;
 
-    let auth_result = fido.finish_authentication(&body.credential, &auth_state).await?;
+    let auth_result = fido
+        .finish_authentication(&body.credential, &auth_state)
+        .await?;
 
     sqlx::query!(
         "UPDATE fido_credentials SET counter = counter + 1 WHERE user_id = ? AND credential_id = ?",

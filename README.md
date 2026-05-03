@@ -20,12 +20,13 @@ RockZeroOS is a high-performance, secure cross-platform private cloud NAS operat
 ## Features
 
 - **Dashboard** — System overview with CPU, memory, disk, network monitoring, and chronograph-style speed test
-- **File Manager** — Browse disks, navigate directories, upload/download files, LAN file transfer, WebDAV, network shares
+- **File Manager** — Browse disks, navigate directories, upload/download files, edit supported text files, LAN file transfer, WebDAV, and Windows scoped-storage setup
 - **Video Playback** — SAE-protected HLS streaming with session-based authentication, ChaCha20-Poly1305 transport encryption (PMK → HKDF-BLAKE3 → session key), local Flutter proxy playback, proof-ticket / ZKP protected segment access, codec-aware adaptive timeouts (30s H.264/120s AV1), on-demand seek segment generation for VP9/AV1 transcode, and PTS timestamp normalization (`-fflags +genpts+discardcorrupt -avoid_negative_ts make_zero`)
 - **Game Center** — Multi-platform gaming hub with Steam, Epic Games, WeGame, Ubisoft Connect, Xbox native store integration (no WebView), unified game library, daily Top 30 recommendations, and built-in SteamDB viewer
 - **Localization & Motion** — zh-CN / English app-level localization foundation, low-motion route transitions, and reduced heavy list animations for weaker Android, Windows, and Linux devices
 - **WASM Runtime** — Run WebAssembly applications and scripts via Wasmtime, including built-in SteamDB viewer (name + AppID dual search), M3U8 video downloader (custom save directory), and Steam P2P connection analyzer (with NAT type help docs)
 - **Storage Management** — Linux full disk lifecycle management (format/mount/partition/SMART/secure erase) and Windows scoped single-root file management with disk status visibility
+- **Private Space** — Administrator-only encrypted vault for selected files and folders, protected by JWT, FIDO2/Passkey step-up, Argon2id second-password derivation, and ChaCha20-Poly1305 content encryption
 - **Hardware Transcoding** — Auto-detected FFmpeg hardware acceleration (VAAPI, V4L2 M2M, Rockchip MPP)
 - **Security** — FIDO2/WebAuthn, wallpaper customization with glassmorphic blur (BackdropFilter high-contrast frost), dynamic color (80% wallpaper + 20% system), Reed-Solomon + CRC32 secure storage, Bulletproofs ZKP for authentication
 - **MD3 Expressive Components** — Custom loading indicators (starburst spinner, wavy progress, pulsing dots, segmented spinner), secure connection shield animation for SAE handshake, buffering overlay with rotating dot ring
@@ -63,9 +64,23 @@ flowchart TB
 | HLS Cache Protection | Optional at-rest segment encryption | Non-Windows default: enabled; Windows default: disabled for stable playback |
 | Session Auth | 128-bit UUID + BLAKE3 HMAC | Session-bound playback token and proof-ticket chain |
 | Replay Protection | Timestamp + Nonce + HMAC | Multi-layer protection mechanism |
-| Zero-Knowledge Proof | Bulletproofs RangeProof | Prove password knowledge without revealing it (auth only) |
+| Zero-Knowledge Proof | Bulletproofs RangeProof | Prove password knowledge without revealing it for login and HLS segment authorization contexts |
 | Hardware Auth | FIDO2/WebAuthn | Support for YubiKey, TouchID, FaceID |
 | Secure Storage | Reed-Solomon + CRC32 | Data integrity verification and error correction |
+| Private Space | Argon2id + ChaCha20-Poly1305 | Admin-only encrypted vault with second password and step-up verification |
+
+## Private Space
+
+Private Space is an administrator-only vault for high-sensitivity files. It is intentionally separate from normal file management: every operation is protected by JWT authentication, `verify_fido2_or_passkey` step-up verification, an administrator role check, and a second password.
+
+- The second password is converted to a 256-bit key with Argon2id and a per-item random salt.
+- Each imported file is wrapped into an encrypted `.rzp` envelope under `DATA_DIR/secure/private_space/items`.
+- File contents and path metadata are encrypted with ChaCha20-Poly1305.
+- Import supports individual files or folders. Folder imports preserve relative paths inside the encrypted payload.
+- Export requires the same second password and restores the decrypted item into a selected target directory.
+- Delete requires the second password before the encrypted vault item is removed.
+
+Private Space APIs live under the JWT-protected `/api/v1/secure/private-space/*` route group and are surfaced from the Flutter Files page through import, vault list, restore, and delete actions.
 
 ## Video Playback Architecture
 
@@ -509,7 +524,7 @@ GET    /api/v1/filemanager/media/thumbnail?path=...
 DELETE /api/v1/filemanager/delete
 ```
 
-### ZKP (Auth only)
+### ZKP
 
 ```http
 POST /api/v1/zkp/search/token
@@ -584,11 +599,26 @@ GET  /api/v1/system/all                              # All system info combined
 ### Speed Test
 
 ```http
-GET  /api/v1/speedtest/download                      # Download speed test
-POST /api/v1/speedtest/upload                        # Upload speed test
-GET  /api/v1/speedtest/ping                          # Latency test
-GET  /api/v1/speedtest/info                          # Server info
+GET  /api/v1/speedtest/download?size=100&chunk_kb=512 # Download throughput stream
+POST /api/v1/speedtest/upload                         # Upload throughput sink
+GET  /api/v1/speedtest/ping?count=4                   # Latency and jitter samples
+GET  /api/v1/speedtest/info                           # Server and test capability info
+GET  /api/v1/speedtest/empty                          # Minimal latency endpoint
 ```
+
+The speed test endpoints follow the same practical shape as OpenSpeedTest and LibreSpeedTest: cache-disabled download streams, streaming upload discard, lightweight ping sampling, an empty endpoint for minimal request latency, and server capability metadata.
+
+### Private Space API
+
+```http
+GET    /api/v1/secure/private-space/status
+POST   /api/v1/secure/private-space/import
+POST   /api/v1/secure/private-space/list
+POST   /api/v1/secure/private-space/export
+DELETE /api/v1/secure/private-space/delete
+```
+
+All Private Space routes require a valid JWT, FIDO2/Passkey step-up verification, administrator role claims, and the second password supplied by the request body where applicable.
 
 ### Invite System
 
@@ -605,7 +635,7 @@ POST /api/v1/invite/remaining                        # Check remaining time
 | EdDSA JWT Sign | ~0.1ms | Ed25519 via dalek |
 | EdDSA JWT Verify | ~0.2ms | Ed25519 via dalek |
 | SAE Handshake (full) | ~5-10ms | Curve25519 Dragonfly |
-| Bulletproofs RangeProof | ~50ms | 64-bit range proof (auth only, not video playback) |
+| Bulletproofs RangeProof | ~50ms | 64-bit range proof for login and HLS segment proof contexts |
 | ChaCha20-Poly1305 Encrypt/Decrypt | ~500 MB/s | Secure HLS transport and optional cache protection |
 | BLAKE3 Hash | ~1 GB/s | Used for HKDF, HMAC, signatures |
 | HLS Segment (stream copy) | <100ms | ≤1080p, no re-encoding |
@@ -613,6 +643,16 @@ POST /api/v1/invite/remaining                        # Check remaining time
 | HLS Segment (sw transcode) | ~1-3s | >1080p, libx264 ultrafast |
 | On-demand seek (hw) | ~0.5-2s | Single segment via `-ss` + hw encode |
 | On-demand seek (sw) | ~2-5s | Single segment via `-ss` + libx264 ultrafast |
+
+## Validation
+
+The current workspace is expected to stay clean under these checks:
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cd RockZeroOS-UI && flutter analyze
+```
 
 ## Roadmap
 

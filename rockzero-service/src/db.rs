@@ -1,7 +1,7 @@
-use rockzero_common::AppError;
 use rockzero_common::models::{FileMetadata, Widget};
-use sqlx::{SqlitePool, Row};
+use rockzero_common::AppError;
 use serde::{Deserialize, Serialize};
+use sqlx::{Row, SqlitePool};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
@@ -16,9 +16,7 @@ pub struct User {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Initialize database tables
 pub async fn initialize_database(pool: &SqlitePool) -> Result<(), AppError> {
-    // Users table
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS users (
@@ -38,7 +36,6 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<(), AppError> {
     .await
     .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-    // FIDO sessions table
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS fido_sessions (
@@ -55,7 +52,6 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<(), AppError> {
     .await
     .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-    // FIDO credentials table
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS fido_credentials (
@@ -73,7 +69,6 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<(), AppError> {
     .await
     .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-    // Invite codes table
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS invite_codes (
@@ -90,7 +85,6 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<(), AppError> {
     .await
     .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-    // Files table for file metadata
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS files (
@@ -103,6 +97,8 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<(), AppError> {
             file_size INTEGER NOT NULL DEFAULT 0,
             checksum TEXT NOT NULL,
             is_public INTEGER NOT NULL DEFAULT 0,
+            tags TEXT,
+            shared_with TEXT,
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -113,7 +109,18 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<(), AppError> {
     .await
     .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-    // Widgets table
+    for column_ddl in [
+        "ALTER TABLE files ADD COLUMN tags TEXT",
+        "ALTER TABLE files ADD COLUMN shared_with TEXT",
+    ] {
+        if let Err(err) = sqlx::query(column_ddl).execute(pool).await {
+            let msg = err.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(AppError::DatabaseError(msg));
+            }
+        }
+    }
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS widgets (
@@ -137,16 +144,13 @@ pub async fn initialize_database(pool: &SqlitePool) -> Result<(), AppError> {
     .await
     .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-    // 数据库迁移：为旧表添加 sae_secret 列（如果不存在）
-    // SQLite 不支持 IF NOT EXISTS 语法用于 ADD COLUMN，所以我们需要先检查
     let _ = sqlx::query("ALTER TABLE users ADD COLUMN sae_secret TEXT")
         .execute(pool)
-        .await; // 忽略错误（列可能已存在）
+        .await;
 
     Ok(())
 }
 
-/// Create a new user
 pub async fn create_user(
     pool: &SqlitePool,
     username: &str,
@@ -197,7 +201,6 @@ pub async fn create_user(
     })
 }
 
-/// Find user by ID
 pub async fn find_user_by_id(pool: &SqlitePool, user_id: &str) -> Result<Option<User>, AppError> {
     let row = sqlx::query(
         r#"
@@ -214,15 +217,29 @@ pub async fn find_user_by_id(pool: &SqlitePool, user_id: &str) -> Result<Option<
     match row {
         Some(r) => {
             let user = User {
-                id: r.try_get("id").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                username: r.try_get("username").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                email: r.try_get("email").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                password_hash: r.try_get("password_hash").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                id: r
+                    .try_get("id")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                username: r
+                    .try_get("username")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                email: r
+                    .try_get("email")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                password_hash: r
+                    .try_get("password_hash")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 sae_secret: r.try_get("sae_secret").ok(),
                 zkp_registration: r.try_get("zkp_registration").ok(),
-                role: r.try_get("role").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                created_at: r.try_get("created_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                updated_at: r.try_get("updated_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                role: r
+                    .try_get("role")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                created_at: r
+                    .try_get("created_at")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                updated_at: r
+                    .try_get("updated_at")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
             };
             Ok(Some(user))
         }
@@ -230,8 +247,10 @@ pub async fn find_user_by_id(pool: &SqlitePool, user_id: &str) -> Result<Option<
     }
 }
 
-/// Find user by username
-pub async fn find_user_by_username(pool: &SqlitePool, username: &str) -> Result<Option<User>, AppError> {
+pub async fn find_user_by_username(
+    pool: &SqlitePool,
+    username: &str,
+) -> Result<Option<User>, AppError> {
     let row = sqlx::query(
         r#"
         SELECT id, username, email, password_hash, sae_secret, zkp_registration, role,
@@ -247,15 +266,29 @@ pub async fn find_user_by_username(pool: &SqlitePool, username: &str) -> Result<
     match row {
         Some(r) => {
             let user = User {
-                id: r.try_get("id").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                username: r.try_get("username").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                email: r.try_get("email").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                password_hash: r.try_get("password_hash").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                id: r
+                    .try_get("id")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                username: r
+                    .try_get("username")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                email: r
+                    .try_get("email")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                password_hash: r
+                    .try_get("password_hash")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 sae_secret: r.try_get("sae_secret").ok(),
                 zkp_registration: r.try_get("zkp_registration").ok(),
-                role: r.try_get("role").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                created_at: r.try_get("created_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                updated_at: r.try_get("updated_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                role: r
+                    .try_get("role")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                created_at: r
+                    .try_get("created_at")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                updated_at: r
+                    .try_get("updated_at")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
             };
             Ok(Some(user))
         }
@@ -263,7 +296,6 @@ pub async fn find_user_by_username(pool: &SqlitePool, username: &str) -> Result<
     }
 }
 
-/// Find user by email
 pub async fn find_user_by_email(pool: &SqlitePool, email: &str) -> Result<Option<User>, AppError> {
     let row = sqlx::query(
         r#"
@@ -280,15 +312,29 @@ pub async fn find_user_by_email(pool: &SqlitePool, email: &str) -> Result<Option
     match row {
         Some(r) => {
             let user = User {
-                id: r.try_get("id").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                username: r.try_get("username").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                email: r.try_get("email").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                password_hash: r.try_get("password_hash").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                id: r
+                    .try_get("id")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                username: r
+                    .try_get("username")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                email: r
+                    .try_get("email")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                password_hash: r
+                    .try_get("password_hash")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
                 sae_secret: r.try_get("sae_secret").ok(),
                 zkp_registration: r.try_get("zkp_registration").ok(),
-                role: r.try_get("role").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                created_at: r.try_get("created_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                updated_at: r.try_get("updated_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                role: r
+                    .try_get("role")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                created_at: r
+                    .try_get("created_at")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                updated_at: r
+                    .try_get("updated_at")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
             };
             Ok(Some(user))
         }
@@ -296,18 +342,16 @@ pub async fn find_user_by_email(pool: &SqlitePool, email: &str) -> Result<Option
     }
 }
 
-/// Count total number of users in the system
 pub async fn count_users(pool: &SqlitePool) -> Result<i64, AppError> {
     let row = sqlx::query("SELECT COUNT(*) as count FROM users")
         .fetch_one(pool)
         .await
         .map_err(|e| AppError::DatabaseError(e.to_string()))?;
-    
+
     let count: i64 = row.try_get("count").unwrap_or(0);
     Ok(count)
 }
 
-/// Validate an invite code
 pub async fn validate_invite_code(pool: &SqlitePool, code: &str) -> Result<bool, AppError> {
     let row = sqlx::query(
         r#"
@@ -320,7 +364,7 @@ pub async fn validate_invite_code(pool: &SqlitePool, code: &str) -> Result<bool,
     .fetch_optional(pool)
     .await
     .map_err(|e| AppError::DatabaseError(e.to_string()))?;
-    
+
     match row {
         Some(r) => {
             let max_uses: i32 = r.try_get("max_uses").unwrap_or(1);
@@ -331,7 +375,6 @@ pub async fn validate_invite_code(pool: &SqlitePool, code: &str) -> Result<bool,
     }
 }
 
-/// Use an invite code (increment usage count)
 pub async fn use_invite_code(pool: &SqlitePool, code: &str) -> Result<(), AppError> {
     sqlx::query(
         r#"
@@ -343,7 +386,7 @@ pub async fn use_invite_code(pool: &SqlitePool, code: &str) -> Result<(), AppErr
     .execute(pool)
     .await
     .map_err(|e| AppError::DatabaseError(e.to_string()))?;
-    
+
     Ok(())
 }
 
@@ -358,7 +401,7 @@ pub async fn create_invite_code(
     sqlx::query(
         r#"
         INSERT INTO invite_codes (code, created_by, max_uses, current_uses, expires_at, created_at)
-        VALUES (?, ?, ?, 0, ?, datetime('now'))
+        VALUES (?, ?, ?, 0, datetime(?), datetime('now'))
         "#,
     )
     .bind(code)
@@ -392,9 +435,20 @@ pub async fn get_invite_remaining_seconds(
             .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
         if let Some(expires_at) = expires_at {
-            let expires = chrono::DateTime::parse_from_rfc3339(&expires_at)
+            let parsed = chrono::DateTime::parse_from_rfc3339(&expires_at)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(&expires_at, "%Y-%m-%d %H:%M:%S").map(
+                        |naive| {
+                            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                                naive,
+                                chrono::Utc,
+                            )
+                        },
+                    )
+                })
                 .map_err(|e| AppError::DatabaseError(e.to_string()))?;
-            let remaining = expires.with_timezone(&chrono::Utc)
+            let remaining = parsed
                 .signed_duration_since(chrono::Utc::now())
                 .num_seconds();
             return Ok(Some(remaining.max(0)));
@@ -476,7 +530,6 @@ pub async fn get_file_by_id(
     Ok(file)
 }
 
-/// Find file by ID and verify user ownership
 pub async fn find_file_by_id(
     pool: &SqlitePool,
     file_id: &str,
@@ -498,17 +551,39 @@ pub async fn find_file_by_id(
     match row {
         Some(r) => {
             let file = FileMetadata {
-                id: r.try_get("id").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                user_id: r.try_get("user_id").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                filename: r.try_get("filename").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                original_filename: r.try_get("original_filename").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                file_path: r.try_get("file_path").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                mime_type: r.try_get("mime_type").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                file_size: r.try_get("file_size").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                checksum: r.try_get("checksum").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                is_public: r.try_get("is_public").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                created_at: r.try_get("created_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
-                updated_at: r.try_get("updated_at").map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                id: r
+                    .try_get("id")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                user_id: r
+                    .try_get("user_id")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                filename: r
+                    .try_get("filename")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                original_filename: r
+                    .try_get("original_filename")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                file_path: r
+                    .try_get("file_path")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                mime_type: r
+                    .try_get("mime_type")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                file_size: r
+                    .try_get("file_size")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                checksum: r
+                    .try_get("checksum")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                is_public: r
+                    .try_get("is_public")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                created_at: r
+                    .try_get("created_at")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                updated_at: r
+                    .try_get("updated_at")
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?,
             };
             Ok(Some(file))
         }
@@ -535,7 +610,6 @@ pub async fn delete_file(pool: &SqlitePool, file_id: &str) -> Result<(), AppErro
 }
 
 pub async fn create_widget(_pool: &SqlitePool, _widget: &Widget) -> Result<(), AppError> {
-    // Placeholder - implement when database tables are created
     Ok(())
 }
 
@@ -543,7 +617,6 @@ pub async fn list_widgets_by_user(
     _pool: &SqlitePool,
     _user_id: &str,
 ) -> Result<Vec<Widget>, AppError> {
-    // Placeholder - implement when database tables are created
     Ok(Vec::new())
 }
 
@@ -553,7 +626,6 @@ pub async fn update_widget(
     _user_id: &str,
     _widget: &Widget,
 ) -> Result<(), AppError> {
-    // Placeholder - implement when database tables are created
     Ok(())
 }
 
@@ -562,11 +634,9 @@ pub async fn delete_widget(
     _widget_id: &str,
     _user_id: &str,
 ) -> Result<bool, AppError> {
-    // Placeholder - implement when database tables are created
     Ok(true)
 }
 
-/// Update user's SAE secret
 pub async fn sync_user_sae_and_zkp_registration(
     pool: &SqlitePool,
     user_id: &str,
@@ -602,4 +672,3 @@ pub async fn sync_user_sae_and_zkp_registration(
 
     Ok(())
 }
-

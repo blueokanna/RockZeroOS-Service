@@ -42,17 +42,13 @@ impl AppConfig {
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
-                "-p" | "--port" => {
-                    if i + 1 < args.len() {
-                        port_override = args[i + 1].parse().ok();
-                        i += 1;
-                    }
+                "-p" | "--port" if i + 1 < args.len() => {
+                    port_override = args[i + 1].parse().ok();
+                    i += 1;
                 }
-                "-h" | "--host" => {
-                    if i + 1 < args.len() {
-                        host_override = Some(args[i + 1].clone());
-                        i += 1;
-                    }
+                "-h" | "--host" if i + 1 < args.len() => {
+                    host_override = Some(args[i + 1].clone());
+                    i += 1;
                 }
                 arg if arg.starts_with("--port=") => {
                     port_override = arg.trim_start_matches("--port=").parse().ok();

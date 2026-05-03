@@ -80,7 +80,11 @@ fn detect_environment_descriptor() -> EnvironmentDescriptor {
         if !override_profile.is_empty() {
             return EnvironmentDescriptor {
                 profile: override_profile.to_string(),
-                label: format!("{} {} backend", platform.to_uppercase(), arch.to_uppercase()),
+                label: format!(
+                    "{} {} backend",
+                    platform.to_uppercase(),
+                    arch.to_uppercase()
+                ),
                 device_model: detect_device_model(),
             };
         }
@@ -121,7 +125,11 @@ fn detect_environment_descriptor() -> EnvironmentDescriptor {
         "windows-x86" => format!("Windows {} backend", arch.to_uppercase()),
         "macos-arm64" => "macOS ARM64 backend".to_string(),
         "macos-x86" => "macOS x86 backend".to_string(),
-        _ => format!("{} {} backend", platform.to_uppercase(), arch.to_uppercase()),
+        _ => format!(
+            "{} {} backend",
+            platform.to_uppercase(),
+            arch.to_uppercase()
+        ),
     };
 
     EnvironmentDescriptor {
@@ -263,12 +271,12 @@ pub fn auto_mount_all_disks() {
         log::warn!("Failed to run lsblk for auto-mount");
         return;
     };
-    
+
     if !output.status.success() {
         log::warn!("lsblk failed: {}", String::from_utf8_lossy(&output.stderr));
         return;
     }
-    
+
     let lsblk_json = String::from_utf8_lossy(&output.stdout);
     let lsblk: serde_json::Value = match serde_json::from_str(&lsblk_json) {
         Ok(v) => v,
@@ -277,7 +285,7 @@ pub fn auto_mount_all_disks() {
             return;
         }
     };
-    
+
     let Some(blockdevices) = lsblk.get("blockdevices").and_then(|v| v.as_array()) else {
         log::warn!("No block devices found");
         return;
@@ -339,9 +347,7 @@ pub fn auto_mount_all_disks() {
                         log::info!("Auto-mounted {} to {}", device_path, mount_point);
                         mounted_count += 1;
 
-                        let _ = Command::new("chmod")
-                            .args(["755", &mount_point])
-                            .output();
+                        let _ = Command::new("chmod").args(["755", &mount_point]).output();
                     } else {
                         let error = String::from_utf8_lossy(&output.stderr);
                         log::debug!("Failed to mount {}: {}", device_path, error.trim());
@@ -353,7 +359,7 @@ pub fn auto_mount_all_disks() {
             }
         }
     }
-    
+
     log::info!("Auto-mount completed: {} disks mounted", mounted_count);
 }
 
@@ -388,11 +394,7 @@ fn auto_mount_after_format(partition_device: &str, mount_point: &str) -> Result<
                 .ok()
                 .and_then(|o| {
                     if o.status.success() {
-                        Some(
-                            String::from_utf8_lossy(&o.stdout)
-                                .trim()
-                                .to_string(),
-                        )
+                        Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
                     } else {
                         None
                     }
@@ -404,11 +406,7 @@ fn auto_mount_after_format(partition_device: &str, mount_point: &str) -> Result<
                 .ok()
                 .and_then(|o| {
                     if o.status.success() {
-                        Some(
-                            String::from_utf8_lossy(&o.stdout)
-                                .trim()
-                                .to_string(),
-                        )
+                        Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
                     } else {
                         None
                     }
@@ -420,17 +418,10 @@ fn auto_mount_after_format(partition_device: &str, mount_point: &str) -> Result<
                     "\n# Auto-added by RockZeroOS after disk initialization\nUUID={}  {}  {}  defaults,nofail  0  2\n",
                     uuid, mount_point, fstype
                 );
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open("/etc/fstab")
-                {
+                if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open("/etc/fstab") {
                     use std::io::Write;
                     let _ = file.write_all(fstab_entry.as_bytes());
-                    log::info!(
-                        "Added fstab entry: UUID={} -> {}",
-                        uuid,
-                        mount_point
-                    );
+                    log::info!("Added fstab entry: UUID={} -> {}", uuid, mount_point);
                 }
             }
         }
@@ -456,12 +447,11 @@ pub fn auto_format_and_mount_uninitialized_disks() {
         return;
     }
 
-    let lsblk: serde_json::Value = match serde_json::from_str(
-        &String::from_utf8_lossy(&output.stdout),
-    ) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
+    let lsblk: serde_json::Value =
+        match serde_json::from_str(&String::from_utf8_lossy(&output.stdout)) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
 
     let Some(devices) = lsblk.get("blockdevices").and_then(|v| v.as_array()) else {
         return;
@@ -475,10 +465,7 @@ pub fn auto_format_and_mount_uninitialized_disks() {
         let dev_type = device.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let fstype = device.get("fstype").and_then(|f| f.as_str());
         let mountpoint = device.get("mountpoint").and_then(|m| m.as_str());
-        let ro = device
-            .get("ro")
-            .and_then(|r| r.as_bool())
-            .unwrap_or(false);
+        let ro = device.get("ro").and_then(|r| r.as_bool()).unwrap_or(false);
         let size_str = device.get("size").and_then(|s| s.as_str()).unwrap_or("0");
 
         if dev_type != "disk" {
@@ -760,145 +747,158 @@ pub struct DiskOperationResult {
 
 pub async fn list_disks() -> Result<HttpResponse, AppError> {
     let disks = tokio::task::spawn_blocking(move || -> Vec<DiskDetail> {
-    let disks_info = Disks::new_with_refreshed_list();
-    let mut disks = Vec::new();
+        let disks_info = Disks::new_with_refreshed_list();
+        let mut disks = Vec::new();
 
-    for disk in disks_info.list() {
-        let device_path = disk.name().to_string_lossy().to_string();
-        let mount_point = disk.mount_point().to_string_lossy().to_string();
-        
-        if device_path.contains("zram") || 
-           device_path.contains("log2ram") ||
-           mount_point.contains("log2ram") ||
-           device_path.contains("loop") ||
-           (device_path.contains("ram") && !device_path.contains("nvram")) {
-            continue;
-        }
-        
-        #[cfg(target_os = "linux")]
-        let (total_space, available_space, used_space, usage_percentage) = {
-            use std::mem::MaybeUninit;
-            let mut stat_result: Option<(u64, u64, u64, f64)> = None;
-            
-            if !mount_point.is_empty() {
-                if let Ok(path_cstr) = std::ffi::CString::new(mount_point.as_bytes()) {
-                    let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
-                    unsafe {
-                        if libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) == 0 {
-                            let stat = stat.assume_init();
-                            let block_size = stat.f_frsize as u64;
-                            let total_blocks = stat.f_blocks as u64;
-                            let free_blocks = stat.f_bfree as u64;
-                            let avail_blocks = stat.f_bavail as u64;
-                            
-                            let raw_total = total_blocks * block_size;
-                            let free = free_blocks * block_size;
-                            let avail = avail_blocks * block_size;
-                            
-                            let used = raw_total.saturating_sub(free);
-                            let reserved = free.saturating_sub(avail);
-                            let user_total = raw_total.saturating_sub(reserved);
-                            
-                            let pct = if user_total > 0 {
-                                (used as f64 / user_total as f64) * 100.0
-                            } else {
-                                0.0
-                            };
-                            
-                            stat_result = Some((user_total, avail, used, pct));
+        for disk in disks_info.list() {
+            let device_path = disk.name().to_string_lossy().to_string();
+            let mount_point = disk.mount_point().to_string_lossy().to_string();
+
+            if device_path.contains("zram")
+                || device_path.contains("log2ram")
+                || mount_point.contains("log2ram")
+                || device_path.contains("loop")
+                || (device_path.contains("ram") && !device_path.contains("nvram"))
+            {
+                continue;
+            }
+
+            #[cfg(target_os = "linux")]
+            let (total_space, available_space, used_space, usage_percentage) = {
+                use std::mem::MaybeUninit;
+                let mut stat_result: Option<(u64, u64, u64, f64)> = None;
+
+                if !mount_point.is_empty() {
+                    if let Ok(path_cstr) = std::ffi::CString::new(mount_point.as_bytes()) {
+                        let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
+                        unsafe {
+                            if libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) == 0 {
+                                let stat = stat.assume_init();
+                                let block_size = stat.f_frsize as u64;
+                                let total_blocks = stat.f_blocks as u64;
+                                let free_blocks = stat.f_bfree as u64;
+                                let avail_blocks = stat.f_bavail as u64;
+
+                                let raw_total = total_blocks * block_size;
+                                let free = free_blocks * block_size;
+                                let avail = avail_blocks * block_size;
+
+                                let used = raw_total.saturating_sub(free);
+                                let reserved = free.saturating_sub(avail);
+                                let user_total = raw_total.saturating_sub(reserved);
+
+                                let pct = if user_total > 0 {
+                                    (used as f64 / user_total as f64) * 100.0
+                                } else {
+                                    0.0
+                                };
+
+                                stat_result = Some((user_total, avail, used, pct));
+                            }
                         }
                     }
                 }
-            }
-            
-            if let Some(result) = stat_result {
-                result
-            } else {
+
+                if let Some(result) = stat_result {
+                    result
+                } else {
+                    let total = disk.total_space();
+                    let avail = disk.available_space();
+                    let used = total.saturating_sub(avail);
+                    let pct = if total > 0 {
+                        (used as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    (total, avail, used, pct)
+                }
+            };
+
+            #[cfg(not(target_os = "linux"))]
+            let (total_space, available_space, used_space, usage_percentage) = {
                 let total = disk.total_space();
                 let avail = disk.available_space();
                 let used = total.saturating_sub(avail);
-                let pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
+                let pct = if total > 0 {
+                    (used as f64 / total as f64) * 100.0
+                } else {
+                    0.0
+                };
                 (total, avail, used, pct)
-            }
-        };
-        
-        #[cfg(not(target_os = "linux"))]
-        let (total_space, available_space, used_space, usage_percentage) = {
-            let total = disk.total_space();
-            let avail = disk.available_space();
-            let used = total.saturating_sub(avail);
-            let pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
-            (total, avail, used, pct)
-        };
-        
-        let is_removable = disk.is_removable();
-        let disk_type = format!("{:?}", disk.kind());
-        
-        let file_system = disk.file_system().to_string_lossy().to_string();
-        
-        #[cfg(target_os = "linux")]
-        let file_system = {
-            if let Ok(output) = Command::new("blkid")
-                .args(["-s", "TYPE", "-o", "value", &device_path])
-                .output()
-            {
-                if output.status.success() {
-                    let fs_from_blkid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if !fs_from_blkid.is_empty() {
-                        fs_from_blkid
+            };
+
+            let is_removable = disk.is_removable();
+            let disk_type = format!("{:?}", disk.kind());
+
+            let file_system = disk.file_system().to_string_lossy().to_string();
+
+            #[cfg(target_os = "linux")]
+            let file_system = {
+                if let Ok(output) = Command::new("blkid")
+                    .args(["-s", "TYPE", "-o", "value", &device_path])
+                    .output()
+                {
+                    if output.status.success() {
+                        let fs_from_blkid =
+                            String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if !fs_from_blkid.is_empty() {
+                            fs_from_blkid
+                        } else {
+                            file_system
+                        }
                     } else {
                         file_system
                     }
                 } else {
                     file_system
                 }
-            } else {
-                file_system
-            }
-        };
+            };
 
-        let (label, uuid, serial, model) = get_disk_metadata(&device_path);
+            let (label, uuid, serial, model) = get_disk_metadata(&device_path);
 
-        disks.push(DiskDetail {
-            name: device_path.clone(),
-            device_path,
-            mount_point,
-            file_system,
-            total_space,
-            available_space,
-            used_space,
-            usage_percentage,
-            is_removable,
-            disk_type,
-            is_mounted: true,
-            read_only: false,
-            label,
-            uuid,
-            serial,
-            model,
-        });
-    }
+            disks.push(DiskDetail {
+                name: device_path.clone(),
+                device_path,
+                mount_point,
+                file_system,
+                total_space,
+                available_space,
+                used_space,
+                usage_percentage,
+                is_removable,
+                disk_type,
+                is_mounted: true,
+                read_only: false,
+                label,
+                uuid,
+                serial,
+                model,
+            });
+        }
 
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(unmounted) = get_unmounted_disks() {
-            for disk in unmounted {
-                if disk.device_path.contains("zram") || 
-                   disk.device_path.contains("log2ram") ||
-                   disk.mount_point.contains("log2ram") ||
-                   disk.device_path.contains("loop") ||
-                   (disk.device_path.contains("ram") && !disk.device_path.contains("nvram")) {
-                    continue;
-                }
-                if !disks.iter().any(|d| d.device_path == disk.device_path) {
-                    disks.push(disk);
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(unmounted) = get_unmounted_disks() {
+                for disk in unmounted {
+                    if disk.device_path.contains("zram")
+                        || disk.device_path.contains("log2ram")
+                        || disk.mount_point.contains("log2ram")
+                        || disk.device_path.contains("loop")
+                        || (disk.device_path.contains("ram") && !disk.device_path.contains("nvram"))
+                    {
+                        continue;
+                    }
+                    if !disks.iter().any(|d| d.device_path == disk.device_path) {
+                        disks.push(disk);
+                    }
                 }
             }
         }
-    }
 
-    disks
-    }).await.map_err(|_| AppError::InternalError)?;
+        disks
+    })
+    .await
+    .map_err(|_| AppError::InternalError)?;
 
     Ok(HttpResponse::Ok().json(disks))
 }
@@ -1032,27 +1032,28 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
                             .unwrap_or("")
                             .to_string();
                         let device_path = format!("/dev/{}", name);
-                        
+
                         let mut fs_type = child
                             .get("fstype")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        
+
                         if fs_type.is_empty() {
                             if let Ok(output) = Command::new("blkid")
                                 .args(["-s", "TYPE", "-o", "value", &device_path])
                                 .output()
                             {
                                 if output.status.success() {
-                                    let fs_from_blkid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                                    let fs_from_blkid =
+                                        String::from_utf8_lossy(&output.stdout).trim().to_string();
                                     if !fs_from_blkid.is_empty() {
                                         fs_type = fs_from_blkid;
                                     }
                                 }
                             }
                         }
-                        
+
                         let label = child
                             .get("label")
                             .and_then(|v| v.as_str())
@@ -1230,7 +1231,7 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
         let mount_check = Command::new("findmnt")
             .args(["-n", "-o", "TARGET", device])
             .output();
-        
+
         if let Ok(output) = mount_check {
             if output.status.success() {
                 let mount_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1311,7 +1312,8 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
             device.clone()
         };
 
-        tokio::fs::create_dir_all(&body.mount_point).await
+        tokio::fs::create_dir_all(&body.mount_point)
+            .await
             .map_err(|e| AppError::BadRequest(format!("Failed to create mount point: {}", e)))?;
 
         let mut cmd = Command::new("mount");
@@ -1338,7 +1340,7 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
             let _ = Command::new("chmod")
                 .args(["755", &body.mount_point])
                 .output();
-            
+
             let _ = Command::new("chown")
                 .args(["-R", "1000:1000", &body.mount_point])
                 .output();
@@ -1476,7 +1478,7 @@ pub async fn format_disk(
     #[cfg(target_os = "linux")]
     {
         let device = &body.device;
-        
+
         if !std::path::Path::new(device).exists() {
             return Err(AppError::BadRequest(format!(
                 "Device {} does not exist",
@@ -1488,39 +1490,37 @@ pub async fn format_disk(
         let mount_check = Command::new("findmnt")
             .args(["-n", "-o", "TARGET", device])
             .output();
-        
+
         if let Ok(output) = mount_check {
             if output.status.success() {
                 let mount_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !mount_point.is_empty() {
-                    log::info!("Device {} is mounted at '{}', auto-unmounting...", device, mount_point);
+                    log::info!(
+                        "Device {} is mounted at '{}', auto-unmounting...",
+                        device,
+                        mount_point
+                    );
                     original_mount_point = Some(mount_point.clone());
-                    
-                    let _ = Command::new("fuser")
-                        .args(["-km", &mount_point])
-                        .output();
-                    
+
+                    let _ = Command::new("fuser").args(["-km", &mount_point]).output();
+
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    
-                    let unmount_output = Command::new("umount")
-                        .arg("-f")
-                        .arg(&mount_point)
-                        .output();
-                    
+
+                    let unmount_output =
+                        Command::new("umount").arg("-f").arg(&mount_point).output();
+
                     if let Err(e) = unmount_output {
                         return Err(AppError::BadRequest(format!(
                             "Failed to unmount device {} from '{}': {}",
                             device, mount_point, e
                         )));
                     }
-                    
+
                     let unmount_result = unmount_output.unwrap();
                     if !unmount_result.status.success() {
-                        let lazy_unmount = Command::new("umount")
-                            .arg("-l")
-                            .arg(&mount_point)
-                            .output();
-                        
+                        let lazy_unmount =
+                            Command::new("umount").arg("-l").arg(&mount_point).output();
+
                         if let Ok(lazy_result) = lazy_unmount {
                             if !lazy_result.status.success() {
                                 let error = String::from_utf8_lossy(&lazy_result.stderr);
@@ -1531,7 +1531,7 @@ pub async fn format_disk(
                             }
                         }
                     }
-                    
+
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     log::info!("Successfully unmounted {} from '{}'", device, mount_point);
                 }
@@ -1623,48 +1623,59 @@ pub async fn format_disk(
         cmd.arg(device);
 
         let output = cmd.output().map_err(|e| {
-            AppError::BadRequest(format!("Failed to run mkfs command '{}': {}. Make sure the package is installed.", cmd_name, e))
+            AppError::BadRequest(format!(
+                "Failed to run mkfs command '{}': {}. Make sure the package is installed.",
+                cmd_name, e
+            ))
         })?;
 
         if output.status.success() {
             let _ = Command::new("udevadm")
                 .args(["trigger", "--subsystem-match=block"])
                 .output();
-            
+
             let _ = Command::new("udevadm")
                 .args(["settle", "--timeout=5"])
                 .output();
-            
+
             let _ = Command::new("partprobe").arg(device).output();
-            
+
             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
             let mut remounted = false;
             if let Some(mount_point) = &original_mount_point {
                 log::info!("Re-mounting {} to '{}'...", device, mount_point);
-                
+
                 let _ = tokio::fs::create_dir_all(mount_point).await;
-                
-                let remount_output = Command::new("mount")
-                    .arg(device)
-                    .arg(mount_point)
-                    .output();
-                
+
+                let remount_output = Command::new("mount").arg(device).arg(mount_point).output();
+
                 if let Ok(result) = remount_output {
                     if result.status.success() {
                         remounted = true;
                         log::info!("Successfully re-mounted {} to '{}'", device, mount_point);
                     } else {
                         let error = String::from_utf8_lossy(&result.stderr);
-                        log::warn!("Failed to re-mount {} to '{}': {}", device, mount_point, error);
+                        log::warn!(
+                            "Failed to re-mount {} to '{}': {}",
+                            device,
+                            mount_point,
+                            error
+                        );
                     }
                 }
             }
 
             let message = if remounted {
-                format!("Disk formatted successfully with {} filesystem and re-mounted", body.file_system)
+                format!(
+                    "Disk formatted successfully with {} filesystem and re-mounted",
+                    body.file_system
+                )
             } else {
-                format!("Disk formatted successfully with {} filesystem", body.file_system)
+                format!(
+                    "Disk formatted successfully with {} filesystem",
+                    body.file_system
+                )
             };
 
             return Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -1974,7 +1985,7 @@ pub async fn initialize_disk(
 
         let _ = Command::new("partprobe").arg(device).output();
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        
+
         let _ = Command::new("udevadm")
             .args(["settle", "--timeout=10"])
             .output();
@@ -2027,7 +2038,7 @@ pub async fn initialize_disk(
         };
 
         let mut format_cmd = Command::new(mkfs_cmd);
-        
+
         if let Some(label) = &body.label {
             if !label.is_empty() {
                 match fs_lower.as_str() {
@@ -2074,8 +2085,7 @@ pub async fn initialize_disk(
                 format_cmd.arg("-F").arg("32");
                 format_cmd.arg("-I");
             }
-            "exfat" => {
-            }
+            "exfat" => {}
             _ => {}
         }
 
@@ -2093,23 +2103,23 @@ pub async fn initialize_disk(
         let _ = Command::new("udevadm")
             .args(["trigger", "--subsystem-match=block"])
             .output();
-        
+
         let _ = Command::new("udevadm")
             .args(["settle", "--timeout=10"])
             .output();
-        
+
         let _ = Command::new("partprobe").arg(device).output();
-        
+
         let _ = Command::new("blkid")
             .args(["-p", &partition_device])
             .output();
-        
+
         tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-        
+
         let verify_output = Command::new("blkid")
             .args(["-s", "TYPE", "-o", "value", &partition_device])
             .output();
-        
+
         let actual_fs = if let Ok(output) = verify_output {
             if output.status.success() {
                 String::from_utf8_lossy(&output.stdout).trim().to_string()
@@ -2122,10 +2132,7 @@ pub async fn initialize_disk(
 
         let mount_base = std::env::var("MOUNT_BASE").unwrap_or_else(|_| "/mnt".to_string());
         let default_mount_label = partition_device.replace("/dev/", "").replace("/", "_");
-        let mount_label = body
-            .label
-            .clone()
-            .unwrap_or(default_mount_label);
+        let mount_label = body.label.clone().unwrap_or(default_mount_label);
         let auto_mount_point = format!("{}/{}", mount_base, mount_label);
 
         let auto_mount_msg = match auto_mount_after_format(&partition_device, &auto_mount_point) {
@@ -2414,7 +2421,6 @@ pub async fn get_zfs_status() -> Result<HttpResponse, AppError> {
     }
 }
 
-
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ZfsPoolConfig {
@@ -2450,25 +2456,33 @@ pub async fn create_zfs_pool(
         let zfs_check = Command::new("which").arg("zpool").output();
         if zfs_check.is_err() || !zfs_check.unwrap().status.success() {
             return Err(AppError::BadRequest(
-                "ZFS is not installed. Please install zfsutils-linux".to_string()
+                "ZFS is not installed. Please install zfsutils-linux".to_string(),
             ));
         }
 
         let mut cmd = Command::new("zpool");
         cmd.arg("create");
-        
+
         if let Some(ashift) = body.ashift {
             cmd.arg("-o").arg(format!("ashift={}", ashift));
         }
-        
+
         cmd.arg(&body.name);
-        
+
         match body.vdev_type.as_str() {
             "" | "stripe" => {}
-            "mirror" => { cmd.arg("mirror"); }
-            "raidz1" => { cmd.arg("raidz1"); }
-            "raidz2" => { cmd.arg("raidz2"); }
-            "raidz3" => { cmd.arg("raidz3"); }
+            "mirror" => {
+                cmd.arg("mirror");
+            }
+            "raidz1" => {
+                cmd.arg("raidz1");
+            }
+            "raidz2" => {
+                cmd.arg("raidz2");
+            }
+            "raidz3" => {
+                cmd.arg("raidz3");
+            }
             other => {
                 return Err(AppError::BadRequest(format!(
                     "Unsupported ZFS vdev type: {}",
@@ -2476,72 +2490,81 @@ pub async fn create_zfs_pool(
                 )));
             }
         }
-        
+
         for device in &body.devices {
             cmd.arg(device);
         }
-        
-        let output = cmd.output()
+
+        let output = cmd
+            .output()
             .map_err(|e| AppError::BadRequest(format!("Failed to create ZFS pool: {}", e)))?;
-        
+
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::BadRequest(format!("ZFS pool creation failed: {}", error)));
+            return Err(AppError::BadRequest(format!(
+                "ZFS pool creation failed: {}",
+                error
+            )));
         }
-        
+
         if let Some(compression) = &body.compression {
             let _ = Command::new("zfs")
                 .args(["set", &format!("compression={}", compression), &body.name])
                 .output();
         }
-        
+
         if let Some(true) = body.dedup {
             let _ = Command::new("zfs")
                 .args(["set", "dedup=on", &body.name])
                 .output();
         }
-        
+
         Ok(HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "message": format!("ZFS pool '{}' created successfully", body.name),
             "pool": body.name,
         })))
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = &body;
-        Err(AppError::BadRequest("ZFS is only supported on Linux".to_string()))
+        Err(AppError::BadRequest(
+            "ZFS is only supported on Linux".to_string(),
+        ))
     }
 }
 
 #[allow(dead_code)]
-pub async fn get_zfs_pool_status(
-    pool_name: web::Path<String>,
-) -> Result<HttpResponse, AppError> {
+pub async fn get_zfs_pool_status(pool_name: web::Path<String>) -> Result<HttpResponse, AppError> {
     #[cfg(target_os = "linux")]
     {
         let output = Command::new("zpool")
             .args(["status", "-v", &pool_name])
             .output()
             .map_err(|_| AppError::InternalError)?;
-        
+
         if !output.status.success() {
-            return Err(AppError::NotFound(format!("Pool '{}' not found", pool_name)));
+            return Err(AppError::NotFound(format!(
+                "Pool '{}' not found",
+                pool_name
+            )));
         }
-        
+
         let status = String::from_utf8_lossy(&output.stdout).to_string();
-        
+
         Ok(HttpResponse::Ok().json(serde_json::json!({
             "pool": pool_name.as_str(),
             "status": status,
         })))
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = &pool_name;
-        Err(AppError::BadRequest("ZFS is only supported on Linux".to_string()))
+        Err(AppError::BadRequest(
+            "ZFS is only supported on Linux".to_string(),
+        ))
     }
 }
 
@@ -2552,7 +2575,7 @@ pub async fn run_smart_test(
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
-    
+
     #[cfg(target_os = "linux")]
     {
         let test_arg = match body.test_type.as_str() {
@@ -2561,34 +2584,41 @@ pub async fn run_smart_test(
             "conveyance" => "conveyance",
             _ => return Err(AppError::BadRequest("Invalid test type".to_string())),
         };
-        
+
         let device_path = if device.starts_with("/dev/") {
             device.to_string()
         } else {
             format!("/dev/{}", device.as_str())
         };
-        
+
         let output = Command::new("smartctl")
             .args(["-t", test_arg, &device_path])
             .output()
-            .map_err(|_| AppError::BadRequest("smartctl not found. Please install smartmontools".to_string()))?;
-        
+            .map_err(|_| {
+                AppError::BadRequest("smartctl not found. Please install smartmontools".to_string())
+            })?;
+
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::BadRequest(format!("SMART test failed: {}", error)));
+            return Err(AppError::BadRequest(format!(
+                "SMART test failed: {}",
+                error
+            )));
         }
-        
+
         Ok(HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "message": format!("{} SMART test started on {}", test_arg, device),
             "device": device.as_str(),
         })))
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (&device, &body);
-        Err(AppError::BadRequest("SMART tests are only supported on Linux".to_string()))
+        Err(AppError::BadRequest(
+            "SMART tests are only supported on Linux".to_string(),
+        ))
     }
 }
 
@@ -2599,15 +2629,15 @@ pub async fn wipe_disk(
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
-    
+
     #[cfg(target_os = "linux")]
     {
         let device_path = format!("/dev/{}", device.as_str());
-        
+
         let mount_check = Command::new("findmnt")
             .args(["-n", "-o", "TARGET", &device_path])
             .output();
-        
+
         if let Ok(output) = mount_check {
             if output.status.success() {
                 let mount_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -2619,7 +2649,7 @@ pub async fn wipe_disk(
                 }
             }
         }
-        
+
         match body.method.as_str() {
             "quick" => {
                 let _ = Command::new("dd")
@@ -2634,50 +2664,44 @@ pub async fn wipe_disk(
             }
             "full" => {
                 let _ = Command::new("dd")
-                    .args([
-                        "if=/dev/zero",
-                        &format!("of={}", device_path),
-                        "bs=1M",
-                    ])
+                    .args(["if=/dev/zero", &format!("of={}", device_path), "bs=1M"])
                     .output();
             }
             "secure" => {
                 let output = Command::new("shred")
-                    .args([
-                        "-v",
-                        "-n", "3",
-                        "-z",
-                        &device_path,
-                    ])
+                    .args(["-v", "-n", "3", "-z", &device_path])
                     .output()
                     .map_err(|_| AppError::BadRequest("shred command not found".to_string()))?;
-                
+
                 if !output.status.success() {
                     let error = String::from_utf8_lossy(&output.stderr);
-                    return Err(AppError::BadRequest(format!("Secure wipe failed: {}", error)));
+                    return Err(AppError::BadRequest(format!(
+                        "Secure wipe failed: {}",
+                        error
+                    )));
                 }
             }
             _ => return Err(AppError::BadRequest("Invalid wipe method".to_string())),
         }
-        
+
         Ok(HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "message": format!("Disk {} wiped successfully", device),
             "device": device.as_str(),
         })))
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (&device, &body);
-        Err(AppError::BadRequest("Disk wipe is only supported on Linux".to_string()))
+        Err(AppError::BadRequest(
+            "Disk wipe is only supported on Linux".to_string(),
+        ))
     }
 }
 
 #[allow(dead_code)]
-pub async fn get_disk_temperature(
-    device: web::Path<String>,
-) -> Result<HttpResponse, AppError> {
+pub async fn get_disk_temperature(device: web::Path<String>) -> Result<HttpResponse, AppError> {
     #[cfg(target_os = "linux")]
     {
         let device_path = if device.starts_with("/dev/") {
@@ -2685,19 +2709,21 @@ pub async fn get_disk_temperature(
         } else {
             format!("/dev/{}", device.as_str())
         };
-        
+
         let output = Command::new("smartctl")
             .args(["-A", &device_path])
             .output()
             .map_err(|_| AppError::InternalError)?;
-        
+
         if !output.status.success() {
-            return Err(AppError::BadRequest("Failed to read SMART data".to_string()));
+            return Err(AppError::BadRequest(
+                "Failed to read SMART data".to_string(),
+            ));
         }
-        
+
         let output_str = String::from_utf8_lossy(&output.stdout);
         let mut temperature: Option<i32> = None;
-        
+
         for line in output_str.lines() {
             if line.contains("Temperature") || line.contains("Airflow_Temperature") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
@@ -2709,16 +2735,18 @@ pub async fn get_disk_temperature(
                 }
             }
         }
-        
+
         Ok(HttpResponse::Ok().json(serde_json::json!({
             "device": device.as_str(),
             "temperature_celsius": temperature,
         })))
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = &device;
-        Err(AppError::BadRequest("Temperature reading is only supported on Linux".to_string()))
+        Err(AppError::BadRequest(
+            "Temperature reading is only supported on Linux".to_string(),
+        ))
     }
 }

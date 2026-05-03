@@ -34,10 +34,8 @@ const WINDOWS_UNCONFIGURED_STORAGE_ROOT: &str = "./storage/unconfigured";
 const WINDOWS_PORTABLE_STORAGE_ROOT: &str = "./storage";
 const WINDOWS_STORAGE_BINDING_FILE: &str = "windows-storage-root.json";
 const HLS_CACHE_PROTECTION_SECS: u64 = 600;
-const WINDOWS_STORAGE_ROOT_ENV_KEYS: &[&str] = &[
-    "ROCKZERO_WINDOWS_STORAGE_ROOT",
-    "EXTERNAL_STORAGE_PATH",
-];
+const WINDOWS_STORAGE_ROOT_ENV_KEYS: &[&str] =
+    &["ROCKZERO_WINDOWS_STORAGE_ROOT", "EXTERNAL_STORAGE_PATH"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowsStorageBinding {
@@ -261,14 +259,14 @@ impl Default for StorageConfig {
             temp_storage_path: external.join("temp"),
             hls_cache_path: external.join("cache/hls"),
             log_path: external.join("logs"),
-            min_free_space: 512 * 1024 * 1024,           // 512 MB
-            min_free_memory: 512 * 1024 * 1024,          // 512 MB
-            warning_free_memory: 768 * 1024 * 1024,      // 768 MB
-            warning_free_space: 2 * 1024 * 1024 * 1024,  // 2 GB
-            critical_free_space: 1024 * 1024 * 1024,     // 1 GB
-            max_hls_cache_size: 1024 * 1024 * 1024,      // 1 GB 鈥?瓒呰繃鑷姩娓呯悊
-            max_temp_size: 1024 * 1024 * 1024,            // 1 GB 鈥?瓒呰繃鑷姩娓呯悊
-            max_log_size: 512 * 1024 * 1024,             // 512 MB
+            min_free_space: 512 * 1024 * 1024,
+            min_free_memory: 512 * 1024 * 1024,
+            warning_free_memory: 768 * 1024 * 1024,
+            warning_free_space: 2 * 1024 * 1024 * 1024,
+            critical_free_space: 1024 * 1024 * 1024,
+            max_hls_cache_size: 1024 * 1024 * 1024,
+            max_temp_size: 1024 * 1024 * 1024,
+            max_log_size: 512 * 1024 * 1024,
             hls_cache_retention_days: 1,
             temp_file_retention_days: 1,
             log_retention_days: 30,
@@ -306,10 +304,7 @@ impl StorageConfig {
                 .unwrap_or_else(|_| external_storage_path.join("logs")),
             min_free_space: env_u64("MIN_FREE_SPACE", defaults.min_free_space),
             min_free_memory: env_u64("MIN_FREE_MEMORY", defaults.min_free_memory),
-            warning_free_memory: env_u64(
-                "WARNING_FREE_MEMORY",
-                defaults.warning_free_memory,
-            ),
+            warning_free_memory: env_u64("WARNING_FREE_MEMORY", defaults.warning_free_memory),
             warning_free_space: env_u64("WARNING_FREE_SPACE", defaults.warning_free_space),
             critical_free_space: env_u64("CRITICAL_FREE_SPACE", defaults.critical_free_space),
             max_hls_cache_size: env_u64("MAX_HLS_CACHE_SIZE", defaults.max_hls_cache_size),
@@ -334,11 +329,8 @@ impl StorageConfig {
             &self.external_storage_path,
             "videos",
         );
-        self.temp_storage_path = coerce_external_path(
-            &self.temp_storage_path,
-            &self.external_storage_path,
-            "temp",
-        );
+        self.temp_storage_path =
+            coerce_external_path(&self.temp_storage_path, &self.external_storage_path, "temp");
         self.hls_cache_path = coerce_external_path(
             &self.hls_cache_path,
             &self.external_storage_path,
@@ -527,7 +519,7 @@ impl StorageManager {
         let temp = self.temp_bytes.load(Ordering::Relaxed);
         let logs = self.log_bytes.load(Ordering::Relaxed);
         let total_cache = hls + temp;
-        let threshold: u64 = 1024 * 1024 * 1024; // 1 GB
+        let threshold: u64 = 1024 * 1024 * 1024;
 
         let usage_percent = if threshold > 0 {
             (total_cache as f64 / threshold as f64 * 100.0).min(100.0)
@@ -536,7 +528,8 @@ impl StorageManager {
         };
 
         let memory_pressure = self.get_memory_pressure_level();
-        let status = if total_cache > threshold || memory_pressure == CachePressureLevel::Emergency {
+        let status = if total_cache > threshold || memory_pressure == CachePressureLevel::Emergency
+        {
             "cleaning".to_string()
         } else if total_cache as f64 > threshold as f64 * 0.8
             || memory_pressure == CachePressureLevel::Warning
@@ -708,7 +701,7 @@ impl StorageManager {
 
         let m = self.clone();
         tokio::spawn(async move {
-            let threshold: u64 = 1024 * 1024 * 1024; // 1 GB
+            let threshold: u64 = 1024 * 1024 * 1024;
             let mut tick = interval(Duration::from_secs(30));
             loop {
                 tick.tick().await;
@@ -1053,10 +1046,7 @@ impl StorageManager {
                 format_bytes(self.config.warning_free_space),
             );
         } else {
-            info!(
-                "Disk pressure resolved to {} after cleanup",
-                pressure
-            );
+            info!("Disk pressure resolved to {} after cleanup", pressure);
         }
 
         info!("Cleanup completed");
@@ -1565,7 +1555,7 @@ async fn cleanup_old_entries_bytes(
                 }
             }
         } else if md.is_file() {
-            if is_cache_entry_protected(path, protection_secs).await {
+            if is_cache_entry_protected(&entry.path(), protection_secs).await {
                 continue;
             }
             let modified = md
@@ -1651,15 +1641,21 @@ async fn lru_evict_from_directory(path: &Path, target_bytes: u64) -> std::io::Re
         };
         if ok {
             freed += ce.size;
-            info!("LRU eviction: removed {:?} ({} freed)", ce.path, format_bytes(ce.size));
+            info!(
+                "LRU eviction: removed {:?} ({} freed)",
+                ce.path,
+                format_bytes(ce.size)
+            );
         } else {
-            warn!("LRU eviction: failed to remove {:?} (may be in use)", ce.path);
+            warn!(
+                "LRU eviction: failed to remove {:?} (may be in use)",
+                ce.path
+            );
         }
     }
 
     Ok(freed)
 }
-
 
 #[cfg(test)]
 mod tests {

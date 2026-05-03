@@ -225,8 +225,6 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), AppError> {
     Ok(())
 }
 
-// ============ 用户操作 ============
-
 pub async fn create_user(pool: &SqlitePool, user: &User) -> Result<(), AppError> {
     sqlx::query(
         r#"
@@ -309,8 +307,6 @@ pub async fn count_users(pool: &SqlitePool) -> Result<i64, AppError> {
         .map_err(to_app_error)?;
     Ok(count.0)
 }
-
-// ============ 推荐码操作 ============
 
 pub async fn create_invite_code(pool: &SqlitePool, invite: &InviteCode) -> Result<(), AppError> {
     sqlx::query(
@@ -400,8 +396,6 @@ pub async fn get_latest_valid_invite(
     Ok(invite)
 }
 
-// ============ 文件操作 ============
-
 pub async fn create_file_metadata(pool: &SqlitePool, file: &FileMetadata) -> Result<(), AppError> {
     sqlx::query(
         r#"
@@ -483,8 +477,6 @@ pub async fn delete_file_metadata(
     Ok(result.rows_affected() > 0)
 }
 
-// ============ 媒体操作 ============
-
 pub async fn create_media_item(pool: &SqlitePool, media: &MediaItem) -> Result<(), AppError> {
     sqlx::query(
         r#"
@@ -527,8 +519,6 @@ pub async fn list_media_by_user(
 
     Ok(items)
 }
-
-// ============ 小组件操作 ============
 
 pub async fn create_widget(pool: &SqlitePool, widget: &Widget) -> Result<(), AppError> {
     sqlx::query(

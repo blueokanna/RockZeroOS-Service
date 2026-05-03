@@ -117,6 +117,7 @@ pub struct SecureStreamTransport {
     sequence_counter: Arc<RwLock<u64>>,
     zkp_registration: Arc<RwLock<Option<PasswordRegistration>>>,
     zkp_password: Arc<RwLock<Option<String>>>,
+    sae_psk: Arc<RwLock<Option<[u8; 32]>>>,
 }
 
 impl SecureStreamTransport {
@@ -132,6 +133,7 @@ impl SecureStreamTransport {
             sequence_counter: Arc::new(RwLock::new(0)),
             zkp_registration: Arc::new(RwLock::new(None)),
             zkp_password: Arc::new(RwLock::new(None)),
+            sae_psk: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -140,16 +142,40 @@ impl SecureStreamTransport {
         *self.zkp_registration.write().await = Some(registration);
     }
 
+    pub async fn configure_sae_psk(&self, psk: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        if psk.len() < 32 {
+            return Err("SAE PSK must be at least 32 bytes".into());
+        }
+        let mut input = Vec::with_capacity(32 + psk.len());
+        input.extend_from_slice(b"rockzero-sae-psk-derive-v1");
+        input.extend_from_slice(psk);
+        let derived = blake3_hash_bytes(&input);
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&derived[..32]);
+        *self.sae_psk.write().await = Some(key);
+        Ok(())
+    }
+
     pub async fn initiate_sae_auth(
         &self,
         peer_id: &str,
     ) -> Result<SaeAuthState, Box<dyn std::error::Error>> {
+        let psk = {
+            let guard = self.sae_psk.read().await;
+            (*guard)
+                .ok_or("SAE PSK not configured; call configure_sae_psk before initiate_sae_auth")?
+        };
+
         let mut commit_scalar = vec![0u8; 32];
         let mut commit_element = vec![0u8; 32];
         OsRng.fill_bytes(&mut commit_scalar);
         OsRng.fill_bytes(&mut commit_element);
 
-        let mut secret_input = Vec::with_capacity(commit_scalar.len() + commit_element.len() + peer_id.len());
+        let mut secret_input = Vec::with_capacity(
+            psk.len() + commit_scalar.len() + commit_element.len() + peer_id.len() + 32,
+        );
+        secret_input.extend_from_slice(b"rockzero-sae-shared-secret-v2");
+        secret_input.extend_from_slice(&psk);
         secret_input.extend_from_slice(&commit_scalar);
         secret_input.extend_from_slice(&commit_element);
         secret_input.extend_from_slice(peer_id.as_bytes());
@@ -185,7 +211,8 @@ impl SecureStreamTransport {
                 return Ok(false);
             }
 
-            let mut confirm_input = Vec::with_capacity(state.commit_scalar.len() + peer_commit.len());
+            let mut confirm_input =
+                Vec::with_capacity(state.commit_scalar.len() + peer_commit.len());
             confirm_input.extend_from_slice(&state.commit_scalar);
             confirm_input.extend_from_slice(peer_commit);
             let confirm_hash = blake3_hash_bytes(&confirm_input);
@@ -321,8 +348,8 @@ impl SecureStreamTransport {
                 .clone()
                 .ok_or("Missing ZKP registration while ZKP is enabled")?;
 
-            let parsed_proof: EnhancedPasswordProof =
-                serde_json::from_slice(proof).map_err(|_| "Invalid EnhancedPasswordProof payload")?;
+            let parsed_proof: EnhancedPasswordProof = serde_json::from_slice(proof)
+                .map_err(|_| "Invalid EnhancedPasswordProof payload")?;
             let context = format!("secure_stream_chunk:{}", chunk.sequence);
             let zkp_ctx = ZkpContext::new();
             return zkp_ctx
@@ -387,6 +414,7 @@ mod tests {
             ..StreamConfig::default()
         };
         let transport = SecureStreamTransport::new(config).unwrap();
+        transport.configure_sae_psk(&[0xA5u8; 32]).await.unwrap();
         let auth_state = transport.initiate_sae_auth("peer1").await.unwrap();
         let mut expected_commit_input = Vec::new();
         expected_commit_input.extend_from_slice(&auth_state.shared_secret);
@@ -397,7 +425,8 @@ mod tests {
         transport
     }
 
-    async fn setup_transport_with_zkp_auth() -> (SecureStreamTransport, String, PasswordRegistration) {
+    async fn setup_transport_with_zkp_auth() -> (SecureStreamTransport, String, PasswordRegistration)
+    {
         let transport = setup_authenticated_transport(true).await;
         let password = "SecureTestPassword123!@#".to_string();
         let zkp_ctx = ZkpContext::new();
@@ -412,6 +441,7 @@ mod tests {
     async fn test_sae_auth() {
         let config = StreamConfig::default();
         let transport = SecureStreamTransport::new(config).unwrap();
+        transport.configure_sae_psk(&[0xA5u8; 32]).await.unwrap();
 
         let auth_state = transport.initiate_sae_auth("peer1").await.unwrap();
         assert!(!auth_state.confirmed);
@@ -517,11 +547,6 @@ mod tests {
     }
 }
 
-// ============================================================================
-// HybridTransport：UDP 70% + TCP 30% 混合传输层
-// ============================================================================
-
-/// 混合传输统计信息
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HybridTransportStats {
     pub udp_chunks_sent: u64,
@@ -539,36 +564,34 @@ pub struct HybridTransportStats {
     pub last_activity: u64,
 }
 
-/// 混合传输配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HybridConfig {
-    /// UDP 传输比例 (0.0 - 1.0)，默认 0.7
     pub udp_ratio: f32,
-    /// TCP 传输比例 (0.0 - 1.0)，默认 0.3
+
     pub tcp_ratio: f32,
-    /// 每个数据块大小（字节），默认 64KB
+
     pub chunk_size: usize,
-    /// UDP 绑定端口
+
     pub udp_bind_addr: String,
-    /// TCP 绑定端口
+
     pub tcp_bind_addr: String,
-    /// 最大并发 UDP 发送窗口
+
     pub udp_window_size: usize,
-    /// TCP 重试次数
+
     pub tcp_max_retries: u32,
-    /// UDP 丢包阈值 — 超过后动态增加 TCP 比例
+
     pub udp_loss_threshold: f64,
-    /// 自适应比例调整启用
+
     pub adaptive_ratio: bool,
-    /// 自适应下 UDP 最小占比（默认 10%，即 TCP 最大 90%）
+
     #[serde(default = "default_udp_min_ratio")]
     pub udp_min_ratio: f32,
-    /// 自适应下 UDP 最大占比（默认 70%，即 TCP 最小 30%）
+
     #[serde(default = "default_udp_max_ratio")]
     pub udp_max_ratio: f32,
-    /// 发送缓冲区大小
+
     pub send_buffer_size: usize,
-    /// 接收乱序重排缓冲区大小
+
     pub reorder_buffer_size: usize,
 }
 
@@ -590,62 +613,47 @@ impl Default for HybridConfig {
             tcp_bind_addr: "0.0.0.0:0".to_string(),
             udp_window_size: 32,
             tcp_max_retries: 3,
-            udp_loss_threshold: 0.05, // 5% 丢包率阈值
+            udp_loss_threshold: 0.05,
             adaptive_ratio: true,
             udp_min_ratio: 0.10,
             udp_max_ratio: 0.70,
-            send_buffer_size: 8 * 1024 * 1024,  // 8MB
+            send_buffer_size: 8 * 1024 * 1024,
             reorder_buffer_size: 256,
         }
     }
 }
 
-/// 块路由决策
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportChannel {
     Udp,
     Tcp,
 }
 
-/// 待发送的数据块描述
 #[derive(Debug, Clone)]
 pub struct TransportChunk {
     pub sequence: u64,
     pub chunk_type: ChunkType,
     pub data: Vec<u8>,
     pub channel: TransportChannel,
-    pub priority: u8, // 0 = 最高，255 = 最低
+    pub priority: u8,
 }
 
-/// 混合传输层 — 将数据按 70% UDP + 30% TCP 分发
-///
-/// 设计原则：
-/// - 关键帧 (KeyFrame) 和字幕 (Subtitle) 始终通过 TCP 可靠传输
-/// - 普通帧 (NormalFrame) 按 udp_ratio/tcp_ratio 分配
-/// - 音频 (Audio) 70% TCP 30% UDP（音频丢包更敏感）
-/// - 支持自适应比例调整：UDP 丢包率超阈值时自动增加 TCP 比例
-/// - 接收端使用重排缓冲区恢复乱序数据
 pub struct HybridTransport {
     transport: Arc<SecureStreamTransport>,
     config: HybridConfig,
     stats: Arc<RwLock<HybridTransportStats>>,
-    /// 当前动态 UDP 比例（自适应调整）
+
     current_udp_ratio: Arc<RwLock<f32>>,
-    /// 接收端乱序重排缓冲区
+
     reorder_buffer: Arc<RwLock<BTreeMap<u64, EncryptedChunk>>>,
-    /// 已确认的最大连续序列号
+
     last_delivered_seq: Arc<RwLock<u64>>,
-    /// 带宽估算采样窗口
-    bandwidth_samples: Arc<RwLock<Vec<(u64, u64)>>>, // (timestamp_ms, bytes)
+
+    bandwidth_samples: Arc<RwLock<Vec<(u64, u64)>>>,
 }
 
 impl HybridTransport {
-    /// 创建新的混合传输层
-    pub fn new(
-        transport: Arc<SecureStreamTransport>,
-        mut config: HybridConfig,
-    ) -> Self {
-        // 归一化边界，确保满足：UDP ∈ [10%, 70%]，TCP ∈ [30%, 90%]
+    pub fn new(transport: Arc<SecureStreamTransport>, mut config: HybridConfig) -> Self {
         if config.udp_min_ratio < 0.0 {
             config.udp_min_ratio = 0.0;
         }
@@ -681,28 +689,14 @@ impl HybridTransport {
         }
     }
 
-    /// 使用默认 70/30 配置创建
     pub fn with_default_config(transport: Arc<SecureStreamTransport>) -> Self {
         Self::new(transport, HybridConfig::default())
     }
 
-    /// 决定数据块的传输通道
-    ///
-    /// 路由策略：
-    /// - KeyFrame → TCP（100%，不可丢失）
-    /// - Subtitle → TCP（100%，不可丢失）
-    /// - Audio → 70% TCP + 30% UDP（音频丢包敏感）
-    /// - NormalFrame → 按当前动态比例分配 UDP/TCP
-    pub async fn route_chunk(
-        &self,
-        chunk_type: ChunkType,
-        sequence: u64,
-    ) -> TransportChannel {
+    pub async fn route_chunk(&self, chunk_type: ChunkType, sequence: u64) -> TransportChannel {
         match chunk_type {
-            // 关键帧和字幕必须可靠传输
             ChunkType::KeyFrame | ChunkType::Subtitle => TransportChannel::Tcp,
 
-            // 音频偏向 TCP（70% TCP, 30% UDP）
             ChunkType::Audio => {
                 if (sequence % 10) < 7 {
                     TransportChannel::Tcp
@@ -711,7 +705,6 @@ impl HybridTransport {
                 }
             }
 
-            // 普通帧按动态比例分配
             ChunkType::NormalFrame => {
                 let ratio = *self.current_udp_ratio.read().await;
                 let threshold = (ratio * 100.0) as u64;
@@ -724,7 +717,6 @@ impl HybridTransport {
         }
     }
 
-    /// 将原始数据分割为传输块并分配通道
     pub async fn prepare_chunks(
         &self,
         data: &[u8],
@@ -738,10 +730,8 @@ impl HybridTransport {
             let end = (offset + chunk_size).min(data.len());
             let chunk_data = &data[offset..end];
 
-            // 加密数据块
             let encrypted = self.transport.encrypt_chunk(chunk_data, chunk_type).await?;
 
-            // 决定传输通道
             let channel = self.route_chunk(chunk_type, encrypted.sequence).await;
 
             let priority = match chunk_type {
@@ -767,11 +757,6 @@ impl HybridTransport {
         Ok(chunks)
     }
 
-    /// 通过混合通道发送数据块列表
-    ///
-    /// 将块按通道分组后并行发送：
-    /// - UDP 块批量发送（不等待 ACK，最大化吞吐）
-    /// - TCP 块顺序发送（确保可靠到达）
     pub async fn send_chunks(
         &self,
         chunks: Vec<TransportChunk>,
@@ -791,10 +776,8 @@ impl HybridTransport {
         let udp_count = udp_chunks.len();
         let tcp_count = tcp_chunks.len();
 
-        // 并行发送 UDP 和 TCP
         let udp_socket = tokio::net::UdpSocket::bind(&self.config.udp_bind_addr).await?;
 
-        // 设置 UDP 发送缓冲区
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
@@ -815,7 +798,6 @@ impl HybridTransport {
         let mut udp_lost = 0u64;
         let mut tcp_bytes = 0u64;
 
-        // 发送 UDP 块（批量，无需等待 ACK）
         for chunk in &udp_chunks {
             match udp_socket.send_to(&chunk.data, udp_dest).await {
                 Ok(n) => udp_bytes += n as u64,
@@ -826,58 +808,57 @@ impl HybridTransport {
                         e
                     );
                     udp_lost += 1;
-                    // UDP 发送失败的块降级到 TCP
+
                     tcp_chunks.push(chunk);
                 }
             }
         }
 
-        // 发送 TCP 块（顺序，可靠）
         let tcp_stream_clone = tcp_stream;
         for chunk in &tcp_chunks {
             let len = chunk.data.len() as u32;
             let mut retries = 0;
             loop {
-                // 使用 try_write 检查是否可写
                 match tcp_stream_clone.try_write(&len.to_le_bytes()) {
-                    Ok(_) => {
-                        match tcp_stream_clone.try_write(&chunk.data) {
-                            Ok(n) => {
-                                tcp_bytes += (n + 4) as u64;
-                                break;
-                            }
-                            Err(e) if retries < self.config.tcp_max_retries => {
-                                retries += 1;
-                                log::warn!(
-                                    "TCP write retry {}/{} for seq {}: {}",
-                                    retries,
-                                    self.config.tcp_max_retries,
-                                    chunk.sequence,
-                                    e
-                                );
-                                tokio::time::sleep(tokio::time::Duration::from_millis(
-                                    10 * retries as u64,
-                                ))
-                                .await;
-                            }
-                            Err(e) => {
-                                log::error!(
-                                    "TCP send failed for seq {} after {} retries: {}",
-                                    chunk.sequence,
-                                    retries,
-                                    e
-                                );
-                                break;
-                            }
+                    Ok(_) => match tcp_stream_clone.try_write(&chunk.data) {
+                        Ok(n) => {
+                            tcp_bytes += (n + 4) as u64;
+                            break;
                         }
-                    }
+                        Err(e) if retries < self.config.tcp_max_retries => {
+                            retries += 1;
+                            log::warn!(
+                                "TCP write retry {}/{} for seq {}: {}",
+                                retries,
+                                self.config.tcp_max_retries,
+                                chunk.sequence,
+                                e
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                10 * retries as u64,
+                            ))
+                            .await;
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "TCP send failed for seq {} after {} retries: {}",
+                                chunk.sequence,
+                                retries,
+                                e
+                            );
+                            break;
+                        }
+                    },
                     Err(e) if retries < self.config.tcp_max_retries => {
                         retries += 1;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(
-                            10 * retries as u64,
-                        ))
-                        .await;
-                        log::warn!("TCP header write retry {}/{}: {}", retries, self.config.tcp_max_retries, e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10 * retries as u64))
+                            .await;
+                        log::warn!(
+                            "TCP header write retry {}/{}: {}",
+                            retries,
+                            self.config.tcp_max_retries,
+                            e
+                        );
                     }
                     Err(e) => {
                         log::error!("TCP header send failed for seq {}: {}", chunk.sequence, e);
@@ -887,7 +868,6 @@ impl HybridTransport {
             }
         }
 
-        // 更新统计
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -909,21 +889,18 @@ impl HybridTransport {
                 stats.effective_tcp_ratio = stats.tcp_bytes_sent as f64 / total as f64;
             }
 
-            // 带宽估算
             let elapsed_s = (now - stats.started_at).max(1) as f64 / 1000.0;
             stats.bandwidth_bps = (total as f64 / elapsed_s) as u64;
         }
 
-        // 自适应比例调整
         if self.config.adaptive_ratio {
             self.adapt_ratio().await;
         }
 
-        // 带宽采样
         {
             let mut samples = self.bandwidth_samples.write().await;
             samples.push((now, udp_bytes + tcp_bytes));
-            // 只保留最近 100 个采样
+
             if samples.len() > 100 {
                 samples.drain(0..50);
             }
@@ -938,13 +915,6 @@ impl HybridTransport {
         })
     }
 
-    /// 自适应调整 UDP/TCP 比例
-    ///
-    /// 基于 UDP 丢包率动态调整：
-    /// - 丢包率 < 2%：增加 UDP 比例（最大 0.70）
-    /// - 丢包率 2-5%：保持当前比例
-    /// - 丢包率 > 5%：减少 UDP 比例（最低 0.10）
-    /// - 丢包率 > 15%：大幅减少 UDP（最低 0.10）
     async fn adapt_ratio(&self) {
         let stats = self.stats.read().await;
         let total_udp = stats.udp_chunks_sent;
@@ -952,7 +922,7 @@ impl HybridTransport {
         drop(stats);
 
         if total_udp < 50 {
-            return; // 采样不足，不调整
+            return;
         }
 
         let loss_rate = lost as f64 / total_udp as f64;
@@ -961,10 +931,8 @@ impl HybridTransport {
         let max_udp = self.config.udp_max_ratio;
 
         if loss_rate < 0.02 {
-            // 网络良好，逐步增加 UDP
             *ratio = (*ratio + 0.02).clamp(min_udp, max_udp);
         } else if loss_rate > 0.15 {
-            // 网络极差，大幅减少 UDP
             *ratio = (*ratio - 0.10).clamp(min_udp, max_udp);
             log::warn!(
                 "High UDP loss rate ({:.1}%), reducing UDP ratio to {:.0}%",
@@ -972,7 +940,6 @@ impl HybridTransport {
                 *ratio * 100.0
             );
         } else if loss_rate > self.config.udp_loss_threshold {
-            // 丢包率超阈值，减少 UDP
             *ratio = (*ratio - 0.05).clamp(min_udp, max_udp);
             log::info!(
                 "UDP loss rate ({:.1}%) above threshold, adjusting ratio to {:.0}%",
@@ -981,18 +948,15 @@ impl HybridTransport {
             );
         }
 
-        // 同步配置语义（current_tcp = 1 - current_udp）
         let current_tcp = 1.0 - *ratio;
         debug_assert!((0.30..=0.90).contains(&current_tcp));
     }
 
-    /// 接收端：将接收到的块放入重排缓冲区
     pub async fn buffer_received_chunk(&self, chunk: EncryptedChunk) {
         let seq = chunk.sequence;
         let mut buffer = self.reorder_buffer.write().await;
         buffer.insert(seq, chunk);
 
-        // 限制缓冲区大小
         while buffer.len() > self.config.reorder_buffer_size {
             if let Some((&oldest_seq, _)) = buffer.iter().next() {
                 buffer.remove(&oldest_seq);
@@ -1000,10 +964,6 @@ impl HybridTransport {
         }
     }
 
-    /// 接收端：从重排缓冲区取出连续可交付的块
-    ///
-    /// 只返回从 last_delivered_seq + 1 开始的连续块序列，
-    /// 确保数据按顺序交付给上层。
     pub async fn drain_ordered_chunks(&self) -> Vec<EncryptedChunk> {
         let mut buffer = self.reorder_buffer.write().await;
         let mut last_seq = self.last_delivered_seq.write().await;
@@ -1022,7 +982,6 @@ impl HybridTransport {
         result
     }
 
-    /// 估算当前带宽（bytes/sec）
     pub async fn estimate_bandwidth(&self) -> u64 {
         let samples = self.bandwidth_samples.read().await;
         if samples.len() < 2 {
@@ -1042,12 +1001,10 @@ impl HybridTransport {
         (total_bytes as f64 / (elapsed_ms as f64 / 1000.0)) as u64
     }
 
-    /// 获取传输统计
     pub async fn get_stats(&self) -> HybridTransportStats {
         self.stats.read().await.clone()
     }
 
-    /// 重置统计
     pub async fn reset_stats(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1063,18 +1020,15 @@ impl HybridTransport {
         self.bandwidth_samples.write().await.clear();
     }
 
-    /// 获取当前动态 UDP 比例
     pub async fn current_udp_ratio(&self) -> f32 {
         *self.current_udp_ratio.read().await
     }
 
-    /// 获取底层配置
     pub fn config(&self) -> &HybridConfig {
         &self.config
     }
 }
 
-/// 发送结果
 #[derive(Debug, Clone)]
 pub struct HybridSendResult {
     pub udp_sent: usize,

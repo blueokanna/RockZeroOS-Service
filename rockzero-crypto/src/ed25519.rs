@@ -56,7 +56,9 @@ impl Ed25519Context {
             .map_err(|_| AppError::CryptoError("Invalid secret key encoding".to_string()))?;
 
         if secret_bytes.len() != SECRET_KEY_LENGTH {
-            return Err(AppError::CryptoError("Invalid secret key length".to_string()));
+            return Err(AppError::CryptoError(
+                "Invalid secret key length".to_string(),
+            ));
         }
 
         let mut secret_array = [0u8; SECRET_KEY_LENGTH];
@@ -77,7 +79,9 @@ impl Ed25519Context {
             .map_err(|_| AppError::CryptoError("Invalid public key encoding".to_string()))?;
 
         if public_bytes.len() != PUBLIC_KEY_LENGTH {
-            return Err(AppError::CryptoError("Invalid public key length".to_string()));
+            return Err(AppError::CryptoError(
+                "Invalid public key length".to_string(),
+            ));
         }
 
         let mut public_array = [0u8; PUBLIC_KEY_LENGTH];
@@ -117,7 +121,9 @@ impl Ed25519Context {
             .map_err(|_| AppError::CryptoError("Invalid public key encoding".to_string()))?;
 
         if public_bytes.len() != PUBLIC_KEY_LENGTH {
-            return Err(AppError::CryptoError("Invalid public key length".to_string()));
+            return Err(AppError::CryptoError(
+                "Invalid public key length".to_string(),
+            ));
         }
 
         let mut public_array = [0u8; PUBLIC_KEY_LENGTH];
@@ -131,7 +137,9 @@ impl Ed25519Context {
             .map_err(|_| AppError::CryptoError("Invalid signature encoding".to_string()))?;
 
         if sig_bytes.len() != SIGNATURE_LENGTH {
-            return Err(AppError::CryptoError("Invalid signature length".to_string()));
+            return Err(AppError::CryptoError(
+                "Invalid signature length".to_string(),
+            ));
         }
 
         let mut sig_array = [0u8; SIGNATURE_LENGTH];
@@ -168,7 +176,9 @@ impl Ed25519Context {
         }
 
         if signed_message.timestamp > now + 60 {
-            return Err(AppError::CryptoError("Message timestamp in future".to_string()));
+            return Err(AppError::CryptoError(
+                "Message timestamp in future".to_string(),
+            ));
         }
 
         let data_to_verify = format!("{}:{}", signed_message.message, signed_message.timestamp);

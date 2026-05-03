@@ -133,7 +133,7 @@ impl FfmpegManager {
                         "FFmpeg extracted successfully from {}",
                         archive_path.display()
                     );
-                    // 设置路径
+
                     let ffmpeg_bin = self.base_dir.join("ffmpeg");
                     if ffmpeg_bin.exists() {
                         self.ffmpeg_path = Some(ffmpeg_bin.clone());
@@ -199,17 +199,14 @@ impl FfmpegManager {
         );
         candidates.push(self.base_dir.join(&archive_name));
 
-        // 父目录
         if let Some(parent) = self.base_dir.parent() {
             candidates.push(parent.join(&archive_name));
             candidates.push(parent.join("assets").join(&archive_name));
         }
 
-        // 当前目录
         candidates.push(PathBuf::from(&archive_name));
         candidates.push(PathBuf::from("assets").join(&archive_name));
 
-        // 绝对路径尝试
         candidates.push(PathBuf::from("/app/assets").join(&archive_name));
         candidates.push(PathBuf::from("/opt/rockzero/assets").join(&archive_name));
 
@@ -231,7 +228,6 @@ impl FfmpegManager {
     }
 
     fn find_system_ffmpeg(&self) -> Option<PathBuf> {
-        // 检查 base_dir 中的 ffmpeg
         let local_path = self.base_dir.join(if cfg!(target_os = "windows") {
             "ffmpeg.exe"
         } else {
@@ -249,7 +245,6 @@ impl FfmpegManager {
             }
         }
 
-        // 检查系统 PATH
         if cfg!(target_os = "windows") {
             if let Ok(output) = Command::new("where").arg("ffmpeg").output() {
                 if output.status.success() {
@@ -264,7 +259,6 @@ impl FfmpegManager {
             }
         }
 
-        // 检查常见路径
         let common_paths = [
             "/usr/bin/ffmpeg",
             "/usr/local/bin/ffmpeg",
@@ -283,7 +277,6 @@ impl FfmpegManager {
     }
 
     fn find_system_ffprobe(&self) -> Option<PathBuf> {
-        // 检查 base_dir 中的 ffprobe
         let local_path = self.base_dir.join(if cfg!(target_os = "windows") {
             "ffprobe.exe"
         } else {
@@ -393,7 +386,6 @@ impl FfmpegManager {
 
         #[cfg(target_family = "unix")]
         {
-            // 创建临时解压目录
             let temp_dir = self.base_dir.join("temp_extract");
             if temp_dir.exists() {
                 std::fs::remove_dir_all(&temp_dir)?;
@@ -412,10 +404,8 @@ impl FfmpegManager {
                 return Err(format!("Failed to extract archive: {}", error_msg).into());
             }
 
-            // 查找解压后的 ffmpeg 二进制文件
             self.find_and_setup_extracted_binaries(&temp_dir)?;
 
-            // 清理临时目录
             let _ = std::fs::remove_dir_all(&temp_dir);
 
             return Ok(());
@@ -449,7 +439,6 @@ impl FfmpegManager {
                     let dest_path = self.base_dir.join("ffmpeg");
                     std::fs::copy(entry.path(), &dest_path)?;
 
-                    // Set executable permissions
                     let metadata = std::fs::metadata(&dest_path)?;
                     let mut permissions = metadata.permissions();
                     permissions.set_mode(0o755);
@@ -463,7 +452,6 @@ impl FfmpegManager {
                     let dest_path = self.base_dir.join("ffprobe");
                     std::fs::copy(entry.path(), &dest_path)?;
 
-                    // Set executable permissions
                     let metadata = std::fs::metadata(&dest_path)?;
                     let mut permissions = metadata.permissions();
                     permissions.set_mode(0o755);

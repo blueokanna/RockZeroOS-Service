@@ -166,23 +166,19 @@ pub async fn chunked_download(
     })))
 }
 
-/// 分块上传请求
 #[derive(Debug, Deserialize)]
 pub struct ChunkedUploadRequest {
     pub sequence: u64,
     pub is_keyframe: bool,
 }
 
-/// 分块下载请求
 #[derive(Debug, Deserialize)]
 pub struct ChunkedDownloadRequest {
     pub seek_to: Option<u64>,
     pub timeout_ms: Option<u64>,
 }
 
-/// 解析Range头
 fn parse_range(range: &str, file_size: u64) -> Result<(u64, u64), AppError> {
-    // 格式: "bytes=start-end" 或 "bytes=start-"
     let range = range.trim_start_matches("bytes=");
     let parts: Vec<&str> = range.split('-').collect();
 
@@ -213,12 +209,10 @@ fn parse_range(range: &str, file_size: u64) -> Result<(u64, u64), AppError> {
     Ok((start, end))
 }
 
-/// 获取文件校验和
 pub async fn get_file_checksum(
     query: web::Query<DownloadRequest>,
     req: HttpRequest,
 ) -> Result<HttpResponse, AppError> {
-    // 验证认证
     crate::middleware::verify_auth(&req).await?;
 
     let file_path = PathBuf::from(&query.path);
@@ -227,7 +221,6 @@ pub async fn get_file_checksum(
         return Err(AppError::NotFound("File not found".to_string()));
     }
 
-    // 计算 Blake3 校验和
     let mut file = File::open(&file_path).await?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; 8192];

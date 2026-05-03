@@ -153,7 +153,6 @@ pub async fn get_cpu_info() -> Result<impl Responder, AppError> {
             })
             .collect();
 
-        // 获取 CPU 核心架构信息 (ARM big.LITTLE 等)
         let hw_caps = hardware::detect_hardware();
         let core_types: Vec<CpuCoreArchInfo> = hw_caps
             .cpu_core_types
@@ -214,14 +213,11 @@ pub async fn get_memory_info() -> Result<impl Responder, AppError> {
 }
 
 pub async fn get_disk_info() -> Result<impl Responder, AppError> {
-    // 获取所有块设备信息（包括未挂载的）
     let block_devices = hardware::get_all_block_devices();
     let mut disks = Vec::new();
     let mut seen_devices: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // 首先添加所有块设备
     for block_dev in block_devices {
-        // 跳过虚拟设备
         if block_dev.name.starts_with("loop")
             || block_dev.name.starts_with("ram")
             || block_dev.name.starts_with("zram")
@@ -230,7 +226,6 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
             continue;
         }
 
-        // 跳过 eMMC boot 分区 (mmcblk*boot0, mmcblk*boot1)
         if block_dev.name.contains("boot0")
             || block_dev.name.contains("boot1")
             || block_dev.name.contains("rpmb")
@@ -238,7 +233,6 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
             continue;
         }
 
-        // 如果设备有分区，添加分区信息
         if !block_dev.partitions.is_empty() {
             for partition in &block_dev.partitions {
                 let device_key = partition.device_path.clone();
@@ -256,7 +250,6 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                     .clone()
                     .unwrap_or_else(|| "Unknown".to_string());
 
-                // 跳过 VFAT/FAT 格式的磁盘（通常是 /boot 分区）
                 let fs_upper = file_system.to_uppercase();
                 if fs_upper == "VFAT"
                     || fs_upper == "FAT32"
@@ -266,12 +259,10 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                     continue;
                 }
 
-                // 跳过 /boot 分区
                 if mount_point == "/boot" || mount_point.starts_with("/boot/") {
                     continue;
                 }
 
-                // 跳过系统虚拟文件系统
                 if mount_point.starts_with("/sys")
                     || mount_point.starts_with("/proc")
                     || mount_point.starts_with("/dev") && !mount_point.starts_with("/dev/shm")
@@ -285,7 +276,6 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                     continue;
                 }
 
-                // 跳过 eMMC boot 分区
                 if partition.name.contains("boot0")
                     || partition.name.contains("boot1")
                     || partition.name.contains("rpmb")
@@ -317,15 +307,8 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                                         let free = free_blocks * block_size;
                                         let avail = avail_blocks * block_size;
 
-                                        // 真实已用空间 = 总空间 - 空闲空间（包含保留块）
-                                        // 但对用户来说，"已用" 应该是 总空间 - 用户可用空间 - 保留块
-                                        // 即：used = total - free (实际占用)
-                                        // 保留块 = free - avail
-                                        // 用户数据 = total - free = used (不含保留块)
                                         let used = total.saturating_sub(free);
 
-                                        // 对于用户显示，总空间应该减去保留块
-                                        // 这样 used/total 的比例才是用户真正关心的
                                         let reserved = free.saturating_sub(avail);
                                         let user_total = total.saturating_sub(reserved);
 
@@ -338,7 +321,6 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                         if let Some((used, avail, total)) = stat_result {
                             (used, avail, total)
                         } else {
-                            // 回退到 sysinfo
                             let disks_info = Disks::new_with_refreshed_list();
                             let mut found = false;
                             let mut total = partition.size;
@@ -432,7 +414,6 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
                 });
             }
         } else {
-            // 没有分区的设备，显示整个设备
             let device_key = block_dev.device_path.clone();
             if seen_devices.contains(&device_key) {
                 continue;
@@ -453,7 +434,6 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
         }
     }
 
-    // 按挂载点排序
     disks.sort_by(|a, b| {
         if a.mount_point == "/" {
             return std::cmp::Ordering::Less;
@@ -477,13 +457,12 @@ pub async fn get_disk_info() -> Result<impl Responder, AppError> {
 fn get_available_space(device_path: &str) -> Option<u64> {
     use std::fs;
 
-    // 从 /proc/mounts 查找挂载点
     if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
         for line in mounts.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 && parts[0] == device_path {
                 let mount_point = parts[1];
-                // 使用 statvfs 获取可用空间
+
                 let disks_info = Disks::new_with_refreshed_list();
                 for disk in disks_info.list() {
                     if disk.mount_point().to_string_lossy() == mount_point {
@@ -777,7 +756,6 @@ fn get_mount_size(mount_point: &str) -> Option<u64> {
     None
 }
 
-/// 检测网络接口
 fn detect_network_interfaces() -> Vec<NetworkInterfaceInfo> {
     let networks = Networks::new_with_refreshed_list();
     let mut interfaces = Vec::new();
@@ -785,7 +763,6 @@ fn detect_network_interfaces() -> Vec<NetworkInterfaceInfo> {
     for (name, data) in networks.iter() {
         let mac_address = data.mac_address().to_string();
 
-        // 获取 IP 地址和接口详情
         let (ip_addresses, is_up, speed_mbps, interface_type) = get_interface_info(name);
 
         interfaces.push(NetworkInterfaceInfo {
@@ -800,7 +777,6 @@ fn detect_network_interfaces() -> Vec<NetworkInterfaceInfo> {
         });
     }
 
-    // 按类型排序
     interfaces.sort_by(|a, b| {
         let type_order = |t: &str| match t {
             "Ethernet" => 0,
@@ -819,7 +795,6 @@ fn get_interface_info(name: &str) -> (Vec<String>, bool, Option<u64>, String) {
     let sys_path = format!("/sys/class/net/{}", name);
     let mut ips = Vec::new();
 
-    // 获取 IP 地址
     if let Ok(output) = std::process::Command::new("ip")
         .args(["addr", "show", name])
         .output()
@@ -835,18 +810,15 @@ fn get_interface_info(name: &str) -> (Vec<String>, bool, Option<u64>, String) {
         }
     }
 
-    // 检查接口状态
     let is_up = fs::read_to_string(format!("{}/operstate", sys_path))
         .map(|s| s.trim() == "up")
         .unwrap_or(false);
 
-    // 获取速度
     let speed_mbps = fs::read_to_string(format!("{}/speed", sys_path))
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&s| s > 0 && s < 1000000);
 
-    // 判断接口类型
     let interface_type = if name == "lo" {
         "Loopback"
     } else if name.starts_with("eth") || name.starts_with("en") {

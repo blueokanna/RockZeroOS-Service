@@ -210,8 +210,9 @@ pub struct SaveTextFileRequest {
 pub async fn get_storage_scope_status(req: HttpRequest) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
 
-    let binding = load_windows_storage_binding()
-        .map_err(|e| AppError::InternalServerError(format!("Failed to read Windows storage binding: {e}")))?;
+    let binding = load_windows_storage_binding().map_err(|e| {
+        AppError::InternalServerError(format!("Failed to read Windows storage binding: {e}"))
+    })?;
 
     Ok(HttpResponse::Ok().json(StorageRootBindingStatus {
         platform: std::env::consts::OS.to_string(),
@@ -277,7 +278,7 @@ pub async fn browse_storage_scope(
                 });
             }
 
-            entries.sort_by(|left, right| left.path.cmp(&right.path));
+            entries.sort_by_key(|entry| entry.path.clone());
 
             return Ok(HttpResponse::Ok().json(StorageRootBrowseResponse {
                 current_path: String::new(),
@@ -286,7 +287,7 @@ pub async fn browse_storage_scope(
             }));
         }
 
-        let target_path = sanitize_windows_storage_selection_path(&decoded_path, false)?;
+        let target_path = sanitize_windows_storage_selection_path(&decoded_path, false, true)?;
         if !target_path.exists() {
             return Err(AppError::NotFound("Directory not found".to_string()));
         }
@@ -299,8 +300,30 @@ pub async fn browse_storage_scope(
 
         let mut entries = Vec::new();
         for entry in fs::read_dir(&target_path).map_err(|_| AppError::InternalError)? {
-            let entry = entry.map_err(|_| AppError::InternalError)?;
-            let metadata = entry.metadata().map_err(|_| AppError::InternalError)?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warn!(
+                        "Skipping unreadable Windows storage browse entry under {}: {}",
+                        target_path.display(),
+                        error
+                    );
+                    continue;
+                }
+            };
+
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    warn!(
+                        "Skipping Windows storage browse entry with unreadable metadata {}: {}",
+                        entry.path().display(),
+                        error
+                    );
+                    continue;
+                }
+            };
+
             if !metadata.is_dir() {
                 continue;
             }
@@ -317,18 +340,24 @@ pub async fn browse_storage_scope(
             });
         }
 
-        entries.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+        entries.sort_by_key(|entry| entry.name.to_lowercase());
 
-        Ok(HttpResponse::Ok().json(StorageRootBrowseResponse {
-            current_path: target_path.to_string_lossy().to_string(),
-            parent_path: target_path.parent().and_then(|parent| {
+        let parent_path = if is_windows_drive_root(&target_path) {
+            Some(String::new())
+        } else {
+            target_path.parent().and_then(|parent| {
                 let value = parent.to_string_lossy().to_string();
                 if value == target_path.to_string_lossy() {
                     None
                 } else {
                     Some(value)
                 }
-            }),
+            })
+        };
+
+        Ok(HttpResponse::Ok().json(StorageRootBrowseResponse {
+            current_path: target_path.to_string_lossy().to_string(),
+            parent_path,
             entries,
         }))
     }
@@ -353,7 +382,8 @@ pub async fn configure_storage_scope(
     {
         let requested_path = decode_path_value(&body.path);
         let allow_missing = body.create_if_missing.unwrap_or(false);
-        let target_path = sanitize_windows_storage_selection_path(&requested_path, allow_missing)?;
+        let target_path =
+            sanitize_windows_storage_selection_path(&requested_path, allow_missing, false)?;
 
         if !target_path.exists() {
             fs::create_dir_all(&target_path).map_err(|e| {
@@ -375,10 +405,11 @@ pub async fn configure_storage_scope(
         })?;
 
         let storage_config = StorageConfig::from_env();
-        storage_config
-            .init_directories()
-            .await
-            .map_err(|e| AppError::InternalServerError(format!("Failed to initialize scoped storage directories: {e}")))?;
+        storage_config.init_directories().await.map_err(|e| {
+            AppError::InternalServerError(format!(
+                "Failed to initialize scoped storage directories: {e}"
+            ))
+        })?;
 
         Ok(HttpResponse::Ok().json(serde_json::json!({
             "message": "Windows storage root configured successfully",
@@ -1215,9 +1246,10 @@ fn get_base_directory() -> Result<PathBuf, AppError> {
 }
 
 fn is_path_allowed(path: &Path, base: &Path) -> bool {
-    let base_canonical = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
-    let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    candidate.starts_with(&base_canonical) || path.starts_with(&base_canonical)
+    let Ok(base_canonical) = base.canonicalize() else {
+        return false;
+    };
+    path.starts_with(&base_canonical)
 }
 
 fn sanitize_path(path: &str) -> Result<PathBuf, AppError> {
@@ -1246,7 +1278,7 @@ fn sanitize_path(path: &str) -> Result<PathBuf, AppError> {
         resolve_path_from_existing_parent(&full_path, &base)?
     };
 
-    if !is_path_allowed(&canonical, &base) && !is_path_allowed(&full_path, &base) {
+    if !is_path_allowed(&canonical, &base) {
         return Err(AppError::Forbidden("Path traversal detected".to_string()));
     }
 
@@ -1258,13 +1290,13 @@ fn resolve_path_from_existing_parent(full_path: &Path, base: &Path) -> Result<Pa
     let mut suffix = Vec::new();
 
     while !existing_parent.exists() {
-        let file_name = existing_parent.file_name().ok_or_else(|| {
-            AppError::Forbidden("Path traversal detected".to_string())
-        })?;
+        let file_name = existing_parent
+            .file_name()
+            .ok_or_else(|| AppError::Forbidden("Path traversal detected".to_string()))?;
         suffix.push(file_name.to_os_string());
-        existing_parent = existing_parent.parent().ok_or_else(|| {
-            AppError::Forbidden("Path traversal detected".to_string())
-        })?;
+        existing_parent = existing_parent
+            .parent()
+            .ok_or_else(|| AppError::Forbidden("Path traversal detected".to_string()))?;
     }
 
     let resolved_parent = existing_parent
@@ -1318,6 +1350,7 @@ fn has_windows_drive_prefix(path: &Path) -> bool {
 fn sanitize_windows_storage_selection_path(
     path: &str,
     allow_missing: bool,
+    allow_drive_root: bool,
 ) -> Result<PathBuf, AppError> {
     let candidate = PathBuf::from(path);
 
@@ -1328,10 +1361,9 @@ fn sanitize_windows_storage_selection_path(
         ));
     }
 
-    if is_windows_drive_root(&candidate) {
+    if !allow_drive_root && is_windows_drive_root(&candidate) {
         return Err(AppError::BadRequest(
-            "Windows storage root must be a folder inside a drive, not the drive root"
-                .to_string(),
+            "Windows storage root must be a folder inside a drive, not the drive root".to_string(),
         ));
     }
 
@@ -1358,8 +1390,7 @@ fn sanitize_windows_storage_selection_path(
     if let Some(parent) = candidate.parent() {
         if !parent.exists() || !parent.is_dir() {
             return Err(AppError::NotFound(
-                "Parent directory for the Windows storage root does not exist"
-                    .to_string(),
+                "Parent directory for the Windows storage root does not exist".to_string(),
             ));
         }
     }
@@ -1783,9 +1814,7 @@ pub async fn serve_image(
         }
     }
 
-    let content_type_parsed = mime_type
-        .parse()
-        .unwrap_or(mime_guess::mime::IMAGE_PNG);
+    let content_type_parsed = mime_type.parse().unwrap_or(mime_guess::mime::IMAGE_PNG);
 
     if file_size <= 10 * 1024 * 1024 {
         let file_content = tokio::fs::read(&full_path)
@@ -1865,7 +1894,6 @@ pub async fn get_thumbnail(query: web::Query<StreamQuery>) -> Result<HttpRespons
         "Cannot generate thumbnail for this file type".to_string(),
     ))
 }
-
 
 #[allow(dead_code)]
 fn parse_range_header(range: &str, file_size: u64) -> Option<(u64, u64)> {
@@ -1991,7 +2019,9 @@ fn generate_video_thumbnail(path: &Path, timestamp: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::auth::JwtHandler;
     use actix_web::{http::StatusCode, test, web, App};
+    use rockzero_common::AppConfig;
     use serde_json::{json, Value};
     use tokio::sync::Mutex;
     use uuid::Uuid;
@@ -2005,6 +2035,24 @@ mod tests {
         "HLS_CACHE_PATH",
         "LOG_PATH",
     ];
+
+    fn test_app_config() -> AppConfig {
+        AppConfig {
+            jwt_secret: "filemanager-test-secret".to_string(),
+            jwt_expiration_hours: 24,
+            refresh_token_expiration_days: 7,
+            ..Default::default()
+        }
+    }
+
+    fn test_auth_header() -> (&'static str, String) {
+        let config = test_app_config();
+        let handler = JwtHandler::new(&config);
+        let tokens = handler
+            .generate_tokens("admin-test", "admin@example.com", "admin")
+            .unwrap();
+        ("Authorization", format!("Bearer {}", tokens.access_token))
+    }
 
     struct FileManagerTestEnv {
         base_dir: PathBuf,
@@ -2049,14 +2097,30 @@ mod tests {
 
         fn read_binding_root(&self) -> String {
             let raw = fs::read_to_string(
-                self.data_dir.join("storage").join("windows-storage-root.json"),
+                self.data_dir
+                    .join("storage")
+                    .join("windows-storage-root.json"),
             )
             .unwrap();
-            serde_json::from_str::<Value>(&raw)
-                .unwrap()["selected_root"]
+            serde_json::from_str::<Value>(&raw).unwrap()["selected_root"]
                 .as_str()
                 .unwrap()
                 .to_string()
+        }
+
+        #[cfg(target_os = "windows")]
+        fn drive_root(&self) -> PathBuf {
+            use std::path::Prefix;
+
+            match self.scope_root.components().next() {
+                Some(Component::Prefix(prefix)) => match prefix.kind() {
+                    Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                        PathBuf::from(format!("{}:\\", (letter as char).to_ascii_uppercase()))
+                    }
+                    _ => panic!("test path is not on a local Windows drive"),
+                },
+                _ => panic!("test path is not on a Windows drive"),
+            }
         }
     }
 
@@ -2080,13 +2144,18 @@ mod tests {
         let _env = FileManagerTestEnv::new("status");
 
         let app = test::init_service(
-            App::new().route("/scope/status", web::get().to(get_storage_scope_status)),
+            App::new()
+                .app_data(web::Data::new(test_app_config()))
+                .route("/scope/status", web::get().to(get_storage_scope_status)),
         )
         .await;
 
         let response = test::call_service(
             &app,
-            test::TestRequest::get().uri("/scope/status").to_request(),
+            test::TestRequest::get()
+                .uri("/scope/status")
+                .insert_header(test_auth_header())
+                .to_request(),
         )
         .await;
 
@@ -2115,6 +2184,7 @@ mod tests {
 
         let app = test::init_service(
             App::new()
+                .app_data(web::Data::new(test_app_config()))
                 .route("/scope/status", web::get().to(get_storage_scope_status))
                 .route("/scope/browse", web::get().to(browse_storage_scope))
                 .route("/scope/configure", web::post().to(configure_storage_scope)),
@@ -2123,6 +2193,7 @@ mod tests {
 
         let configure_request = test::TestRequest::post()
             .uri("/scope/configure")
+            .insert_header(test_auth_header())
             .set_json(json!({
                 "path": env.scope_root.to_string_lossy(),
                 "create_if_missing": false,
@@ -2145,7 +2216,10 @@ mod tests {
 
         let status_response = test::call_service(
             &app,
-            test::TestRequest::get().uri("/scope/status").to_request(),
+            test::TestRequest::get()
+                .uri("/scope/status")
+                .insert_header(test_auth_header())
+                .to_request(),
         )
         .await;
         assert_eq!(status_response.status(), StatusCode::OK);
@@ -2164,7 +2238,10 @@ mod tests {
         );
         let browse_response = test::call_service(
             &app,
-            test::TestRequest::get().uri(&browse_uri).to_request(),
+            test::TestRequest::get()
+                .uri(&browse_uri)
+                .insert_header(test_auth_header())
+                .to_request(),
         )
         .await;
         assert_eq!(browse_response.status(), StatusCode::OK);
@@ -2176,9 +2253,86 @@ mod tests {
             .iter()
             .filter_map(|entry| entry["name"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(browse_payload["current_path"], expected_root.to_string_lossy().to_string());
+        assert_eq!(
+            browse_payload["current_path"],
+            expected_root.to_string_lossy().to_string()
+        );
         assert!(entry_names.contains(&"Documents"));
         assert!(entry_names.contains(&"Media"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[actix_web::test]
+    async fn storage_scope_browse_allows_drive_root_navigation() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let env = FileManagerTestEnv::new("browse-drive-root");
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_app_config()))
+                .route("/scope/browse", web::get().to(browse_storage_scope)),
+        )
+        .await;
+
+        let drive_root = env.drive_root();
+        let browse_uri = format!(
+            "/scope/browse?path={}",
+            urlencoding::encode(drive_root.to_string_lossy().as_ref())
+        );
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&browse_uri)
+                .insert_header(test_auth_header())
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let payload: Value = test::read_body_json(response).await;
+        let expected_drive_root = drive_root.canonicalize().unwrap_or(drive_root);
+        assert_eq!(
+            payload["current_path"],
+            Value::String(expected_drive_root.to_string_lossy().to_string())
+        );
+        assert!(payload["entries"].is_array());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[actix_web::test]
+    async fn storage_scope_configure_rejects_drive_root_binding() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let env = FileManagerTestEnv::new("reject-drive-root");
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_app_config()))
+                .route("/scope/configure", web::post().to(configure_storage_scope)),
+        )
+        .await;
+
+        let drive_root = env.drive_root();
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/scope/configure")
+                .insert_header(test_auth_header())
+                .set_json(json!({
+                    "path": drive_root.to_string_lossy(),
+                    "create_if_missing": false,
+                }))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let payload: Value = test::read_body_json(response).await;
+        assert!(payload["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("folder inside a drive"));
     }
 
     #[cfg(target_os = "windows")]
@@ -2190,7 +2344,9 @@ mod tests {
         persist_windows_storage_binding(&env.scope_root).unwrap();
 
         let app = test::init_service(
-            App::new().route("/text/save", web::post().to(write_text_file)),
+            App::new()
+                .app_data(web::Data::new(test_app_config()))
+                .route("/text/save", web::post().to(write_text_file)),
         )
         .await;
 
@@ -2198,6 +2354,7 @@ mod tests {
             &app,
             test::TestRequest::post()
                 .uri("/text/save")
+                .insert_header(test_auth_header())
                 .set_json(json!({
                     "path": "notes/readme.md",
                     "content": "hello from scoped storage",
@@ -2212,7 +2369,10 @@ mod tests {
         let saved_path = env.scope_root.join("notes").join("readme.md");
         assert_eq!(payload["path"], "notes/readme.md");
         assert_eq!(payload["size"], 25);
-        assert_eq!(fs::read_to_string(saved_path).unwrap(), "hello from scoped storage");
+        assert_eq!(
+            fs::read_to_string(saved_path).unwrap(),
+            "hello from scoped storage"
+        );
     }
 
     #[cfg(not(target_os = "windows"))]

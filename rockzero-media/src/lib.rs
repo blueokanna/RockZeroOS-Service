@@ -17,7 +17,9 @@ pub use ffmpeg_manager::{
     set_global_ffprobe_path, FfmpegManager,
 };
 pub use playlist::PlaylistGenerator;
-pub use secure_transport::{SecureStreamTransport, HybridTransport, HybridConfig, HybridTransportStats, TransportChannel};
+pub use secure_transport::{
+    HybridConfig, HybridTransport, HybridTransportStats, SecureStreamTransport, TransportChannel,
+};
 pub use session::{HlsSession, HlsSessionManager};
 pub use tcp_stream::TcpStreamSender;
 pub use udp_stream::UdpStreamSender;

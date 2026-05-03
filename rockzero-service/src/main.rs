@@ -18,6 +18,7 @@ use rockzero_sae as _;
 
 use actix_cors::Cors;
 use actix_web::{middleware::Logger, web, App, HttpServer};
+use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::SqlitePool;
 use std::{io::Write, path::PathBuf, sync::Arc};
 use tokio::sync::RwLock;
@@ -121,7 +122,10 @@ fn install_windows_runtime_diagnostics(data_dir: &str) {
 
     std::panic::set_hook(Box::new(|panic_info| {
         let backtrace = Backtrace::force_capture();
-        runtime_diag_log(&format!("panic_hook info={}\nbacktrace={}", panic_info, backtrace));
+        runtime_diag_log(&format!(
+            "panic_hook info={}\nbacktrace={}",
+            panic_info, backtrace
+        ));
     }));
 
     unsafe {
@@ -170,13 +174,13 @@ async fn main() -> std::io::Result<()> {
     info!("Starting RockZero Service...");
 
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
-    std::fs::create_dir_all(&data_dir).ok();
+    std::fs::create_dir_all(&data_dir)?;
 
     #[cfg(target_os = "windows")]
     install_windows_runtime_diagnostics(&data_dir);
 
     info!("Initializing FFmpeg manager...");
-    
+
     let assets_path = std::env::var("FFMPEG_ASSETS_PATH").unwrap_or_else(|_| {
         let candidates = [
             "./assets",
@@ -193,10 +197,11 @@ async fn main() -> std::io::Result<()> {
         }
         "./assets".to_string()
     });
-    
+
     info!("Using assets path: {}", assets_path);
-    
-    let mut ffmpeg_manager = ffmpeg_manager::FfmpegManager::with_assets_path(&data_dir, &assets_path);
+
+    let mut ffmpeg_manager =
+        ffmpeg_manager::FfmpegManager::with_assets_path(&data_dir, &assets_path);
     match ffmpeg_manager.ensure_available().await {
         Ok(_) => {
             if let Some(path) = ffmpeg_manager.ffmpeg_path() {
@@ -248,13 +253,28 @@ async fn main() -> std::io::Result<()> {
     let bind_addr = format!("{}:{}", host, port);
     info!("Listening on: {}", bind_addr);
 
-    let database_url =
+    let database_setting =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| format!("{}/rockzero.db", data_dir));
 
-    info!("Connecting to database: {}", database_url);
-    let pool = SqlitePool::connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
+    info!("Connecting to database: {}", database_setting);
+    let pool = if database_setting.starts_with("sqlite:") {
+        SqlitePool::connect(&database_setting)
+            .await
+            .expect("Failed to connect to database")
+    } else {
+        let db_path = PathBuf::from(&database_setting);
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true);
+
+        SqlitePool::connect_with(options)
+            .await
+            .expect("Failed to connect to database")
+    };
 
     info!("Initializing database tables...");
     db::initialize_database(&pool)
@@ -273,9 +293,7 @@ async fn main() -> std::io::Result<()> {
 
     let external_cache_ready = handlers::secure_hls::initialize_external_cache_startup_guard();
     if external_cache_ready {
-        info!(
-            "Secure HLS startup guard passed: external cache is ready for production playback"
-        );
+        info!("Secure HLS startup guard passed: external cache is ready for production playback");
     } else {
         info!(
             "Secure HLS startup guard failed: playback chain will be blocked until external cache is correctly mounted"
@@ -408,7 +426,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(Logger::default())
             .wrap(cors)
-            .app_data(web::PayloadConfig::default().limit(100 * 1024 * 1024)) // 100 MB max payload for ARM devices
+            .app_data(web::PayloadConfig::default().limit(100 * 1024 * 1024))
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(secure_storage.clone()))
             .app_data(web::Data::new(media_processor_data))
@@ -495,10 +513,7 @@ async fn main() -> std::io::Result<()> {
                                 "/capabilities",
                                 web::get().to(handlers::system::get_hardware_capabilities),
                             )
-                            .route(
-                                "/public-ip",
-                                web::get().to(handlers::system::get_public_ip),
-                            ),
+                            .route("/public-ip", web::get().to(handlers::system::get_public_ip)),
                     )
                     .service(
                         web::scope("/storage")
@@ -621,7 +636,10 @@ async fn main() -> std::io::Result<()> {
                                         "/register/finish",
                                         web::post().to(fido::finish_fido_registration),
                                     )
-                                    .route("/credentials", web::get().to(fido::list_fido_credentials))
+                                    .route(
+                                        "/credentials",
+                                        web::get().to(fido::list_fido_credentials),
+                                    )
                                     .route(
                                         "/credentials/{id}",
                                         web::delete().to(fido::delete_fido_credential),
@@ -1001,18 +1019,54 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(
                         web::scope("/lan-transfer")
-                            .route("/device-info", web::get().to(handlers::lan_transfer::get_device_info))
-                            .route("/shared", web::get().to(handlers::lan_transfer::list_shared_items))
-                            .route("/download/{item_id}", web::get().to(handlers::lan_transfer::download_shared_item))
-                            .route("/share", web::post().to(handlers::lan_transfer::add_shared_item))
-                            .route("/share/{id}", web::delete().to(handlers::lan_transfer::remove_shared_item))
-                            .route("/scan-games", web::post().to(handlers::lan_transfer::scan_local_games))
-                            .route("/receive", web::post().to(handlers::lan_transfer::receive_from_peer))
-                            .route("/sessions", web::get().to(handlers::lan_transfer::list_sessions))
-                            .route("/sessions/{id}", web::get().to(handlers::lan_transfer::get_session))
-                            .route("/sessions/{id}/cancel", web::post().to(handlers::lan_transfer::cancel_session))
-                            .route("/sessions/{id}", web::delete().to(handlers::lan_transfer::delete_session))
-                            .route("/sessions/cleanup", web::post().to(handlers::lan_transfer::cleanup_sessions)),
+                            .route(
+                                "/device-info",
+                                web::get().to(handlers::lan_transfer::get_device_info),
+                            )
+                            .route(
+                                "/shared",
+                                web::get().to(handlers::lan_transfer::list_shared_items),
+                            )
+                            .route(
+                                "/download/{item_id}",
+                                web::get().to(handlers::lan_transfer::download_shared_item),
+                            )
+                            .route(
+                                "/share",
+                                web::post().to(handlers::lan_transfer::add_shared_item),
+                            )
+                            .route(
+                                "/share/{id}",
+                                web::delete().to(handlers::lan_transfer::remove_shared_item),
+                            )
+                            .route(
+                                "/scan-games",
+                                web::post().to(handlers::lan_transfer::scan_local_games),
+                            )
+                            .route(
+                                "/receive",
+                                web::post().to(handlers::lan_transfer::receive_from_peer),
+                            )
+                            .route(
+                                "/sessions",
+                                web::get().to(handlers::lan_transfer::list_sessions),
+                            )
+                            .route(
+                                "/sessions/{id}",
+                                web::get().to(handlers::lan_transfer::get_session),
+                            )
+                            .route(
+                                "/sessions/{id}/cancel",
+                                web::post().to(handlers::lan_transfer::cancel_session),
+                            )
+                            .route(
+                                "/sessions/{id}",
+                                web::delete().to(handlers::lan_transfer::delete_session),
+                            )
+                            .route(
+                                "/sessions/cleanup",
+                                web::post().to(handlers::lan_transfer::cleanup_sessions),
+                            ),
                     )
                     .service(
                         web::scope("/secure")
@@ -1048,6 +1102,28 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/db/close",
                                 web::post().to(handlers::secure_storage::close_database),
+                            )
+                            .route(
+                                "/private-space/status",
+                                web::get().to(handlers::secure_storage::private_space_status),
+                            )
+                            .route(
+                                "/private-space/import",
+                                web::post()
+                                    .to(handlers::secure_storage::import_private_space_items),
+                            )
+                            .route(
+                                "/private-space/list",
+                                web::post().to(handlers::secure_storage::list_private_space_items),
+                            )
+                            .route(
+                                "/private-space/export",
+                                web::post().to(handlers::secure_storage::export_private_space_item),
+                            )
+                            .route(
+                                "/private-space/delete",
+                                web::delete()
+                                    .to(handlers::secure_storage::delete_private_space_item),
                             )
                             .route(
                                 "/encrypt",
@@ -1167,14 +1243,10 @@ async fn main() -> std::io::Result<()> {
                                             .to(handlers::secure_hls::complete_sae_handshake),
                                     ),
                             )
-                            .service(
-                                web::scope("/transport")
-                                    .wrap(middleware::JwtAuth)
-                                    .route(
-                                        "/stats",
-                                        web::get().to(handlers::secure_hls::get_transport_stats),
-                                    ),
-                            )
+                            .service(web::scope("/transport").wrap(middleware::JwtAuth).route(
+                                "/stats",
+                                web::get().to(handlers::secure_hls::get_transport_stats),
+                            ))
                             .service(
                                 web::scope("/session")
                                     .wrap(middleware::JwtAuth)
@@ -1266,6 +1338,10 @@ async fn main() -> std::io::Result<()> {
                     .service(
                         web::scope("")
                             .wrap(middleware::JwtAuth)
+                            .route(
+                                "/admin/health",
+                                web::get().to(handlers::edge_compute::admin_health),
+                            )
                             .route("/stats", web::get().to(handlers::edge_compute::edge_stats))
                             .route("/nodes", web::get().to(handlers::edge_compute::list_nodes))
                             .route(
@@ -1317,7 +1393,10 @@ async fn main() -> std::io::Result<()> {
                                 "/self-check/run",
                                 web::post().to(handlers::edge_compute::run_startup_self_check_now),
                             )
-                            .route("/jobs/{job_id}", web::get().to(handlers::edge_compute::get_job))
+                            .route(
+                                "/jobs/{job_id}",
+                                web::get().to(handlers::edge_compute::get_job),
+                            )
                             .route(
                                 "/jobs/{job_id}/cancel",
                                 web::post().to(handlers::edge_compute::cancel_job),

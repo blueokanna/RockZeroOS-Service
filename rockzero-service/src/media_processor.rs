@@ -3,16 +3,29 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 pub const UNSUPPORTED_AUDIO_CODECS: &[&str] = &[
-    "dts", "dca", "ac3", "truehd", "eac3",
-    "wmav1", "wmav2", "wmapro", "wmalossless",
-    "pcm_bluray", "pcm_dvd",
-    "cook", "ra_288", "atrac3", "atrac3p",
+    "dts",
+    "dca",
+    "ac3",
+    "truehd",
+    "eac3",
+    "wmav1",
+    "wmav2",
+    "wmapro",
+    "wmalossless",
+    "pcm_bluray",
+    "pcm_dvd",
+    "cook",
+    "ra_288",
+    "atrac3",
+    "atrac3p",
     "ape",
 ];
 
 pub fn needs_audio_transcode(codec: &str) -> bool {
     let codec_lower = codec.to_lowercase();
-    UNSUPPORTED_AUDIO_CODECS.iter().any(|&c| codec_lower.contains(c))
+    UNSUPPORTED_AUDIO_CODECS
+        .iter()
+        .any(|&c| codec_lower.contains(c))
 }
 
 pub struct MediaProcessor {
@@ -34,7 +47,7 @@ impl HardwareCapabilities {
     pub fn has_any_acceleration(&self) -> bool {
         self.has_rkmpp || self.has_vaapi || self.has_cuda || self.has_videotoolbox
     }
-    
+
     pub fn get_available_accelerations(&self) -> Vec<&str> {
         let mut accel = Vec::new();
         if self.has_rkmpp {
@@ -122,8 +135,8 @@ impl StreamingTranscoder {
         bitrate: Option<&str>,
         channels: Option<u8>,
     ) -> Result<Child, std::io::Error> {
-        let ffmpeg_cmd = crate::ffmpeg_manager::get_global_ffmpeg_path()
-            .unwrap_or_else(|| "ffmpeg".to_string());
+        let ffmpeg_cmd =
+            crate::ffmpeg_manager::get_global_ffmpeg_path().unwrap_or_else(|| "ffmpeg".to_string());
 
         let mut args = vec!["-hide_banner".to_string()];
 
@@ -193,9 +206,7 @@ impl futures::Stream for TranscodeStream {
                     buffer.truncate(n);
                     std::task::Poll::Ready(Some(Ok(bytes::Bytes::from(buffer))))
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::task::Poll::Pending
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::task::Poll::Pending,
                 Err(e) => std::task::Poll::Ready(Some(Err(e))),
             }
         } else {

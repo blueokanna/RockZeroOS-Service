@@ -1,18 +1,15 @@
-// Service 特有的加密功能
-use rockzero_common::AppError as ServiceAppError;
 use crate::crc32_checksum;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use rockzero_common::AppError as ServiceAppError;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub const NONCE_SIZE: usize = 12;
-
-// ============ BLAKE3 哈希宏 (Service 特有) ============
 
 #[macro_export]
 macro_rules! blake3_hash {
@@ -43,8 +40,6 @@ macro_rules! blake3_derive_key {
         key
     }};
 }
-
-// ============ 加密上下文 (Service 特有) ============
 
 pub struct CryptoContext {
     cipher: Aes256Gcm,
@@ -116,15 +111,14 @@ impl CryptoContext {
     pub fn decrypt_string(&self, encrypted_base64: &str) -> Result<String, ServiceAppError> {
         let encrypted = EncryptedData::from_base64(encrypted_base64)?;
         let plaintext = self.decrypt(&encrypted)?;
-        String::from_utf8(plaintext).map_err(|_| ServiceAppError::CryptoError("Invalid UTF-8".to_string()))
+        String::from_utf8(plaintext)
+            .map_err(|_| ServiceAppError::CryptoError("Invalid UTF-8".to_string()))
     }
 
     pub fn key_id(&self) -> &str {
         &self.key_id
     }
 }
-
-// ============ 加密数据结构 (Service 特有) ============
 
 #[derive(Debug, Clone)]
 pub struct EncryptedData {
@@ -136,7 +130,7 @@ pub struct EncryptedData {
 impl EncryptedData {
     pub fn to_base64(&self) -> String {
         let mut bytes = Vec::new();
-        bytes.push(1); // 版本号
+        bytes.push(1);
         bytes.push(self.key_id.len() as u8);
         bytes.extend_from_slice(self.key_id.as_bytes());
         bytes.extend_from_slice(&self.nonce);
@@ -150,7 +144,9 @@ impl EncryptedData {
             .map_err(|_| ServiceAppError::CryptoError("Invalid Base64".to_string()))?;
 
         if bytes.len() < 14 {
-            return Err(ServiceAppError::CryptoError("Invalid encrypted data".to_string()));
+            return Err(ServiceAppError::CryptoError(
+                "Invalid encrypted data".to_string(),
+            ));
         }
 
         let mut offset = 0;
@@ -158,14 +154,18 @@ impl EncryptedData {
         offset += 1;
 
         if version != 1 {
-            return Err(ServiceAppError::CryptoError("Unsupported version".to_string()));
+            return Err(ServiceAppError::CryptoError(
+                "Unsupported version".to_string(),
+            ));
         }
 
         let key_id_len = bytes[offset] as usize;
         offset += 1;
 
         if bytes.len() < offset + key_id_len + NONCE_SIZE {
-            return Err(ServiceAppError::CryptoError("Invalid encrypted data".to_string()));
+            return Err(ServiceAppError::CryptoError(
+                "Invalid encrypted data".to_string(),
+            ));
         }
 
         let key_id = String::from_utf8(bytes[offset..offset + key_id_len].to_vec())
@@ -185,8 +185,6 @@ impl EncryptedData {
         })
     }
 }
-
-// ============ 文件传输状态管理 (Service 特有) ============
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferState {
@@ -218,7 +216,11 @@ impl TransferManager {
         }
     }
 
-    pub async fn start_transfer(&self, path: &str, expected_size: u64) -> Result<(), ServiceAppError> {
+    pub async fn start_transfer(
+        &self,
+        path: &str,
+        expected_size: u64,
+    ) -> Result<(), ServiceAppError> {
         let now = chrono::Utc::now().timestamp();
         let info = TransferInfo {
             path: path.to_string(),
@@ -235,7 +237,11 @@ impl TransferManager {
         Ok(())
     }
 
-    pub async fn update_progress(&self, path: &str, current_size: u64) -> Result<(), ServiceAppError> {
+    pub async fn update_progress(
+        &self,
+        path: &str,
+        current_size: u64,
+    ) -> Result<(), ServiceAppError> {
         let mut transfers = self.transfers.write().await;
         if let Some(info) = transfers.get_mut(path) {
             info.current_size = current_size;
@@ -267,7 +273,11 @@ impl TransferManager {
         Ok(())
     }
 
-    pub async fn mark_encryption_failed(&self, path: &str, error: &str) -> Result<(), ServiceAppError> {
+    pub async fn mark_encryption_failed(
+        &self,
+        path: &str,
+        error: &str,
+    ) -> Result<(), ServiceAppError> {
         let mut transfers = self.transfers.write().await;
         if let Some(info) = transfers.get_mut(path) {
             info.state = TransferState::EncryptionFailed(error.to_string());
@@ -332,8 +342,6 @@ impl Default for TransferManager {
     }
 }
 
-// ============ 辅助函数 (使用 rockzero-crypto 的实现) ============
-
 pub fn blake3_hash_bytes(data: &[u8]) -> [u8; 32] {
     let hash = blake3::hash(data);
     let mut result = [0u8; 32];
@@ -348,12 +356,7 @@ pub fn blake3_keyed_hash(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
     result
 }
 
-
-// ============ 密钥派生器 (Service 特有) ============
-
-pub struct KeyDeriver {
-    // 不使用 SAE，直接使用 BLAKE3
-}
+pub struct KeyDeriver {}
 
 impl KeyDeriver {
     pub fn new() -> Self {
@@ -361,7 +364,6 @@ impl KeyDeriver {
     }
 
     pub fn derive_key(&self, password: &str, context: &str) -> [u8; 32] {
-        // 使用 BLAKE3 派生密钥
         blake3_derive_key!(context, password.as_bytes())
     }
 
@@ -391,8 +393,6 @@ impl Default for KeyDeriver {
         Self::new()
     }
 }
-
-// ============ 安全文件加密器 (Service 特有) ============
 
 pub struct SecureFileEncryptor {
     key_deriver: KeyDeriver,
@@ -456,16 +456,12 @@ impl SecureFileEncryptor {
     }
 }
 
-// ============ 加密文件数据 (Service 特有) ============
-
 #[derive(Debug, Clone)]
 pub struct EncryptedFileData {
     pub encrypted_data: EncryptedData,
     pub original_crc32: u32,
     pub original_size: u64,
 }
-
-// ============ WPA3-SAE 简化实现 (Service 特有) ============
 
 pub struct Wpa3Sae {
     state_hash: [u8; 32],
@@ -494,12 +490,7 @@ impl Wpa3Sae {
     }
 
     pub fn derive_session_key(&self, pmk: &[u8; 32], context: &[u8]) -> [u8; 32] {
-        blake3_derive_key!(
-            "WPA3-SAE-SESSION",
-            &self.state_hash,
-            pmk,
-            context
-        )
+        blake3_derive_key!("WPA3-SAE-SESSION", &self.state_hash, pmk, context)
     }
 
     pub fn derive_db_key(&self, master_password: &str, db_identifier: &str) -> [u8; 32] {

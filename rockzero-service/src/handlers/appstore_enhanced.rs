@@ -122,7 +122,6 @@ fn now_epoch_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-/// GET /api/v1/appstore-enhanced/wasm/apps - 列出所有已安装的 WASM 应用
 pub async fn list_wasm_apps() -> Result<HttpResponse, AppError> {
     info!("📦 Listing enhanced WASM apps");
 
@@ -144,7 +143,6 @@ pub async fn list_wasm_apps() -> Result<HttpResponse, AppError> {
     }))
 }
 
-/// GET /api/v1/appstore-enhanced/wasm/apps/{id} - 获取单个 WASM 应用详情
 pub async fn get_wasm_app(path: web::Path<String>) -> Result<HttpResponse, AppError> {
     let app_id = path.into_inner();
     info!("📦 Getting WASM app details: {}", app_id);
@@ -158,7 +156,6 @@ pub async fn get_wasm_app(path: web::Path<String>) -> Result<HttpResponse, AppEr
     Ok(HttpResponse::Ok().json(package))
 }
 
-/// POST /api/v1/appstore-enhanced/wasm/install - 安装 WASM 应用（增强版，带验证和元数据）
 pub async fn install_wasm_app(
     body: web::Json<WasmInstallRequest>,
     req: HttpRequest,
@@ -199,7 +196,6 @@ pub async fn install_wasm_app(
         }
     }
 
-    // Validate that the downloaded bytes are a valid WASM module
     let engine = wasmtime::Engine::default();
     wasmtime::Module::new(&engine, &bytes)
         .map_err(|e| AppError::BadRequest(format!("Invalid WASM module: {}", e)))?;
@@ -223,7 +219,6 @@ pub async fn install_wasm_app(
 
     fs::write(&target, &bytes).map_err(|e| AppError::IoError(e.to_string()))?;
 
-    // Fetch optional manifest
     let manifest = if let Some(manifest_url) = &body.manifest_url {
         if !manifest_url.is_empty() {
             match client.get(manifest_url).send().await {
@@ -278,7 +273,6 @@ pub async fn install_wasm_app(
     Ok(HttpResponse::Created().json(record))
 }
 
-/// DELETE /api/v1/appstore-enhanced/wasm/apps/{id} - 卸载 WASM 应用
 pub async fn uninstall_wasm_app(
     path: web::Path<String>,
     req: HttpRequest,
@@ -313,7 +307,6 @@ pub async fn uninstall_wasm_app(
     Err(AppError::NotFound(format!("WASM app {} not found", app_id)))
 }
 
-/// PUT /api/v1/appstore-enhanced/wasm/apps/{id}/status - 更新 WASM 应用状态
 pub async fn update_wasm_app_status(
     path: web::Path<String>,
     body: web::Json<UpdateStatusRequest>,
@@ -347,7 +340,6 @@ pub async fn update_wasm_app_status(
     Err(AppError::NotFound(format!("WASM app {} not found", app_id)))
 }
 
-/// POST /api/v1/appstore-enhanced/wasm/apps/{id}/run - 运行 WASM 应用
 pub async fn run_wasm_app(
     path: web::Path<String>,
     body: web::Json<RunWasmAppRequest>,
@@ -378,7 +370,6 @@ pub async fn run_wasm_app(
     let args = body.args.clone().unwrap_or_default();
     let env = body.env.clone().unwrap_or_default();
 
-    // Update status to Running
     if let Some(app_mut) = packages.iter_mut().find(|p| p.id == app_id) {
         app_mut.status = WasmAppStatus::Running;
         let _ = save_packages(&packages);
@@ -387,7 +378,6 @@ pub async fn run_wasm_app(
     let func_name_clone = func_name.clone();
     let app_id_clone = app_id.clone();
 
-    // WASM execution in blocking thread pool with 30s timeout
     let exec_result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -397,18 +387,21 @@ pub async fn run_wasm_app(
 
             let mut linker = wasmtime::Linker::new(&engine);
             #[allow(deprecated)]
-            wasmtime_wasi::add_to_linker(&mut linker, |cx| cx)
-                .map_err(|e| e.to_string())?;
+            wasmtime_wasi::add_to_linker(&mut linker, |cx| cx).map_err(|e| e.to_string())?;
 
             #[allow(deprecated)]
             let mut builder = wasmtime_wasi::sync::WasiCtxBuilder::new();
             builder.inherit_stdio();
 
             for arg in &args {
-                builder.arg(arg).map_err(|e| format!("Invalid WASM arg: {}", e))?;
+                builder
+                    .arg(arg)
+                    .map_err(|e| format!("Invalid WASM arg: {}", e))?;
             }
             for (key, value) in &env {
-                builder.env(key, value).map_err(|e| format!("Invalid env var: {}", e))?;
+                builder
+                    .env(key, value)
+                    .map_err(|e| format!("Invalid env var: {}", e))?;
             }
 
             let mut store = wasmtime::Store::new(&engine, builder.build());
@@ -422,7 +415,10 @@ pub async fn run_wasm_app(
                 func.call(&mut store, &[], &mut [])
                     .map_err(|e| e.to_string())?;
             } else {
-                return Err(format!("Function '{}' not found in WASM module", func_name_clone));
+                return Err(format!(
+                    "Function '{}' not found in WASM module",
+                    func_name_clone
+                ));
             }
 
             Ok(())
@@ -430,7 +426,6 @@ pub async fn run_wasm_app(
     )
     .await;
 
-    // Update status based on result
     let mut packages = load_packages().unwrap_or_default();
     match exec_result {
         Ok(Ok(Ok(()))) => {
@@ -451,14 +446,20 @@ pub async fn run_wasm_app(
                 let _ = save_packages(&packages);
             }
             error!("WASM app execution failed: {}: {}", app_id, err_msg);
-            Err(AppError::BadRequest(format!("WASM execution failed: {}", err_msg)))
+            Err(AppError::BadRequest(format!(
+                "WASM execution failed: {}",
+                err_msg
+            )))
         }
         Ok(Err(join_err)) => {
             if let Some(app_mut) = packages.iter_mut().find(|p| p.id == app_id) {
                 app_mut.status = WasmAppStatus::Error;
                 let _ = save_packages(&packages);
             }
-            Err(AppError::InternalServerError(format!("WASM task panicked: {}", join_err)))
+            Err(AppError::InternalServerError(format!(
+                "WASM task panicked: {}",
+                join_err
+            )))
         }
         Err(_timeout) => {
             if let Some(app_mut) = packages.iter_mut().find(|p| p.id == app_id) {
@@ -467,13 +468,13 @@ pub async fn run_wasm_app(
             }
             warn!("WASM app execution timed out (30s): {}", app_id_clone);
             Err(AppError::InternalServerError(format!(
-                "WASM execution timed out (30s): {}", app_id_clone
+                "WASM execution timed out (30s): {}",
+                app_id_clone
             )))
         }
     }
 }
 
-/// 运行 WASM 应用请求
 #[derive(Debug, Deserialize)]
 pub struct RunWasmAppRequest {
     pub function: Option<String>,
@@ -481,7 +482,6 @@ pub struct RunWasmAppRequest {
     pub env: Option<std::collections::HashMap<String, String>>,
 }
 
-/// POST /api/v1/appstore-enhanced/wasm/validate - 验证 WASM 模块（不安装）
 pub async fn validate_wasm_module(
     body: web::Bytes,
     req: HttpRequest,

@@ -1371,7 +1371,12 @@ fn partition_and_format_linux(opts: &PartitionOptions) -> Result<PartitionResult
         );
 
         let partition_end = next_partition_boundary(&partition_start, &partition_spec.size)?;
-        create_partition(&opts.device, partition_num, &partition_start, &partition_end)?;
+        create_partition(
+            &opts.device,
+            partition_num,
+            &partition_start,
+            &partition_end,
+        )?;
         partition_start = partition_end;
 
         std::thread::sleep(std::time::Duration::from_millis(1000));
@@ -1546,6 +1551,37 @@ fn create_partition(
 }
 
 #[cfg(target_os = "linux")]
+fn parse_size_to_mib(value: &str) -> Option<f64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let (num_part, factor_mib): (&str, f64) = if let Some(v) = lower.strip_suffix("tib") {
+        (v, 1024.0 * 1024.0)
+    } else if let Some(v) = lower.strip_suffix("gib") {
+        (v, 1024.0)
+    } else if let Some(v) = lower.strip_suffix("mib") {
+        (v, 1.0)
+    } else if let Some(v) = lower.strip_suffix("kib") {
+        (v, 1.0 / 1024.0)
+    } else if let Some(v) = lower.strip_suffix("tb") {
+        (v, 1_000_000_000_000.0 / (1024.0 * 1024.0))
+    } else if let Some(v) = lower.strip_suffix("gb") {
+        (v, 1_000_000_000.0 / (1024.0 * 1024.0))
+    } else if let Some(v) = lower.strip_suffix("mb") {
+        (v, 1_000_000.0 / (1024.0 * 1024.0))
+    } else if let Some(v) = lower.strip_suffix("kb") {
+        (v, 1_000.0 / (1024.0 * 1024.0))
+    } else if let Some(v) = lower.strip_suffix('b') {
+        (v, 1.0 / (1024.0 * 1024.0))
+    } else {
+        return None;
+    };
+    num_part.trim().parse::<f64>().ok().map(|n| n * factor_mib)
+}
+
+#[cfg(target_os = "linux")]
 fn next_partition_boundary(start: &str, size: &str) -> Result<String, AppError> {
     if size.eq_ignore_ascii_case("all") || size == "100%" {
         return Ok("100%".to_string());
@@ -1563,21 +1599,22 @@ fn next_partition_boundary(start: &str, size: &str) -> Result<String, AppError> 
         return Ok(format!("{}%", (start_value + size_value).min(100.0)));
     }
 
-    if start.eq_ignore_ascii_case("1MiB") {
-        return Ok(size.to_string());
-    }
-
-    if start.eq_ignore_ascii_case(size) {
+    let start_mib = parse_size_to_mib(start).ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "Cannot mix '%'-based start with byte-sized partition; got start={}",
+            start
+        ))
+    })?;
+    let size_mib = parse_size_to_mib(size)
+        .ok_or_else(|| AppError::BadRequest(format!("Invalid partition size: {}", size)))?;
+    if size_mib <= 0.0 {
         return Err(AppError::BadRequest(format!(
-            "Partition size {} would create an empty range",
+            "Partition size {} must be positive",
             size
         )));
     }
-
-    Err(AppError::BadRequest(format!(
-        "Partition size {} requires explicit compatible boundaries",
-        size
-    )))
+    let end_mib = start_mib + size_mib;
+    Ok(format!("{:.0}MiB", end_mib))
 }
 
 #[cfg(target_os = "linux")]
@@ -1618,7 +1655,6 @@ fn wipe_disk_linux(device: &str) -> Result<(), AppError> {
     info!("Disk wiped successfully");
     Ok(())
 }
-
 
 pub async fn read_file(
     req: HttpRequest,
@@ -2023,7 +2059,6 @@ fn get_optimal_mount_options(fs_type: &str) -> Vec<String> {
     options
 }
 
-
 #[cfg(target_os = "linux")]
 pub fn validate_external_storage_path(path: &str) -> Result<(), AppError> {
     use std::path::Path;
@@ -2044,7 +2079,8 @@ pub fn validate_external_storage_path(path: &str) -> Result<(), AppError> {
             device
         );
         return Err(AppError::Forbidden(
-            "Storage to internal eMMC is not allowed. Please use external storage (USB/SATA).".to_string()
+            "Storage to internal eMMC is not allowed. Please use external storage (USB/SATA)."
+                .to_string(),
         ));
     }
 
@@ -2066,9 +2102,10 @@ pub fn validate_external_storage_path(path: &str) -> Result<(), AppError> {
                 path.display(),
                 mount_point
             );
-            return Err(AppError::Forbidden(
-                format!("Storage to system partition {} is not allowed. Please use external storage.", mount_point)
-            ));
+            return Err(AppError::Forbidden(format!(
+                "Storage to system partition {} is not allowed. Please use external storage.",
+                mount_point
+            )));
         }
     }
 
@@ -2182,7 +2219,8 @@ pub fn get_default_external_storage_path() -> Result<String, AppError> {
     }
 
     Err(AppError::NotFound(
-        "No external storage device found. Please connect a USB or SATA storage device.".to_string()
+        "No external storage device found. Please connect a USB or SATA storage device."
+            .to_string(),
     ))
 }
 
@@ -2266,7 +2304,6 @@ pub async fn get_external_storage_config() -> Result<HttpResponse, AppError> {
         })))
     }
 }
-
 
 #[allow(dead_code)]
 fn ensure_all_types_used() {

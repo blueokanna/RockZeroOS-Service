@@ -1,4 +1,8 @@
 use actix_web::{web, HttpRequest, HttpResponse};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, OsRng as AeadOsRng},
+    AeadCore, ChaCha20Poly1305, Key, Nonce,
+};
 use futures_util::StreamExt;
 use reqwest::Client;
 use rockzero_common::AppError;
@@ -17,12 +21,65 @@ use uuid::Uuid;
 const EDGE_ROOT_DEFAULT: &str = "./data/edge";
 const NODES_FILE: &str = "nodes.json";
 const JOBS_FILE: &str = "jobs.json";
-const WXY_AUTH_FILE: &str = "wxy_auth.json";
+const WXY_AUTH_FILE: &str = "wxy_auth.bin";
+const WXY_AUTH_LEGACY_FILE: &str = "wxy_auth.json";
+const WXY_AUTH_KEY_DOMAIN: &str = "rockzero.edge.wxy_auth.v1";
 const WXY_QR_FILE: &str = "wxy_qr_sessions.json";
 const DEFAULT_MAX_PENDING_JOBS: usize = 256;
 const DEFAULT_MAX_TOTAL_JOBS: usize = 5000;
 const DEFAULT_MAX_WASM_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_STDIO_BYTES: usize = 1024 * 1024;
+
+fn edge_secret_master() -> Result<Vec<u8>, AppError> {
+    if let Ok(value) = std::env::var("ROCKZERO_EDGE_SECRET") {
+        if value.len() >= 32 {
+            return Ok(value.into_bytes());
+        }
+        return Err(AppError::InternalServerError(
+            "ROCKZERO_EDGE_SECRET must be at least 32 characters".to_string(),
+        ));
+    }
+    if let Ok(value) = std::env::var("ROCKZERO_MASTER_KEY") {
+        if value.len() >= 32 {
+            return Ok(value.into_bytes());
+        }
+    }
+    Err(AppError::InternalServerError(
+        "ROCKZERO_EDGE_SECRET is required to persist edge credentials".to_string(),
+    ))
+}
+
+fn edge_envelope_cipher() -> Result<ChaCha20Poly1305, AppError> {
+    let master = edge_secret_master()?;
+    let derived = blake3::derive_key(WXY_AUTH_KEY_DOMAIN, &master);
+    let key = Key::from_slice(&derived);
+    Ok(ChaCha20Poly1305::new(key))
+}
+
+fn encrypt_edge_envelope(plaintext: &[u8]) -> Result<Vec<u8>, AppError> {
+    let cipher = edge_envelope_cipher()?;
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut AeadOsRng);
+    let ct = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| AppError::CryptoError(format!("edge envelope encrypt failed: {}", e)))?;
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(nonce.as_slice());
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+fn decrypt_edge_envelope(blob: &[u8]) -> Result<Vec<u8>, AppError> {
+    if blob.len() < 13 {
+        return Err(AppError::BadRequest(
+            "Edge credential envelope too short".to_string(),
+        ));
+    }
+    let cipher = edge_envelope_cipher()?;
+    let nonce = Nonce::from_slice(&blob[..12]);
+    cipher
+        .decrypt(nonce, &blob[12..])
+        .map_err(|e| AppError::CryptoError(format!("edge envelope decrypt failed: {}", e)))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -159,6 +216,8 @@ pub struct EdgeJob {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub requires_wxy_auth: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +256,7 @@ pub struct SubmitJobRequest {
     pub priority: Option<i32>,
     pub timeout_ms: Option<u64>,
     pub max_retries: Option<u32>,
+    pub requires_wxy_auth: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -570,7 +630,10 @@ impl EdgeManager {
         let timeout_secs = env_u64("WXY_GATEWAY_HEALTH_TIMEOUT_SECS", 8).max(1);
 
         let endpoint = format!("{}{}", api_base.trim_end_matches('/'), path);
-        let client = match Client::builder().timeout(Duration::from_secs(timeout_secs)).build() {
+        let client = match Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()
+        {
             Ok(c) => c,
             Err(e) => {
                 return serde_json::json!({
@@ -701,13 +764,13 @@ impl EdgeManager {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let overall_status = if !gateway_ok || !mapping_ok || (logged_in && !refresh_report.success)
-        {
-            "degraded"
-        } else {
-            "ok"
-        }
-        .to_string();
+        let overall_status =
+            if !gateway_ok || !mapping_ok || (logged_in && !refresh_report.success) {
+                "degraded"
+            } else {
+                "ok"
+            }
+            .to_string();
 
         EdgeStartupSelfCheckReport {
             checked_at,
@@ -806,12 +869,29 @@ impl EdgeManager {
 
         let wxy_auth_path = self.root.join(WXY_AUTH_FILE);
         if wxy_auth_path.exists() {
-            let data = tokio::fs::read_to_string(&wxy_auth_path)
+            let blob = tokio::fs::read(&wxy_auth_path)
                 .await
                 .map_err(|e| AppError::IoError(e.to_string()))?;
-            let token: WxyAuthToken = serde_json::from_str(&data)
+            let plaintext = decrypt_edge_envelope(&blob)?;
+            let token: WxyAuthToken = serde_json::from_slice(&plaintext)
                 .map_err(|e| AppError::BadRequest(format!("Invalid wxy auth file: {}", e)))?;
             *self.wxy_auth.write().await = Some(token);
+        } else {
+            let legacy_path = self.root.join(WXY_AUTH_LEGACY_FILE);
+            if legacy_path.exists() {
+                let data = tokio::fs::read_to_string(&legacy_path)
+                    .await
+                    .map_err(|e| AppError::IoError(e.to_string()))?;
+                let token: WxyAuthToken = serde_json::from_str(&data)
+                    .map_err(|e| AppError::BadRequest(format!("Invalid wxy auth file: {}", e)))?;
+                *self.wxy_auth.write().await = Some(token);
+                let plaintext = data.into_bytes();
+                if let Ok(blob) = encrypt_edge_envelope(&plaintext) {
+                    if tokio::fs::write(&wxy_auth_path, blob).await.is_ok() {
+                        let _ = tokio::fs::remove_file(&legacy_path).await;
+                    }
+                }
+            }
         }
 
         let wxy_qr_path = self.root.join(WXY_QR_FILE);
@@ -843,7 +923,7 @@ impl EdgeManager {
     async fn persist_jobs(&self) -> Result<(), AppError> {
         let jobs = self.jobs.read().await;
         let mut all: Vec<EdgeJob> = jobs.values().cloned().collect();
-        all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        all.sort_by_key(|job| std::cmp::Reverse(job.created_at));
 
         let max_total = env_usize("EDGE_MAX_TOTAL_JOBS", DEFAULT_MAX_TOTAL_JOBS).max(100);
         if all.len() > max_total {
@@ -859,18 +939,27 @@ impl EdgeManager {
 
     async fn persist_wxy_auth(&self) -> Result<(), AppError> {
         let auth = self.wxy_auth.read().await;
+        let target = self.root.join(WXY_AUTH_FILE);
+        let legacy = self.root.join(WXY_AUTH_LEGACY_FILE);
         match auth.as_ref() {
             Some(token) => {
-                let text = serde_json::to_string_pretty(token)
+                let plaintext = serde_json::to_vec(token)
                     .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-                tokio::fs::write(self.root.join(WXY_AUTH_FILE), text)
+                let blob = encrypt_edge_envelope(&plaintext)?;
+                tokio::fs::write(&target, blob)
                     .await
-                    .map_err(|e| AppError::IoError(e.to_string()))
+                    .map_err(|e| AppError::IoError(e.to_string()))?;
+                if legacy.exists() {
+                    let _ = tokio::fs::remove_file(&legacy).await;
+                }
+                Ok(())
             }
             None => {
-                let path = self.root.join(WXY_AUTH_FILE);
-                if path.exists() {
-                    let _ = tokio::fs::remove_file(path).await;
+                if target.exists() {
+                    let _ = tokio::fs::remove_file(&target).await;
+                }
+                if legacy.exists() {
+                    let _ = tokio::fs::remove_file(&legacy).await;
                 }
                 Ok(())
             }
@@ -880,7 +969,7 @@ impl EdgeManager {
     async fn persist_wxy_qr_sessions(&self) -> Result<(), AppError> {
         let sessions = self.wxy_qr_sessions.read().await;
         let mut all: Vec<WxyQrSession> = sessions.values().cloned().collect();
-        all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        all.sort_by_key(|session| std::cmp::Reverse(session.created_at));
         if all.len() > 500 {
             all.truncate(500);
         }
@@ -896,11 +985,15 @@ impl EdgeManager {
         let now = now_epoch();
         let node = EdgeNode {
             node_id: node_id.clone(),
-            name: body.name.unwrap_or_else(|| "RockZero Edge Node".to_string()),
+            name: body
+                .name
+                .unwrap_or_else(|| "RockZero Edge Node".to_string()),
             endpoint: body.endpoint,
             tags: body.tags.unwrap_or_default(),
             max_concurrency: body.max_concurrency.unwrap_or(2).clamp(1, 128),
-            capabilities: body.capabilities.unwrap_or_else(|| vec!["wasm32-wasi".to_string()]),
+            capabilities: body
+                .capabilities
+                .unwrap_or_else(|| vec!["wasm32-wasi".to_string()]),
             registered_at: now,
             last_heartbeat: now,
             status: NodeStatus::Online,
@@ -940,7 +1033,10 @@ impl EdgeManager {
         let max_pending = env_usize("EDGE_MAX_PENDING_JOBS", DEFAULT_MAX_PENDING_JOBS).max(1);
         {
             let jobs = self.jobs.read().await;
-            let pending = jobs.values().filter(|j| j.status == JobStatus::Pending).count();
+            let pending = jobs
+                .values()
+                .filter(|j| j.status == JobStatus::Pending)
+                .count();
             if pending >= max_pending {
                 return Err(AppError::PreconditionFailed(format!(
                     "Edge queue is full: pending={} max_pending={}",
@@ -949,12 +1045,26 @@ impl EdgeManager {
             }
         }
 
-        let require_auth = std::env::var("EDGE_REQUIRE_WXY_AUTH")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let require_auth = body.requires_wxy_auth.unwrap_or(false)
+            || std::env::var("EDGE_REQUIRE_WXY_AUTH")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
 
-        let refresh_report = self.ensure_wxy_auth_valid(false).await;
+        let refresh_report = if require_auth {
+            self.ensure_wxy_auth_valid(false).await
+        } else {
+            WxyRefreshReport {
+                checked_at: now_epoch(),
+                attempted: false,
+                success: false,
+                used_fallback: false,
+                reason: "wxy_auth_not_required".to_string(),
+                expires_at: None,
+                seconds_left: None,
+                refresh_error: None,
+            }
+        };
         let auth = self.wxy_auth.read().await.clone();
         if require_auth && auth.is_none() {
             return Err(AppError::PreconditionFailed(
@@ -992,6 +1102,7 @@ impl EdgeManager {
             stdout: None,
             stderr: None,
             error: None,
+            requires_wxy_auth: require_auth,
         };
 
         self.jobs.write().await.insert(job_id.clone(), job);
@@ -1017,7 +1128,7 @@ impl EdgeManager {
             })
             .map(|(id, j)| (id.clone(), j.finished_at.unwrap_or(j.created_at)))
             .collect();
-        finished.sort_by(|a, b| a.1.cmp(&b.1));
+        finished.sort_by_key(|item| item.1);
 
         let mut to_remove = jobs.len().saturating_sub(max_total);
         for (id, _) in finished {
@@ -1080,16 +1191,18 @@ impl EdgeManager {
         let function = snapshot.function.clone();
         let args = snapshot.args.clone();
         let mut env = snapshot.env.clone();
-        if let Some(token) = self.wxy_auth.read().await.clone() {
-            env.insert("WXY_ACCESS_TOKEN".to_string(), token.access_token);
-            if let Some(refresh) = token.refresh_token {
-                env.insert("WXY_REFRESH_TOKEN".to_string(), refresh);
-            }
-            if let Some(account_id) = token.account_id {
-                env.insert("WXY_ACCOUNT_ID".to_string(), account_id);
-            }
-            if let Some(expires_at) = token.expires_at {
-                env.insert("WXY_EXPIRES_AT".to_string(), expires_at.to_string());
+        if snapshot.requires_wxy_auth {
+            if let Some(token) = self.wxy_auth.read().await.clone() {
+                env.insert("WXY_ACCESS_TOKEN".to_string(), token.access_token);
+                if let Some(refresh) = token.refresh_token {
+                    env.insert("WXY_REFRESH_TOKEN".to_string(), refresh);
+                }
+                if let Some(account_id) = token.account_id {
+                    env.insert("WXY_ACCOUNT_ID".to_string(), account_id);
+                }
+                if let Some(expires_at) = token.expires_at {
+                    env.insert("WXY_EXPIRES_AT".to_string(), expires_at.to_string());
+                }
             }
         }
         let stdio_max = env_usize("EDGE_JOB_STDIO_MAX_BYTES", DEFAULT_MAX_STDIO_BYTES).max(4096);
@@ -1147,7 +1260,10 @@ impl EdgeManager {
                     func.call(&mut store, &[], &mut [])
                         .map_err(|e| AppError::BadRequest(format!("WASM call failed: {}", e)))?;
                 } else {
-                    return Err(AppError::NotFound(format!("Function '{}' not found", function)));
+                    return Err(AppError::NotFound(format!(
+                        "Function '{}' not found",
+                        function
+                    )));
                 }
 
                 drop(store);
@@ -1243,7 +1359,8 @@ impl EdgeManager {
     }
 
     async fn resolve_wasm_bytes(&self, job: &EdgeJob) -> Result<Vec<u8>, AppError> {
-        let max_wasm_bytes = env_usize("EDGE_WASM_MAX_BYTES", DEFAULT_MAX_WASM_BYTES).max(64 * 1024);
+        let max_wasm_bytes =
+            env_usize("EDGE_WASM_MAX_BYTES", DEFAULT_MAX_WASM_BYTES).max(64 * 1024);
 
         if let Some(path) = &job.wasm_path {
             let p = Path::new(path);
@@ -1267,9 +1384,9 @@ impl EdgeManager {
 
         if let Some(app_id) = &job.app_id {
             if let Some(path) = resolve_app_path(app_id).await? {
-                let meta = tokio::fs::metadata(&path)
-                    .await
-                    .map_err(|e| AppError::IoError(format!("Read app wasm metadata failed: {}", e)))?;
+                let meta = tokio::fs::metadata(&path).await.map_err(|e| {
+                    AppError::IoError(format!("Read app wasm metadata failed: {}", e))
+                })?;
                 let size = meta.len() as usize;
                 if size > max_wasm_bytes {
                     return Err(AppError::BadRequest(format!(
@@ -1281,7 +1398,10 @@ impl EdgeManager {
                     .await
                     .map_err(|e| AppError::IoError(format!("Read app wasm failed: {}", e)));
             }
-            return Err(AppError::NotFound(format!("Installed app '{}' not found", app_id)));
+            return Err(AppError::NotFound(format!(
+                "Installed app '{}' not found",
+                app_id
+            )));
         }
 
         if let Some(url) = &job.wasm_url {
@@ -1290,11 +1410,10 @@ impl EdgeManager {
                 .timeout(Duration::from_secs(60))
                 .build()
                 .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-            let resp = client
-                .get(url)
-                .send()
-                .await
-                .map_err(|e| AppError::BadRequest(format!("Download wasm_url failed: {}", e)))?;
+            let resp =
+                client.get(url).send().await.map_err(|e| {
+                    AppError::BadRequest(format!("Download wasm_url failed: {}", e))
+                })?;
             if !resp.status().is_success() {
                 return Err(AppError::BadRequest(format!(
                     "wasm_url returned status {}",
@@ -1314,8 +1433,9 @@ impl EdgeManager {
             let mut bytes: Vec<u8> = Vec::new();
             let mut stream = resp.bytes_stream();
             while let Some(chunk_res) = stream.next().await {
-                let chunk = chunk_res
-                    .map_err(|e| AppError::BadRequest(format!("Read wasm_url stream failed: {}", e)))?;
+                let chunk = chunk_res.map_err(|e| {
+                    AppError::BadRequest(format!("Read wasm_url stream failed: {}", e))
+                })?;
                 if bytes.len() + chunk.len() > max_wasm_bytes {
                     return Err(AppError::BadRequest(format!(
                         "wasm_url stream exceeds limit {} bytes",
@@ -1343,7 +1463,9 @@ impl EdgeManager {
             return Err(AppError::Forbidden("Job access denied".to_string()));
         }
         if j.status == JobStatus::Completed || j.status == JobStatus::Failed {
-            return Err(AppError::Conflict("Finished job cannot be cancelled".to_string()));
+            return Err(AppError::Conflict(
+                "Finished job cannot be cancelled".to_string(),
+            ));
         }
         j.status = JobStatus::Cancelled;
         j.assigned_node = None;
@@ -1365,11 +1487,26 @@ impl EdgeManager {
 
         let nodes_online = nodes.values().filter(|n| node_is_online(n)).count();
         let nodes_total = nodes.len();
-        let jobs_pending = jobs.values().filter(|j| j.status == JobStatus::Pending).count();
-        let jobs_running = jobs.values().filter(|j| j.status == JobStatus::Running).count();
-        let jobs_completed = jobs.values().filter(|j| j.status == JobStatus::Completed).count();
-        let jobs_failed = jobs.values().filter(|j| j.status == JobStatus::Failed).count();
-        let jobs_cancelled = jobs.values().filter(|j| j.status == JobStatus::Cancelled).count();
+        let jobs_pending = jobs
+            .values()
+            .filter(|j| j.status == JobStatus::Pending)
+            .count();
+        let jobs_running = jobs
+            .values()
+            .filter(|j| j.status == JobStatus::Running)
+            .count();
+        let jobs_completed = jobs
+            .values()
+            .filter(|j| j.status == JobStatus::Completed)
+            .count();
+        let jobs_failed = jobs
+            .values()
+            .filter(|j| j.status == JobStatus::Failed)
+            .count();
+        let jobs_cancelled = jobs
+            .values()
+            .filter(|j| j.status == JobStatus::Cancelled)
+            .count();
 
         EdgeStats {
             nodes_online,
@@ -1388,9 +1525,7 @@ async fn validate_wasm_url(url: &str) -> Result<(), AppError> {
         .map_err(|e| AppError::BadRequest(format!("Invalid wasm_url: {}", e)))?;
 
     if parsed.scheme() != "https" {
-        return Err(AppError::BadRequest(
-            "wasm_url must use https".to_string(),
-        ));
+        return Err(AppError::BadRequest("wasm_url must use https".to_string()));
     }
 
     let host = parsed
@@ -1545,7 +1680,13 @@ pub async fn inspect_wxy_adapter(
         let raw_status = get_first_string(
             &json,
             "WXY_ADAPTER_STATUS_PATHS",
-            &["status", "data.status", "result.status", "code", "data.code"],
+            &[
+                "status",
+                "data.status",
+                "result.status",
+                "code",
+                "data.code",
+            ],
         )
         .unwrap_or_else(|| "pending".to_string());
         let status = status_from_text(&raw_status);
@@ -1570,10 +1711,7 @@ pub async fn inspect_wxy_adapter(
 
 fn env_required(name: &str) -> Result<String, AppError> {
     std::env::var(name).map_err(|_| {
-        AppError::PreconditionFailed(format!(
-            "Missing environment variable: {}",
-            name
-        ))
+        AppError::PreconditionFailed(format!("Missing environment variable: {}", name))
     })
 }
 
@@ -1690,7 +1828,11 @@ async fn call_wxy_start_qr(body: &StartWxyQrLoginRequest) -> Result<WxyQrSession
     req_map.insert("client_id".to_string(), Value::String(client_id));
     req_map.insert(
         "scope".to_string(),
-        Value::String(body.scope.clone().unwrap_or_else(|| "edge.compute".to_string())),
+        Value::String(
+            body.scope
+                .clone()
+                .unwrap_or_else(|| "edge.compute".to_string()),
+        ),
     );
     if let Some(redirect) = &body.redirect_uri {
         req_map.insert("redirect_uri".to_string(), Value::String(redirect.clone()));
@@ -1775,8 +1917,8 @@ async fn call_wxy_start_qr(body: &StartWxyQrLoginRequest) -> Result<WxyQrSession
 
 async fn call_wxy_poll_qr(session: &WxyQrSession) -> Result<(WxyQrStatus, Value), AppError> {
     let api_base = env_required("WXY_API_BASE")?;
-    let mut path =
-        std::env::var("WXY_QR_POLL_PATH").unwrap_or_else(|_| "/auth/qr/poll/{session_id}".to_string());
+    let mut path = std::env::var("WXY_QR_POLL_PATH")
+        .unwrap_or_else(|_| "/auth/qr/poll/{session_id}".to_string());
     path = path.replace("{session_id}", &session.session_id);
     if let Some(code) = &session.device_code {
         path = path.replace("{device_code}", code);
@@ -1793,7 +1935,10 @@ async fn call_wxy_poll_qr(session: &WxyQrSession) -> Result<(WxyQrStatus, Value)
 
     let mut req_map = serde_json::Map::new();
     req_map.insert("client_id".to_string(), Value::String(client_id));
-    req_map.insert("session_id".to_string(), Value::String(session.session_id.clone()));
+    req_map.insert(
+        "session_id".to_string(),
+        Value::String(session.session_id.clone()),
+    );
     if let Some(code) = &session.device_code {
         req_map.insert("device_code".to_string(), Value::String(code.clone()));
     }
@@ -1834,7 +1979,13 @@ async fn call_wxy_poll_qr(session: &WxyQrSession) -> Result<(WxyQrStatus, Value)
     let raw_status = get_first_string(
         &json,
         "WXY_ADAPTER_STATUS_PATHS",
-        &["status", "data.status", "result.status", "code", "data.code"],
+        &[
+            "status",
+            "data.status",
+            "result.status",
+            "code",
+            "data.code",
+        ],
     )
     .unwrap_or_else(|| "pending".to_string());
 
@@ -1906,8 +2057,9 @@ async fn call_wxy_refresh_token(current: &WxyAuthToken) -> Result<WxyAuthToken, 
         .await
         .map_err(|e| AppError::BadRequest(format!("WXY refresh parse failed: {}", e)))?;
 
-    let mut next = extract_auth_from_poll_json(&json)
-        .ok_or_else(|| AppError::BadRequest("WXY refresh response missing access token".to_string()))?;
+    let mut next = extract_auth_from_poll_json(&json).ok_or_else(|| {
+        AppError::BadRequest("WXY refresh response missing access token".to_string())
+    })?;
     next.provider = "wangxinyun".to_string();
     if next.refresh_token.as_ref().is_none_or(|v| v.is_empty()) {
         next.refresh_token = current.refresh_token.clone();
@@ -1936,7 +2088,11 @@ fn extract_auth_from_poll_json(json: &Value) -> Option<WxyAuthToken> {
     let refresh_token = get_first_string(
         json,
         "WXY_ADAPTER_REFRESH_TOKEN_PATHS",
-        &["refresh_token", "data.refresh_token", "result.refresh_token"],
+        &[
+            "refresh_token",
+            "data.refresh_token",
+            "result.refresh_token",
+        ],
     );
 
     let account_id = get_first_string(
@@ -2004,7 +2160,10 @@ pub async fn start_wxy_qr_login(
     let session = call_wxy_start_qr(&body.into_inner()).await?;
     let sid = session.session_id.clone();
 
-    mgr.wxy_qr_sessions.write().await.insert(sid.clone(), session.clone());
+    mgr.wxy_qr_sessions
+        .write()
+        .await
+        .insert(sid.clone(), session.clone());
     mgr.persist_wxy_qr_sessions().await?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -2120,10 +2279,7 @@ pub async fn refresh_wxy_auth_token(
     crate::middleware::verify_fido2_or_passkey(&req).await?;
     ensure_admin(&claims)?;
     let mgr = manager().await?;
-    let force = body
-        .as_ref()
-        .and_then(|b| b.force)
-        .unwrap_or(true);
+    let force = body.as_ref().and_then(|b| b.force).unwrap_or(true);
     let report = mgr.ensure_wxy_auth_valid(force).await;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -2157,7 +2313,8 @@ pub async fn node_heartbeat(
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
     let mgr = manager().await?;
-    mgr.heartbeat(&path.into_inner(), body.status.clone()).await?;
+    mgr.heartbeat(&path.into_inner(), body.status.clone())
+        .await?;
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "status": "ok",
     })))
@@ -2190,7 +2347,9 @@ pub async fn submit_job(
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
     let mgr = manager().await?;
-    let job_id = mgr.submit_job(claims.sub.clone(), body.into_inner()).await?;
+    let job_id = mgr
+        .submit_job(claims.sub.clone(), body.into_inner())
+        .await?;
     Ok(HttpResponse::Accepted().json(SubmitJobResponse {
         job_id,
         status: "queued".to_string(),
@@ -2233,7 +2392,7 @@ pub async fn list_jobs(
         .cloned()
         .collect();
 
-    jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.created_at));
     if jobs.len() > limit {
         jobs.truncate(limit);
     }
@@ -2284,6 +2443,7 @@ pub async fn retry_job(
     job.finished_at = None;
     job.assigned_node = None;
     job.error = None;
+    job.retry_count = 0;
     drop(jobs);
 
     mgr.persist_jobs().await?;
@@ -2339,6 +2499,24 @@ pub async fn health() -> Result<HttpResponse, AppError> {
     let mgr = manager().await?;
     let stats = mgr.stats().await;
     let logged_in = mgr.wxy_auth.read().await.is_some();
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "service": "edge-compute",
+        "status": "ok",
+        "stats": stats,
+        "wxy_logged_in": logged_in,
+        "now": now_epoch(),
+    })))
+}
+
+pub async fn admin_health(
+    req: HttpRequest,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
+) -> Result<HttpResponse, AppError> {
+    crate::middleware::verify_fido2_or_passkey(&req).await?;
+    ensure_admin(&claims)?;
+    let mgr = manager().await?;
+    let stats = mgr.stats().await;
+    let logged_in = mgr.wxy_auth.read().await.is_some();
     let startup_report = mgr.startup_self_check.read().await.clone();
     let last_refresh = mgr.last_wxy_refresh.read().await.clone();
     Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -2356,16 +2534,12 @@ pub async fn builtin_wxy_edge_node_status() -> Result<Value, AppError> {
     let mgr = manager().await?;
     let stats = mgr.stats().await;
     let logged_in = mgr.wxy_auth.read().await.is_some();
-    let startup_report = mgr.startup_self_check.read().await.clone();
-    let last_refresh = mgr.last_wxy_refresh.read().await.clone();
 
     Ok(serde_json::json!({
         "service": "edge-compute",
         "status": "ok",
         "stats": stats,
         "wxy_logged_in": logged_in,
-        "wxy_last_refresh": last_refresh,
-        "startup_self_check": startup_report,
         "now": now_epoch(),
     }))
 }

@@ -5,8 +5,8 @@ use uuid::Uuid;
 use validator::Validate;
 
 use crate::db;
-use rockzero_common::AppError;
 use rockzero_common::models::{CreateWidgetRequest, UpdateWidgetRequest, Widget, WidgetResponse};
+use rockzero_common::AppError;
 
 pub async fn list_widgets(
     pool: web::Data<SqlitePool>,

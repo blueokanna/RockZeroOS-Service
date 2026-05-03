@@ -1,8 +1,8 @@
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use super::secure_transport::{EncryptedChunk, SecureStreamTransport};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
 
 pub struct TcpStreamSender {
     stream: Arc<RwLock<TcpStream>>,
@@ -17,11 +17,9 @@ pub struct TcpStats {
 }
 
 impl TcpStreamSender {
-    pub async fn new(
-        stream: TcpStream,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(stream: TcpStream) -> Result<Self, Box<dyn std::error::Error>> {
         stream.set_nodelay(true)?;
-        
+
         Ok(Self {
             stream: Arc::new(RwLock::new(stream)),
             stats: Arc::new(RwLock::new(TcpStats::default())),
@@ -34,16 +32,16 @@ impl TcpStreamSender {
     ) -> Result<usize, Box<dyn std::error::Error>> {
         let serialized = bincode::serialize(chunk)?;
         let len = serialized.len() as u32;
-        
+
         let mut stream = self.stream.write().await;
         stream.write_all(&len.to_le_bytes()).await?;
         stream.write_all(&serialized).await?;
         stream.flush().await?;
-        
+
         let mut stats = self.stats.write().await;
         stats.chunks_sent += 1;
         stats.bytes_sent += (len + 4) as u64;
-        
+
         Ok((len + 4) as usize)
     }
 
@@ -52,7 +50,7 @@ impl TcpStreamSender {
         chunks: &[EncryptedChunk],
     ) -> Result<usize, Box<dyn std::error::Error>> {
         let mut total_sent = 0;
-        
+
         for chunk in chunks {
             match self.send_chunk(chunk).await {
                 Ok(sent) => total_sent += sent,
@@ -64,7 +62,7 @@ impl TcpStreamSender {
                 }
             }
         }
-        
+
         Ok(total_sent)
     }
 
@@ -84,7 +82,7 @@ impl TcpStreamReceiver {
         transport: Arc<SecureStreamTransport>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         stream.set_nodelay(true)?;
-        
+
         Ok(Self {
             stream: Arc::new(RwLock::new(stream)),
             transport,
@@ -93,18 +91,18 @@ impl TcpStreamReceiver {
 
     pub async fn receive_chunk(&self) -> Result<EncryptedChunk, Box<dyn std::error::Error>> {
         let mut stream = self.stream.write().await;
-        
+
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await?;
         let len = u32::from_le_bytes(len_buf) as usize;
-        
+
         let mut data_buf = vec![0u8; len];
         stream.read_exact(&mut data_buf).await?;
-        
+
         let chunk: EncryptedChunk = bincode::deserialize(&data_buf)?;
-        
+
         self.transport.verify_zkp_proof(&chunk).await?;
-        
+
         Ok(chunk)
     }
 
@@ -137,7 +135,7 @@ impl TcpStreamServer {
         transport: Arc<SecureStreamTransport>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(bind_addr).await?;
-        
+
         Ok(Self {
             listener,
             transport,

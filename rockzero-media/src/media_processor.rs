@@ -410,7 +410,6 @@ impl Default for MediaProcessor {
     }
 }
 
-/// Audio transcoding stream for DTS/AC3/TrueHD to AAC conversion
 #[allow(dead_code)]
 pub struct AudioTranscodeStream {
     child: Child,
@@ -419,8 +418,6 @@ pub struct AudioTranscodeStream {
 
 #[allow(dead_code)]
 impl AudioTranscodeStream {
-    /// Create a new audio transcoding stream
-    /// Converts DTS/AC3/TrueHD audio to AAC while keeping video stream intact
     pub fn new(
         input_path: &str,
         start_position: Option<f64>,
@@ -428,7 +425,6 @@ impl AudioTranscodeStream {
     ) -> Result<Self, AppError> {
         let mut args: Vec<String> = Vec::new();
 
-        // Hardware acceleration for decoding
         match hardware_accel {
             Some(HardwareAccel::VAAPI) => {
                 args.extend_from_slice(&[
@@ -450,33 +446,30 @@ impl AudioTranscodeStream {
             _ => {}
         }
 
-        // Seek position if specified
         if let Some(pos) = start_position {
             args.push("-ss".to_string());
             args.push(pos.to_string());
         }
 
-        // Input file
         args.push("-i".to_string());
         args.push(input_path.to_string());
 
-        // Copy video stream, transcode audio to AAC
         args.extend_from_slice(&[
             "-c:v".to_string(),
-            "copy".to_string(), // Copy video without re-encoding
+            "copy".to_string(),
             "-c:a".to_string(),
-            "aac".to_string(), // Transcode audio to AAC
+            "aac".to_string(),
             "-b:a".to_string(),
-            "256k".to_string(), // Audio bitrate
+            "256k".to_string(),
             "-ac".to_string(),
-            "2".to_string(), // Stereo output (for compatibility)
+            "2".to_string(),
             "-ar".to_string(),
-            "48000".to_string(), // Sample rate
+            "48000".to_string(),
             "-movflags".to_string(),
-            "frag_keyframe+empty_moov+faststart".to_string(), // Streaming-friendly MP4
+            "frag_keyframe+empty_moov+faststart".to_string(),
             "-f".to_string(),
-            "mp4".to_string(), // Output format
-            "-".to_string(),   // Output to stdout
+            "mp4".to_string(),
+            "-".to_string(),
         ]);
 
         info!("Starting audio transcode with args: {:?}", args);
@@ -493,15 +486,14 @@ impl AudioTranscodeStream {
 
         Ok(Self {
             child,
-            buffer: vec![0u8; 64 * 1024], // 64KB buffer
+            buffer: vec![0u8; 64 * 1024],
         })
     }
 
-    /// Read next chunk from the transcoding stream
     pub fn read_chunk(&mut self) -> Option<Vec<u8>> {
         if let Some(ref mut stdout) = self.child.stdout {
             match stdout.read(&mut self.buffer) {
-                Ok(0) => None, // EOF
+                Ok(0) => None,
                 Ok(n) => Some(self.buffer[..n].to_vec()),
                 Err(e) => {
                     warn!("Error reading transcode stream: {}", e);
@@ -513,7 +505,6 @@ impl AudioTranscodeStream {
         }
     }
 
-    /// Check if the process is still running
     pub fn is_running(&mut self) -> bool {
         match self.child.try_wait() {
             Ok(Some(_)) => false,
@@ -529,7 +520,6 @@ impl Drop for AudioTranscodeStream {
     }
 }
 
-/// Streaming transcoder that outputs to a pipe for HTTP streaming
 pub struct StreamingTranscoder {
     ffmpeg_path: String,
 }
@@ -541,8 +531,6 @@ impl StreamingTranscoder {
         }
     }
 
-    /// Start a streaming transcode process for DTS/AC3 audio
-    /// Returns a Child process with stdout as the transcoded stream
     pub fn start_audio_transcode(
         &self,
         input_path: &str,
@@ -556,41 +544,32 @@ impl StreamingTranscoder {
             "error".to_string(),
         ];
 
-        // Seek position
         if let Some(pos) = seek_seconds {
             args.push("-ss".to_string());
             args.push(pos.to_string());
         }
 
-        // Input
         args.push("-i".to_string());
         args.push(input_path.to_string());
 
-        // Video: copy (no re-encoding)
         args.push("-c:v".to_string());
         args.push("copy".to_string());
 
-        // Audio: transcode to AAC
         args.push("-c:a".to_string());
         args.push("aac".to_string());
 
-        // Audio bitrate
         args.push("-b:a".to_string());
         args.push(audio_bitrate.unwrap_or("256k").to_string());
 
-        // Channels (default to stereo for compatibility)
         args.push("-ac".to_string());
         args.push(channels.unwrap_or(2).to_string());
 
-        // Sample rate
         args.push("-ar".to_string());
         args.push("48000".to_string());
 
-        // Streaming-optimized MP4
         args.push("-movflags".to_string());
         args.push("frag_keyframe+empty_moov+faststart+default_base_moof".to_string());
 
-        // Output format and destination
         args.push("-f".to_string());
         args.push("mp4".to_string());
         args.push("-".to_string());
@@ -608,7 +587,6 @@ impl StreamingTranscoder {
             })
     }
 
-    /// Start HLS transcode for better seeking support
     #[allow(dead_code)]
     pub fn start_hls_transcode(
         &self,

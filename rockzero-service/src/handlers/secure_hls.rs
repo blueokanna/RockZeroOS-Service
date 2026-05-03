@@ -28,8 +28,7 @@ static NO_DISK_SEGMENT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mu
 static NO_DISK_FALLBACK_WARNED: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 static HW_ACCEL_DETECTION_CACHE: OnceLock<HardwareAccel> = OnceLock::new();
 static VIDEO_CODEC_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
-static EXTERNAL_CACHE_STARTUP_GUARD: OnceLock<Mutex<ExternalCacheStartupGuard>> =
-    OnceLock::new();
+static EXTERNAL_CACHE_STARTUP_GUARD: OnceLock<Mutex<ExternalCacheStartupGuard>> = OnceLock::new();
 static SEGMENT_TICKET_SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 static SESSION_CACHE_DIRS: OnceLock<Mutex<HashMap<String, std::path::PathBuf>>> = OnceLock::new();
 static A311D_PROFILE_CACHE: OnceLock<bool> = OnceLock::new();
@@ -60,9 +59,9 @@ fn chacha_encrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, AppError> {
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher
-        .encrypt(nonce, data)
-        .map_err(|e| AppError::CryptoError(format!("ChaCha20-Poly1305 encryption failed: {}", e)))?;
+    let ciphertext = cipher.encrypt(nonce, data).map_err(|e| {
+        AppError::CryptoError(format!("ChaCha20-Poly1305 encryption failed: {}", e))
+    })?;
 
     let mut out = Vec::with_capacity(12 + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
@@ -136,7 +135,10 @@ fn remove_session_cache_dir(session_id: &str) -> Option<std::path::PathBuf> {
     dirs.remove(session_id)
 }
 
-fn resolve_session_cache_dir(file_path: &str, session_id: Option<&str>) -> Result<std::path::PathBuf, AppError> {
+fn resolve_session_cache_dir(
+    file_path: &str,
+    session_id: Option<&str>,
+) -> Result<std::path::PathBuf, AppError> {
     if let Some(sid) = session_id {
         if let Some(existing) = get_session_cache_dir(sid) {
             return Ok(existing);
@@ -151,7 +153,9 @@ fn resolve_session_cache_dir(file_path: &str, session_id: Option<&str>) -> Resul
         ))
     })?;
 
-    let parent_canonical = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    let parent_canonical = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
 
     #[cfg(target_os = "linux")]
     {
@@ -189,12 +193,16 @@ fn resolve_session_cache_dir(file_path: &str, session_id: Option<&str>) -> Resul
 }
 
 fn set_session_no_disk_mode(session_id: &str, enabled: bool) {
-    let mut modes = no_disk_mode_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut modes = no_disk_mode_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     modes.insert(session_id.to_string(), enabled);
 }
 
 fn clear_session_no_disk_mode(session_id: &str) {
-    let mut modes = no_disk_mode_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut modes = no_disk_mode_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     modes.remove(session_id);
 
     let mut warned = no_disk_fallback_warned_registry()
@@ -212,7 +220,10 @@ async fn cleanup_session_cache_dir(session_id: &str) {
                     cache_dir, session_id, e
                 );
             } else {
-                info!("Removed session cache dir {:?} for {}", cache_dir, session_id);
+                info!(
+                    "Removed session cache dir {:?} for {}",
+                    cache_dir, session_id
+                );
             }
         }
     }
@@ -275,7 +286,9 @@ where
 }
 
 pub fn get_no_disk_playback_status() -> (bool, usize) {
-    let modes = no_disk_mode_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let modes = no_disk_mode_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let count = modes.values().filter(|&&enabled| enabled).count();
     (count > 0, count)
 }
@@ -448,7 +461,10 @@ fn cleanup_orphan_hls_temp_dirs() {
     }
 
     if removed > 0 {
-        info!("Startup cleanup removed {} orphan .rockzero_hls_tmp directories", removed);
+        info!(
+            "Startup cleanup removed {} orphan .rockzero_hls_tmp directories",
+            removed
+        );
     }
 }
 
@@ -486,17 +502,16 @@ pub fn initialize_external_cache_startup_guard() -> bool {
         Err(e) => {
             guard.checked = true;
             guard.ready = false;
-            guard.message = format!(
-                "external HLS cache startup validation failed: {}",
-                e
-            );
+            guard.message = format!("external HLS cache startup validation failed: {}", e);
             false
         }
     }
 }
 
 fn get_cached_no_disk_segment(cache_key: &str) -> Option<Vec<u8>> {
-    let mut cache = no_disk_segment_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = no_disk_segment_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     cache.retain(|_, entry| {
         entry.created_at.elapsed() < std::time::Duration::from_secs(NO_DISK_SEGMENT_TTL_SECS)
     });
@@ -545,7 +560,9 @@ fn put_cached_no_disk_segment(cache_key: String, data: Vec<u8>) {
         return;
     }
 
-    let mut cache = no_disk_segment_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = no_disk_segment_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     trim_no_disk_segment_cache_locked(&mut cache);
 
     cache.insert(
@@ -561,15 +578,21 @@ fn put_cached_no_disk_segment(cache_key: String, data: Vec<u8>) {
 
 fn clear_no_disk_segment_cache_for_session(session_id: &str) {
     let prefix = format!("{}:", session_id);
-    let mut cache = no_disk_segment_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = no_disk_segment_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     cache.retain(|k, _| !k.starts_with(&prefix));
 
-    let mut locks = no_disk_segment_locks().lock().unwrap_or_else(|e| e.into_inner());
+    let mut locks = no_disk_segment_locks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     locks.retain(|k, _| !k.starts_with(&prefix));
 }
 
 fn get_no_disk_segment_lock(cache_key: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let mut locks = no_disk_segment_locks().lock().unwrap_or_else(|e| e.into_inner());
+    let mut locks = no_disk_segment_locks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = locks.get(cache_key) {
         return existing.clone();
     }
@@ -580,7 +603,9 @@ fn get_no_disk_segment_lock(cache_key: &str) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 fn release_no_disk_segment_lock(cache_key: &str) {
-    let mut locks = no_disk_segment_locks().lock().unwrap_or_else(|e| e.into_inner());
+    let mut locks = no_disk_segment_locks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     locks.remove(cache_key);
 }
 
@@ -626,7 +651,8 @@ fn prewarm_no_disk_segments(file_path: String, session_id: String, current_idx: 
         for next in 1..=PREWARM_WINDOW {
             let idx = current_idx.saturating_add(next);
             let segment_name = format!("segment_{}.ts", idx);
-            let _ = read_video_segment_from_ffmpeg(&file_path, &segment_name, Some(&session_id)).await;
+            let _ =
+                read_video_segment_from_ffmpeg(&file_path, &segment_name, Some(&session_id)).await;
         }
     });
 }
@@ -740,8 +766,10 @@ fn verify_segment_access_ticket(session: &HlsSession, ticket: &str) -> Result<bo
     let payload_bytes = B64URL
         .decode(payload_b64)
         .map_err(|_| AppError::BadRequest("Invalid segment ticket payload encoding".to_string()))?;
-    let payload: SegmentAccessTicketPayload = serde_json::from_slice(&payload_bytes)
-        .map_err(|_| AppError::BadRequest("Invalid segment ticket payload structure".to_string()))?;
+    let payload: SegmentAccessTicketPayload =
+        serde_json::from_slice(&payload_bytes).map_err(|_| {
+            AppError::BadRequest("Invalid segment ticket payload structure".to_string())
+        })?;
 
     let now = chrono::Utc::now().timestamp();
     if payload.scope != "hls_segment_access" {
@@ -804,7 +832,9 @@ fn hls_path_within_root(path: &Path, root: &Path) -> bool {
 #[cfg(target_os = "windows")]
 fn secure_hls_base_directory() -> Result<PathBuf, AppError> {
     let binding = load_windows_storage_binding()
-        .map_err(|e| AppError::InternalServerError(format!("Failed to load Windows storage binding: {}", e)))?
+        .map_err(|e| {
+            AppError::InternalServerError(format!("Failed to load Windows storage binding: {}", e))
+        })?
         .ok_or_else(|| {
             AppError::PreconditionFailed("Windows storage root is not configured".to_string())
         })?;
@@ -878,8 +908,7 @@ fn sanitize_file_path(path: &str) -> Result<PathBuf, AppError> {
         .unwrap_or_else(|_| full_path.clone());
 
     #[cfg(target_os = "windows")]
-    if !hls_path_within_root(&canonical, &base_dir)
-        && !hls_path_within_root(&full_path, &base_dir)
+    if !hls_path_within_root(&canonical, &base_dir) && !hls_path_within_root(&full_path, &base_dir)
     {
         return Err(AppError::Forbidden(
             "File path is outside the configured Windows storage root".to_string(),
@@ -1001,11 +1030,7 @@ pub async fn send_client_commit(
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
 
-    if !verify_anti_clogging_token(
-        &body.temp_session_id,
-        &user_id,
-        &body.anti_clogging_token,
-    ) {
+    if !verify_anti_clogging_token(&body.temp_session_id, &user_id, &body.anti_clogging_token) {
         return Err(AppError::Unauthorized(
             "Invalid anti-clogging token".to_string(),
         ));
@@ -1051,11 +1076,7 @@ pub async fn send_client_confirm(
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
 
-    if !verify_anti_clogging_token(
-        &body.temp_session_id,
-        &user_id,
-        &body.anti_clogging_token,
-    ) {
+    if !verify_anti_clogging_token(&body.temp_session_id, &user_id, &body.anti_clogging_token) {
         return Err(AppError::Unauthorized(
             "Invalid anti-clogging token".to_string(),
         ));
@@ -1096,11 +1117,7 @@ pub async fn complete_sae_handshake(
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
 
-    if !verify_anti_clogging_token(
-        &body.temp_session_id,
-        &user_id,
-        &body.anti_clogging_token,
-    ) {
+    if !verify_anti_clogging_token(&body.temp_session_id, &user_id, &body.anti_clogging_token) {
         return Err(AppError::Unauthorized(
             "Invalid anti-clogging token".to_string(),
         ));
@@ -1615,7 +1632,6 @@ fn playlist_segments_exist_on_disk(cache_dir: &std::path::Path, playlist_content
     })
 }
 
-
 async fn detect_video_codec(ffmpeg_path: &str, file_path: &str) -> Option<String> {
     let ffprobe_path = if let Some(dir) = std::path::Path::new(ffmpeg_path).parent() {
         let probe = dir.join("ffprobe");
@@ -1751,7 +1767,7 @@ async fn encrypt_segments_at_rest(
             );
         }
 
-        return Ok(encrypted_count);
+        Ok(encrypted_count)
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1771,8 +1787,12 @@ async fn encrypt_segments_at_rest(
 
                         match encrypt_result {
                             Ok(Ok(encrypted)) => {
-                                if let Err(e) = write_file_best_effort(&enc_path, &encrypted).await {
-                                    warn!("Failed to write encrypted segment {:?}: {}", enc_path, e);
+                                if let Err(e) = write_file_best_effort(&enc_path, &encrypted).await
+                                {
+                                    warn!(
+                                        "Failed to write encrypted segment {:?}: {}",
+                                        enc_path, e
+                                    );
                                     return false;
                                 }
                                 let _ = remove_file_best_effort(&ts_path).await;
@@ -1877,7 +1897,6 @@ async fn run_ffmpeg_progressive(
         "-y".into(),
         "-threads".into(),
         "0".into(),
-
         "-fflags".into(),
         "+genpts+discardcorrupt".into(),
         "-i".into(),
@@ -2027,13 +2046,29 @@ async fn run_ffmpeg_progressive(
                     "-c:v".into(),
                     "h264_rkmpp".into(),
                     "-b:v".into(),
-                    if a311d_profile { "2600k".into() } else { "3M".into() },
+                    if a311d_profile {
+                        "2600k".into()
+                    } else {
+                        "3M".into()
+                    },
                     "-maxrate".into(),
-                    if a311d_profile { "3200k".into() } else { "4200k".into() },
+                    if a311d_profile {
+                        "3200k".into()
+                    } else {
+                        "4200k".into()
+                    },
                     "-bufsize".into(),
-                    if a311d_profile { "5200k".into() } else { "8400k".into() },
+                    if a311d_profile {
+                        "5200k".into()
+                    } else {
+                        "8400k".into()
+                    },
                     "-rc_mode".into(),
-                    if a311d_profile { "CBR".into() } else { "VBR".into() },
+                    if a311d_profile {
+                        "CBR".into()
+                    } else {
+                        "VBR".into()
+                    },
                     "-g".into(),
                     "48".into(),
                 ]);
@@ -2044,11 +2079,23 @@ async fn run_ffmpeg_progressive(
                     "-c:v".into(),
                     "h264_v4l2m2m".into(),
                     "-b:v".into(),
-                    if a311d_profile { "2200k".into() } else { "2M".into() },
+                    if a311d_profile {
+                        "2200k".into()
+                    } else {
+                        "2M".into()
+                    },
                     "-maxrate".into(),
-                    if a311d_profile { "2800k".into() } else { "3500k".into() },
+                    if a311d_profile {
+                        "2800k".into()
+                    } else {
+                        "3500k".into()
+                    },
                     "-bufsize".into(),
-                    if a311d_profile { "4400k".into() } else { "7000k".into() },
+                    if a311d_profile {
+                        "4400k".into()
+                    } else {
+                        "7000k".into()
+                    },
                     "-g".into(),
                     "48".into(),
                 ]);
@@ -2070,9 +2117,17 @@ async fn run_ffmpeg_progressive(
                     "-c:v".into(),
                     "libx264".into(),
                     "-preset".into(),
-                    if a311d_profile { "superfast".into() } else { "veryfast".into() },
+                    if a311d_profile {
+                        "superfast".into()
+                    } else {
+                        "veryfast".into()
+                    },
                     "-crf".into(),
-                    if a311d_profile { "24".into() } else { "22".into() },
+                    if a311d_profile {
+                        "24".into()
+                    } else {
+                        "22".into()
+                    },
                     "-x264-params".into(),
                     "keyint=48:min-keyint=48:scenecut=0".into(),
                     "-pix_fmt".into(),
@@ -2283,11 +2338,23 @@ async fn generate_segment_on_demand(
                     "-c:v".into(),
                     "h264_rkmpp".into(),
                     "-b:v".into(),
-                    if a311d_profile { "2600k".into() } else { "3M".into() },
+                    if a311d_profile {
+                        "2600k".into()
+                    } else {
+                        "3M".into()
+                    },
                     "-maxrate".into(),
-                    if a311d_profile { "3200k".into() } else { "4200k".into() },
+                    if a311d_profile {
+                        "3200k".into()
+                    } else {
+                        "4200k".into()
+                    },
                     "-bufsize".into(),
-                    if a311d_profile { "5200k".into() } else { "8400k".into() },
+                    if a311d_profile {
+                        "5200k".into()
+                    } else {
+                        "8400k".into()
+                    },
                     "-g".into(),
                     "48".into(),
                 ]);
@@ -2297,11 +2364,23 @@ async fn generate_segment_on_demand(
                     "-c:v".into(),
                     "h264_v4l2m2m".into(),
                     "-b:v".into(),
-                    if a311d_profile { "2200k".into() } else { "2M".into() },
+                    if a311d_profile {
+                        "2200k".into()
+                    } else {
+                        "2M".into()
+                    },
                     "-maxrate".into(),
-                    if a311d_profile { "2800k".into() } else { "3500k".into() },
+                    if a311d_profile {
+                        "2800k".into()
+                    } else {
+                        "3500k".into()
+                    },
                     "-bufsize".into(),
-                    if a311d_profile { "4400k".into() } else { "7000k".into() },
+                    if a311d_profile {
+                        "4400k".into()
+                    } else {
+                        "7000k".into()
+                    },
                     "-g".into(),
                     "48".into(),
                 ]);
@@ -2321,9 +2400,17 @@ async fn generate_segment_on_demand(
                     "-c:v".into(),
                     "libx264".into(),
                     "-preset".into(),
-                    if a311d_profile { "superfast".into() } else { "veryfast".into() },
+                    if a311d_profile {
+                        "superfast".into()
+                    } else {
+                        "veryfast".into()
+                    },
                     "-crf".into(),
-                    if a311d_profile { "24".into() } else { "22".into() },
+                    if a311d_profile {
+                        "24".into()
+                    } else {
+                        "22".into()
+                    },
                     "-x264-params".into(),
                     "keyint=48:min-keyint=48:scenecut=0".into(),
                     "-pix_fmt".into(),
@@ -2429,7 +2516,10 @@ async fn encrypt_on_demand_segment(
         Err(e) => {
             let _ = remove_file_best_effort(&enc_path).await;
             let _ = remove_file_best_effort(segment_path).await;
-            return Err(format!("Failed to read on-demand segment for encryption: {}", e));
+            return Err(format!(
+                "Failed to read on-demand segment for encryption: {}",
+                e
+            ));
         }
     };
 
@@ -2445,13 +2535,19 @@ async fn encrypt_on_demand_segment(
     if let Err(e) = write_file_best_effort(&enc_path, &encrypted).await {
         let _ = remove_file_best_effort(&enc_path).await;
         let _ = remove_file_best_effort(segment_path).await;
-        return Err(format!("Failed to write encrypted on-demand segment: {}", e));
+        return Err(format!(
+            "Failed to write encrypted on-demand segment: {}",
+            e
+        ));
     }
 
     if let Err(e) = remove_file_best_effort(segment_path).await {
         let _ = remove_file_best_effort(&enc_path).await;
         let _ = remove_file_best_effort(segment_path).await;
-        return Err(format!("Failed to remove plaintext on-demand segment: {}", e));
+        return Err(format!(
+            "Failed to remove plaintext on-demand segment: {}",
+            e
+        ));
     }
 
     Ok(())
@@ -2541,7 +2637,9 @@ pub async fn get_secure_playlist(
             session_id, found, active_count, known_ids
         );
 
-        let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+        let session = manager
+            .get_session(&session_id)
+            .map_err(convert_hls_error)?;
         ensure_session_belongs_to_user(&session, &user_id)?;
         session.file_path.clone()
     };
@@ -2595,7 +2693,9 @@ pub async fn get_secure_playlist(
                     warn!("📋 Cannot determine duration in no-disk mode, using short fallback playlist");
                     generate_complete_vod_playlist(1800.0, 2.0)
                 } else {
-                    warn!("📋 Cannot determine video duration, using bounded fallback VOD playlist");
+                    warn!(
+                        "📋 Cannot determine video duration, using bounded fallback VOD playlist"
+                    );
                     generate_complete_vod_playlist(1800.0, 2.0)
                 }
             }
@@ -2720,7 +2820,9 @@ pub async fn get_segment_direct(
 
     let file_path = {
         let manager = hls_manager.read().await;
-        let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+        let session = manager
+            .get_session(&session_id)
+            .map_err(convert_hls_error)?;
         ensure_session_belongs_to_user(&session, &user_id)?;
         session.file_path.clone()
     };
@@ -2751,7 +2853,9 @@ pub async fn get_segment_direct(
             read_video_segment_from_ffmpeg(&file_path, &segment_name, Some(&session_id)).await?;
 
         let manager = hls_manager.read().await;
-        let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+        let session = manager
+            .get_session(&session_id)
+            .map_err(convert_hls_error)?;
         ensure_session_belongs_to_user(&session, &user_id)?;
         let encrypted_data = session
             .encrypt_segment(&segment_data)
@@ -2821,7 +2925,9 @@ pub async fn get_segment_direct(
     touch_cache_access(&cache_dir).await;
 
     let manager = hls_manager.read().await;
-    let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+    let session = manager
+        .get_session(&session_id)
+        .map_err(convert_hls_error)?;
     ensure_session_belongs_to_user(&session, &user_id)?;
     let encrypted_data = session
         .encrypt_segment(&segment_data)
@@ -2882,11 +2988,17 @@ pub async fn get_secure_segment(
             .as_ref()
             .map(|v| !v.is_empty())
             .unwrap_or(false),
-        segment_request.zkp_proof.as_ref().map(|v| v.len()).unwrap_or(0)
+        segment_request
+            .zkp_proof
+            .as_ref()
+            .map(|v| v.len())
+            .unwrap_or(0)
     );
 
     let manager = hls_manager.read().await;
-    let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+    let session = manager
+        .get_session(&session_id)
+        .map_err(convert_hls_error)?;
     ensure_session_belongs_to_user(&session, &user_id)?;
 
     let ticket_verified = if let Some(ticket) = segment_request.zkp_ticket.as_ref() {
@@ -2912,8 +3024,7 @@ pub async fn get_secure_segment(
                 ));
             }
             return Err(AppError::Unauthorized(
-                "Missing authentication material: zkp_ticket or zkp_proof is required"
-                    .to_string(),
+                "Missing authentication material: zkp_ticket or zkp_proof is required".to_string(),
             ));
         };
 
@@ -2949,8 +3060,12 @@ pub async fn get_secure_segment(
                 if enc_path.exists() || segment_path.exists() {
                     read_segment_data(&segment_path, &storage_key).await?
                 } else {
-                    read_video_segment_from_ffmpeg(&session.file_path, &segment_name, Some(&session_id))
-                        .await?
+                    read_video_segment_from_ffmpeg(
+                        &session.file_path,
+                        &segment_name,
+                        Some(&session_id),
+                    )
+                    .await?
                 }
             }
             Err(AppError::PreconditionFailed(msg)) => {
@@ -3012,7 +3127,9 @@ pub async fn stop_session(
     info!("Stopping HLS session: {}", session_id);
     let manager = hls_manager.read().await;
 
-    let session = manager.get_session(&session_id).map_err(convert_hls_error)?;
+    let session = manager
+        .get_session(&session_id)
+        .map_err(convert_hls_error)?;
     ensure_session_belongs_to_user(&session, &user_id)?;
 
     match manager.remove_session(&session_id) {
@@ -3200,9 +3317,7 @@ fn get_hls_cache_dir() -> std::path::PathBuf {
     std::env::var("HLS_CACHE_PATH")
         .or_else(|_| std::env::var("ROCKZERO_HLS_CACHE_DIR"))
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from("/mnt/external/cache/hls")
-        })
+        .unwrap_or_else(|_| std::path::PathBuf::from("/mnt/external/cache/hls"))
 }
 
 #[cfg(target_os = "linux")]
@@ -3381,12 +3496,14 @@ async fn read_video_segment_from_ffmpeg(
             "Cache hit for segment {} of video {}",
             segment_name, video_id
         );
-        let encrypted = tokio::fs::read(&cached_segment_enc_path).await.map_err(|e| {
-            AppError::IoError(format!(
-                "Failed to read encrypted cached segment {}: {}",
-                segment_name, e
-            ))
-        })?;
+        let encrypted = tokio::fs::read(&cached_segment_enc_path)
+            .await
+            .map_err(|e| {
+                AppError::IoError(format!(
+                    "Failed to read encrypted cached segment {}: {}",
+                    segment_name, e
+                ))
+            })?;
         return chacha_decrypt(&storage_key, &encrypted);
     }
 
@@ -3408,12 +3525,14 @@ async fn read_video_segment_from_ffmpeg(
     let _guard = lock.lock().await;
 
     if cached_segment_enc_path.exists() {
-        let encrypted = tokio::fs::read(&cached_segment_enc_path).await.map_err(|e| {
-            AppError::IoError(format!(
-                "Failed to read encrypted cached segment {} after wait: {}",
-                segment_name, e
-            ))
-        })?;
+        let encrypted = tokio::fs::read(&cached_segment_enc_path)
+            .await
+            .map_err(|e| {
+                AppError::IoError(format!(
+                    "Failed to read encrypted cached segment {} after wait: {}",
+                    segment_name, e
+                ))
+            })?;
         let data = chacha_decrypt(&storage_key, &encrypted)?;
         drop(_guard);
         release_no_disk_segment_lock(&cache_key);
@@ -3467,7 +3586,9 @@ async fn transcode_segment_in_memory(
     let codec_key = hex::encode(blake3_hash_bytes(file_path_str.as_bytes()));
 
     let maybe_codec = {
-        let cache = video_codec_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let cache = video_codec_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cache.get(&codec_key).cloned().flatten()
     };
 
@@ -3475,7 +3596,9 @@ async fn transcode_segment_in_memory(
         Some(codec) => Some(codec),
         None => {
             let detected = detect_video_codec(&ffmpeg_path, &file_path_str).await;
-            let mut cache = video_codec_cache().lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = video_codec_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             cache.insert(codec_key, detected.clone());
             detected
         }
@@ -3575,11 +3698,7 @@ async fn transcode_segment_async(
     }
     let a311d_profile = is_a311d_device();
 
-    let mut args = vec![
-        "-y".to_string(),
-        "-threads".to_string(),
-        "0".to_string(),
-    ];
+    let mut args = vec!["-y".to_string(), "-threads".to_string(), "0".to_string()];
 
     match hw_accel {
         HardwareAccel::Vaapi => {
@@ -3620,13 +3739,29 @@ async fn transcode_segment_async(
                 "-c:v".to_string(),
                 "h264_rkmpp".to_string(),
                 "-b:v".to_string(),
-                if a311d_profile { "2600k".to_string() } else { "3M".to_string() },
+                if a311d_profile {
+                    "2600k".to_string()
+                } else {
+                    "3M".to_string()
+                },
                 "-maxrate".to_string(),
-                if a311d_profile { "3200k".to_string() } else { "4200k".to_string() },
+                if a311d_profile {
+                    "3200k".to_string()
+                } else {
+                    "4200k".to_string()
+                },
                 "-bufsize".to_string(),
-                if a311d_profile { "5200k".to_string() } else { "8400k".to_string() },
+                if a311d_profile {
+                    "5200k".to_string()
+                } else {
+                    "8400k".to_string()
+                },
                 "-rc_mode".to_string(),
-                if a311d_profile { "CBR".to_string() } else { "VBR".to_string() },
+                if a311d_profile {
+                    "CBR".to_string()
+                } else {
+                    "VBR".to_string()
+                },
                 "-g".to_string(),
                 "48".to_string(),
             ]);
@@ -3652,11 +3787,23 @@ async fn transcode_segment_async(
                 "-c:v".to_string(),
                 "h264_v4l2m2m".to_string(),
                 "-b:v".to_string(),
-                if a311d_profile { "2200k".to_string() } else { "2M".to_string() },
+                if a311d_profile {
+                    "2200k".to_string()
+                } else {
+                    "2M".to_string()
+                },
                 "-maxrate".to_string(),
-                if a311d_profile { "2800k".to_string() } else { "3500k".to_string() },
+                if a311d_profile {
+                    "2800k".to_string()
+                } else {
+                    "3500k".to_string()
+                },
                 "-bufsize".to_string(),
-                if a311d_profile { "4400k".to_string() } else { "7000k".to_string() },
+                if a311d_profile {
+                    "4400k".to_string()
+                } else {
+                    "7000k".to_string()
+                },
                 "-g".to_string(),
                 "48".to_string(),
             ]);
@@ -3682,7 +3829,11 @@ async fn transcode_segment_async(
                 "-level".to_string(),
                 "4.0".to_string(),
                 "-crf".to_string(),
-                if a311d_profile { "24".to_string() } else { "23".to_string() },
+                if a311d_profile {
+                    "24".to_string()
+                } else {
+                    "23".to_string()
+                },
             ]);
         }
     }
@@ -3900,13 +4051,7 @@ async fn verify_vaapi_works() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{
-        body::to_bytes,
-        http::StatusCode,
-        FromRequest,
-        HttpMessage,
-        Responder,
-    };
+    use actix_web::{body::to_bytes, http::StatusCode, FromRequest, HttpMessage, Responder};
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
     use rockzero_media::HlsSession;
     use std::sync::OnceLock;
@@ -3966,6 +4111,7 @@ mod tests {
     fn cleanup_test_cache(file_path: &str) {
         let cache_dir = test_cache_dir_for_file(file_path);
         let _ = std::fs::remove_dir_all(cache_dir);
+        let _ = std::fs::remove_file(file_path);
     }
 
     fn insert_test_session(
@@ -3982,6 +4128,7 @@ mod tests {
         )
         .unwrap();
         let session_id = session.session_id.clone();
+        let _ = std::fs::write(file_path, b"rockzero-test-video-placeholder");
         manager
             .sessions
             .lock()
@@ -4051,9 +4198,9 @@ mod tests {
             test_claims().await,
             web::Path::from(session_id.clone()),
         )
-            .await
-            .unwrap()
-            .respond_to(&req);
+        .await
+        .unwrap()
+        .respond_to(&req);
         assert_eq!(playlist_resp.status(), StatusCode::OK);
 
         let play_resp = get_segment_direct(
@@ -4180,12 +4327,17 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(bad_result, Err(AppError::Unauthorized(msg)) if msg.contains("Invalid ZKP proof")));
+        assert!(
+            matches!(bad_result, Err(AppError::Unauthorized(msg)) if msg.contains("Invalid ZKP proof"))
+        );
 
         let session_id_good = {
             let guard = manager.read().await;
             insert_test_session(&guard, &file_path, Some(registration.clone()))
         };
+        let good_cache_dir = get_session_cache_dir(&session_id_good).unwrap();
+        std::fs::create_dir_all(&good_cache_dir).unwrap();
+        std::fs::write(good_cache_dir.join("segment_0.ts"), segment_plain).unwrap();
         let good_proof = build_zkp_proof_base64(&password, &registration, "hls_segment_access");
         let good_body = serde_json::json!({ "zkp_proof": good_proof });
         let good_req = actix_web::test::TestRequest::post().to_http_request();

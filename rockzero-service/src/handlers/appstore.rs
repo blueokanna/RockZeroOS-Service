@@ -131,8 +131,6 @@ async fn fetch_manifest(client: &Client, url: &str) -> Result<Option<Value>, App
     Ok(Some(manifest))
 }
 
-/// Execute a WASM module in a blocking thread with a 30-second timeout.
-/// This prevents WASM execution from blocking the tokio async runtime.
 async fn execute_wasm_module(
     wasm_path: &str,
     function: Option<String>,
@@ -159,9 +157,9 @@ async fn execute_wasm_module(
             builder.inherit_stdio();
             let _ = builder.inherit_env();
             for arg in &args {
-                builder
-                    .arg(arg)
-                    .map_err(|e| AppError::ValidationError(format!("Invalid WASM arg '{}': {}", arg, e)))?;
+                builder.arg(arg).map_err(|e| {
+                    AppError::ValidationError(format!("Invalid WASM arg '{}': {}", arg, e))
+                })?;
             }
 
             let mut store = Store::new(&engine, builder.build());
@@ -258,16 +256,18 @@ pub async fn install_package(
         }
     }
 
-    // Validate that the downloaded bytes are a valid WASM module
     let engine = Engine::default();
     Module::new(&engine, &bytes)
         .map_err(|e| AppError::BadRequest(format!("Invalid WASM module: {}", e)))?;
 
     let dir = ensure_wasm_storage()?;
-    let filename = body
-        .name
-        .clone()
-        .unwrap_or_else(|| body.url.rsplit('/').next().unwrap_or("module.wasm").to_string());
+    let filename = body.name.clone().unwrap_or_else(|| {
+        body.url
+            .rsplit('/')
+            .next()
+            .unwrap_or("module.wasm")
+            .to_string()
+    });
     let safe_filename = sanitize_filename(&filename);
     let target = dir.join(&safe_filename);
 
@@ -290,10 +290,7 @@ pub async fn install_package(
         id: Uuid::new_v4().to_string(),
         name: safe_filename,
         source_url: body.url.clone(),
-        installed_path: target
-            .to_str()
-            .unwrap_or(DEFAULT_APPSTORE_ROOT)
-            .to_string(),
+        installed_path: target.to_str().unwrap_or(DEFAULT_APPSTORE_ROOT).to_string(),
         blake3: digest,
         size_bytes: bytes.len() as u64,
         created_at: now_epoch_seconds(),

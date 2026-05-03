@@ -20,12 +20,9 @@ impl HlsEncryptor {
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let ciphertext = self
-            .cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|e| {
-                HlsError::EncryptionError(format!("ChaCha20-Poly1305 encryption failed: {}", e))
-            })?;
+        let ciphertext = self.cipher.encrypt(nonce, plaintext).map_err(|e| {
+            HlsError::EncryptionError(format!("ChaCha20-Poly1305 encryption failed: {}", e))
+        })?;
 
         Ok((nonce_bytes.to_vec(), ciphertext))
     }
@@ -39,12 +36,9 @@ impl HlsEncryptor {
 
         let nonce = Nonce::from_slice(nonce);
 
-        let plaintext = self
-            .cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| {
-                HlsError::DecryptionError(format!("ChaCha20-Poly1305 decryption failed: {}", e))
-            })?;
+        let plaintext = self.cipher.decrypt(nonce, ciphertext).map_err(|e| {
+            HlsError::DecryptionError(format!("ChaCha20-Poly1305 decryption failed: {}", e))
+        })?;
 
         Ok(plaintext)
     }

@@ -258,7 +258,7 @@ impl HlsSessionManager {
         }
 
         let pmk = sae_server.get_pmk()?;
-        
+
         let session =
             HlsSession::new_with_registration(user_id, file_path, pmk, 1000, zkp_registration)?;
         let session_id = session.session_id.clone();
@@ -288,9 +288,8 @@ impl HlsSessionManager {
     pub fn invalidate_sessions_for_user_file(&self, user_id: &str, file_path: &str) -> usize {
         let mut sessions = self.sessions.lock().unwrap();
         let before = sessions.len();
-        sessions.retain(|_, session| {
-            !(session.user_id == user_id && session.file_path == file_path)
-        });
+        sessions
+            .retain(|_, session| !(session.user_id == user_id && session.file_path == file_path));
         before.saturating_sub(sessions.len())
     }
 

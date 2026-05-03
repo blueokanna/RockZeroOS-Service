@@ -28,13 +28,14 @@ RockZeroOS 是一套以 Rust 后端和 Flutter 前端实现的高性能私有云
 ## 主要特性
 
 - 仪表盘：系统总览、CPU/内存/磁盘/网络监控、表盘式测速、平滑化下载/上传实时动画。
-- 文件管理：目录浏览、上传/下载、重命名、复制、移动、删除、文本预览与保存、局域网传输。
+- 文件管理：目录浏览、上传/下载、重命名、复制、移动、删除、文本预览与保存、局域网传输、Windows 作用域存储配置。
 - 安全视频播放：SAE 握手、会话化 HLS、本地 Flutter 代理、proof-ticket / ZKP 受控分段访问、ChaCha20-Poly1305 传输加密、按编码类型动态超时、非零 PTS 偏移修正。
 - 音频播放：多级回退播放源、后台播放、小窗控制、服务端不兼容编解码自动转码。
 - 游戏中心：Steam、Epic Games、WeGame、Ubisoft Connect、Xbox 原生聚合页，无 WebView 依赖。
 - WASM 运行时：支持 WebAssembly 应用与脚本执行，并内置 SteamDB 查看器、M3U8 下载器、Steam P2P 分析器。
 - 存储管理：Linux 支持磁盘生命周期管理；Windows 使用单根目录绑定与作用域文件操作模型。
-- 安全能力：Ed25519 JWT、WPA3-SAE、ChaCha20-Poly1305、BLAKE3、FIDO2/WebAuthn、Reed-Solomon + CRC32。
+- 安全能力：Ed25519 JWT、WPA3-SAE、ChaCha20-Poly1305、BLAKE3、FIDO2/WebAuthn、Reed-Solomon + CRC32、Argon2id 二次密码派生。
+- 私密空间：管理员专用加密保险库，导入文件或目录后使用 Argon2id 与 ChaCha20-Poly1305 加密保存，并强制 JWT、FIDO2/Passkey step-up 与管理员角色校验。
 - 界面能力：动态主题、壁纸混色、玻璃拟态效果、MD3 组件、低动效路由过渡。
 
 ## 安全架构
@@ -44,8 +45,8 @@ RockZeroOS 的安全链路以用户认证、密钥协商、会话授权和传输
 - JWT 认证使用 EdDSA（Ed25519）。
 - SAE 握手用于协商 PMK。
 - HLS 播放会话基于 PMK 派生 ChaCha20-Poly1305 传输密钥。
-- 视频播放使用会话令牌而不是逐片段 ZKP。
-- Bulletproofs ZKP 仅用于认证链路，不用于媒体播放。
+- HLS 分段访问使用 proof-ticket 或 Bulletproofs ZKP 进行逐分段授权。
+- Bulletproofs ZKP 既用于认证链路，也用于 HLS 分段授权（context = `hls_segment_access`）。
 
 | 能力 | 技术 | 说明 |
 | ------ | ------ | ------ |
@@ -55,9 +56,23 @@ RockZeroOS 的安全链路以用户认证、密钥协商、会话授权和传输
 | HLS 临时缓存保护 | 可选静态加密 | 非 Windows 默认开启，Windows 默认关闭以保证稳定播放 |
 | 会话鉴权 | UUID + BLAKE3 HMAC | 每条 HLS 播放链路使用独立会话 |
 | 防重放 | 时间戳 + Nonce + HMAC | 降低请求重放风险 |
-| 零知识认证 | Bulletproofs RangeProof | 用于认证，不参与视频播放 |
+| 零知识认证 | Bulletproofs RangeProof | 用于登录认证与 HLS 分段授权 |
 | 硬件认证 | FIDO2 / WebAuthn | 支持安全密钥、生物识别 |
 | 存储完整性 | Reed-Solomon + CRC32 | 数据纠错与完整性校验 |
+| 私密空间 | Argon2id + ChaCha20-Poly1305 | 管理员专用保险库，二次密码与 step-up 校验后才可导入、列出、恢复或删除 |
+
+## 私密空间
+
+私密空间用于保存高敏感文件，与普通文件管理流程隔离。所有接口都位于 JWT 保护的 `/api/v1/secure/private-space/*` 路由组下，并额外执行 FIDO2/Passkey step-up、管理员角色校验与二次密码验证。
+
+- 二次密码通过 Argon2id 与每个条目的随机 salt 派生 256 位密钥。
+- 每个导入文件都会生成 `.rzp` 加密信封，保存到 `DATA_DIR/secure/private_space/items`。
+- 文件内容、原始路径、相对路径、文件名等元数据一起使用 ChaCha20-Poly1305 加密。
+- 导入支持单文件和目录；目录导入会保留相对路径。
+- 恢复导出必须提供相同二次密码，并写入用户选择的目标目录。
+- 删除保险库条目前也必须先用二次密码完成解密校验。
+
+Flutter 文件页已经接入私密空间入口，可从文件或文件夹动作中导入，也可打开保险库列表执行恢复和删除。
 
 ## 视频播放架构
 
@@ -344,7 +359,39 @@ POST /api/v1/secure-hls/{session_id}/{segment}
 ### 系统与测速
 
 - CPU / 内存 / 温度 / 磁盘 / 网络
-- 速度测试结果上报与实时采样
+- 下载流、上传流、延迟、抖动、空响应与服务器能力信息
+
+```http
+GET  /api/v1/speedtest/download?size=100&chunk_kb=512
+POST /api/v1/speedtest/upload
+GET  /api/v1/speedtest/ping?count=4
+GET  /api/v1/speedtest/info
+GET  /api/v1/speedtest/empty
+```
+
+测速接口采用接近 OpenSpeedTest、LibreSpeedTest、Homebox 的实用模型：下载端禁用缓存并持续输出二进制流，上传端流式接收并丢弃数据，ping 接口提供多样本延迟和抖动，empty 接口用于测量最小请求延迟。
+
+### 私密空间接口
+
+```http
+GET    /api/v1/secure/private-space/status
+POST   /api/v1/secure/private-space/import
+POST   /api/v1/secure/private-space/list
+POST   /api/v1/secure/private-space/export
+DELETE /api/v1/secure/private-space/delete
+```
+
+这些接口均要求有效 JWT、FIDO2/Passkey step-up、管理员角色；涉及内容解密的操作还要求请求体中的二次密码。
+
+## 验证
+
+当前代码库需要保持以下检查全部通过：
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cd RockZeroOS-UI && flutter analyze
+```
 
 ## 性能说明
 

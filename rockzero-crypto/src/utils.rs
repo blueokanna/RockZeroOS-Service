@@ -1,7 +1,5 @@
-use rockzero_common::AppError;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-
-// ============ CRC32 实现 ============
+use rockzero_common::AppError;
 
 const CRC32_POLYNOMIAL: u32 = 0xEDB88320;
 
@@ -40,8 +38,6 @@ pub fn crc32_verify(data: &[u8], expected: u32) -> bool {
     crc32_checksum(data) == expected
 }
 
-// ============ 随机数生成 ============
-
 pub fn secure_random_bytes(len: usize) -> Result<Vec<u8>, AppError> {
     let mut bytes = vec![0u8; len];
     getrandom::getrandom(&mut bytes)
@@ -59,8 +55,6 @@ pub fn secure_random_hex(len: usize) -> Result<String, AppError> {
     Ok(hex::encode(&bytes))
 }
 
-// ============ 安全内存清零 ============
-
 pub fn secure_zero(data: &mut [u8]) {
     for byte in data.iter_mut() {
         unsafe {
@@ -74,8 +68,6 @@ pub fn secure_zero_key(key: &mut [u8; 32]) {
     secure_zero(key);
 }
 
-// ============ 常量时间比较 ============
-
 pub fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -86,8 +78,6 @@ pub fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
 }
-
-// ============ 测试 ============
 
 #[cfg(test)]
 mod tests {

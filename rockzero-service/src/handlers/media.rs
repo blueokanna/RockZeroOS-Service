@@ -6,32 +6,7 @@ use std::path::Path;
 use std::process::Command;
 use tracing::info;
 
-// ============================================================
-// Media Processing Module
-//
-// Note: For video streaming, use Secure HLS (secure_hls.rs)
-//
-// Secure HLS provides:
-// - WPA3-SAE handshake (key exchange)
-// - ZKP zero-knowledge proof (authentication)
-// - AES-256-GCM encryption (data protection)
-// - Replay attack protection (timestamp + nonce)
-// - Hardware acceleration support (VAAPI, V4L2, NVENC, etc.)
-//
-// This module provides:
-// - Basic media information queries
-// - Codec capability detection
-// - Media metadata management
-// ============================================================
-
-/// Find FFmpeg executable path
-///
-/// Priority:
-/// 1. Global settings path (via ffmpeg_manager)
-/// 2. 常见系统路径（/usr/bin, /usr/local/bin等）
-/// 3. Windows特定路径（C:\ffmpeg\bin等）
 fn find_ffmpeg() -> Option<String> {
-    // 首先检查全局设置的路径
     if let Some(path) = crate::ffmpeg_manager::get_global_ffmpeg_path() {
         if Path::new(&path).exists() {
             return Some(path);
@@ -76,13 +51,6 @@ pub struct MediaCodecInfo {
     pub version: Option<String>,
 }
 
-// ============================================================
-// API 端点实现
-// ============================================================
-
-/// 创建媒体元数据
-///
-/// 用于存储媒体文件的元信息（标题、描述等）
 pub async fn create_media(
     _pool: web::Data<SqlitePool>,
     claims: web::ReqData<crate::handlers::auth::Claims>,
@@ -105,13 +73,6 @@ pub async fn create_media(
     })))
 }
 
-/// 获取编解码器信息
-///
-/// 返回系统支持的视频/音频编解码器和硬件加速能力
-///
-/// # 硬件加速检测
-/// - ARM平台：V4L2 M2M, Rockchip MPP, Amlogic VDEC
-/// - x86平台：VAAPI, Intel QSV, NVIDIA NVENC
 pub async fn get_codec_info() -> Result<impl Responder, AppError> {
     let ffmpeg_path = find_ffmpeg();
     let ffmpeg_available = ffmpeg_path.is_some();
@@ -126,7 +87,6 @@ pub async fn get_codec_info() -> Result<impl Responder, AppError> {
         }
     }
 
-    // 支持的视频编解码器
     let supported_video_codecs = vec![
         "h264".to_string(),
         "h265".to_string(),
@@ -137,7 +97,6 @@ pub async fn get_codec_info() -> Result<impl Responder, AppError> {
         "mpeg4".to_string(),
     ];
 
-    // 支持的音频编解码器
     let supported_audio_codecs = vec![
         "aac".to_string(),
         "mp3".to_string(),
@@ -147,10 +106,8 @@ pub async fn get_codec_info() -> Result<impl Responder, AppError> {
         "pcm".to_string(),
     ];
 
-    // 检测硬件加速能力
     let mut hardware_acceleration = Vec::new();
 
-    // ARM平台硬件加速
     if cfg!(target_arch = "aarch64") || cfg!(target_arch = "arm") {
         hardware_acceleration.push("v4l2m2m".to_string());
         hardware_acceleration.push("rkmpp".to_string());
@@ -164,7 +121,6 @@ pub async fn get_codec_info() -> Result<impl Responder, AppError> {
         }
     }
 
-    // x86平台硬件加速
     if cfg!(target_arch = "x86_64") || cfg!(target_arch = "x86") {
         if Path::new("/dev/dri/renderD128").exists() {
             hardware_acceleration.push("vaapi".to_string());
@@ -185,19 +141,14 @@ pub async fn get_codec_info() -> Result<impl Responder, AppError> {
     Ok(HttpResponse::Ok().json(codec_info))
 }
 
-// ============================================================
-// 测试
-// ============================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_find_ffmpeg() {
-        // 测试FFmpeg查找（可能返回None如果未安装）
         let result = find_ffmpeg();
-        // 只验证函数不会panic
+
         println!("FFmpeg path: {:?}", result);
     }
 

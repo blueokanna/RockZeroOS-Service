@@ -18,16 +18,14 @@ pub async fn health_check() -> impl Responder {
     })
 }
 
-/// 提供RockZero Logo图标
 pub async fn serve_logo() -> impl Responder {
-    // 尝试从根目录读取 RockZero.png
     let logo_paths = [
         "RockZero.png",
         "./RockZero.png",
         "/app/RockZero.png",
         "/opt/rockzero/RockZero.png",
     ];
-    
+
     for path in logo_paths {
         if let Ok(data) = std::fs::read(path) {
             return HttpResponse::Ok()
@@ -36,12 +34,10 @@ pub async fn serve_logo() -> impl Responder {
                 .body(data);
         }
     }
-    
-    // 如果找不到文件，返回404
+
     HttpResponse::NotFound().body("Logo not found")
 }
 
-/// 提供README.md内容
 pub async fn serve_readme() -> impl Responder {
     let readme_paths = [
         "README.md",
@@ -49,7 +45,7 @@ pub async fn serve_readme() -> impl Responder {
         "/app/README.md",
         "/opt/rockzero/README.md",
     ];
-    
+
     for path in readme_paths {
         if let Ok(content) = std::fs::read_to_string(path) {
             return HttpResponse::Ok()
@@ -58,11 +54,11 @@ pub async fn serve_readme() -> impl Responder {
                 .body(content);
         }
     }
-    
-    // 如果找不到文件，返回默认内容
+
     HttpResponse::Ok()
         .content_type("text/markdown; charset=utf-8")
-        .body(r#"# RockZero OS
+        .body(
+            r#"# RockZero OS
 
 ## Secure Private Cloud NAS Operating System
 
@@ -76,10 +72,10 @@ RockZero OS is a high-performance, secure cross-platform private cloud NAS opera
 - Cross-platform Flutter client
 
 For more information, visit [GitHub](https://github.com/blueokanna/rockzero-service).
-"#)
+"#,
+        )
 }
 
-/// 提供关于信息
 #[derive(Serialize)]
 struct AboutInfo {
     name: String,

@@ -203,7 +203,9 @@ impl JwtEncoder {
             .map_err(|_| AppError::CryptoError("Invalid signature encoding".to_string()))?;
 
         if signature_bytes.len() != 64 {
-            return Err(AppError::CryptoError("Invalid signature length".to_string()));
+            return Err(AppError::CryptoError(
+                "Invalid signature length".to_string(),
+            ));
         }
 
         let mut sig_array = [0u8; 64];
@@ -286,7 +288,9 @@ impl JwtVerifier {
             .map_err(|_| AppError::CryptoError("Invalid public key encoding".to_string()))?;
 
         if key_bytes.len() != 32 {
-            return Err(AppError::CryptoError("Invalid public key length".to_string()));
+            return Err(AppError::CryptoError(
+                "Invalid public key length".to_string(),
+            ));
         }
 
         let mut key_array = [0u8; 32];
@@ -320,7 +324,9 @@ impl JwtVerifier {
             .map_err(|_| AppError::CryptoError("Invalid signature encoding".to_string()))?;
 
         if signature_bytes.len() != 64 {
-            return Err(AppError::CryptoError("Invalid signature length".to_string()));
+            return Err(AppError::CryptoError(
+                "Invalid signature length".to_string(),
+            ));
         }
 
         let mut sig_array = [0u8; 64];
@@ -448,7 +454,7 @@ mod tests {
         );
 
         let token = encoder.encode(&claims).unwrap();
-        
+
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
 

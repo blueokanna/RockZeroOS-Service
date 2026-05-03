@@ -1,3 +1,5 @@
+#![allow(clippy::missing_safety_doc)]
+
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use bulletproofs::{BulletproofGens, PedersenGens, RangeProof};
 use curve25519_dalek::ristretto::CompressedRistretto;
@@ -216,10 +218,6 @@ fn constant_time_compare(a: &str, b: &str) -> bool {
     result == 0
 }
 
-/// # Safety
-///
-/// `out_proof` and `out_proof_len` must be valid, non-null, aligned pointers.
-/// The caller is responsible for freeing the returned buffer via `bulletproofs_free`.
 #[no_mangle]
 pub unsafe extern "C" fn bulletproofs_create_range_proof(
     value: u64,
@@ -249,9 +247,6 @@ pub unsafe extern "C" fn bulletproofs_create_range_proof(
     }
 }
 
-/// # Safety
-///
-/// `proof_json` must point to a valid UTF-8 byte buffer of at least `proof_json_len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn bulletproofs_verify_range_proof(
     proof_json: *const u8,
@@ -283,10 +278,6 @@ pub unsafe extern "C" fn bulletproofs_verify_range_proof(
     }
 }
 
-/// # Safety
-///
-/// `ptr` must have been allocated by `bulletproofs_create_range_proof` with the given `len`.
-/// After calling this function the pointer is invalid and must not be used again.
 #[no_mangle]
 pub unsafe extern "C" fn bulletproofs_free(ptr: *mut u8, len: usize) {
     if !ptr.is_null() && len > 0 {
