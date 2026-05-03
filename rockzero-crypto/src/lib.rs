@@ -18,7 +18,7 @@ pub use utils::{
     secure_random_hex, secure_zero, secure_zero_key,
 };
 pub use zkp::{
-    EnhancedPasswordProof, SchnorrProof, BoundStrengthProof, PasswordRegistration, ZkpContext,
+    BoundStrengthProof, EnhancedPasswordProof, PasswordRegistration, SchnorrProof, ZkpContext,
 };
 
 pub use bulletproofs_ffi::{BulletproofsContext, BulletproofsRangeProof, VideoStreamProof};

@@ -1,5 +1,5 @@
-pub use rockzero_crypto::*;
 use rockzero_common::AppError;
+pub use rockzero_crypto::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -51,7 +51,8 @@ impl CryptoContext {
 
     pub fn decrypt_string(&self, encrypted_base64: &str) -> Result<String, AppError> {
         use base64::{engine::general_purpose::STANDARD, Engine};
-        let ciphertext = STANDARD.decode(encrypted_base64)
+        let ciphertext = STANDARD
+            .decode(encrypted_base64)
             .map_err(|_| AppError::CryptoError("Invalid base64".to_string()))?;
         let encrypted = EncryptedData {
             ciphertext,
@@ -59,8 +60,7 @@ impl CryptoContext {
             tag: None,
         };
         let decrypted = self.decrypt(&encrypted)?;
-        String::from_utf8(decrypted)
-            .map_err(|_| AppError::CryptoError("Invalid UTF-8".to_string()))
+        String::from_utf8(decrypted).map_err(|_| AppError::CryptoError("Invalid UTF-8".to_string()))
     }
 }
 
@@ -110,7 +110,11 @@ impl KeyDeriver {
         Ok(derive_key_from_password(password, salt))
     }
 
-    pub fn derive_keys(&self, password: &str, contexts: &[String]) -> Result<Vec<String>, AppError> {
+    pub fn derive_keys(
+        &self,
+        password: &str,
+        contexts: &[String],
+    ) -> Result<Vec<String>, AppError> {
         let mut keys = Vec::new();
         for context in contexts {
             let key = derive_key_from_password(password, context.as_bytes());
@@ -163,17 +167,20 @@ impl TransferManager {
     pub fn create_transfer(&self, path: &str, total_bytes: u64) -> Result<(), AppError> {
         let mut transfers = self.transfers.lock().map_err(|_| AppError::InternalError)?;
         let now = chrono::Utc::now();
-        transfers.insert(path.to_string(), TransferState {
-            id: uuid::Uuid::new_v4().to_string(),
-            path: path.to_string(),
-            total_bytes,
-            transferred_bytes: 0,
-            current_size: 0,
-            expected_size: total_bytes,
-            status: "active".to_string(),
-            started_at: now,
-            updated_at: now,
-        });
+        transfers.insert(
+            path.to_string(),
+            TransferState {
+                id: uuid::Uuid::new_v4().to_string(),
+                path: path.to_string(),
+                total_bytes,
+                transferred_bytes: 0,
+                current_size: 0,
+                expected_size: total_bytes,
+                status: "active".to_string(),
+                started_at: now,
+                updated_at: now,
+            },
+        );
         Ok(())
     }
 
@@ -273,25 +280,48 @@ impl SecureFileEncryptor {
     }
 
     pub async fn can_safely_encrypt(&self, path: &str) -> bool {
-        self.can_encrypt_safely(&PathBuf::from(path)).unwrap_or(true)
+        self.can_encrypt_safely(&PathBuf::from(path))
+            .unwrap_or(true)
     }
 
     #[allow(dead_code)]
-    pub async fn encrypt_file(&self, source: &PathBuf, dest: &PathBuf, key: &[u8]) -> Result<(), AppError> {
-        let data = tokio::fs::read(source).await.map_err(|e| AppError::IoError(e.to_string()))?;
+    pub async fn encrypt_file(
+        &self,
+        source: &PathBuf,
+        dest: &PathBuf,
+        key: &[u8],
+    ) -> Result<(), AppError> {
+        let data = tokio::fs::read(source)
+            .await
+            .map_err(|e| AppError::IoError(e.to_string()))?;
         let encrypted = aes_encrypt(key, &data)?;
-        tokio::fs::write(dest, encrypted).await.map_err(|e| AppError::IoError(e.to_string()))?;
+        tokio::fs::write(dest, encrypted)
+            .await
+            .map_err(|e| AppError::IoError(e.to_string()))?;
         Ok(())
     }
 
-    pub async fn decrypt_file(&self, source: &PathBuf, dest: &PathBuf, key: &[u8]) -> Result<(), AppError> {
-        let encrypted = tokio::fs::read(source).await.map_err(|e| AppError::IoError(e.to_string()))?;
+    pub async fn decrypt_file(
+        &self,
+        source: &PathBuf,
+        dest: &PathBuf,
+        key: &[u8],
+    ) -> Result<(), AppError> {
+        let encrypted = tokio::fs::read(source)
+            .await
+            .map_err(|e| AppError::IoError(e.to_string()))?;
         let data = aes_decrypt(key, &encrypted)?;
-        tokio::fs::write(dest, data).await.map_err(|e| AppError::IoError(e.to_string()))?;
+        tokio::fs::write(dest, data)
+            .await
+            .map_err(|e| AppError::IoError(e.to_string()))?;
         Ok(())
     }
 
-    pub async fn encrypt_data(&self, data: &[u8], password: &str) -> Result<EncryptedData, AppError> {
+    pub async fn encrypt_data(
+        &self,
+        data: &[u8],
+        password: &str,
+    ) -> Result<EncryptedData, AppError> {
         let key = derive_key_from_password(password, b"file-encryption");
         let nonce = generate_random_bytes(12)?;
         let encrypted = aes_encrypt(&key, data)?;
@@ -304,7 +334,11 @@ impl SecureFileEncryptor {
         })
     }
 
-    pub async fn decrypt_data(&self, encrypted: &EncryptedData, password: &str) -> Result<Vec<u8>, AppError> {
+    pub async fn decrypt_data(
+        &self,
+        encrypted: &EncryptedData,
+        password: &str,
+    ) -> Result<Vec<u8>, AppError> {
         let key = derive_key_from_password(password, b"file-encryption");
 
         let _ = self.transfer_manager.list_active();
@@ -312,7 +346,8 @@ impl SecureFileEncryptor {
         let temp_dir = std::env::temp_dir();
         let source_path = temp_dir.join("decrypt_source.tmp");
         let dest_path = temp_dir.join("decrypt_dest.tmp");
-        fs::write(&source_path, &encrypted.ciphertext).map_err(|e| AppError::IoError(e.to_string()))?;
+        fs::write(&source_path, &encrypted.ciphertext)
+            .map_err(|e| AppError::IoError(e.to_string()))?;
         let _ = self.decrypt_file(&source_path, &dest_path, &key).await;
         let _ = fs::remove_file(&source_path);
         let _ = fs::remove_file(&dest_path);

@@ -160,7 +160,9 @@ impl ZkpAuthManager {
         };
 
         if !has_permission {
-            return Err(AppError::Unauthorized("Insufficient permission".to_string()));
+            return Err(AppError::Unauthorized(
+                "Insufficient permission".to_string(),
+            ));
         }
 
         Ok(proof.user_id.clone())
@@ -178,6 +180,54 @@ fn generate_random_id() -> Result<String, AppError> {
     getrandom::getrandom(&mut bytes)
         .map_err(|_| AppError::CryptoError("Failed to generate random ID".to_string()))?;
     Ok(hex::encode(bytes))
+}
+
+async fn load_or_repair_user_registration(
+    pool: &SqlitePool,
+    user: &crate::db::User,
+) -> Result<PasswordRegistration, AppError> {
+    if let Some(zkp_registration_json) = &user.zkp_registration {
+        if let Ok(registration) =
+            serde_json::from_str::<PasswordRegistration>(zkp_registration_json)
+        {
+            return Ok(registration);
+        }
+
+        warn!(
+            "Invalid stored ZKP registration for user {}, rebuilding from SAE secret",
+            user.id
+        );
+    }
+
+    let sae_secret = user.sae_secret.as_ref().ok_or_else(|| {
+        AppError::Unauthorized(
+            "Synchronized SAE/ZKP credentials are missing; please log in with password again"
+                .to_string(),
+        )
+    })?;
+
+    let registration = ZkpContext::new()
+        .register_password(sae_secret)
+        .map_err(|e| {
+            AppError::InternalServerError(format!(
+                "Failed to regenerate ZKP registration from SAE secret: {}",
+                e
+            ))
+        })?;
+    let reg_json = serde_json::to_string(&registration).map_err(|e| {
+        AppError::InternalServerError(format!(
+            "Failed to serialize regenerated ZKP registration: {}",
+            e
+        ))
+    })?;
+
+    crate::db::sync_user_sae_and_zkp_registration(pool, &user.id, sae_secret, &reg_json).await?;
+    info!(
+        "Repaired synchronized SAE/ZKP credentials for user {}",
+        user.id
+    );
+
+    Ok(registration)
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,21 +311,30 @@ pub async fn zkp_login(
         AppError::Unauthorized("Authentication failed".to_string())
     })?;
 
-    let zkp_registration_json = user.zkp_registration.as_ref().ok_or_else(|| {
-        warn!("ZKP login failed: user not registered for ZKP - {}", username);
-        AppError::Unauthorized("Authentication failed".to_string())
-    })?;
-
-    let registration: PasswordRegistration =
-        serde_json::from_str(zkp_registration_json).map_err(|e| {
-            warn!("ZKP login failed: ZKP registration parse error - {}: {}", username, e);
-            AppError::InternalServerError("Authentication configuration error".to_string())
+    let registration = load_or_repair_user_registration(&pool, &user)
+        .await
+        .map_err(|e| {
+            warn!(
+                "ZKP login failed: registration load error - {}: {}",
+                username, e
+            );
+            match e {
+                AppError::Unauthorized(_) => {
+                    AppError::Unauthorized("Authentication failed".to_string())
+                }
+                _ => {
+                    AppError::InternalServerError("Authentication configuration error".to_string())
+                }
+            }
         })?;
 
     let is_valid = zkp_manager
         .verify_password_proof(&body.proof, &registration, "login")
         .map_err(|e| {
-            warn!("ZKP login failed: proof verification error - {}: {}", username, e);
+            warn!(
+                "ZKP login failed: proof verification error - {}: {}",
+                username, e
+            );
             AppError::Unauthorized("Authentication failed".to_string())
         })?;
 
@@ -312,7 +371,9 @@ pub async fn create_search_token(
         .map_err(|_| AppError::BadRequest("Invalid keyword hash format".to_string()))?;
 
     if keyword_hash_bytes.len() != 32 {
-        return Err(AppError::BadRequest("Keyword hash must be 32 bytes".to_string()));
+        return Err(AppError::BadRequest(
+            "Keyword hash must be 32 bytes".to_string(),
+        ));
     }
 
     let mut keyword_hash = [0u8; 32];
@@ -322,7 +383,10 @@ pub async fn create_search_token(
         .generate_search_token(&claims.sub, keyword_hash)
         .await?;
 
-    info!("Search token generated: user {} - token {}", claims.sub, token_id);
+    info!(
+        "Search token generated: user {} - token {}",
+        claims.sub, token_id
+    );
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
@@ -344,7 +408,11 @@ pub async fn execute_encrypted_search(
 
     let matching_files = search_files_by_hash(&pool, &claims.sub, &keyword_hash).await?;
 
-    info!("Encrypted search completed: user {} - found {} files", claims.sub, matching_files.len());
+    info!(
+        "Encrypted search completed: user {} - found {} files",
+        claims.sub,
+        matching_files.len()
+    );
 
     Ok(HttpResponse::Ok().json(EncryptedSearchResponse {
         success: true,
@@ -360,7 +428,7 @@ async fn search_files_by_hash(
 ) -> Result<Vec<String>, AppError> {
     let files: Vec<(String, String, Option<String>)> = sqlx::query_as(
         r#"
-        SELECT id, file_name, tags
+        SELECT id, filename AS file_name, tags
         FROM files
         WHERE user_id = ?
         "#,
@@ -416,7 +484,9 @@ pub async fn create_share_proof(
             .await?;
 
     if !has_permission {
-        return Err(AppError::Forbidden("You don't have the specified permission for this file".to_string()));
+        return Err(AppError::Forbidden(
+            "You don't have the specified permission for this file".to_string(),
+        ));
     }
 
     let proof_id = zkp_manager
@@ -425,7 +495,10 @@ pub async fn create_share_proof(
 
     let expires_at = Utc::now().timestamp() + 86400;
 
-    info!("Share proof generated: user {} - file {} - permission {}", claims.sub, body.file_id, body.permission_level);
+    info!(
+        "Share proof generated: user {} - file {} - permission {}",
+        claims.sub, body.file_id, body.permission_level
+    );
 
     Ok(HttpResponse::Ok().json(ShareProofResponse {
         success: true,
@@ -466,9 +539,7 @@ async fn verify_user_file_permission(
             for share in shares {
                 if share.user_id == user_id {
                     return Ok(match permission_level {
-                        "read" => {
-                            ["read", "write", "admin"].contains(&share.permission.as_str())
-                        }
+                        "read" => ["read", "write", "admin"].contains(&share.permission.as_str()),
                         "write" => ["write", "admin"].contains(&share.permission.as_str()),
                         "admin" => share.permission == "admin",
                         _ => false,
@@ -497,7 +568,10 @@ pub async fn verify_share_proof(
 
     match result {
         Ok(user_id) => {
-            info!("Share proof verified: file {} - user {}", body.file_id, user_id);
+            info!(
+                "Share proof verified: file {} - user {}",
+                body.file_id, user_id
+            );
             Ok(HttpResponse::Ok().json(VerifyShareResponse {
                 success: true,
                 message: "Permission verified".to_string(),
@@ -505,7 +579,10 @@ pub async fn verify_share_proof(
             }))
         }
         Err(e) => {
-            warn!("Share proof verification failed: file {} - {}", body.file_id, e);
+            warn!(
+                "Share proof verification failed: file {} - {}",
+                body.file_id, e
+            );
             Ok(HttpResponse::Ok().json(VerifyShareResponse {
                 success: false,
                 message: e.to_string(),
@@ -529,14 +606,7 @@ pub async fn get_zkp_registration(
 
     let user = user.ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    let zkp_registration = user
-        .zkp_registration
-        .ok_or_else(|| AppError::NotFound("User not registered for ZKP authentication".to_string()))?;
-
-    let registration: PasswordRegistration =
-        serde_json::from_str(&zkp_registration).map_err(|_| {
-            AppError::InternalServerError("ZKP registration parse error".to_string())
-        })?;
+    let registration = load_or_repair_user_registration(&pool, &user).await?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
@@ -576,9 +646,43 @@ mod tests {
 pub struct GenerateProofRequest {
     #[allow(dead_code)]
     pub username: Option<String>,
-    pub password: String,
+    pub password: Option<String>,
     pub registration: Option<PasswordRegistration>,
     pub context: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GenerateBatchProofRequest {
+    pub context: String,
+    pub count: usize,
+}
+
+async fn resolve_registration_and_password(
+    pool: &SqlitePool,
+    user: &crate::db::User,
+    body_registration: Option<PasswordRegistration>,
+    body_password: Option<String>,
+    context: &str,
+) -> Result<(PasswordRegistration, String), AppError> {
+    let registration = if let Some(registration) = body_registration {
+        registration
+    } else {
+        load_or_repair_user_registration(pool, user).await?
+    };
+
+    let proof_password = if context == "hls_segment_access" {
+        user.sae_secret.clone().ok_or_else(|| {
+            AppError::BadRequest(
+                "User does not have SAE secret; please re-login to refresh credentials".to_string(),
+            )
+        })?
+    } else {
+        body_password.ok_or_else(|| {
+            AppError::BadRequest("Missing password for proof generation".to_string())
+        })?
+    };
+
+    Ok((registration, proof_password))
 }
 
 pub async fn generate_zkp_proof(
@@ -589,26 +693,20 @@ pub async fn generate_zkp_proof(
     let zkp_context = ZkpContext::new();
     let user_id = claims.sub.clone();
 
-    let registration = if let Some(registration) = body.registration.clone() {
-        registration
-    } else {
-        let user = crate::db::find_user_by_id(&pool, &user_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    let user = crate::db::find_user_by_id(&pool, &user_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-        let zkp_registration_json = user.zkp_registration.ok_or_else(|| {
-            AppError::BadRequest(
-                "User does not have ZKP registration data; please re-login or re-register"
-                    .to_string(),
-            )
-        })?;
+    let (registration, proof_password) = resolve_registration_and_password(
+        &pool,
+        &user,
+        body.registration.clone(),
+        body.password.clone(),
+        &body.context,
+    )
+    .await?;
 
-        serde_json::from_str::<PasswordRegistration>(&zkp_registration_json).map_err(|e| {
-            AppError::InternalServerError(format!("Invalid ZKP registration data in database: {}", e))
-        })?
-    };
-
-    match zkp_context.generate_enhanced_proof(&body.password, &registration, &body.context) {
+    match zkp_context.generate_enhanced_proof(&proof_password, &registration, &body.context) {
         Ok(proof) => Ok(HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "proof": proof
@@ -618,4 +716,40 @@ pub async fn generate_zkp_proof(
             "error": e.to_string()
         }))),
     }
+}
+
+pub async fn generate_zkp_proof_batch(
+    pool: web::Data<SqlitePool>,
+    claims: web::ReqData<Claims>,
+    body: web::Json<GenerateBatchProofRequest>,
+) -> Result<impl Responder, AppError> {
+    if body.context != "hls_segment_access" {
+        return Err(AppError::BadRequest(
+            "Batch proof generation is only available for context=hls_segment_access".to_string(),
+        ));
+    }
+
+    let user_id = claims.sub.clone();
+    let user = crate::db::find_user_by_id(&pool, &user_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    let count = body.count.clamp(1, 12);
+    let zkp_context = ZkpContext::new();
+    let (registration, proof_password) =
+        resolve_registration_and_password(&pool, &user, None, None, &body.context).await?;
+
+    let mut proofs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let proof = zkp_context
+            .generate_enhanced_proof(&proof_password, &registration, &body.context)
+            .map_err(|e| AppError::BadRequest(format!("Proof generation failed: {}", e)))?;
+        proofs.push(proof);
+    }
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "proofs": proofs,
+        "count": proofs.len(),
+    })))
 }

@@ -38,7 +38,6 @@ pub fn load_rustls_config(tls_config: &TlsConfig) -> std::io::Result<ServerConfi
 
     let private_key = load_private_key(&mut key_reader, &tls_config.key_path)?;
 
-    // 构建 TLS 配置
     let config = ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()

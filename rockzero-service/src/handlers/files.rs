@@ -41,8 +41,7 @@ pub async fn upload_file(
         let filename = format!("{}_{}.{}", claims.sub, file_id, file_ext);
         let file_path = format!("{}/{}", UPLOAD_DIR, filename);
 
-        let mut file = std::fs::File::create(&file_path)
-            .map_err(|_| AppError::InternalError)?;
+        let mut file = std::fs::File::create(&file_path).map_err(|_| AppError::InternalError)?;
 
         let mut hasher = blake3::Hasher::new();
         let mut file_size = 0usize;
@@ -135,7 +134,7 @@ pub async fn download_file(
     claims: web::ReqData<crate::handlers::auth::Claims>,
     file_id: web::Path<String>,
 ) -> Result<actix_files::NamedFile, AppError> {
-    let file = db::get_file_by_id(&pool, &file_id)
+    let file = db::find_file_by_id(&pool, &file_id, &claims.sub)
         .await?
         .ok_or_else(|| AppError::NotFound("File not found".to_string()))?;
 
@@ -162,7 +161,7 @@ pub async fn delete_file(
     claims: web::ReqData<crate::handlers::auth::Claims>,
     file_id: web::Path<String>,
 ) -> Result<impl Responder, AppError> {
-    let file = db::get_file_by_id(&pool, &file_id)
+    let file = db::find_file_by_id(&pool, &file_id, &claims.sub)
         .await?
         .ok_or_else(|| AppError::NotFound("File not found".to_string()))?;
 
@@ -170,7 +169,10 @@ pub async fn delete_file(
 
     db::delete_file(&pool, &file_id).await?;
 
-    info!("File deleted: {} - User: {}", file.original_filename, claims.sub);
+    info!(
+        "File deleted: {} - User: {}",
+        file.original_filename, claims.sub
+    );
 
     Ok(HttpResponse::NoContent().finish())
 }

@@ -18,16 +18,142 @@ use rockzero_sae as _;
 
 use actix_cors::Cors;
 use actix_web::{middleware::Logger, web, App, HttpServer};
+use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::SqlitePool;
-use std::{path::PathBuf, sync::Arc};
+use std::{io::Write, path::PathBuf, sync::Arc};
 use tokio::sync::RwLock;
+use tracing::error;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::handlers::secure_storage::SecureStorageManager;
-use crate::invite::InviteCodeManager;
 use crate::media_processor::MediaProcessor;
 use crate::storage_manager::{StorageConfig, StorageManager};
+
+#[cfg(target_os = "windows")]
+static WINDOWS_RUNTIME_DIAG_LOG: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "windows")]
+extern "C" fn windows_atexit_hook() {
+    runtime_diag_log("windows_atexit_hook invoked");
+}
+
+#[cfg(target_os = "windows")]
+fn runtime_diag_log(message: &str) {
+    use std::io::Write;
+
+    let timestamp = chrono::Local::now().to_rfc3339();
+    let line = format!("[{}] {}\n", timestamp, message);
+
+    if let Some(lock) = WINDOWS_RUNTIME_DIAG_LOG.get() {
+        if let Ok(mut file) = lock.lock() {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.flush();
+            return;
+        }
+    }
+
+    let _ = std::io::stderr().write_all(line.as_bytes());
+    let _ = std::io::stderr().flush();
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn windows_ctrl_handler(ctrl_type: u32) -> i32 {
+    runtime_diag_log(&format!("windows_ctrl_handler ctrl_type={}", ctrl_type));
+    0
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn windows_vectored_exception_handler(
+    exception_info: *mut winapi::um::winnt::EXCEPTION_POINTERS,
+) -> i32 {
+    if !exception_info.is_null() {
+        let record = unsafe { (*exception_info).ExceptionRecord };
+        if !record.is_null() {
+            let code = unsafe { (*record).ExceptionCode };
+            let address = unsafe { (*record).ExceptionAddress };
+            runtime_diag_log(&format!(
+                "vectored_exception code=0x{:08x} address={:?}",
+                code, address
+            ));
+        } else {
+            runtime_diag_log("vectored_exception with null ExceptionRecord");
+        }
+    } else {
+        runtime_diag_log("vectored_exception with null EXCEPTION_POINTERS");
+    }
+
+    0
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows_runtime_diagnostics(data_dir: &str) {
+    use std::backtrace::Backtrace;
+    use std::fs::OpenOptions;
+    use std::path::Path;
+
+    let candidate_paths = [
+        Path::new(data_dir)
+            .join("logs")
+            .join("windows-runtime-diagnostics.log"),
+        Path::new("./storage")
+            .join("logs")
+            .join("windows-runtime-diagnostics.log"),
+        Path::new("./windows-runtime-diagnostics.log").to_path_buf(),
+    ];
+
+    for path in &candidate_paths {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        if let Ok(file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = WINDOWS_RUNTIME_DIAG_LOG.set(std::sync::Mutex::new(file));
+            info!("Windows runtime diagnostics log path: {}", path.display());
+            break;
+        }
+    }
+
+    runtime_diag_log(&format!(
+        "install_windows_runtime_diagnostics pid={}",
+        std::process::id()
+    ));
+
+    std::panic::set_hook(Box::new(|panic_info| {
+        let backtrace = Backtrace::force_capture();
+        runtime_diag_log(&format!(
+            "panic_hook info={}\nbacktrace={}",
+            panic_info, backtrace
+        ));
+    }));
+
+    unsafe {
+        let atexit_rc = libc::atexit(windows_atexit_hook);
+        runtime_diag_log(&format!("libc::atexit register rc={}", atexit_rc));
+    }
+
+    unsafe {
+        let ctrl_ok = winapi::um::consoleapi::SetConsoleCtrlHandler(Some(windows_ctrl_handler), 1);
+        let ctrl_err = winapi::um::errhandlingapi::GetLastError();
+        runtime_diag_log(&format!(
+            "SetConsoleCtrlHandler result={} last_error={}",
+            ctrl_ok, ctrl_err
+        ));
+
+        let veh_handle = winapi::um::errhandlingapi::AddVectoredExceptionHandler(
+            1,
+            Some(windows_vectored_exception_handler),
+        );
+        let veh_err = winapi::um::errhandlingapi::GetLastError();
+        runtime_diag_log(&format!(
+            "AddVectoredExceptionHandler handle={:?} last_error={}",
+            veh_handle, veh_err
+        ));
+    }
+
+    runtime_diag_log("windows diagnostics hooks installed");
+}
 
 async fn hardware_info_endpoint() -> actix_web::Result<impl actix_web::Responder> {
     let info = hardware::detect_hardware();
@@ -48,13 +174,14 @@ async fn main() -> std::io::Result<()> {
     info!("Starting RockZero Service...");
 
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
-    std::fs::create_dir_all(&data_dir).ok();
+    std::fs::create_dir_all(&data_dir)?;
+
+    #[cfg(target_os = "windows")]
+    install_windows_runtime_diagnostics(&data_dir);
 
     info!("Initializing FFmpeg manager...");
-    
-    // 确定 assets 目录路径
+
     let assets_path = std::env::var("FFMPEG_ASSETS_PATH").unwrap_or_else(|_| {
-        // 尝试多个可能的 assets 路径
         let candidates = [
             "./assets",
             "../assets",
@@ -70,17 +197,17 @@ async fn main() -> std::io::Result<()> {
         }
         "./assets".to_string()
     });
-    
+
     info!("Using assets path: {}", assets_path);
-    
-    let mut ffmpeg_manager = ffmpeg_manager::FfmpegManager::with_assets_path(&data_dir, &assets_path);
+
+    let mut ffmpeg_manager =
+        ffmpeg_manager::FfmpegManager::with_assets_path(&data_dir, &assets_path);
     match ffmpeg_manager.ensure_available().await {
         Ok(_) => {
             if let Some(path) = ffmpeg_manager.ffmpeg_path() {
                 let ffmpeg_path_str = path.to_string_lossy().to_string();
                 info!("FFmpeg ready: {}", ffmpeg_path_str);
                 ffmpeg_manager::set_global_ffmpeg_path(Some(ffmpeg_path_str.clone()));
-                // 同时设置环境变量，确保其他模块也能找到
                 std::env::set_var("FFMPEG_PATH", &ffmpeg_path_str);
             }
             if let Some(path) = ffmpeg_manager.ffprobe_path() {
@@ -126,15 +253,29 @@ async fn main() -> std::io::Result<()> {
     let bind_addr = format!("{}:{}", host, port);
     info!("Listening on: {}", bind_addr);
 
-    let database_url =
+    let database_setting =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| format!("{}/rockzero.db", data_dir));
 
-    info!("Connecting to database: {}", database_url);
-    let pool = SqlitePool::connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
+    info!("Connecting to database: {}", database_setting);
+    let pool = if database_setting.starts_with("sqlite:") {
+        SqlitePool::connect(&database_setting)
+            .await
+            .expect("Failed to connect to database")
+    } else {
+        let db_path = PathBuf::from(&database_setting);
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
 
-    // Initialize database tables
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true);
+
+        SqlitePool::connect_with(options)
+            .await
+            .expect("Failed to connect to database")
+    };
+
     info!("Initializing database tables...");
     db::initialize_database(&pool)
         .await
@@ -147,11 +288,18 @@ async fn main() -> std::io::Result<()> {
     let secure_storage = Arc::new(SecureStorageManager::new(PathBuf::from(&secure_base)));
     info!("Secure Storage: ZKP + WPA3-SAE + CRC32 enabled");
 
-    // Initialize secure HLS manager
     let secure_hls_manager = Arc::new(RwLock::new(rockzero_media::HlsSessionManager::new()));
-    info!("Secure HLS streaming: WPA3-SAE + ZKP + AES-256-GCM enabled");
+    info!("Secure HLS streaming: WPA3-SAE + ChaCha20-Poly1305 enabled");
 
-    // Initialize hybrid transport (UDP 70% + TCP 30%)
+    let external_cache_ready = handlers::secure_hls::initialize_external_cache_startup_guard();
+    if external_cache_ready {
+        info!("Secure HLS startup guard passed: external cache is ready for production playback");
+    } else {
+        info!(
+            "Secure HLS startup guard failed: playback chain will be blocked until external cache is correctly mounted"
+        );
+    }
+
     let stream_config = rockzero_media::secure_transport::StreamConfig::default();
     let secure_transport = Arc::new(
         rockzero_media::SecureStreamTransport::new(stream_config)
@@ -179,48 +327,45 @@ async fn main() -> std::io::Result<()> {
         0.3 * 100.0
     );
 
-    // Initialize storage manager
     let storage_config = StorageConfig::from_env();
     storage_config.init_directories().await?;
     let storage_manager = Arc::new(StorageManager::new(storage_config));
     info!("Storage Manager initialized");
 
-    // Start background cleanup tasks
     storage_manager.clone().start_cleanup_tasks();
     info!("Storage cleanup tasks started");
 
-    let invite_manager = Arc::new(InviteCodeManager::new());
-
-    // Initialize AppConfig
     let app_config = Arc::new(AppConfig::from_env());
     info!("App configuration loaded");
 
-    // Initialize event notifier (200ms debounce)
     let _event_notifier = event_notifier::init_global_notifier(200);
     info!("Event notifier initialized");
 
     info!("WASM store initialized");
 
-    // Initialize LAN transfer manager
     let lan_transfer_manager = Arc::new(RwLock::new(
         handlers::lan_transfer::LanTransferManager::new(),
     ));
     info!("LAN transfer manager initialized");
 
-    // Auto-mount all disks
-    info!("Auto-mounting disks...");
-    handlers::disk_manager::auto_mount_all_disks();
-    info!("Disk auto-mount completed");
+    if cfg!(target_os = "linux") {
+        info!("Auto-mounting disks...");
+        handlers::disk_manager::auto_mount_all_disks();
+        info!("Disk auto-mount completed");
 
-    // Auto-format and mount uninitialized disks
-    info!("Scanning for uninitialized disks...");
-    handlers::disk_manager::auto_format_and_mount_uninitialized_disks();
-    info!("Uninitialized disk scan completed");
+        info!("Scanning for uninitialized disks...");
+        handlers::disk_manager::auto_format_and_mount_uninitialized_disks();
+        info!("Uninitialized disk scan completed");
+    } else {
+        info!(
+            "Disk management startup routines disabled on {}: exposing disk status and file operations only",
+            std::env::consts::OS
+        );
+    }
 
-    HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         let pool = pool.clone();
         let secure_storage = secure_storage.clone();
-        let invite_manager = invite_manager.clone();
         let media_processor_data = media_processor.clone();
         let secure_hls_manager_data = secure_hls_manager.clone();
         let storage_manager_data = storage_manager.clone();
@@ -281,10 +426,9 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(Logger::default())
             .wrap(cors)
-            .app_data(web::PayloadConfig::default().limit(100 * 1024 * 1024)) // 100 MB max payload for ARM devices
+            .app_data(web::PayloadConfig::default().limit(100 * 1024 * 1024))
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(secure_storage.clone()))
-            .app_data(web::Data::new(invite_manager.clone()))
             .app_data(web::Data::new(media_processor_data))
             .app_data(web::Data::new(secure_hls_manager_data))
             .app_data(web::Data::new(storage_manager_data))
@@ -297,7 +441,6 @@ async fn main() -> std::io::Result<()> {
             .route("/health", web::get().to(handlers::health::health_check))
             .service(
                 web::scope("/api/v1")
-                    // 静态资源路由（Logo等）
                     .service(
                         web::scope("/assets")
                             .route("/logo", web::get().to(handlers::health::serve_logo))
@@ -309,13 +452,11 @@ async fn main() -> std::io::Result<()> {
                             .route("/register", web::post().to(handlers::auth::register))
                             .route("/login", web::post().to(handlers::auth::login))
                             .route("/refresh", web::post().to(handlers::auth::refresh_token))
-                            // ZKP zero-knowledge proof authentication
                             .route("/zkp/login", web::post().to(handlers::zkp_auth::zkp_login))
                             .route(
                                 "/zkp/registration",
                                 web::post().to(handlers::zkp_auth::get_zkp_registration),
                             )
-                            // Protected auth endpoints (require JWT)
                             .service(
                                 web::scope("")
                                     .wrap(middleware::JwtAuth)
@@ -344,6 +485,10 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/proof/generate",
                                 web::post().to(handlers::zkp_auth::generate_zkp_proof),
+                            )
+                            .route(
+                                "/proof/generate-batch",
+                                web::post().to(handlers::zkp_auth::generate_zkp_proof_batch),
                             ),
                     )
                     .service(
@@ -368,10 +513,7 @@ async fn main() -> std::io::Result<()> {
                                 "/capabilities",
                                 web::get().to(handlers::system::get_hardware_capabilities),
                             )
-                            .route(
-                                "/public-ip",
-                                web::get().to(handlers::system::get_public_ip),
-                            ),
+                            .route("/public-ip", web::get().to(handlers::system::get_public_ip)),
                     )
                     .service(
                         web::scope("/storage")
@@ -465,14 +607,16 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(
                         web::scope("/invite")
-                            .wrap(middleware::JwtAuth)
-                            .route("/create", web::post().to(invite::create_invite))
+                            .service(
+                                web::scope("")
+                                    .wrap(middleware::JwtAuth)
+                                    .route("/create", web::post().to(invite::create_invite)),
+                            )
                             .route("/validate/{code}", web::get().to(invite::validate_invite))
                             .route("/remaining", web::post().to(invite::invite_remaining_time)),
                     )
                     .service(
                         web::scope("/fido")
-                            // FIDO2 authentication (public - used for passwordless login)
                             .route(
                                 "/auth/start",
                                 web::post().to(fido::start_fido_authentication),
@@ -481,7 +625,6 @@ async fn main() -> std::io::Result<()> {
                                 "/auth/finish",
                                 web::post().to(fido::finish_fido_authentication),
                             )
-                            // FIDO2 registration and credential management (requires JWT)
                             .service(
                                 web::scope("")
                                     .wrap(middleware::JwtAuth)
@@ -493,7 +636,10 @@ async fn main() -> std::io::Result<()> {
                                         "/register/finish",
                                         web::post().to(fido::finish_fido_registration),
                                     )
-                                    .route("/credentials", web::get().to(fido::list_fido_credentials))
+                                    .route(
+                                        "/credentials",
+                                        web::get().to(fido::list_fido_credentials),
+                                    )
                                     .route(
                                         "/credentials/{id}",
                                         web::delete().to(fido::delete_fido_credential),
@@ -503,6 +649,18 @@ async fn main() -> std::io::Result<()> {
                     .service(
                         web::scope("/filemanager")
                             .wrap(middleware::JwtAuth)
+                            .route(
+                                "/scope/status",
+                                web::get().to(handlers::filemanager::get_storage_scope_status),
+                            )
+                            .route(
+                                "/scope/browse",
+                                web::get().to(handlers::filemanager::browse_storage_scope),
+                            )
+                            .route(
+                                "/scope/configure",
+                                web::post().to(handlers::filemanager::configure_storage_scope),
+                            )
                             .route(
                                 "/list",
                                 web::get().to(handlers::filemanager::list_directory),
@@ -538,6 +696,10 @@ async fn main() -> std::io::Result<()> {
                                 web::get().to(handlers::filemanager::preview_text_file),
                             )
                             .route(
+                                "/text/save",
+                                web::post().to(handlers::filemanager::write_text_file),
+                            )
+                            .route(
                                 "/media/info",
                                 web::get().to(handlers::filemanager::get_media_info),
                             )
@@ -554,8 +716,6 @@ async fn main() -> std::io::Result<()> {
                                 web::get().to(handlers::filemanager::get_thumbnail),
                             ),
                     )
-                    // ============ WASM 商店 (纯 WASM 应用) ============
-                    // 旧的 /appstore 路径（向后兼容，仅 WASM 包管理）
                     .service(
                         web::scope("/appstore")
                             .wrap(middleware::JwtAuth)
@@ -579,12 +739,10 @@ async fn main() -> std::io::Result<()> {
                     .service(
                         web::scope("/wasm-store")
                             .wrap(middleware::JwtAuth)
-                            // 商店概览
                             .route(
                                 "/overview",
                                 web::get().to(handlers::wasm_store::get_store_overview),
                             )
-                            // Steam 游戏
                             .route(
                                 "/steam/featured",
                                 web::get().to(handlers::wasm_store::get_steam_featured),
@@ -601,42 +759,34 @@ async fn main() -> std::io::Result<()> {
                                 "/steam/player",
                                 web::get().to(handlers::wasm_store::get_steam_player_summary),
                             )
-                            // Epic 免费游戏
                             .route(
                                 "/epic/free",
                                 web::get().to(handlers::wasm_store::get_epic_free_games),
                             )
-                            // 平台游戏数据 (Epic/WeGame/Ubisoft/Xbox 官方 API)
                             .route(
                                 "/platform/games",
                                 web::get().to(handlers::wasm_store::get_platform_games),
                             )
-                            // WASM 应用搜索
                             .route(
                                 "/search",
                                 web::get().to(handlers::wasm_store::search_wasm_apps),
                             )
-                            // 每日 Top 30 推荐
                             .route(
                                 "/recommendations",
                                 web::get().to(handlers::wasm_store::get_daily_recommendations),
                             )
-                            // Steam 商店搜索
                             .route(
                                 "/steam/search",
                                 web::get().to(handlers::wasm_store::search_steam_store),
                             )
-                            // GitHub WASM 导入
                             .route(
                                 "/github/import",
                                 web::post().to(handlers::wasm_store::import_from_github),
                             )
-                            // WASM 脚本执行（带输出捕获）
                             .route(
                                 "/wasm/run-script",
                                 web::post().to(handlers::wasm_store::run_wasm_script),
                             )
-                            // WASM 应用管理
                             .route(
                                 "/wasm/apps",
                                 web::get().to(handlers::wasm_store::list_wasm_apps),
@@ -657,7 +807,6 @@ async fn main() -> std::io::Result<()> {
                                 "/wasm/{app_id}",
                                 web::delete().to(handlers::wasm_store::uninstall_wasm_app),
                             )
-                            // 内置应用
                             .route(
                                 "/builtin/{app_id}/run",
                                 web::get().to(handlers::wasm_store::run_builtin_app),
@@ -674,7 +823,6 @@ async fn main() -> std::io::Result<()> {
                                 "/builtin/downloads/{filename}",
                                 web::get().to(handlers::wasm_store::serve_download_file),
                             )
-                            // 插件系统
                             .route(
                                 "/plugins",
                                 web::get().to(handlers::wasm_store::list_plugins),
@@ -691,6 +839,10 @@ async fn main() -> std::io::Result<()> {
                     .service(
                         web::scope("/disk")
                             .wrap(middleware::JwtAuth)
+                            .route(
+                                "/capabilities",
+                                web::get().to(handlers::disk_manager::get_disk_capabilities),
+                            )
                             .route("/list", web::get().to(handlers::disk_manager::list_disks))
                             .route(
                                 "/{id}/details",
@@ -700,7 +852,6 @@ async fn main() -> std::io::Result<()> {
                                 "/{id}/partitions",
                                 web::get().to(handlers::disk_manager::list_partitions),
                             )
-                            // Add routes without ID for direct device parameter passing
                             .route("/mount", web::post().to(handlers::disk_manager::mount_disk))
                             .route(
                                 "/unmount",
@@ -710,7 +861,6 @@ async fn main() -> std::io::Result<()> {
                                 "/format",
                                 web::post().to(handlers::disk_manager::format_disk),
                             )
-                            // Add routes without ID for initialize and rename
                             .route(
                                 "/initialize",
                                 web::post().to(handlers::disk_manager::initialize_disk),
@@ -719,7 +869,6 @@ async fn main() -> std::io::Result<()> {
                                 "/rename",
                                 web::post().to(handlers::disk_manager::rename_disk),
                             )
-                            // Keep routes with ID for backward compatibility
                             .route(
                                 "/{id}/mount",
                                 web::post().to(handlers::disk_manager::mount_disk),
@@ -770,7 +919,6 @@ async fn main() -> std::io::Result<()> {
                                 web::get().to(handlers::disk_manager::get_disk_temperature),
                             ),
                     )
-                    // Professional storage management API
                     .service(
                         web::scope("/storage")
                             .wrap(middleware::JwtAuth)
@@ -814,7 +962,6 @@ async fn main() -> std::io::Result<()> {
                             )
                             .route("/auto-mount", web::post().to(handlers::storage::auto_mount)),
                     )
-                    // Video hardware acceleration API
                     .service(
                         web::scope("/video-hardware")
                             .wrap(middleware::JwtAuth)
@@ -872,20 +1019,54 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(
                         web::scope("/lan-transfer")
-                            // 设备信息和共享列表不需要认证（对端设备需要匿名访问）
-                            .route("/device-info", web::get().to(handlers::lan_transfer::get_device_info))
-                            .route("/shared", web::get().to(handlers::lan_transfer::list_shared_items))
-                            .route("/download/{item_id}", web::get().to(handlers::lan_transfer::download_shared_item))
-                            // 管理操作需要认证
-                            .route("/share", web::post().to(handlers::lan_transfer::add_shared_item))
-                            .route("/share/{id}", web::delete().to(handlers::lan_transfer::remove_shared_item))
-                            .route("/scan-games", web::post().to(handlers::lan_transfer::scan_local_games))
-                            .route("/receive", web::post().to(handlers::lan_transfer::receive_from_peer))
-                            .route("/sessions", web::get().to(handlers::lan_transfer::list_sessions))
-                            .route("/sessions/{id}", web::get().to(handlers::lan_transfer::get_session))
-                            .route("/sessions/{id}/cancel", web::post().to(handlers::lan_transfer::cancel_session))
-                            .route("/sessions/{id}", web::delete().to(handlers::lan_transfer::delete_session))
-                            .route("/sessions/cleanup", web::post().to(handlers::lan_transfer::cleanup_sessions)),
+                            .route(
+                                "/device-info",
+                                web::get().to(handlers::lan_transfer::get_device_info),
+                            )
+                            .route(
+                                "/shared",
+                                web::get().to(handlers::lan_transfer::list_shared_items),
+                            )
+                            .route(
+                                "/download/{item_id}",
+                                web::get().to(handlers::lan_transfer::download_shared_item),
+                            )
+                            .route(
+                                "/share",
+                                web::post().to(handlers::lan_transfer::add_shared_item),
+                            )
+                            .route(
+                                "/share/{id}",
+                                web::delete().to(handlers::lan_transfer::remove_shared_item),
+                            )
+                            .route(
+                                "/scan-games",
+                                web::post().to(handlers::lan_transfer::scan_local_games),
+                            )
+                            .route(
+                                "/receive",
+                                web::post().to(handlers::lan_transfer::receive_from_peer),
+                            )
+                            .route(
+                                "/sessions",
+                                web::get().to(handlers::lan_transfer::list_sessions),
+                            )
+                            .route(
+                                "/sessions/{id}",
+                                web::get().to(handlers::lan_transfer::get_session),
+                            )
+                            .route(
+                                "/sessions/{id}/cancel",
+                                web::post().to(handlers::lan_transfer::cancel_session),
+                            )
+                            .route(
+                                "/sessions/{id}",
+                                web::delete().to(handlers::lan_transfer::delete_session),
+                            )
+                            .route(
+                                "/sessions/cleanup",
+                                web::post().to(handlers::lan_transfer::cleanup_sessions),
+                            ),
                     )
                     .service(
                         web::scope("/secure")
@@ -921,6 +1102,28 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 "/db/close",
                                 web::post().to(handlers::secure_storage::close_database),
+                            )
+                            .route(
+                                "/private-space/status",
+                                web::get().to(handlers::secure_storage::private_space_status),
+                            )
+                            .route(
+                                "/private-space/import",
+                                web::post()
+                                    .to(handlers::secure_storage::import_private_space_items),
+                            )
+                            .route(
+                                "/private-space/list",
+                                web::post().to(handlers::secure_storage::list_private_space_items),
+                            )
+                            .route(
+                                "/private-space/export",
+                                web::post().to(handlers::secure_storage::export_private_space_item),
+                            )
+                            .route(
+                                "/private-space/delete",
+                                web::delete()
+                                    .to(handlers::secure_storage::delete_private_space_item),
                             )
                             .route(
                                 "/encrypt",
@@ -1017,10 +1220,8 @@ async fn main() -> std::io::Result<()> {
                                 web::post().to(handlers::secure_storage::derive_specific_key),
                             ),
                     )
-                    // ============ Secure HLS Streaming ============
                     .service(
                         web::scope("/secure-hls")
-                            // SAE handshake (requires JWT)
                             .service(
                                 web::scope("/sae")
                                     .wrap(middleware::JwtAuth)
@@ -1042,43 +1243,42 @@ async fn main() -> std::io::Result<()> {
                                             .to(handlers::secure_hls::complete_sae_handshake),
                                     ),
                             )
-                            // Transport stats (requires JWT)
-                            .service(
-                                web::scope("/transport")
-                                    .wrap(middleware::JwtAuth)
-                                    .route(
-                                        "/stats",
-                                        web::get().to(handlers::secure_hls::get_transport_stats),
-                                    ),
-                            )
-                            // Session management (requires JWT)
+                            .service(web::scope("/transport").wrap(middleware::JwtAuth).route(
+                                "/stats",
+                                web::get().to(handlers::secure_hls::get_transport_stats),
+                            ))
                             .service(
                                 web::scope("/session")
                                     .wrap(middleware::JwtAuth)
                                     .route(
                                         "/create",
                                         web::post().to(handlers::secure_hls::create_hls_session),
+                                    )
+                                    .route(
+                                        "/{session_id}/proof-ticket",
+                                        web::post()
+                                            .to(handlers::secure_hls::create_session_proof_ticket),
                                     ),
                             )
-                            // Playback routes: authenticated by session_id (no JWT needed)
-                            // Session creation already required JWT + SAE handshake
-                            .route(
-                                "/{session_id}/playlist.m3u8",
-                                web::get().to(handlers::secure_hls::get_secure_playlist),
-                            )
-                            .route(
-                                "/{session_id}/stop",
-                                web::post().to(handlers::secure_hls::stop_session),
-                            )
-                            // Direct segment access (GET, no encryption)
-                            .route(
-                                "/{session_id}/{segment}",
-                                web::get().to(handlers::secure_hls::get_segment_direct),
-                            )
-                            // Encrypted segment access (POST with ZKP proof)
-                            .route(
-                                "/{session_id}/{segment}",
-                                web::post().to(handlers::secure_hls::get_secure_segment),
+                            .service(
+                                web::scope("")
+                                    .wrap(middleware::JwtAuth)
+                                    .route(
+                                        "/{session_id}/playlist.m3u8",
+                                        web::get().to(handlers::secure_hls::get_secure_playlist),
+                                    )
+                                    .route(
+                                        "/{session_id}/stop",
+                                        web::post().to(handlers::secure_hls::stop_session),
+                                    )
+                                    .route(
+                                        "/{session_id}/{segment}",
+                                        web::get().to(handlers::secure_hls::get_segment_direct),
+                                    )
+                                    .route(
+                                        "/{session_id}/{segment}",
+                                        web::post().to(handlers::secure_hls::get_secure_segment),
+                                    ),
                             ),
                     )
                     .service(
@@ -1115,8 +1315,95 @@ async fn main() -> std::io::Result<()> {
                                 web::get().to(handlers::streaming::get_thumbnail),
                             )
                             .route(
+                                "/play/{path:.*}",
+                                web::get().to(handlers::streaming::stream_media),
+                            )
+                            .route(
+                                "/smart-play/{path:.*}",
+                                web::get().to(handlers::streaming::smart_play),
+                            )
+                            .route(
                                 "/transcode/{path:.*}",
                                 web::get().to(handlers::streaming::transcode_audio),
+                            )
+                            .route(
+                                "/transcode-video/{path:.*}",
+                                web::get().to(handlers::streaming::transcode_video),
+                            ),
+                    ),
+            )
+            .service(
+                web::scope("/api/v1/edge")
+                    .route("/health", web::get().to(handlers::edge_compute::health))
+                    .service(
+                        web::scope("")
+                            .wrap(middleware::JwtAuth)
+                            .route(
+                                "/admin/health",
+                                web::get().to(handlers::edge_compute::admin_health),
+                            )
+                            .route("/stats", web::get().to(handlers::edge_compute::edge_stats))
+                            .route("/nodes", web::get().to(handlers::edge_compute::list_nodes))
+                            .route(
+                                "/nodes/register",
+                                web::post().to(handlers::edge_compute::register_node),
+                            )
+                            .route(
+                                "/nodes/{node_id}/heartbeat",
+                                web::post().to(handlers::edge_compute::node_heartbeat),
+                            )
+                            .route("/jobs", web::get().to(handlers::edge_compute::list_jobs))
+                            .route(
+                                "/jobs/submit",
+                                web::post().to(handlers::edge_compute::submit_job),
+                            )
+                            .route(
+                                "/wxy/qr/start",
+                                web::post().to(handlers::edge_compute::start_wxy_qr_login),
+                            )
+                            .route(
+                                "/wxy/qr/{session_id}",
+                                web::get().to(handlers::edge_compute::poll_wxy_qr_login),
+                            )
+                            .route(
+                                "/wxy/auth/bind",
+                                web::post().to(handlers::edge_compute::bind_wxy_token),
+                            )
+                            .route(
+                                "/wxy/auth/status",
+                                web::get().to(handlers::edge_compute::wxy_auth_status),
+                            )
+                            .route(
+                                "/wxy/auth/refresh",
+                                web::post().to(handlers::edge_compute::refresh_wxy_auth_token),
+                            )
+                            .route(
+                                "/wxy/auth/logout",
+                                web::post().to(handlers::edge_compute::wxy_logout),
+                            )
+                            .route(
+                                "/wxy/adapter/inspect",
+                                web::post().to(handlers::edge_compute::inspect_wxy_adapter),
+                            )
+                            .route(
+                                "/self-check/startup",
+                                web::get().to(handlers::edge_compute::get_startup_self_check),
+                            )
+                            .route(
+                                "/self-check/run",
+                                web::post().to(handlers::edge_compute::run_startup_self_check_now),
+                            )
+                            .route(
+                                "/jobs/{job_id}",
+                                web::get().to(handlers::edge_compute::get_job),
+                            )
+                            .route(
+                                "/jobs/{job_id}/cancel",
+                                web::post().to(handlers::edge_compute::cancel_job),
+                            )
+                            .route(
+                                "/jobs/{job_id}/retry",
+                                web::post().to(handlers::edge_compute::retry_job),
                             ),
                     ),
             )
@@ -1180,7 +1467,36 @@ async fn main() -> std::io::Result<()> {
     .client_request_timeout(std::time::Duration::from_secs(600))
     .client_disconnect_timeout(std::time::Duration::from_secs(30))
     .max_connection_rate(512)
-    .bind(&bind_addr)?
-    .run()
-    .await
+    .bind(&bind_addr)?;
+
+    let result = server.run().await;
+    match &result {
+        Ok(_) => {
+            info!("Actix server exited normally");
+            eprintln!("ACTIX_SERVER_EXIT_OK");
+            #[cfg(target_os = "windows")]
+            runtime_diag_log("ACTIX_SERVER_EXIT_OK");
+        }
+        Err(e) => {
+            error!(
+                "Actix server exited with error: {} (raw_os_error={:?})",
+                e,
+                e.raw_os_error()
+            );
+            eprintln!(
+                "ACTIX_SERVER_EXIT_ERR raw_os_error={:?} err={}",
+                e.raw_os_error(),
+                e
+            );
+            #[cfg(target_os = "windows")]
+            runtime_diag_log(&format!(
+                "ACTIX_SERVER_EXIT_ERR raw_os_error={:?} err={}",
+                e.raw_os_error(),
+                e
+            ));
+        }
+    }
+    let _ = std::io::stderr().flush();
+
+    result
 }

@@ -1,16 +1,16 @@
-//! Docker API Client
-//!
-//! Production-grade Docker API client using Unix socket communication.
-//! This is more secure than shell commands as it:
-//! - Avoids shell injection vulnerabilities
-//! - Provides proper error handling
-//! - Supports Docker Compose for CasaOS/iStoreOS compatibility
-//!
-//! ## Security Features
-//! - Unix socket communication (no shell execution)
-//! - Input validation and sanitization
-//! - Proper error handling
-//! - Rate limiting support
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -25,19 +25,19 @@ use {
     std::time::Duration,
 };
 
-/// Docker socket path
+
 #[allow(dead_code)]
 const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 
-/// Docker API version
+
 #[allow(dead_code)]
 const DOCKER_API_VERSION: &str = "v1.41";
 
-/// Default timeout for Docker API requests (seconds)
+
 #[allow(dead_code)]
 const DOCKER_REQUEST_TIMEOUT_SECS: u64 = 15;
 
-/// Docker container information
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ContainerInfo {
@@ -59,7 +59,7 @@ pub struct ContainerInfo {
     pub labels: Option<HashMap<String, String>>,
 }
 
-/// Port binding information
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct PortBinding {
@@ -73,7 +73,7 @@ pub struct PortBinding {
     pub port_type: String,
 }
 
-/// Docker image information
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ImageInfo {
@@ -89,7 +89,7 @@ pub struct ImageInfo {
     pub labels: Option<HashMap<String, String>>,
 }
 
-/// Container creation configuration
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ContainerConfig {
@@ -105,7 +105,7 @@ pub struct ContainerConfig {
     pub labels: Option<HashMap<String, String>>,
 }
 
-/// Host configuration for container
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct HostConfig {
@@ -119,7 +119,7 @@ pub struct HostConfig {
     pub network_mode: Option<String>,
 }
 
-/// Port mapping
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct PortMap {
@@ -129,7 +129,7 @@ pub struct PortMap {
     pub host_port: String,
 }
 
-/// Restart policy
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct RestartPolicy {
@@ -139,7 +139,7 @@ pub struct RestartPolicy {
     pub maximum_retry_count: Option<i32>,
 }
 
-/// Docker Compose service definition (CasaOS/iStoreOS compatible)
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ComposeService {
@@ -154,7 +154,7 @@ pub struct ComposeService {
     pub depends_on: Option<Vec<String>>,
 }
 
-/// Docker Compose file structure
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ComposeFile {
@@ -164,7 +164,7 @@ pub struct ComposeFile {
     pub volumes: Option<HashMap<String, serde_json::Value>>,
 }
 
-/// Docker API client error
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum DockerError {
@@ -193,7 +193,7 @@ impl std::fmt::Display for DockerError {
 
 impl std::error::Error for DockerError {}
 
-/// Docker API client
+
 #[allow(dead_code)]
 pub struct DockerClient {
     #[cfg(target_os = "linux")]
@@ -204,17 +204,17 @@ pub struct DockerClient {
 
 #[allow(dead_code)]
 impl DockerClient {
-    /// Create a new Docker client
+
     pub fn new() -> Result<Self, DockerError> {
         Self::with_socket(DOCKER_SOCKET)
     }
 
-    /// Create a new Docker client with custom socket path
+
     #[allow(dead_code)]
     pub fn with_socket(socket_path: &str) -> Result<Self, DockerError> {
         #[cfg(target_os = "linux")]
         {
-            // Check if socket exists
+
             if !std::path::Path::new(socket_path).exists() {
                 return Err(DockerError::ConnectionFailed(format!(
                     "Docker socket not found at {}",
@@ -231,14 +231,14 @@ impl DockerClient {
 
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = socket_path; // Suppress unused warning
+            let _ = socket_path;
             Err(DockerError::ConnectionFailed(
                 "Docker API only supported on Linux".to_string(),
             ))
         }
     }
 
-    /// Send a request to Docker with a timeout to prevent indefinite hangs
+
     #[cfg(target_os = "linux")]
     async fn request_with_timeout(
         &self,
@@ -258,7 +258,7 @@ impl DockerClient {
         .map_err(|e| DockerError::ConnectionFailed(e.to_string()))
     }
 
-    /// List all containers
+
     #[cfg(target_os = "linux")]
     pub async fn list_containers(&self, all: bool) -> Result<Vec<ContainerInfo>, DockerError> {
         let query = if all { "?all=true" } else { "" };
@@ -292,7 +292,7 @@ impl DockerClient {
         Err(DockerError::ConnectionFailed("Docker API only supported on Linux".to_string()))
     }
 
-    /// List all images
+
     #[cfg(target_os = "linux")]
     pub async fn list_images(&self) -> Result<Vec<ImageInfo>, DockerError> {
         let uri = UnixUri::new(&self.socket_path, &format!("/{}/images/json", DOCKER_API_VERSION));
@@ -325,14 +325,14 @@ impl DockerClient {
         Err(DockerError::ConnectionFailed("Docker API only supported on Linux".to_string()))
     }
 
-    /// Create a container
+
     #[cfg(target_os = "linux")]
     pub async fn create_container(
         &self,
         name: &str,
         config: &ContainerConfig,
     ) -> Result<String, DockerError> {
-        // Sanitize container name
+
         let safe_name = sanitize_container_name(name);
         
         let uri = UnixUri::new(
@@ -390,7 +390,7 @@ impl DockerClient {
         Err(DockerError::ConnectionFailed("Docker API only supported on Linux".to_string()))
     }
 
-    /// Start a container
+
     #[cfg(target_os = "linux")]
     pub async fn start_container(&self, container_id: &str) -> Result<(), DockerError> {
         let safe_id = sanitize_container_id(container_id);
@@ -425,7 +425,7 @@ impl DockerClient {
         Err(DockerError::ConnectionFailed("Docker API only supported on Linux".to_string()))
     }
 
-    /// Stop a container
+
     #[cfg(target_os = "linux")]
     pub async fn stop_container(&self, container_id: &str, timeout: Option<u32>) -> Result<(), DockerError> {
         let safe_id = sanitize_container_id(container_id);
@@ -461,7 +461,7 @@ impl DockerClient {
         Err(DockerError::ConnectionFailed("Docker API only supported on Linux".to_string()))
     }
 
-    /// Remove a container
+
     #[cfg(target_os = "linux")]
     pub async fn remove_container(&self, container_id: &str, force: bool) -> Result<(), DockerError> {
         let safe_id = sanitize_container_id(container_id);
@@ -497,7 +497,7 @@ impl DockerClient {
         Err(DockerError::ConnectionFailed("Docker API only supported on Linux".to_string()))
     }
 
-    /// Pull an image
+
     #[cfg(target_os = "linux")]
     pub async fn pull_image(&self, image: &str, tag: Option<&str>) -> Result<(), DockerError> {
         let safe_image = sanitize_image_name(image);
@@ -533,7 +533,7 @@ impl DockerClient {
         Err(DockerError::ConnectionFailed("Docker API only supported on Linux".to_string()))
     }
 
-    /// Remove an image
+
     #[cfg(target_os = "linux")]
     pub async fn remove_image(&self, image_id: &str, force: bool) -> Result<(), DockerError> {
         let safe_id = sanitize_image_name(image_id);
@@ -573,7 +573,7 @@ impl DockerClient {
         Err(DockerError::ConnectionFailed("Docker API only supported on Linux".to_string()))
     }
 
-    /// Get container logs
+
     #[cfg(target_os = "linux")]
     pub async fn get_logs(&self, container_id: &str, tail: Option<u32>) -> Result<String, DockerError> {
         let safe_id = sanitize_container_id(container_id);
@@ -600,8 +600,8 @@ impl DockerClient {
                     .map_err(|e| DockerError::ParseError(e.to_string()))?
                     .to_bytes();
                 
-                // Docker logs have a special format with 8-byte header per line
-                // We need to strip these headers
+
+
                 let logs = parse_docker_logs(&body);
                 Ok(logs)
             }
@@ -628,11 +628,11 @@ impl Default for DockerClient {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
 
-/// Sanitize container name to prevent injection
+
+
+
+
 #[allow(dead_code)]
 fn sanitize_container_name(name: &str) -> String {
     name.chars()
@@ -640,7 +640,7 @@ fn sanitize_container_name(name: &str) -> String {
         .collect()
 }
 
-/// Sanitize container ID to prevent injection
+
 #[allow(dead_code)]
 fn sanitize_container_id(id: &str) -> String {
     id.chars()
@@ -648,7 +648,7 @@ fn sanitize_container_id(id: &str) -> String {
         .collect()
 }
 
-/// Sanitize image name to prevent injection
+
 #[allow(dead_code)]
 fn sanitize_image_name(name: &str) -> String {
     name.chars()
@@ -656,15 +656,15 @@ fn sanitize_image_name(name: &str) -> String {
         .collect()
 }
 
-/// Parse Docker logs (strip 8-byte headers)
+
 #[allow(dead_code)]
 fn parse_docker_logs(data: &[u8]) -> String {
     let mut result = String::new();
     let mut i = 0;
     
     while i + 8 <= data.len() {
-        // Read header
-        let _stream_type = data[i]; // 0=stdin, 1=stdout, 2=stderr
+
+        let _stream_type = data[i];
         let size = u32::from_be_bytes([data[i + 4], data[i + 5], data[i + 6], data[i + 7]]) as usize;
         
         i += 8;
@@ -682,7 +682,7 @@ fn parse_docker_logs(data: &[u8]) -> String {
     result
 }
 
-/// Convert ComposeService to ContainerConfig
+
 #[allow(dead_code)]
 pub fn compose_to_container_config(service: &ComposeService) -> ContainerConfig {
     let mut port_bindings: HashMap<String, Vec<PortMap>> = HashMap::new();
@@ -690,7 +690,7 @@ pub fn compose_to_container_config(service: &ComposeService) -> ContainerConfig 
     
     if let Some(ports) = &service.ports {
         for port in ports {
-            // Parse port mapping (e.g., "8080:80" or "8080:80/tcp")
+
             let parts: Vec<&str> = port.split(':').collect();
             if parts.len() == 2 {
                 let host_port = parts[0];
@@ -730,7 +730,7 @@ pub fn compose_to_container_config(service: &ComposeService) -> ContainerConfig 
     }
 }
 
-/// Parse Docker Compose file
+
 #[allow(dead_code)]
 pub fn parse_compose_file(content: &str) -> Result<ComposeFile, DockerError> {
     serde_yaml::from_str(content)

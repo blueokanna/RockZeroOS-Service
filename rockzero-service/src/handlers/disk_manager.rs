@@ -2,34 +2,281 @@
 
 use actix_web::{web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
+use std::env;
 use sysinfo::Disks;
 
+#[cfg(target_os = "linux")]
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::process::Command;
 
 use rockzero_common::AppError;
 
-/// Auto-mount all configured disks on startup
-/// This function reads the fstab or auto-mount configuration and mounts any unmounted disks
+use crate::storage_manager::{load_windows_storage_binding, windows_storage_binding_path};
+
+#[derive(Debug, Serialize)]
+pub struct DiskPlatformCapabilities {
+    pub platform: String,
+    pub architecture: String,
+    pub environment_profile: String,
+    pub environment_label: String,
+    pub device_model: Option<String>,
+    pub supports_disk_listing: bool,
+    pub supports_disk_details: bool,
+    pub supports_disk_scan: bool,
+    pub supports_mount: bool,
+    pub supports_unmount: bool,
+    pub supports_format: bool,
+    pub supports_initialize: bool,
+    pub supports_rename: bool,
+    pub supports_health: bool,
+    pub supports_eject: bool,
+    pub supports_file_operations: bool,
+    pub read_write_only_mode: bool,
+    pub scoped_storage_required: bool,
+    pub scoped_storage_configured: bool,
+    pub selected_root: Option<String>,
+    pub config_path: Option<String>,
+    pub restriction_message: Option<String>,
+}
+
+#[derive(Debug)]
+struct EnvironmentDescriptor {
+    profile: String,
+    label: String,
+    device_model: Option<String>,
+}
+
+fn current_platform_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        std::env::consts::OS
+    }
+}
+
+fn current_architecture_name() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "x86" | "i686" | "i586" => "x86",
+        "aarch64" => "arm64",
+        "arm" | "armv7" => "arm",
+        other => other,
+    }
+}
+
+fn detect_environment_descriptor() -> EnvironmentDescriptor {
+    let platform = current_platform_name();
+    let arch = current_architecture_name();
+
+    if let Ok(override_profile) = env::var("ROCKZERO_PLATFORM_PROFILE") {
+        let override_profile = override_profile.trim();
+        if !override_profile.is_empty() {
+            return EnvironmentDescriptor {
+                profile: override_profile.to_string(),
+                label: format!(
+                    "{} {} backend",
+                    platform.to_uppercase(),
+                    arch.to_uppercase()
+                ),
+                device_model: detect_device_model(),
+            };
+        }
+    }
+
+    let device_model = detect_device_model();
+    let profile = match (platform, arch) {
+        ("windows", "arm64") => "windows-arm64",
+        ("windows", "x86") | ("windows", "x86_64") => "windows-x86",
+        ("linux", "arm") | ("linux", "arm64") if is_oes_device(device_model.as_deref()) => {
+            "linux-arm-oes"
+        }
+        ("linux", "arm") | ("linux", "arm64") => "linux-arm",
+        ("linux", "x86") | ("linux", "x86_64") => "linux-x86",
+        ("macos", "arm64") => "macos-arm64",
+        ("macos", _) => "macos-x86",
+        _ => "generic",
+    }
+    .to_string();
+
+    let label = match profile.as_str() {
+        "linux-arm-oes" => format!(
+            "OES Linux ARM backend{}",
+            device_model
+                .as_deref()
+                .map(|model| format!(" ({model})"))
+                .unwrap_or_default()
+        ),
+        "linux-arm" => format!(
+            "Linux ARM backend{}",
+            device_model
+                .as_deref()
+                .map(|model| format!(" ({model})"))
+                .unwrap_or_default()
+        ),
+        "linux-x86" => format!("Linux {} backend", arch.to_uppercase()),
+        "windows-arm64" => "Windows ARM64 backend".to_string(),
+        "windows-x86" => format!("Windows {} backend", arch.to_uppercase()),
+        "macos-arm64" => "macOS ARM64 backend".to_string(),
+        "macos-x86" => "macOS x86 backend".to_string(),
+        _ => format!(
+            "{} {} backend",
+            platform.to_uppercase(),
+            arch.to_uppercase()
+        ),
+    };
+
+    EnvironmentDescriptor {
+        profile,
+        label,
+        device_model,
+    }
+}
+
+fn is_oes_device(device_model: Option<&str>) -> bool {
+    let Some(device_model) = device_model else {
+        return false;
+    };
+
+    let normalized = device_model.to_ascii_lowercase();
+    normalized.contains("oes")
+        || normalized.contains("a311d")
+        || normalized.contains("amlogic")
+        || normalized.contains("meson-g12b")
+}
+
+#[cfg(target_os = "linux")]
+fn detect_device_model() -> Option<String> {
+    let candidates = [
+        "/proc/device-tree/model",
+        "/sys/firmware/devicetree/base/model",
+        "/sys/devices/virtual/dmi/id/product_name",
+    ];
+
+    for candidate in candidates {
+        let path = Path::new(candidate);
+        if !path.exists() {
+            continue;
+        }
+
+        if let Ok(raw) = fs::read(path) {
+            let value = String::from_utf8_lossy(&raw)
+                .replace('\0', "")
+                .trim()
+                .to_string();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+
+    if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
+        for key in ["Model", "Hardware", "Processor"] {
+            if let Some(value) = cpuinfo.lines().find_map(|line| {
+                let (left, right) = line.split_once(':')?;
+                if left.trim().eq_ignore_ascii_case(key) {
+                    Some(right.trim().to_string())
+                } else {
+                    None
+                }
+            }) {
+                if !value.is_empty() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_device_model() -> Option<String> {
+    None
+}
+
+pub async fn get_disk_capabilities() -> Result<HttpResponse, AppError> {
+    let is_linux = cfg!(target_os = "linux");
+    let read_write_only_mode = !is_linux;
+    let environment = detect_environment_descriptor();
+    let windows_binding = if cfg!(target_os = "windows") {
+        Some(load_windows_storage_binding().map_err(|e| {
+            AppError::InternalServerError(format!(
+                "Failed to read Windows storage root configuration: {e}"
+            ))
+        })?)
+    } else {
+        None
+    };
+    let selected_root = windows_binding
+        .as_ref()
+        .and_then(|binding| binding.as_ref())
+        .map(|binding| binding.selected_root.to_string_lossy().to_string());
+    let scoped_storage_required = cfg!(target_os = "windows");
+    let scoped_storage_configured = !scoped_storage_required || selected_root.is_some();
+
+    Ok(HttpResponse::Ok().json(DiskPlatformCapabilities {
+        platform: current_platform_name().to_string(),
+        architecture: current_architecture_name().to_string(),
+        environment_profile: environment.profile,
+        environment_label: environment.label,
+        device_model: environment.device_model,
+        supports_disk_listing: true,
+        supports_disk_details: true,
+        supports_disk_scan: is_linux,
+        supports_mount: is_linux,
+        supports_unmount: is_linux,
+        supports_format: is_linux,
+        supports_initialize: is_linux,
+        supports_rename: is_linux,
+        supports_health: is_linux,
+        supports_eject: is_linux,
+        supports_file_operations: true,
+        read_write_only_mode,
+        scoped_storage_required,
+        scoped_storage_configured,
+        selected_root: selected_root.clone(),
+        config_path: scoped_storage_required
+            .then(|| windows_storage_binding_path().to_string_lossy().to_string()),
+        restriction_message: read_write_only_mode.then(|| {
+            if scoped_storage_required {
+                match selected_root {
+                    Some(root) => format!(
+                        "This Windows backend runs in scoped read/write mode. Disk status is available, but initialize, format, mount, unmount, rename, SMART, and eject operations are disabled. File access is constrained to the bound root: {root}."
+                    ),
+                    None => "This Windows backend runs in scoped read/write mode. Disk status is available, but initialize, format, mount, unmount, rename, SMART, and eject operations are disabled. Select one Windows storage root before file browsing is enabled.".to_string(),
+                }
+            } else {
+                "This backend is running in read/write-only storage mode. Disk status is available, but initialize, format, mount, unmount, rename, SMART, and eject operations are disabled on this platform.".to_string()
+            }
+        }),
+    }))
+}
+
 #[cfg(target_os = "linux")]
 pub fn auto_mount_all_disks() {
     log::info!("Starting auto-mount for all disks...");
-    
-    // Read lsblk to find all block devices with filesystems
+
     let output = Command::new("lsblk")
         .args(["-J", "-o", "NAME,TYPE,MOUNTPOINT,FSTYPE,SIZE,UUID"])
         .output();
-    
+
     let Ok(output) = output else {
         log::warn!("Failed to run lsblk for auto-mount");
         return;
     };
-    
+
     if !output.status.success() {
         log::warn!("lsblk failed: {}", String::from_utf8_lossy(&output.stderr));
         return;
     }
-    
+
     let lsblk_json = String::from_utf8_lossy(&output.stdout);
     let lsblk: serde_json::Value = match serde_json::from_str(&lsblk_json) {
         Ok(v) => v,
@@ -38,79 +285,69 @@ pub fn auto_mount_all_disks() {
             return;
         }
     };
-    
+
     let Some(blockdevices) = lsblk.get("blockdevices").and_then(|v| v.as_array()) else {
         log::warn!("No block devices found");
         return;
     };
-    
+
     let mount_base = std::env::var("MOUNT_BASE").unwrap_or_else(|_| "/mnt".to_string());
     let mut mounted_count = 0;
-    
+
     for device in blockdevices {
-        // Process each device and its children (partitions)
         let children = device.get("children").and_then(|c| c.as_array());
-        
+
         let devices_to_check: Vec<&serde_json::Value> = if let Some(children) = children {
             children.iter().collect()
         } else {
             vec![device]
         };
-        
+
         for dev in devices_to_check {
             let name = dev.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let dev_type = dev.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let mountpoint = dev.get("mountpoint").and_then(|m| m.as_str());
             let fstype = dev.get("fstype").and_then(|f| f.as_str());
-            
-            // Skip if not a partition or disk, or if already mounted
+
             if dev_type != "part" && dev_type != "disk" {
                 continue;
             }
-            
-            // Skip if already mounted
+
             if mountpoint.is_some() && !mountpoint.unwrap().is_empty() {
                 continue;
             }
-            
-            // Skip if no filesystem
+
             let Some(fstype) = fstype else {
                 continue;
             };
             if fstype.is_empty() {
                 continue;
             }
-            
-            // Skip system partitions (boot, swap, etc.)
+
             if fstype == "swap" || fstype == "vfat" && name.contains("boot") {
                 continue;
             }
-            
+
             let device_path = format!("/dev/{}", name);
             let mount_point = format!("{}/{}", mount_base, name);
-            
-            // Create mount point
+
             if let Err(e) = std::fs::create_dir_all(&mount_point) {
                 log::warn!("Failed to create mount point {}: {}", mount_point, e);
                 continue;
             }
-            
-            // Mount the device
+
             let mount_result = Command::new("mount")
                 .arg(&device_path)
                 .arg(&mount_point)
                 .output();
-            
+
             match mount_result {
                 Ok(output) => {
                     if output.status.success() {
                         log::info!("Auto-mounted {} to {}", device_path, mount_point);
                         mounted_count += 1;
-                        
-                        // Set permissions
-                        let _ = Command::new("chmod")
-                            .args(["755", &mount_point])
-                            .output();
+
+                        let _ = Command::new("chmod").args(["755", &mount_point]).output();
                     } else {
                         let error = String::from_utf8_lossy(&output.stderr);
                         log::debug!("Failed to mount {}: {}", device_path, error.trim());
@@ -122,7 +359,7 @@ pub fn auto_mount_all_disks() {
             }
         }
     }
-    
+
     log::info!("Auto-mount completed: {} disks mounted", mounted_count);
 }
 
@@ -131,17 +368,11 @@ pub fn auto_mount_all_disks() {
     log::info!("Auto-mount not supported on this platform");
 }
 
-/// 格式化后自动挂载分区
-///
-/// 在 `initialize_disk` 完成后自动调用，确保新格式化的分区立即可用。
-/// 创建挂载点目录、执行挂载、设置权限。
 #[cfg(target_os = "linux")]
 fn auto_mount_after_format(partition_device: &str, mount_point: &str) -> Result<(), String> {
-    // 创建挂载点
     std::fs::create_dir_all(mount_point)
         .map_err(|e| format!("Failed to create mount point {}: {}", mount_point, e))?;
 
-    // 挂载
     let output = Command::new("mount")
         .arg(partition_device)
         .arg(mount_point)
@@ -153,24 +384,17 @@ fn auto_mount_after_format(partition_device: &str, mount_point: &str) -> Result<
         return Err(format!("Mount failed: {}", stderr.trim()));
     }
 
-    // 设置权限 — 确保普通用户可读写
     let _ = Command::new("chmod").args(["755", mount_point]).output();
 
-    // 写入 fstab 实现持久化挂载（如果尚未存在）
     if let Ok(fstab) = std::fs::read_to_string("/etc/fstab") {
         if !fstab.contains(partition_device) {
-            // 获取 UUID 用于 fstab（比设备名更稳定）
             let uuid = Command::new("blkid")
                 .args(["-s", "UUID", "-o", "value", partition_device])
                 .output()
                 .ok()
                 .and_then(|o| {
                     if o.status.success() {
-                        Some(
-                            String::from_utf8_lossy(&o.stdout)
-                                .trim()
-                                .to_string(),
-                        )
+                        Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
                     } else {
                         None
                     }
@@ -182,11 +406,7 @@ fn auto_mount_after_format(partition_device: &str, mount_point: &str) -> Result<
                 .ok()
                 .and_then(|o| {
                     if o.status.success() {
-                        Some(
-                            String::from_utf8_lossy(&o.stdout)
-                                .trim()
-                                .to_string(),
-                        )
+                        Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
                     } else {
                         None
                     }
@@ -198,17 +418,10 @@ fn auto_mount_after_format(partition_device: &str, mount_point: &str) -> Result<
                     "\n# Auto-added by RockZeroOS after disk initialization\nUUID={}  {}  {}  defaults,nofail  0  2\n",
                     uuid, mount_point, fstype
                 );
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open("/etc/fstab")
-                {
+                if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open("/etc/fstab") {
                     use std::io::Write;
                     let _ = file.write_all(fstab_entry.as_bytes());
-                    log::info!(
-                        "Added fstab entry: UUID={} → {}",
-                        uuid,
-                        mount_point
-                    );
+                    log::info!("Added fstab entry: UUID={} -> {}", uuid, mount_point);
                 }
             }
         }
@@ -217,12 +430,6 @@ fn auto_mount_after_format(partition_device: &str, mount_point: &str) -> Result<
     Ok(())
 }
 
-/// 启动时检测未格式化的磁盘并自动格式化+挂载
-///
-/// 在 `auto_mount_all_disks` 之后调用，处理全新磁盘：
-/// 1. 扫描所有无文件系统的块设备（排除系统盘）
-/// 2. 使用 GPT 分区表 + ext4 自动格式化
-/// 3. 自动挂载到 /mnt/<设备名>
 #[cfg(target_os = "linux")]
 pub fn auto_format_and_mount_uninitialized_disks() {
     log::info!("Scanning for uninitialized disks...");
@@ -240,12 +447,11 @@ pub fn auto_format_and_mount_uninitialized_disks() {
         return;
     }
 
-    let lsblk: serde_json::Value = match serde_json::from_str(
-        &String::from_utf8_lossy(&output.stdout),
-    ) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
+    let lsblk: serde_json::Value =
+        match serde_json::from_str(&String::from_utf8_lossy(&output.stdout)) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
 
     let Some(devices) = lsblk.get("blockdevices").and_then(|v| v.as_array()) else {
         return;
@@ -259,33 +465,25 @@ pub fn auto_format_and_mount_uninitialized_disks() {
         let dev_type = device.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let fstype = device.get("fstype").and_then(|f| f.as_str());
         let mountpoint = device.get("mountpoint").and_then(|m| m.as_str());
-        let ro = device
-            .get("ro")
-            .and_then(|r| r.as_bool())
-            .unwrap_or(false);
+        let ro = device.get("ro").and_then(|r| r.as_bool()).unwrap_or(false);
         let size_str = device.get("size").and_then(|s| s.as_str()).unwrap_or("0");
 
-        // 只处理物理磁盘（disk 类型）
         if dev_type != "disk" {
             continue;
         }
 
-        // 跳过只读设备
         if ro {
             continue;
         }
 
-        // 跳过系统盘（mmcblk0 通常是 eMMC 系统盘）
         if name.starts_with("mmcblk0") || name.starts_with("mmcblk1") {
             continue;
         }
 
-        // 跳过回环设备和 RAM 设备
         if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("zram") {
             continue;
         }
 
-        // 跳过已有文件系统或已挂载的磁盘
         if fstype.is_some_and(|f| !f.is_empty()) {
             continue;
         }
@@ -293,14 +491,12 @@ pub fn auto_format_and_mount_uninitialized_disks() {
             continue;
         }
 
-        // 跳过太小的磁盘（< 1GB）
         let size_bytes = parse_size_string(size_str);
         if size_bytes < 1024 * 1024 * 1024 {
             log::debug!("Skipping small disk {} ({})", name, size_str);
             continue;
         }
 
-        // 检查该磁盘是否有分区
         let part_check = Command::new("lsblk")
             .args(["-n", "-o", "TYPE", &format!("/dev/{}", name)])
             .output();
@@ -309,7 +505,7 @@ pub fn auto_format_and_mount_uninitialized_disks() {
             let types = String::from_utf8_lossy(&output.stdout);
             let has_partitions = types.lines().any(|l| l.trim() == "part");
             if has_partitions {
-                continue; // 已有分区，跳过
+                continue;
             }
         }
 
@@ -317,12 +513,11 @@ pub fn auto_format_and_mount_uninitialized_disks() {
         let mount_point = format!("{}/{}", mount_base, name);
 
         log::info!(
-            "🔧 Found uninitialized disk: {} ({}), auto-formatting with GPT + ext4...",
+            "Found uninitialized disk: {} ({}), auto-formatting with GPT + ext4...",
             device_path,
             size_str
         );
 
-        // 创建 GPT 分区表
         let parted_result = Command::new("parted")
             .args(["-s", "-a", "optimal", &device_path, "mklabel", "gpt"])
             .output();
@@ -332,7 +527,6 @@ pub fn auto_format_and_mount_uninitialized_disks() {
             continue;
         }
 
-        // 创建分区
         let mkpart_result = Command::new("parted")
             .args([
                 "-s",
@@ -351,18 +545,15 @@ pub fn auto_format_and_mount_uninitialized_disks() {
             continue;
         }
 
-        // 通知内核
         let _ = Command::new("partprobe").arg(&device_path).output();
         std::thread::sleep(std::time::Duration::from_secs(2));
 
-        // 分区设备名
         let partition_device = if device_path.contains("nvme") || device_path.contains("mmcblk") {
             format!("{}p1", device_path)
         } else {
             format!("{}1", device_path)
         };
 
-        // 等待分区出现
         let mut found = false;
         for _ in 0..10 {
             if std::path::Path::new(&partition_device).exists() {
@@ -377,7 +568,6 @@ pub fn auto_format_and_mount_uninitialized_disks() {
             continue;
         }
 
-        // 格式化为 ext4
         let label = format!("rz-{}", name);
         let mkfs_result = Command::new("mkfs.ext4")
             .args(["-F", "-m", "1", "-L", &label, &partition_device])
@@ -388,11 +578,10 @@ pub fn auto_format_and_mount_uninitialized_disks() {
             continue;
         }
 
-        // 自动挂载
         match auto_mount_after_format(&partition_device, &mount_point) {
             Ok(()) => {
                 log::info!(
-                    "✅ Auto-formatted and mounted {} → {} (ext4, label: {})",
+                    "Auto-formatted and mounted {} -> {} (ext4, label: {})",
                     partition_device,
                     mount_point,
                     label
@@ -415,7 +604,6 @@ pub fn auto_format_and_mount_uninitialized_disks() {
     }
 }
 
-/// 解析 lsblk 的 SIZE 字段（如 "100G", "500M", "1T"）为字节数
 #[cfg(target_os = "linux")]
 fn parse_size_string(size: &str) -> u64 {
     let s = size.trim().to_uppercase();
@@ -525,18 +713,15 @@ pub struct FormatRequest {
     pub quick: Option<bool>,
 }
 
-/// Request to initialize a new disk (create partition table and format)
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct InitializeDiskRequest {
     pub device: String,
     pub file_system: String,
     pub label: Option<String>,
-    /// Partition table type: "gpt" or "msdos" (default: gpt)
     pub partition_table: Option<String>,
 }
 
-/// Request to rename a disk label
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct RenameDiskRequest {
@@ -544,16 +729,13 @@ pub struct RenameDiskRequest {
     pub new_label: String,
 }
 
-/// Request to resize a partition
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct ResizePartitionRequest {
     pub device: String,
-    /// New size in bytes, or "max" to use all available space
     pub new_size: String,
 }
 
-/// Disk operation result
 #[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct DiskOperationResult {
@@ -565,153 +747,158 @@ pub struct DiskOperationResult {
 
 pub async fn list_disks() -> Result<HttpResponse, AppError> {
     let disks = tokio::task::spawn_blocking(move || -> Vec<DiskDetail> {
-    let disks_info = Disks::new_with_refreshed_list();
-    let mut disks = Vec::new();
+        let disks_info = Disks::new_with_refreshed_list();
+        let mut disks = Vec::new();
 
-    for disk in disks_info.list() {
-        let device_path = disk.name().to_string_lossy().to_string();
-        let mount_point = disk.mount_point().to_string_lossy().to_string();
-        
-        // 过滤掉 zram 和 log2ram 等虚拟设备
-        if device_path.contains("zram") || 
-           device_path.contains("log2ram") ||
-           mount_point.contains("log2ram") ||
-           device_path.contains("loop") ||
-           (device_path.contains("ram") && !device_path.contains("nvram")) {
-            continue;
-        }
-        
-        // 使用 statvfs 获取准确的空间信息（排除保留块）
-        #[cfg(target_os = "linux")]
-        let (total_space, available_space, used_space, usage_percentage) = {
-            use std::mem::MaybeUninit;
-            let mut stat_result: Option<(u64, u64, u64, f64)> = None;
-            
-            if !mount_point.is_empty() {
-                if let Ok(path_cstr) = std::ffi::CString::new(mount_point.as_bytes()) {
-                    let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
-                    unsafe {
-                        if libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) == 0 {
-                            let stat = stat.assume_init();
-                            let block_size = stat.f_frsize as u64;
-                            let total_blocks = stat.f_blocks as u64;
-                            let free_blocks = stat.f_bfree as u64;
-                            let avail_blocks = stat.f_bavail as u64;
-                            
-                            let raw_total = total_blocks * block_size;
-                            let free = free_blocks * block_size;
-                            let avail = avail_blocks * block_size;
-                            
-                            // 实际已用 = 总空间 - 空闲空间
-                            let used = raw_total.saturating_sub(free);
-                            // 保留块 = 空闲 - 用户可用
-                            let reserved = free.saturating_sub(avail);
-                            // 用户可见总空间 = 总空间 - 保留块
-                            let user_total = raw_total.saturating_sub(reserved);
-                            
-                            let pct = if user_total > 0 {
-                                (used as f64 / user_total as f64) * 100.0
-                            } else {
-                                0.0
-                            };
-                            
-                            stat_result = Some((user_total, avail, used, pct));
+        for disk in disks_info.list() {
+            let device_path = disk.name().to_string_lossy().to_string();
+            let mount_point = disk.mount_point().to_string_lossy().to_string();
+
+            if device_path.contains("zram")
+                || device_path.contains("log2ram")
+                || mount_point.contains("log2ram")
+                || device_path.contains("loop")
+                || (device_path.contains("ram") && !device_path.contains("nvram"))
+            {
+                continue;
+            }
+
+            #[cfg(target_os = "linux")]
+            let (total_space, available_space, used_space, usage_percentage) = {
+                use std::mem::MaybeUninit;
+                let mut stat_result: Option<(u64, u64, u64, f64)> = None;
+
+                if !mount_point.is_empty() {
+                    if let Ok(path_cstr) = std::ffi::CString::new(mount_point.as_bytes()) {
+                        let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
+                        unsafe {
+                            if libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) == 0 {
+                                let stat = stat.assume_init();
+                                let block_size = stat.f_frsize as u64;
+                                let total_blocks = stat.f_blocks as u64;
+                                let free_blocks = stat.f_bfree as u64;
+                                let avail_blocks = stat.f_bavail as u64;
+
+                                let raw_total = total_blocks * block_size;
+                                let free = free_blocks * block_size;
+                                let avail = avail_blocks * block_size;
+
+                                let used = raw_total.saturating_sub(free);
+                                let reserved = free.saturating_sub(avail);
+                                let user_total = raw_total.saturating_sub(reserved);
+
+                                let pct = if user_total > 0 {
+                                    (used as f64 / user_total as f64) * 100.0
+                                } else {
+                                    0.0
+                                };
+
+                                stat_result = Some((user_total, avail, used, pct));
+                            }
                         }
                     }
                 }
-            }
-            
-            if let Some(result) = stat_result {
-                result
-            } else {
+
+                if let Some(result) = stat_result {
+                    result
+                } else {
+                    let total = disk.total_space();
+                    let avail = disk.available_space();
+                    let used = total.saturating_sub(avail);
+                    let pct = if total > 0 {
+                        (used as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    (total, avail, used, pct)
+                }
+            };
+
+            #[cfg(not(target_os = "linux"))]
+            let (total_space, available_space, used_space, usage_percentage) = {
                 let total = disk.total_space();
                 let avail = disk.available_space();
                 let used = total.saturating_sub(avail);
-                let pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
+                let pct = if total > 0 {
+                    (used as f64 / total as f64) * 100.0
+                } else {
+                    0.0
+                };
                 (total, avail, used, pct)
-            }
-        };
-        
-        #[cfg(not(target_os = "linux"))]
-        let (total_space, available_space, used_space, usage_percentage) = {
-            let total = disk.total_space();
-            let avail = disk.available_space();
-            let used = total.saturating_sub(avail);
-            let pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
-            (total, avail, used, pct)
-        };
-        
-        let is_removable = disk.is_removable();
-        let disk_type = format!("{:?}", disk.kind());
-        
-        // 获取文件系统类型 - 优先使用 blkid 获取准确信息
-        let file_system = disk.file_system().to_string_lossy().to_string();
-        
-        #[cfg(target_os = "linux")]
-        let file_system = {
-            // 使用 blkid 获取更准确的文件系统类型
-            if let Ok(output) = Command::new("blkid")
-                .args(["-s", "TYPE", "-o", "value", &device_path])
-                .output()
-            {
-                if output.status.success() {
-                    let fs_from_blkid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if !fs_from_blkid.is_empty() {
-                        fs_from_blkid
+            };
+
+            let is_removable = disk.is_removable();
+            let disk_type = format!("{:?}", disk.kind());
+
+            let file_system = disk.file_system().to_string_lossy().to_string();
+
+            #[cfg(target_os = "linux")]
+            let file_system = {
+                if let Ok(output) = Command::new("blkid")
+                    .args(["-s", "TYPE", "-o", "value", &device_path])
+                    .output()
+                {
+                    if output.status.success() {
+                        let fs_from_blkid =
+                            String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if !fs_from_blkid.is_empty() {
+                            fs_from_blkid
+                        } else {
+                            file_system
+                        }
                     } else {
                         file_system
                     }
                 } else {
                     file_system
                 }
-            } else {
-                file_system
-            }
-        };
+            };
 
-        let (label, uuid, serial, model) = get_disk_metadata(&device_path);
+            let (label, uuid, serial, model) = get_disk_metadata(&device_path);
 
-        disks.push(DiskDetail {
-            name: device_path.clone(),
-            device_path,
-            mount_point,
-            file_system,
-            total_space,
-            available_space,
-            used_space,
-            usage_percentage,
-            is_removable,
-            disk_type,
-            is_mounted: true,
-            read_only: false,
-            label,
-            uuid,
-            serial,
-            model,
-        });
-    }
+            disks.push(DiskDetail {
+                name: device_path.clone(),
+                device_path,
+                mount_point,
+                file_system,
+                total_space,
+                available_space,
+                used_space,
+                usage_percentage,
+                is_removable,
+                disk_type,
+                is_mounted: true,
+                read_only: false,
+                label,
+                uuid,
+                serial,
+                model,
+            });
+        }
 
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(unmounted) = get_unmounted_disks() {
-            for disk in unmounted {
-                // 过滤掉 zram 和 log2ram 等虚拟设备
-                if disk.device_path.contains("zram") || 
-                   disk.device_path.contains("log2ram") ||
-                   disk.mount_point.contains("log2ram") ||
-                   disk.device_path.contains("loop") ||
-                   (disk.device_path.contains("ram") && !disk.device_path.contains("nvram")) {
-                    continue;
-                }
-                if !disks.iter().any(|d| d.device_path == disk.device_path) {
-                    disks.push(disk);
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(unmounted) = get_unmounted_disks() {
+                for disk in unmounted {
+                    if disk.device_path.contains("zram")
+                        || disk.device_path.contains("log2ram")
+                        || disk.mount_point.contains("log2ram")
+                        || disk.device_path.contains("loop")
+                        || (disk.device_path.contains("ram") && !disk.device_path.contains("nvram"))
+                    {
+                        continue;
+                    }
+                    if !disks.iter().any(|d| d.device_path == disk.device_path) {
+                        disks.push(disk);
+                    }
                 }
             }
         }
-    }
 
-    disks
-    }).await.map_err(|_| AppError::InternalError)?;
+        disks
+    })
+    .await
+    .map_err(|_| AppError::InternalError)?;
 
     Ok(HttpResponse::Ok().json(disks))
 }
@@ -739,22 +926,18 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
         for device in blockdevices {
             let device_type = device.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-            // Skip non-disk devices (like loop, rom, etc.)
             if device_type != "disk" {
                 continue;
             }
 
             let device_name = device.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
-            // Skip system disks (mmcblk0, mmcblk1 are typically eMMC/SD boot devices)
             if device_name.starts_with("mmcblk") || device_name.starts_with("loop") {
                 continue;
             }
 
-            // Detect disk type (SSD/HDD/NVMe)
             let disk_type = detect_disk_type(device_name);
 
-            // Check if this is a raw disk without partitions
             let has_children = device
                 .get("children")
                 .and_then(|v| v.as_array())
@@ -771,7 +954,6 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
                 .unwrap_or("")
                 .to_string();
 
-            // If disk has no partitions and no filesystem, it's a raw unpartitioned disk
             if !has_children && fs_type.is_empty() && mount_point.is_empty() {
                 let name = device_name.to_string();
                 let device_path = format!("/dev/{}", name);
@@ -819,7 +1001,7 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
                     name: name.clone(),
                     device_path,
                     mount_point: String::new(),
-                    file_system: String::new(), // Empty means unpartitioned/unformatted
+                    file_system: String::new(),
                     total_space,
                     available_space: total_space,
                     used_space: 0,
@@ -835,7 +1017,6 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
                 });
             }
 
-            // Also check partitions (children) that are unmounted
             if let Some(children) = device.get("children").and_then(|v| v.as_array()) {
                 for child in children {
                     let child_mount = child
@@ -851,29 +1032,28 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
                             .unwrap_or("")
                             .to_string();
                         let device_path = format!("/dev/{}", name);
-                        
-                        // 获取文件系统类型 - 优先使用 blkid
+
                         let mut fs_type = child
                             .get("fstype")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        
-                        // 如果 lsblk 没有返回文件系统类型，使用 blkid 再次检查
+
                         if fs_type.is_empty() {
                             if let Ok(output) = Command::new("blkid")
                                 .args(["-s", "TYPE", "-o", "value", &device_path])
                                 .output()
                             {
                                 if output.status.success() {
-                                    let fs_from_blkid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                                    let fs_from_blkid =
+                                        String::from_utf8_lossy(&output.stdout).trim().to_string();
                                     if !fs_from_blkid.is_empty() {
                                         fs_type = fs_from_blkid;
                                     }
                                 }
                             }
                         }
-                        
+
                         let label = child
                             .get("label")
                             .and_then(|v| v.as_str())
@@ -914,8 +1094,7 @@ fn get_unmounted_disks() -> Result<Vec<DiskDetail>, std::io::Error> {
                         let size_str = child.get("size").and_then(|v| v.as_str()).unwrap_or("0");
                         let total_space = parse_size_string(size_str);
 
-                        // 使用父设备的类型
-                        let partition_disk_type = format!("{} 分区", disk_type);
+                        let partition_disk_type = format!("{} partition", disk_type);
 
                         disks.push(DiskDetail {
                             name: name.clone(),
@@ -1042,7 +1221,6 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
     {
         let device = &body.device;
 
-        // 检查设备是否存在
         if !std::path::Path::new(device).exists() {
             return Err(AppError::BadRequest(format!(
                 "Device {} does not exist",
@@ -1050,11 +1228,10 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
             )));
         }
 
-        // 检查设备是否已经挂载
         let mount_check = Command::new("findmnt")
             .args(["-n", "-o", "TARGET", device])
             .output();
-        
+
         if let Ok(output) = mount_check {
             if output.status.success() {
                 let mount_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1070,13 +1247,10 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
             }
         }
 
-        // 检查是否是整盘设备（没有分区号）
         let device_name = device.split('/').last().unwrap_or("");
         let is_whole_disk = is_whole_disk_device(device_name);
 
-        // 如果是整盘设备，尝试找到第一个分区
         let actual_device = if is_whole_disk {
-            // 检查是否有分区
             let partition1 = if device.contains("nvme") || device.contains("mmcblk") {
                 format!("{}p1", device)
             } else {
@@ -1086,7 +1260,6 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
             if std::path::Path::new(&partition1).exists() {
                 partition1
             } else {
-                // 没有分区，检查整盘是否有文件系统
                 let blkid_output = Command::new("blkid")
                     .args(["-s", "TYPE", "-o", "value", device])
                     .output();
@@ -1095,7 +1268,6 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
                     if output.status.success() {
                         let fs_type = String::from_utf8_lossy(&output.stdout).trim().to_string();
                         if !fs_type.is_empty() {
-                            // 整盘有文件系统，可以直接挂载
                             device.clone()
                         } else {
                             return Err(AppError::BadRequest(format!(
@@ -1117,7 +1289,6 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
                 }
             }
         } else {
-            // 这是分区设备，检查是否有文件系统
             let blkid_output = Command::new("blkid")
                 .args(["-s", "TYPE", "-o", "value", device])
                 .output();
@@ -1141,13 +1312,12 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
             device.clone()
         };
 
-        // 创建挂载点目录
-        tokio::fs::create_dir_all(&body.mount_point).await
+        tokio::fs::create_dir_all(&body.mount_point)
+            .await
             .map_err(|e| AppError::BadRequest(format!("Failed to create mount point: {}", e)))?;
 
         let mut cmd = Command::new("mount");
 
-        // 如果指定了文件系统类型且不是 "auto"
         if let Some(fs) = &body.file_system {
             if fs != "auto" && !fs.is_empty() {
                 cmd.arg("-t").arg(fs);
@@ -1167,13 +1337,10 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
             .map_err(|e| AppError::BadRequest(format!("Failed to execute mount: {}", e)))?;
 
         if output.status.success() {
-            // 挂载成功后，设置挂载点权限为 755，允许所有用户读取和执行
             let _ = Command::new("chmod")
                 .args(["755", &body.mount_point])
                 .output();
-            
-            // 尝试设置所有者为当前用户（如果有权限的话）
-            // 这样可以确保用户可以在挂载点中创建文件
+
             let _ = Command::new("chown")
                 .args(["-R", "1000:1000", &body.mount_point])
                 .output();
@@ -1199,10 +1366,8 @@ pub async fn mount_disk(body: web::Json<MountRequest>) -> Result<HttpResponse, A
     }
 }
 
-/// 检查是否是整盘设备（而不是分区）
 #[cfg(target_os = "linux")]
 fn is_whole_disk_device(device_name: &str) -> bool {
-    // sd[a-z] 是整盘，sd[a-z][0-9]+ 是分区
     if device_name.starts_with("sd") && device_name.len() == 3 {
         return device_name
             .chars()
@@ -1210,7 +1375,6 @@ fn is_whole_disk_device(device_name: &str) -> bool {
             .map(|c| c.is_alphabetic())
             .unwrap_or(false);
     }
-    // vd[a-z] 是整盘
     if device_name.starts_with("vd") && device_name.len() == 3 {
         return device_name
             .chars()
@@ -1218,7 +1382,6 @@ fn is_whole_disk_device(device_name: &str) -> bool {
             .map(|c| c.is_alphabetic())
             .unwrap_or(false);
     }
-    // hd[a-z] 是整盘
     if device_name.starts_with("hd") && device_name.len() == 3 {
         return device_name
             .chars()
@@ -1226,36 +1389,29 @@ fn is_whole_disk_device(device_name: &str) -> bool {
             .map(|c| c.is_alphabetic())
             .unwrap_or(false);
     }
-    // nvme0n1 是整盘，nvme0n1p1 是分区
     if device_name.starts_with("nvme") {
         return !device_name.contains('p')
             || device_name.ends_with("n1")
             || device_name.ends_with("n2");
     }
-    // mmcblk0 是整盘，mmcblk0p1 是分区
     if device_name.starts_with("mmcblk") {
         return !device_name.contains('p');
     }
     false
 }
 
-/// 检测磁盘类型 (SSD/HDD/NVMe)
 #[cfg(target_os = "linux")]
 fn detect_disk_type(device_name: &str) -> String {
-    // NVMe 设备
     if device_name.starts_with("nvme") {
         return "NVMe SSD".to_string();
     }
 
-    // 尝试读取 rotational 属性来判断是 SSD 还是 HDD
-    // 0 = SSD, 1 = HDD
     let base_device = if device_name
         .chars()
         .last()
         .map(|c| c.is_numeric())
         .unwrap_or(false)
     {
-        // 这是分区，获取基础设备名
         device_name.trim_end_matches(|c: char| c.is_numeric())
     } else {
         device_name
@@ -1271,7 +1427,6 @@ fn detect_disk_type(device_name: &str) -> String {
         }
     }
 
-    // 默认返回 HDD
     "HDD".to_string()
 }
 
@@ -1279,7 +1434,6 @@ pub async fn unmount_disk(
     body: web::Json<UnmountRequest>,
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, AppError> {
-    // 验证FIDO2认证
     crate::middleware::verify_fido2_or_passkey(&req).await?;
 
     #[cfg(target_os = "linux")]
@@ -1319,14 +1473,12 @@ pub async fn format_disk(
     body: web::Json<FormatRequest>,
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, AppError> {
-    // 验证FIDO2认证 - 格式化是危险操作
     crate::middleware::verify_fido2_or_passkey(&req).await?;
 
     #[cfg(target_os = "linux")]
     {
         let device = &body.device;
-        
-        // 检查设备是否存在
+
         if !std::path::Path::new(device).exists() {
             return Err(AppError::BadRequest(format!(
                 "Device {} does not exist",
@@ -1334,48 +1486,41 @@ pub async fn format_disk(
             )));
         }
 
-        // 检查设备是否已挂载 - 如果已挂载则自动卸载
         let mut original_mount_point: Option<String> = None;
         let mount_check = Command::new("findmnt")
             .args(["-n", "-o", "TARGET", device])
             .output();
-        
+
         if let Ok(output) = mount_check {
             if output.status.success() {
                 let mount_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !mount_point.is_empty() {
-                    log::info!("Device {} is mounted at '{}', auto-unmounting...", device, mount_point);
+                    log::info!(
+                        "Device {} is mounted at '{}', auto-unmounting...",
+                        device,
+                        mount_point
+                    );
                     original_mount_point = Some(mount_point.clone());
-                    
-                    // 先尝试使用 fuser 杀死占用进程
-                    let _ = Command::new("fuser")
-                        .args(["-km", &mount_point])
-                        .output();
-                    
-                    // 等待进程终止
+
+                    let _ = Command::new("fuser").args(["-km", &mount_point]).output();
+
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    
-                    // 尝试卸载
-                    let unmount_output = Command::new("umount")
-                        .arg("-f")  // Force unmount
-                        .arg(&mount_point)
-                        .output();
-                    
+
+                    let unmount_output =
+                        Command::new("umount").arg("-f").arg(&mount_point).output();
+
                     if let Err(e) = unmount_output {
                         return Err(AppError::BadRequest(format!(
                             "Failed to unmount device {} from '{}': {}",
                             device, mount_point, e
                         )));
                     }
-                    
+
                     let unmount_result = unmount_output.unwrap();
                     if !unmount_result.status.success() {
-                        // 尝试 lazy unmount
-                        let lazy_unmount = Command::new("umount")
-                            .arg("-l")  // Lazy unmount
-                            .arg(&mount_point)
-                            .output();
-                        
+                        let lazy_unmount =
+                            Command::new("umount").arg("-l").arg(&mount_point).output();
+
                         if let Ok(lazy_result) = lazy_unmount {
                             if !lazy_result.status.success() {
                                 let error = String::from_utf8_lossy(&lazy_result.stderr);
@@ -1386,8 +1531,7 @@ pub async fn format_disk(
                             }
                         }
                     }
-                    
-                    // 等待卸载完成
+
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     log::info!("Successfully unmounted {} from '{}'", device, mount_point);
                 }
@@ -1412,7 +1556,6 @@ pub async fn format_disk(
             }
         };
 
-        // 检查命令是否存在
         let which_check = Command::new("which").arg(cmd_name).output();
         if let Ok(output) = which_check {
             if !output.status.success() {
@@ -1425,7 +1568,6 @@ pub async fn format_disk(
 
         let mut cmd = Command::new(cmd_name);
 
-        // 添加标签参数
         if let Some(label) = &body.label {
             if !label.is_empty() {
                 match body.file_system.to_lowercase().as_str() {
@@ -1455,26 +1597,25 @@ pub async fn format_disk(
             }
         }
 
-        // 添加强制格式化参数
         match body.file_system.to_lowercase().as_str() {
             "ext4" | "ext3" | "ext2" => {
-                cmd.arg("-F"); // Force
+                cmd.arg("-F");
             }
             "xfs" => {
-                cmd.arg("-f"); // Force
+                cmd.arg("-f");
             }
             "btrfs" => {
-                cmd.arg("-f"); // Force
+                cmd.arg("-f");
             }
             "ntfs" => {
-                cmd.arg("-Q"); // Quick format
-                cmd.arg("-F"); // Force
+                cmd.arg("-Q");
+                cmd.arg("-F");
             }
             "fat32" | "vfat" => {
-                cmd.arg("-F").arg("32"); // FAT32
+                cmd.arg("-F").arg("32");
             }
             "f2fs" => {
-                cmd.arg("-f"); // Force
+                cmd.arg("-f");
             }
             _ => {}
         }
@@ -1482,55 +1623,59 @@ pub async fn format_disk(
         cmd.arg(device);
 
         let output = cmd.output().map_err(|e| {
-            AppError::BadRequest(format!("Failed to run mkfs command '{}': {}. Make sure the package is installed.", cmd_name, e))
+            AppError::BadRequest(format!(
+                "Failed to run mkfs command '{}': {}. Make sure the package is installed.",
+                cmd_name, e
+            ))
         })?;
 
         if output.status.success() {
-            // 格式化成功后，触发 udev 更新设备信息
             let _ = Command::new("udevadm")
                 .args(["trigger", "--subsystem-match=block"])
                 .output();
-            
-            // 等待 udev 处理完成
+
             let _ = Command::new("udevadm")
                 .args(["settle", "--timeout=5"])
                 .output();
-            
-            // 强制重新扫描分区表
+
             let _ = Command::new("partprobe").arg(device).output();
-            
-            // 额外等待确保文件系统信息已更新
+
             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
-            // 如果之前有挂载点，自动重新挂载
             let mut remounted = false;
             if let Some(mount_point) = &original_mount_point {
                 log::info!("Re-mounting {} to '{}'...", device, mount_point);
-                
-                // 确保挂载点目录存在
+
                 let _ = tokio::fs::create_dir_all(mount_point).await;
-                
-                // 重新挂载
-                let remount_output = Command::new("mount")
-                    .arg(device)
-                    .arg(mount_point)
-                    .output();
-                
+
+                let remount_output = Command::new("mount").arg(device).arg(mount_point).output();
+
                 if let Ok(result) = remount_output {
                     if result.status.success() {
                         remounted = true;
                         log::info!("Successfully re-mounted {} to '{}'", device, mount_point);
                     } else {
                         let error = String::from_utf8_lossy(&result.stderr);
-                        log::warn!("Failed to re-mount {} to '{}': {}", device, mount_point, error);
+                        log::warn!(
+                            "Failed to re-mount {} to '{}': {}",
+                            device,
+                            mount_point,
+                            error
+                        );
                     }
                 }
             }
 
             let message = if remounted {
-                format!("Disk formatted successfully with {} filesystem and re-mounted", body.file_system)
+                format!(
+                    "Disk formatted successfully with {} filesystem and re-mounted",
+                    body.file_system
+                )
             } else {
-                format!("Disk formatted successfully with {} filesystem", body.file_system)
+                format!(
+                    "Disk formatted successfully with {} filesystem",
+                    body.file_system
+                )
             };
 
             return Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -1642,7 +1787,6 @@ pub async fn eject_disk(
     device: web::Path<String>,
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, AppError> {
-    // 验证FIDO2认证
     crate::middleware::verify_fido2_or_passkey(&req).await?;
 
     #[cfg(target_os = "linux")]
@@ -1747,19 +1891,16 @@ pub async fn initialize_disk(
         let device = &body.device;
         let partition_table = body.partition_table.as_deref().unwrap_or("gpt");
 
-        // Validate device path
         if !device.starts_with("/dev/") {
             return Err(AppError::BadRequest("Invalid device path".to_string()));
         }
 
-        // Safety check: don't allow initializing system disks
         if device.contains("mmcblk0") || device.contains("mmcblk1") {
             return Err(AppError::BadRequest(
                 "Cannot initialize system disk".to_string(),
             ));
         }
 
-        // Check if device exists
         if !std::path::Path::new(device).exists() {
             return Err(AppError::BadRequest(format!(
                 "Device {} does not exist",
@@ -1767,7 +1908,6 @@ pub async fn initialize_disk(
             )));
         }
 
-        // Validate file system
         let fs_lower = body.file_system.to_lowercase();
         if !SUPPORTED_FILESYSTEMS.contains(&fs_lower.as_str()) {
             return Err(AppError::BadRequest(format!(
@@ -1776,7 +1916,6 @@ pub async fn initialize_disk(
             )));
         }
 
-        // Check if disk or any of its partitions are mounted - refuse if so
         let lsblk_output = Command::new("lsblk")
             .args(["-n", "-o", "MOUNTPOINT", device])
             .output();
@@ -1794,14 +1933,12 @@ pub async fn initialize_disk(
             }
         }
 
-        // Step 1: Wipe existing partition table signatures
         let wipefs_output = Command::new("wipefs")
             .args(["--all", "--force", device])
             .output();
 
         if let Ok(output) = &wipefs_output {
             if !output.status.success() {
-                // Try alternative: dd to zero out first sectors
                 let _ = Command::new("dd")
                     .args([
                         "if=/dev/zero",
@@ -1816,7 +1953,6 @@ pub async fn initialize_disk(
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        // Step 2: Create partition table using parted with optimal alignment (4096 sector)
         let parted_label = Command::new("parted")
             .args(["-s", "-a", "optimal", device, "mklabel", partition_table])
             .output()
@@ -1832,8 +1968,6 @@ pub async fn initialize_disk(
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        // Step 3: Create a single partition using all space with 4096 alignment
-        // Start at 1MiB (2048 sectors for 512-byte sectors, aligned to 4096)
         let parted_mkpart = Command::new("parted")
             .args([
                 "-s", "-a", "optimal", device, "mkpart", "primary", "1MiB", "100%",
@@ -1849,29 +1983,25 @@ pub async fn initialize_disk(
             )));
         }
 
-        // Step 4: Notify kernel about partition table changes
         let _ = Command::new("partprobe").arg(device).output();
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        
+
         let _ = Command::new("udevadm")
             .args(["settle", "--timeout=10"])
             .output();
 
-        // Force kernel to re-read partition table
         let _ = Command::new("blockdev")
             .args(["--rereadpt", device])
             .output();
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        // Determine partition device name
         let partition_device = if device.contains("nvme") || device.contains("mmcblk") {
             format!("{}p1", device)
         } else {
             format!("{}1", device)
         };
 
-        // Verify partition exists with retries
         let mut partition_exists = false;
         for _ in 0..10 {
             if std::path::Path::new(&partition_device).exists() {
@@ -1889,7 +2019,6 @@ pub async fn initialize_disk(
             )));
         }
 
-        // Step 5: Format the partition
         let mkfs_cmd = match fs_lower.as_str() {
             "ext4" => "mkfs.ext4",
             "ext3" => "mkfs.ext3",
@@ -1909,8 +2038,7 @@ pub async fn initialize_disk(
         };
 
         let mut format_cmd = Command::new(mkfs_cmd);
-        
-        // Add label if provided
+
         if let Some(label) = &body.label {
             if !label.is_empty() {
                 match fs_lower.as_str() {
@@ -1931,37 +2059,33 @@ pub async fn initialize_disk(
             }
         }
 
-        // Add force flag and filesystem-specific options
         match fs_lower.as_str() {
             "ext4" => {
-                format_cmd.arg("-F"); // Force
-                format_cmd.arg("-m").arg("1"); // Reserve 1% for root
-                format_cmd.arg("-O").arg("^has_journal"); // Disable journal for faster formatting (optional)
+                format_cmd.arg("-F");
+                format_cmd.arg("-m").arg("1");
             }
             "ext3" | "ext2" => {
                 format_cmd.arg("-F");
             }
             "xfs" => {
-                format_cmd.arg("-f"); // Force
-                format_cmd.arg("-K"); // Don't send discard/TRIM commands
+                format_cmd.arg("-f");
+                format_cmd.arg("-K");
             }
             "btrfs" => {
-                format_cmd.arg("-f"); // Force
+                format_cmd.arg("-f");
             }
             "f2fs" => {
-                format_cmd.arg("-f"); // Force
+                format_cmd.arg("-f");
             }
             "ntfs" => {
-                format_cmd.arg("-Q"); // Quick format
-                format_cmd.arg("-F"); // Force
+                format_cmd.arg("-Q");
+                format_cmd.arg("-F");
             }
             "fat32" | "vfat" => {
-                format_cmd.arg("-F").arg("32"); // FAT32
-                format_cmd.arg("-I"); // Allow whole disk format
+                format_cmd.arg("-F").arg("32");
+                format_cmd.arg("-I");
             }
-            "exfat" => {
-                // exfat-utils doesn't need special flags
-            }
+            "exfat" => {}
             _ => {}
         }
 
@@ -1976,33 +2100,26 @@ pub async fn initialize_disk(
             return Err(AppError::BadRequest(format!("Format failed: {}", error)));
         }
 
-        // Step 6: Comprehensive device info refresh
-        // Trigger udev to update device info
         let _ = Command::new("udevadm")
             .args(["trigger", "--subsystem-match=block"])
             .output();
-        
-        // Wait for udev to settle with longer timeout
+
         let _ = Command::new("udevadm")
             .args(["settle", "--timeout=10"])
             .output();
-        
-        // Force kernel to re-scan the partition
+
         let _ = Command::new("partprobe").arg(device).output();
-        
-        // Use blkid to force cache refresh
+
         let _ = Command::new("blkid")
             .args(["-p", &partition_device])
             .output();
-        
-        // Additional wait to ensure filesystem is recognized
+
         tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-        
-        // Verify the filesystem was created correctly
+
         let verify_output = Command::new("blkid")
             .args(["-s", "TYPE", "-o", "value", &partition_device])
             .output();
-        
+
         let actual_fs = if let Ok(output) = verify_output {
             if output.status.success() {
                 String::from_utf8_lossy(&output.stdout).trim().to_string()
@@ -2013,19 +2130,15 @@ pub async fn initialize_disk(
             "unknown".to_string()
         };
 
-        // Step 7: 初始化后自动挂载 — 用户无需手动挂载
         let mount_base = std::env::var("MOUNT_BASE").unwrap_or_else(|_| "/mnt".to_string());
         let default_mount_label = partition_device.replace("/dev/", "").replace("/", "_");
-        let mount_label = body
-            .label
-            .clone()
-            .unwrap_or(default_mount_label);
+        let mount_label = body.label.clone().unwrap_or(default_mount_label);
         let auto_mount_point = format!("{}/{}", mount_base, mount_label);
 
         let auto_mount_msg = match auto_mount_after_format(&partition_device, &auto_mount_point) {
             Ok(()) => {
                 log::info!(
-                    "✅ Auto-mounted {} → {} after initialization",
+                    "Auto-mounted {} -> {} after initialization",
                     partition_device,
                     auto_mount_point
                 );
@@ -2033,7 +2146,7 @@ pub async fn initialize_disk(
             }
             Err(e) => {
                 log::warn!(
-                    "Auto-mount failed for {} → {}: {}",
+                    "Auto-mount failed for {} -> {}: {}",
                     partition_device,
                     auto_mount_point,
                     e
@@ -2149,7 +2262,6 @@ pub async fn rename_disk(
     }
 }
 
-/// Get detailed disk information including SMART data
 pub async fn get_disk_details(device: web::Path<String>) -> Result<HttpResponse, AppError> {
     let device_path = if device.starts_with("/dev/") {
         device.to_string()
@@ -2159,7 +2271,6 @@ pub async fn get_disk_details(device: web::Path<String>) -> Result<HttpResponse,
 
     #[cfg(target_os = "linux")]
     {
-        // Get basic info from lsblk
         let lsblk_output = Command::new("lsblk")
             .args([
                 "-J",
@@ -2181,7 +2292,6 @@ pub async fn get_disk_details(device: web::Path<String>) -> Result<HttpResponse,
             }
         }
 
-        // Get SMART info
         let smart_output = Command::new("smartctl")
             .args(["-i", "-H", &device_path])
             .output();
@@ -2201,7 +2311,6 @@ pub async fn get_disk_details(device: web::Path<String>) -> Result<HttpResponse,
             }
         }
 
-        // Get filesystem usage if mounted
         let df_output = Command::new("df").args(["-B1", &device_path]).output();
 
         if let Ok(output) = df_output {
@@ -2235,22 +2344,17 @@ pub async fn get_disk_details(device: web::Path<String>) -> Result<HttpResponse,
     }
 }
 
-/// Scan for new disks (useful after hot-plugging)
 pub async fn scan_disks() -> Result<HttpResponse, AppError> {
     #[cfg(target_os = "linux")]
     {
-        // Trigger kernel to rescan for new devices
         let _ = Command::new("partprobe").output();
 
-        // Also try udevadm trigger
         let _ = Command::new("udevadm")
             .args(["trigger", "--subsystem-match=block"])
             .output();
 
-        // Wait a moment for devices to be recognized
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        // Return updated disk list
         return list_disks().await;
     }
 
@@ -2317,35 +2421,29 @@ pub async fn get_zfs_status() -> Result<HttpResponse, AppError> {
     }
 }
 
-// ============ TrueNAS级别的高级磁盘管理功能 ============
-
-/// ZFS池配置（TrueNAS风格）
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ZfsPoolConfig {
     pub name: String,
-    pub vdev_type: String, // "stripe", "mirror", "raidz1", "raidz2", "raidz3"
+    pub vdev_type: String,
     pub devices: Vec<String>,
     pub ashift: Option<u8>,
     pub compression: Option<String>,
     pub dedup: Option<bool>,
 }
 
-/// SMART测试类型
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct SmartTestRequest {
-    pub test_type: String, // "short", "long", "conveyance"
+    pub test_type: String,
 }
 
-/// 磁盘擦除请求
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct WipeDiskRequest {
-    pub method: String, // "quick", "full", "secure"
+    pub method: String,
 }
 
-/// 创建ZFS池（TrueNAS风格）
 #[allow(dead_code)]
 pub async fn create_zfs_pool(
     body: web::Json<ZfsPoolConfig>,
@@ -2355,104 +2453,121 @@ pub async fn create_zfs_pool(
 
     #[cfg(target_os = "linux")]
     {
-        // 检查ZFS是否可用
         let zfs_check = Command::new("which").arg("zpool").output();
         if zfs_check.is_err() || !zfs_check.unwrap().status.success() {
             return Err(AppError::BadRequest(
-                "ZFS is not installed. Please install zfsutils-linux".to_string()
+                "ZFS is not installed. Please install zfsutils-linux".to_string(),
             ));
         }
 
         let mut cmd = Command::new("zpool");
         cmd.arg("create");
-        
+
         if let Some(ashift) = body.ashift {
             cmd.arg("-o").arg(format!("ashift={}", ashift));
         }
-        
+
         cmd.arg(&body.name);
-        
-        // 添加VDEV类型
+
         match body.vdev_type.as_str() {
-            "mirror" => { cmd.arg("mirror"); }
-            "raidz1" => { cmd.arg("raidz1"); }
-            "raidz2" => { cmd.arg("raidz2"); }
-            "raidz3" => { cmd.arg("raidz3"); }
-            _ => {} // stripe不需要额外参数
+            "" | "stripe" => {}
+            "mirror" => {
+                cmd.arg("mirror");
+            }
+            "raidz1" => {
+                cmd.arg("raidz1");
+            }
+            "raidz2" => {
+                cmd.arg("raidz2");
+            }
+            "raidz3" => {
+                cmd.arg("raidz3");
+            }
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "Unsupported ZFS vdev type: {}",
+                    other
+                )));
+            }
         }
-        
+
         for device in &body.devices {
             cmd.arg(device);
         }
-        
-        let output = cmd.output()
+
+        let output = cmd
+            .output()
             .map_err(|e| AppError::BadRequest(format!("Failed to create ZFS pool: {}", e)))?;
-        
+
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::BadRequest(format!("ZFS pool creation failed: {}", error)));
+            return Err(AppError::BadRequest(format!(
+                "ZFS pool creation failed: {}",
+                error
+            )));
         }
-        
-        // 设置压缩
+
         if let Some(compression) = &body.compression {
             let _ = Command::new("zfs")
                 .args(["set", &format!("compression={}", compression), &body.name])
                 .output();
         }
-        
-        // 设置去重
+
         if let Some(true) = body.dedup {
             let _ = Command::new("zfs")
                 .args(["set", "dedup=on", &body.name])
                 .output();
         }
-        
+
         Ok(HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "message": format!("ZFS pool '{}' created successfully", body.name),
             "pool": body.name,
         })))
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = &body;
-        Err(AppError::BadRequest("ZFS is only supported on Linux".to_string()))
+        Err(AppError::BadRequest(
+            "ZFS is only supported on Linux".to_string(),
+        ))
     }
 }
 
-/// 获取ZFS池状态
 #[allow(dead_code)]
-pub async fn get_zfs_pool_status(
-    pool_name: web::Path<String>,
-) -> Result<HttpResponse, AppError> {
+pub async fn get_zfs_pool_status(pool_name: web::Path<String>) -> Result<HttpResponse, AppError> {
     #[cfg(target_os = "linux")]
     {
         let output = Command::new("zpool")
             .args(["status", "-v", &pool_name])
             .output()
             .map_err(|_| AppError::InternalError)?;
-        
+
         if !output.status.success() {
-            return Err(AppError::NotFound(format!("Pool '{}' not found", pool_name)));
+            return Err(AppError::NotFound(format!(
+                "Pool '{}' not found",
+                pool_name
+            )));
         }
-        
+
         let status = String::from_utf8_lossy(&output.stdout).to_string();
-        
+
         Ok(HttpResponse::Ok().json(serde_json::json!({
             "pool": pool_name.as_str(),
             "status": status,
         })))
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = &pool_name;
-        Err(AppError::BadRequest("ZFS is only supported on Linux".to_string()))
+        Err(AppError::BadRequest(
+            "ZFS is only supported on Linux".to_string(),
+        ))
     }
 }
 
-/// 运行SMART测试（TrueNAS风格）
 #[allow(dead_code)]
 pub async fn run_smart_test(
     device: web::Path<String>,
@@ -2460,7 +2575,7 @@ pub async fn run_smart_test(
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
-    
+
     #[cfg(target_os = "linux")]
     {
         let test_arg = match body.test_type.as_str() {
@@ -2469,38 +2584,44 @@ pub async fn run_smart_test(
             "conveyance" => "conveyance",
             _ => return Err(AppError::BadRequest("Invalid test type".to_string())),
         };
-        
+
         let device_path = if device.starts_with("/dev/") {
             device.to_string()
         } else {
             format!("/dev/{}", device.as_str())
         };
-        
+
         let output = Command::new("smartctl")
             .args(["-t", test_arg, &device_path])
             .output()
-            .map_err(|_| AppError::BadRequest("smartctl not found. Please install smartmontools".to_string()))?;
-        
+            .map_err(|_| {
+                AppError::BadRequest("smartctl not found. Please install smartmontools".to_string())
+            })?;
+
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::BadRequest(format!("SMART test failed: {}", error)));
+            return Err(AppError::BadRequest(format!(
+                "SMART test failed: {}",
+                error
+            )));
         }
-        
+
         Ok(HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "message": format!("{} SMART test started on {}", test_arg, device),
             "device": device.as_str(),
         })))
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (&device, &body);
-        Err(AppError::BadRequest("SMART tests are only supported on Linux".to_string()))
+        Err(AppError::BadRequest(
+            "SMART tests are only supported on Linux".to_string(),
+        ))
     }
 }
 
-/// 安全擦除磁盘（TrueNAS风格）
 #[allow(dead_code)]
 pub async fn wipe_disk(
     device: web::Path<String>,
@@ -2508,16 +2629,15 @@ pub async fn wipe_disk(
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, AppError> {
     crate::middleware::verify_fido2_or_passkey(&req).await?;
-    
+
     #[cfg(target_os = "linux")]
     {
         let device_path = format!("/dev/{}", device.as_str());
-        
-        // 检查设备是否已挂载
+
         let mount_check = Command::new("findmnt")
             .args(["-n", "-o", "TARGET", &device_path])
             .output();
-        
+
         if let Ok(output) = mount_check {
             if output.status.success() {
                 let mount_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -2529,10 +2649,9 @@ pub async fn wipe_disk(
                 }
             }
         }
-        
+
         match body.method.as_str() {
             "quick" => {
-                // 快速擦除：写零到开头1MB和结尾1MB
                 let _ = Command::new("dd")
                     .args([
                         "if=/dev/zero",
@@ -2544,54 +2663,45 @@ pub async fn wipe_disk(
                     .output();
             }
             "full" => {
-                // 完全擦除：写零到整个磁盘
                 let _ = Command::new("dd")
-                    .args([
-                        "if=/dev/zero",
-                        &format!("of={}", device_path),
-                        "bs=1M",
-                    ])
+                    .args(["if=/dev/zero", &format!("of={}", device_path), "bs=1M"])
                     .output();
             }
             "secure" => {
-                // 安全擦除：使用shred进行多次随机写入
                 let output = Command::new("shred")
-                    .args([
-                        "-v",
-                        "-n", "3",  // 3次覆写
-                        "-z",       // 最后写零
-                        &device_path,
-                    ])
+                    .args(["-v", "-n", "3", "-z", &device_path])
                     .output()
                     .map_err(|_| AppError::BadRequest("shred command not found".to_string()))?;
-                
+
                 if !output.status.success() {
                     let error = String::from_utf8_lossy(&output.stderr);
-                    return Err(AppError::BadRequest(format!("Secure wipe failed: {}", error)));
+                    return Err(AppError::BadRequest(format!(
+                        "Secure wipe failed: {}",
+                        error
+                    )));
                 }
             }
             _ => return Err(AppError::BadRequest("Invalid wipe method".to_string())),
         }
-        
+
         Ok(HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "message": format!("Disk {} wiped successfully", device),
             "device": device.as_str(),
         })))
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (&device, &body);
-        Err(AppError::BadRequest("Disk wipe is only supported on Linux".to_string()))
+        Err(AppError::BadRequest(
+            "Disk wipe is only supported on Linux".to_string(),
+        ))
     }
 }
 
-/// 获取磁盘温度（TrueNAS风格）
 #[allow(dead_code)]
-pub async fn get_disk_temperature(
-    device: web::Path<String>,
-) -> Result<HttpResponse, AppError> {
+pub async fn get_disk_temperature(device: web::Path<String>) -> Result<HttpResponse, AppError> {
     #[cfg(target_os = "linux")]
     {
         let device_path = if device.starts_with("/dev/") {
@@ -2599,20 +2709,21 @@ pub async fn get_disk_temperature(
         } else {
             format!("/dev/{}", device.as_str())
         };
-        
+
         let output = Command::new("smartctl")
             .args(["-A", &device_path])
             .output()
             .map_err(|_| AppError::InternalError)?;
-        
+
         if !output.status.success() {
-            return Err(AppError::BadRequest("Failed to read SMART data".to_string()));
+            return Err(AppError::BadRequest(
+                "Failed to read SMART data".to_string(),
+            ));
         }
-        
+
         let output_str = String::from_utf8_lossy(&output.stdout);
         let mut temperature: Option<i32> = None;
-        
-        // 解析温度
+
         for line in output_str.lines() {
             if line.contains("Temperature") || line.contains("Airflow_Temperature") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
@@ -2624,16 +2735,18 @@ pub async fn get_disk_temperature(
                 }
             }
         }
-        
+
         Ok(HttpResponse::Ok().json(serde_json::json!({
             "device": device.as_str(),
             "temperature_celsius": temperature,
         })))
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = &device;
-        Err(AppError::BadRequest("Temperature reading is only supported on Linux".to_string()))
+        Err(AppError::BadRequest(
+            "Temperature reading is only supported on Linux".to_string(),
+        ))
     }
 }

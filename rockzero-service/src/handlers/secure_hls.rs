@@ -1,13 +1,801 @@
+use crate::storage_manager::load_windows_storage_binding;
 use actix_web::{web, HttpResponse, Responder};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, OsRng},
+    ChaCha20Poly1305, Nonce,
+};
+use rand::RngCore;
 use rockzero_common::AppError;
 use rockzero_crypto::{EnhancedPasswordProof, PasswordRegistration, ZkpContext};
 use rockzero_media::{HlsSession, HlsSessionManager};
 use rockzero_sae::{SaeCommit, SaeConfirm};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
+
+static SAE_ANTI_CLOGGING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+static SESSION_NO_DISK_MODE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+static NO_DISK_SEGMENT_CACHE: OnceLock<Mutex<HashMap<String, NoDiskSegmentCacheEntry>>> =
+    OnceLock::new();
+static NO_DISK_SEGMENT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+static NO_DISK_FALLBACK_WARNED: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+static HW_ACCEL_DETECTION_CACHE: OnceLock<HardwareAccel> = OnceLock::new();
+static VIDEO_CODEC_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+static EXTERNAL_CACHE_STARTUP_GUARD: OnceLock<Mutex<ExternalCacheStartupGuard>> = OnceLock::new();
+static SEGMENT_TICKET_SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+static SESSION_CACHE_DIRS: OnceLock<Mutex<HashMap<String, std::path::PathBuf>>> = OnceLock::new();
+static A311D_PROFILE_CACHE: OnceLock<bool> = OnceLock::new();
+static NO_DISK_SEGMENT_CACHE_MAX_BYTES: OnceLock<usize> = OnceLock::new();
+static NO_DISK_SEGMENT_CACHE_MAX_ENTRY_BYTES: OnceLock<usize> = OnceLock::new();
+
+const NO_DISK_SEGMENT_TTL_SECS: u64 = 300;
+const NO_DISK_SEGMENT_MAX_ENTRIES: usize = 512;
+const SEGMENT_TICKET_MAX_AGE_SECONDS: i64 = 1800;
+const DEFAULT_NO_DISK_SEGMENT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_NO_DISK_SEGMENT_CACHE_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
+
+fn blake3_hash_bytes(data: &[u8]) -> [u8; 32] {
+    let digest = blake3::hash(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_bytes());
+    out
+}
+
+fn blake3_hex8(data: &[u8]) -> String {
+    let digest = blake3_hash_bytes(data);
+    hex::encode(&digest[..8])
+}
+
+fn chacha_encrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, AppError> {
+    let cipher = ChaCha20Poly1305::new(key.into());
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher.encrypt(nonce, data).map_err(|e| {
+        AppError::CryptoError(format!("ChaCha20-Poly1305 encryption failed: {}", e))
+    })?;
+
+    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+fn chacha_decrypt(key: &[u8; 32], encrypted: &[u8]) -> Result<Vec<u8>, AppError> {
+    if encrypted.len() < 12 {
+        return Err(AppError::CryptoError(
+            "ChaCha20-Poly1305 payload too short".to_string(),
+        ));
+    }
+    let (nonce_bytes, ciphertext) = encrypted.split_at(12);
+    let cipher = ChaCha20Poly1305::new(key.into());
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| AppError::CryptoError(format!("ChaCha20-Poly1305 decryption failed: {}", e)))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SegmentAccessTicketPayload {
+    session_id: String,
+    user_id: String,
+    issued_at: i64,
+    expires_at: i64,
+    scope: String,
+}
+
+#[derive(Clone)]
+struct NoDiskSegmentCacheEntry {
+    data: Vec<u8>,
+    created_at: std::time::Instant,
+}
+
+#[derive(Clone)]
+struct ExternalCacheStartupGuard {
+    checked: bool,
+    ready: bool,
+    message: String,
+}
+
+fn no_disk_mode_registry() -> &'static Mutex<HashMap<String, bool>> {
+    SESSION_NO_DISK_MODE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn session_cache_dir_registry() -> &'static Mutex<HashMap<String, std::path::PathBuf>> {
+    SESSION_CACHE_DIRS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn set_session_cache_dir(session_id: &str, cache_dir: std::path::PathBuf) {
+    let mut dirs = session_cache_dir_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    dirs.insert(session_id.to_string(), cache_dir);
+}
+
+fn get_session_cache_dir(session_id: &str) -> Option<std::path::PathBuf> {
+    let dirs = session_cache_dir_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    dirs.get(session_id).cloned()
+}
+
+fn remove_session_cache_dir(session_id: &str) -> Option<std::path::PathBuf> {
+    let mut dirs = session_cache_dir_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    dirs.remove(session_id)
+}
+
+fn resolve_session_cache_dir(
+    file_path: &str,
+    session_id: Option<&str>,
+) -> Result<std::path::PathBuf, AppError> {
+    if let Some(sid) = session_id {
+        if let Some(existing) = get_session_cache_dir(sid) {
+            return Ok(existing);
+        }
+    }
+
+    let source = std::path::PathBuf::from(file_path);
+    let parent = source.parent().ok_or_else(|| {
+        AppError::PreconditionFailed(format!(
+            "Video path '{}' does not have a valid parent directory for cache placement",
+            file_path
+        ))
+    })?;
+
+    let parent_canonical = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+
+    #[cfg(target_os = "linux")]
+    {
+        let parent_str = parent_canonical.to_string_lossy();
+        if !parent_str.starts_with("/mnt/") {
+            return Err(AppError::PreconditionFailed(format!(
+                "Refusing internal cache path '{}': temporary HLS cache must be under external /mnt/*",
+                parent_str
+            )));
+        }
+        if is_same_filesystem_as_root(&parent_canonical) {
+            return Err(AppError::PreconditionFailed(format!(
+                "Refusing cache placement on root filesystem '{}': temporary cache must stay on external storage",
+                parent_str
+            )));
+        }
+    }
+
+    let cache_root = parent_canonical.join(".rockzero_hls_tmp");
+    let cache_dir = if let Some(sid) = session_id {
+        cache_root.join(sid)
+    } else {
+        let video_id = blake3_hex8(file_path.as_bytes());
+        cache_root.join(video_id)
+    };
+
+    std::fs::create_dir_all(&cache_dir).map_err(|e| {
+        AppError::IoError(format!(
+            "Failed to create session cache directory {:?}: {}",
+            cache_dir, e
+        ))
+    })?;
+
+    Ok(cache_dir)
+}
+
+fn set_session_no_disk_mode(session_id: &str, enabled: bool) {
+    let mut modes = no_disk_mode_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    modes.insert(session_id.to_string(), enabled);
+}
+
+fn clear_session_no_disk_mode(session_id: &str) {
+    let mut modes = no_disk_mode_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    modes.remove(session_id);
+
+    let mut warned = no_disk_fallback_warned_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    warned.remove(session_id);
+}
+
+async fn cleanup_session_cache_dir(session_id: &str) {
+    if let Some(cache_dir) = remove_session_cache_dir(session_id) {
+        if cache_dir.exists() {
+            if let Err(e) = remove_dir_all_best_effort(&cache_dir).await {
+                warn!(
+                    "Failed to remove session cache dir {:?} for {}: {}",
+                    cache_dir, session_id, e
+                );
+            } else {
+                info!(
+                    "Removed session cache dir {:?} for {}",
+                    cache_dir, session_id
+                );
+            }
+        }
+    }
+}
+
+async fn remove_file_best_effort(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+async fn remove_dir_all_best_effort(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        match tokio::fs::remove_dir_all(path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+async fn write_file_best_effort<P, C>(path: P, contents: C) -> std::io::Result<()>
+where
+    P: AsRef<Path>,
+    C: AsRef<[u8]>,
+{
+    #[cfg(target_os = "windows")]
+    {
+        std::fs::write(path.as_ref(), contents.as_ref())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        tokio::fs::write(path.as_ref(), contents.as_ref()).await
+    }
+}
+
+pub fn get_no_disk_playback_status() -> (bool, usize) {
+    let modes = no_disk_mode_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let count = modes.values().filter(|&&enabled| enabled).count();
+    (count > 0, count)
+}
+
+fn no_disk_segment_cache() -> &'static Mutex<HashMap<String, NoDiskSegmentCacheEntry>> {
+    NO_DISK_SEGMENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn no_disk_segment_cache_max_bytes() -> usize {
+    *NO_DISK_SEGMENT_CACHE_MAX_BYTES.get_or_init(|| {
+        std::env::var("ROCKZERO_NO_DISK_SEGMENT_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v >= (4 * 1024 * 1024))
+            .unwrap_or(DEFAULT_NO_DISK_SEGMENT_CACHE_MAX_BYTES)
+    })
+}
+
+fn no_disk_segment_cache_max_entry_bytes() -> usize {
+    *NO_DISK_SEGMENT_CACHE_MAX_ENTRY_BYTES.get_or_init(|| {
+        std::env::var("ROCKZERO_NO_DISK_SEGMENT_CACHE_MAX_ENTRY_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v >= (512 * 1024))
+            .unwrap_or(DEFAULT_NO_DISK_SEGMENT_CACHE_MAX_ENTRY_BYTES)
+    })
+}
+
+fn no_disk_segment_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    NO_DISK_SEGMENT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn no_disk_fallback_warned_registry() -> &'static Mutex<HashMap<String, bool>> {
+    NO_DISK_FALLBACK_WARNED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn video_codec_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    VIDEO_CODEC_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn external_cache_startup_guard() -> &'static Mutex<ExternalCacheStartupGuard> {
+    EXTERNAL_CACHE_STARTUP_GUARD.get_or_init(|| {
+        Mutex::new(ExternalCacheStartupGuard {
+            checked: false,
+            ready: false,
+            message: "external cache guard has not been initialized".to_string(),
+        })
+    })
+}
+
+fn is_strict_external_cache_required() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+
+    std::env::var("ROCKZERO_STRICT_EXTERNAL_HLS_CACHE")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn allow_stream_copy_for_hls() -> bool {
+    std::env::var("ROCKZERO_HLS_ALLOW_STREAM_COPY")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn require_hardware_codec_for_video() -> bool {
+    std::env::var("ROCKZERO_REQUIRE_HW_CODEC")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or({
+            #[cfg(target_os = "windows")]
+            {
+                false
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                true
+            }
+        })
+}
+
+fn encrypt_hls_cache_at_rest() -> bool {
+    std::env::var("ROCKZERO_HLS_CACHE_AT_REST_ENCRYPTION")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or({
+            #[cfg(target_os = "windows")]
+            {
+                false
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                true
+            }
+        })
+}
+
+fn is_a311d_device() -> bool {
+    *A311D_PROFILE_CACHE.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(model) = std::fs::read_to_string("/proc/device-tree/model") {
+                let model = model.to_ascii_lowercase();
+                if model.contains("a311d") || model.contains("amlogic") {
+                    return true;
+                }
+            }
+            if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+                let cpuinfo = cpuinfo.to_ascii_lowercase();
+                if cpuinfo.contains("a311d") || cpuinfo.contains("amlogic") {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_orphan_hls_temp_dirs() {
+    let mut removed = 0usize;
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(std::path::PathBuf::from("/mnt"), 0)];
+    const MAX_DEPTH: usize = 6;
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > MAX_DEPTH {
+            continue;
+        }
+
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            if path
+                .file_name()
+                .is_some_and(|name| name == ".rockzero_hls_tmp")
+            {
+                if std::fs::remove_dir_all(&path).is_ok() {
+                    removed += 1;
+                }
+                continue;
+            }
+
+            stack.push((path, depth + 1));
+        }
+    }
+
+    if removed > 0 {
+        info!(
+            "Startup cleanup removed {} orphan .rockzero_hls_tmp directories",
+            removed
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cleanup_orphan_hls_temp_dirs() {}
+
+pub fn initialize_external_cache_startup_guard() -> bool {
+    cleanup_orphan_hls_temp_dirs();
+
+    let strict = is_strict_external_cache_required();
+
+    let mut guard = external_cache_startup_guard()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if !strict {
+        guard.checked = true;
+        guard.ready = true;
+        guard.message =
+            "strict external HLS cache guard is disabled by ROCKZERO_STRICT_EXTERNAL_HLS_CACHE"
+                .to_string();
+        return true;
+    }
+
+    match ensure_external_hls_cache_root() {
+        Ok(path) => {
+            guard.checked = true;
+            guard.ready = true;
+            guard.message = format!(
+                "external HLS cache validated at startup: {}",
+                path.display()
+            );
+            true
+        }
+        Err(e) => {
+            guard.checked = true;
+            guard.ready = false;
+            guard.message = format!("external HLS cache startup validation failed: {}", e);
+            false
+        }
+    }
+}
+
+fn get_cached_no_disk_segment(cache_key: &str) -> Option<Vec<u8>> {
+    let mut cache = no_disk_segment_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache.retain(|_, entry| {
+        entry.created_at.elapsed() < std::time::Duration::from_secs(NO_DISK_SEGMENT_TTL_SECS)
+    });
+    cache.get(cache_key).map(|entry| entry.data.clone())
+}
+
+fn trim_no_disk_segment_cache_locked(cache: &mut HashMap<String, NoDiskSegmentCacheEntry>) {
+    cache.retain(|_, entry| {
+        entry.created_at.elapsed() < std::time::Duration::from_secs(NO_DISK_SEGMENT_TTL_SECS)
+    });
+
+    let max_bytes = no_disk_segment_cache_max_bytes();
+
+    while cache.len() > NO_DISK_SEGMENT_MAX_ENTRIES {
+        let oldest_key = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.created_at)
+            .map(|(k, _)| k.clone());
+        if let Some(key) = oldest_key {
+            cache.remove(&key);
+        } else {
+            break;
+        }
+    }
+
+    loop {
+        let total_bytes: usize = cache.values().map(|entry| entry.data.len()).sum();
+        if total_bytes <= max_bytes {
+            break;
+        }
+
+        let oldest_key = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.created_at)
+            .map(|(k, _)| k.clone());
+        if let Some(key) = oldest_key {
+            cache.remove(&key);
+        } else {
+            break;
+        }
+    }
+}
+
+fn put_cached_no_disk_segment(cache_key: String, data: Vec<u8>) {
+    if data.len() > no_disk_segment_cache_max_entry_bytes() {
+        return;
+    }
+
+    let mut cache = no_disk_segment_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    trim_no_disk_segment_cache_locked(&mut cache);
+
+    cache.insert(
+        cache_key,
+        NoDiskSegmentCacheEntry {
+            data,
+            created_at: std::time::Instant::now(),
+        },
+    );
+
+    trim_no_disk_segment_cache_locked(&mut cache);
+}
+
+fn clear_no_disk_segment_cache_for_session(session_id: &str) {
+    let prefix = format!("{}:", session_id);
+    let mut cache = no_disk_segment_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache.retain(|k, _| !k.starts_with(&prefix));
+
+    let mut locks = no_disk_segment_locks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    locks.retain(|k, _| !k.starts_with(&prefix));
+}
+
+fn get_no_disk_segment_lock(cache_key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = no_disk_segment_locks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = locks.get(cache_key) {
+        return existing.clone();
+    }
+
+    let created = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(cache_key.to_string(), created.clone());
+    created
+}
+
+fn release_no_disk_segment_lock(cache_key: &str) {
+    let mut locks = no_disk_segment_locks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    locks.remove(cache_key);
+}
+
+fn warn_no_disk_fallback_once(session_id: Option<&str>, segment_name: &str) {
+    let Some(session_id) = session_id else {
+        warn!(
+            "External HLS cache unavailable, using no-disk transcoding for {}",
+            segment_name
+        );
+        return;
+    };
+
+    let mut warned = no_disk_fallback_warned_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if warned.contains_key(session_id) {
+        return;
+    }
+
+    warned.insert(session_id.to_string(), true);
+    warn!(
+        "External HLS cache unavailable for session {}, switching to no-disk transcoding path (first segment: {})",
+        session_id, segment_name
+    );
+}
+
+fn parse_segment_index_from_name(segment_name: &str) -> Option<usize> {
+    if !segment_name.starts_with("segment_") || !segment_name.ends_with(".ts") {
+        return None;
+    }
+
+    segment_name
+        .trim_start_matches("segment_")
+        .trim_end_matches(".ts")
+        .parse::<usize>()
+        .ok()
+}
+
+fn prewarm_no_disk_segments(file_path: String, session_id: String, current_idx: usize) {
+    tokio::spawn(async move {
+        const PREWARM_WINDOW: usize = 2;
+        for next in 1..=PREWARM_WINDOW {
+            let idx = current_idx.saturating_add(next);
+            let segment_name = format!("segment_{}.ts", idx);
+            let _ =
+                read_video_segment_from_ffmpeg(&file_path, &segment_name, Some(&session_id)).await;
+        }
+    });
+}
+
+fn get_sae_anti_clogging_key() -> &'static [u8; 32] {
+    SAE_ANTI_CLOGGING_KEY.get_or_init(|| {
+        if let Ok(secret_hex) = std::env::var("SAE_ANTI_CLOGGING_SECRET") {
+            if let Ok(bytes) = hex::decode(secret_hex) {
+                if bytes.len() == 32 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&bytes);
+                    return key;
+                }
+            }
+        }
+
+        let mut key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut key);
+        key
+    })
+}
+
+fn compute_anti_clogging_token(temp_session_id: &str, user_id: &str) -> String {
+    let key = get_sae_anti_clogging_key();
+    let mut payload = Vec::with_capacity(32 + temp_session_id.len() + user_id.len());
+    payload.extend_from_slice(key);
+    payload.extend_from_slice(temp_session_id.as_bytes());
+    payload.extend_from_slice(user_id.as_bytes());
+    hex::encode(blake3_hash_bytes(&payload))
+}
+
+fn verify_anti_clogging_token(temp_session_id: &str, user_id: &str, token: &str) -> bool {
+    let expected = compute_anti_clogging_token(temp_session_id, user_id);
+    expected == token
+}
+
+fn segment_ticket_signing_key() -> &'static [u8; 32] {
+    SEGMENT_TICKET_SIGNING_KEY.get_or_init(|| {
+        if let Ok(secret_hex) = std::env::var("ROCKZERO_SEGMENT_TICKET_SECRET") {
+            if let Ok(bytes) = hex::decode(secret_hex) {
+                if bytes.len() == 32 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&bytes);
+                    return key;
+                }
+            }
+            warn!(
+                "ROCKZERO_SEGMENT_TICKET_SECRET is set but invalid; falling back to derived startup key"
+            );
+        }
+
+        let mut key_material = Vec::new();
+        key_material.extend_from_slice(get_sae_anti_clogging_key());
+        key_material.extend_from_slice(b"RockZero-Segment-Ticket-v1");
+        blake3_hash_bytes(&key_material)
+    })
+}
+
+fn sign_ticket_payload(payload_b64: &str) -> [u8; 32] {
+    let mut input = Vec::with_capacity(32 + payload_b64.len());
+    input.extend_from_slice(segment_ticket_signing_key());
+    input.extend_from_slice(payload_b64.as_bytes());
+    blake3_hash_bytes(&input)
+}
+
+fn issue_segment_access_ticket(session: &HlsSession) -> Result<String, AppError> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
+
+    let now = chrono::Utc::now().timestamp();
+    let expires_at = (now + SEGMENT_TICKET_MAX_AGE_SECONDS).min(session.expires_at.timestamp());
+
+    let payload = SegmentAccessTicketPayload {
+        session_id: session.session_id.clone(),
+        user_id: session.user_id.clone(),
+        issued_at: now,
+        expires_at,
+        scope: "hls_segment_access".to_string(),
+    };
+
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|e| AppError::InternalServerError(format!("Failed to encode ticket: {}", e)))?;
+    let payload_b64 = B64URL.encode(&payload_bytes);
+
+    let sig = sign_ticket_payload(&payload_b64);
+    let sig_b64 = B64URL.encode(sig);
+
+    Ok(format!("{}.{}", payload_b64, sig_b64))
+}
+
+fn verify_segment_access_ticket(session: &HlsSession, ticket: &str) -> Result<bool, AppError> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
+
+    let mut parts = ticket.split('.');
+    let payload_b64 = parts.next().unwrap_or_default();
+    let sig_b64 = parts.next().unwrap_or_default();
+    if payload_b64.is_empty() || sig_b64.is_empty() || parts.next().is_some() {
+        return Ok(false);
+    }
+
+    let expected_sig = sign_ticket_payload(payload_b64);
+    let provided_sig = B64URL.decode(sig_b64).map_err(|_| {
+        AppError::BadRequest("Invalid segment ticket signature encoding".to_string())
+    })?;
+
+    if provided_sig.len() != expected_sig.len()
+        || !constant_time_compare(&provided_sig, &expected_sig)
+    {
+        return Ok(false);
+    }
+
+    let payload_bytes = B64URL
+        .decode(payload_b64)
+        .map_err(|_| AppError::BadRequest("Invalid segment ticket payload encoding".to_string()))?;
+    let payload: SegmentAccessTicketPayload =
+        serde_json::from_slice(&payload_bytes).map_err(|_| {
+            AppError::BadRequest("Invalid segment ticket payload structure".to_string())
+        })?;
+
+    let now = chrono::Utc::now().timestamp();
+    if payload.scope != "hls_segment_access" {
+        return Ok(false);
+    }
+    if payload.session_id != session.session_id || payload.user_id != session.user_id {
+        return Ok(false);
+    }
+    if payload.expires_at < now || payload.issued_at > now + 60 {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 fn convert_hls_error(err: rockzero_media::HlsError) -> AppError {
     match err {
@@ -22,29 +810,80 @@ fn convert_hls_error(err: rockzero_media::HlsError) -> AppError {
     }
 }
 
-fn sanitize_file_path(path: &str) -> Result<std::path::PathBuf, AppError> {
-    use std::path::PathBuf;
-
-    let decoded_path = urlencoding::decode(path)
+fn decode_hls_path_value(path: &str) -> String {
+    urlencoding::decode(path)
         .map(|s| s.into_owned())
-        .unwrap_or_else(|_| path.to_string());
+        .unwrap_or_else(|_| path.to_string())
+}
 
-    let path_buf = PathBuf::from(&decoded_path);
+fn hls_path_contains_parent_dir(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir))
+}
 
-    if path_buf.is_absolute() {
-        let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
+fn hls_path_within_root(path: &Path, root: &Path) -> bool {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    candidate.starts_with(&canonical_root)
+        || path.starts_with(&canonical_root)
+        || path.starts_with(root)
+}
 
-        const ALLOWED_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
-        let path_str = canonical.to_string_lossy();
-        for allowed_dir in ALLOWED_DIRS {
-            if path_str.starts_with(allowed_dir) {
-                return Ok(canonical);
+#[cfg(target_os = "windows")]
+fn secure_hls_base_directory() -> Result<PathBuf, AppError> {
+    let binding = load_windows_storage_binding()
+        .map_err(|e| {
+            AppError::InternalServerError(format!("Failed to load Windows storage binding: {}", e))
+        })?
+        .ok_or_else(|| {
+            AppError::PreconditionFailed("Windows storage root is not configured".to_string())
+        })?;
+
+    Ok(binding
+        .selected_root
+        .canonicalize()
+        .unwrap_or(binding.selected_root))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn secure_hls_base_directory() -> Result<PathBuf, AppError> {
+    const BASE_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
+
+    for base_dir in BASE_DIRS {
+        let path = Path::new(base_dir);
+        if path.exists() && path.is_dir() {
+            if std::fs::read_dir(path).is_ok() {
+                return Ok(path.to_path_buf());
             }
         }
+    }
 
-        #[cfg(target_os = "windows")]
-        {
-            if path_str.len() >= 2 && path_str.chars().nth(1) == Some(':') {
+    let data_dir = Path::new("/data");
+    if std::fs::create_dir_all(data_dir).is_ok() {
+        return Ok(data_dir.to_path_buf());
+    }
+
+    let fallback = Path::new("./storage");
+    std::fs::create_dir_all(fallback).ok();
+    Ok(fallback.to_path_buf())
+}
+
+fn sanitize_file_path(path: &str) -> Result<PathBuf, AppError> {
+    let decoded_path = decode_hls_path_value(path);
+    let input_path = Path::new(&decoded_path);
+
+    if hls_path_contains_parent_dir(input_path) {
+        return Err(AppError::Forbidden("Path traversal detected".to_string()));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    if input_path.is_absolute() {
+        let canonical = input_path
+            .canonicalize()
+            .unwrap_or_else(|_| input_path.to_path_buf());
+        let path_str = canonical.to_string_lossy();
+        for allowed_dir in ["/mnt", "/media", "/home", "/data", "/storage"] {
+            if path_str.starts_with(allowed_dir) {
                 return Ok(canonical);
             }
         }
@@ -54,47 +893,29 @@ fn sanitize_file_path(path: &str) -> Result<std::path::PathBuf, AppError> {
         ));
     }
 
-    let base_dir = get_base_directory()?;
-    let full_path = base_dir.join(&decoded_path);
+    let base_dir = secure_hls_base_directory()?;
+    let full_path = if decoded_path.is_empty() {
+        base_dir.clone()
+    } else if input_path.is_absolute() {
+        input_path.to_path_buf()
+    } else {
+        let clean_path = decoded_path.trim_start_matches(['/', '\\']);
+        base_dir.join(clean_path)
+    };
+
     let canonical = full_path
         .canonicalize()
         .unwrap_or_else(|_| full_path.clone());
 
-    Ok(canonical)
-}
-
-fn get_base_directory() -> Result<std::path::PathBuf, AppError> {
-    use std::path::Path;
-
     #[cfg(target_os = "windows")]
+    if !hls_path_within_root(&canonical, &base_dir) && !hls_path_within_root(&full_path, &base_dir)
     {
-        let fallback = Path::new("./storage");
-        std::fs::create_dir_all(fallback).ok();
-        Ok(fallback.to_path_buf())
+        return Err(AppError::Forbidden(
+            "File path is outside the configured Windows storage root".to_string(),
+        ));
     }
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        const BASE_DIRS: &[&str] = &["/mnt", "/media", "/home", "/data", "/storage"];
-
-        for base_dir in BASE_DIRS {
-            let path = Path::new(base_dir);
-            if path.exists() && path.is_dir() {
-                if std::fs::read_dir(path).is_ok() {
-                    return Ok(path.to_path_buf());
-                }
-            }
-        }
-
-        let data_dir = Path::new("/data");
-        if std::fs::create_dir_all(data_dir).is_ok() {
-            return Ok(data_dir.to_path_buf());
-        }
-
-        let fallback = Path::new("./storage");
-        std::fs::create_dir_all(fallback).ok();
-        Ok(fallback.to_path_buf())
-    }
+    Ok(canonical)
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,10 +929,17 @@ pub struct CompleteSaeRequest {
     pub temp_session_id: String,
     pub client_commit: SaeCommit,
     pub client_confirm: SaeConfirm,
+    pub anti_clogging_token: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SecureSegmentRequest {
+    pub zkp_proof: Option<String>,
+    pub zkp_ticket: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateProofTicketRequest {
     pub zkp_proof: String,
 }
 
@@ -170,6 +998,7 @@ pub async fn init_sae_handshake(
     let temp_session_id = manager
         .init_sae_handshake(user_id.clone(), password)
         .map_err(convert_hls_error)?;
+    let anti_clogging_token = compute_anti_clogging_token(&temp_session_id, &user_id);
 
     info!(
         "Initialized SAE handshake for user {} - temp session {}",
@@ -178,6 +1007,9 @@ pub async fn init_sae_handshake(
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "temp_session_id": temp_session_id,
+        "anti_clogging_token": anti_clogging_token,
+        "supported_groups": [19],
+        "selected_group": 19,
         "file_path": file_path,
         "message": "SAE handshake initialized, send client commit next"
     })))
@@ -187,6 +1019,7 @@ pub async fn init_sae_handshake(
 pub struct SendClientCommitRequest {
     pub temp_session_id: String,
     pub client_commit: SaeCommit,
+    pub anti_clogging_token: String,
 }
 
 pub async fn send_client_commit(
@@ -196,6 +1029,12 @@ pub async fn send_client_commit(
     body: web::Json<SendClientCommitRequest>,
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
+
+    if !verify_anti_clogging_token(&body.temp_session_id, &user_id, &body.anti_clogging_token) {
+        return Err(AppError::Unauthorized(
+            "Invalid anti-clogging token".to_string(),
+        ));
+    }
 
     let server_commit = {
         let manager = hls_manager.read().await;
@@ -226,6 +1065,7 @@ pub async fn send_client_commit(
 pub struct SendClientConfirmRequest {
     pub temp_session_id: String,
     pub client_confirm: SaeConfirm,
+    pub anti_clogging_token: String,
 }
 
 pub async fn send_client_confirm(
@@ -235,6 +1075,12 @@ pub async fn send_client_confirm(
     body: web::Json<SendClientConfirmRequest>,
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
+
+    if !verify_anti_clogging_token(&body.temp_session_id, &user_id, &body.anti_clogging_token) {
+        return Err(AppError::Unauthorized(
+            "Invalid anti-clogging token".to_string(),
+        ));
+    }
 
     let server_confirm = {
         let manager = hls_manager.read().await;
@@ -271,6 +1117,12 @@ pub async fn complete_sae_handshake(
 ) -> Result<impl Responder, AppError> {
     let user_id = claims.sub.clone();
 
+    if !verify_anti_clogging_token(&body.temp_session_id, &user_id, &body.anti_clogging_token) {
+        return Err(AppError::Unauthorized(
+            "Invalid anti-clogging token".to_string(),
+        ));
+    }
+
     let (server_commit, server_confirm) = {
         let manager = hls_manager.read().await;
         let mut servers = manager.sae_servers.lock().unwrap();
@@ -304,13 +1156,12 @@ pub async fn complete_sae_handshake(
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
     pub temp_session_id: String,
-    pub file_id: Option<String>,   // 文件 ID（数据库中的）
-    pub file_path: Option<String>, // 文件路径（文件系统中的）
+    pub file_id: Option<String>,
+    pub file_path: Option<String>,
     pub zkp_registration: Option<String>,
-    /// When true, segments are served as plaintext (no AES-256-GCM transport encryption).
-    /// Suitable for ARM / low-performance devices or when libmpv cannot decrypt inline.
-    #[serde(default)]
-    pub direct_mode: bool,
+
+    #[serde(default, alias = "direct_mode")]
+    pub legacy_direct_mode_requested: bool,
 }
 
 pub async fn create_hls_session(
@@ -322,13 +1173,11 @@ pub async fn create_hls_session(
     let user_id = claims.sub.clone();
 
     let file_path = if let Some(ref file_id) = body.file_id {
-        // 通过文件 ID 查找
         let file = crate::db::find_file_by_id(&pool, file_id, &user_id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("File not found: {}", file_id)))?;
         file.file_path
     } else if let Some(ref path) = body.file_path {
-        // 直接使用文件路径（验证路径是否存在）
         let sanitized_path = sanitize_file_path(path)?;
         if !sanitized_path.exists() {
             return Err(AppError::NotFound(format!("File not found: {}", path)));
@@ -408,13 +1257,10 @@ pub async fn create_hls_session(
         )
         .map_err(convert_hls_error)?;
 
-    // Set direct mode if requested (plaintext segments for ARM / libmpv)
-    if body.direct_mode {
-        manager
-            .set_session_direct_mode(&session_id, true)
-            .map_err(convert_hls_error)?;
-        info!(
-            "Session {} direct_mode enabled (plaintext segments)",
+    if body.legacy_direct_mode_requested {
+        warn!(
+            "Client requested direct_mode for session {}, but it is disabled by security policy. \
+             All segments will be ChaCha20-Poly1305 encrypted.",
             session_id
         );
     }
@@ -423,16 +1269,18 @@ pub async fn create_hls_session(
         .get_session(&session_id)
         .map_err(convert_hls_error)?;
 
+    let cache_dir = resolve_session_cache_dir(&file_path, Some(&session_id))?;
+    set_session_cache_dir(&session_id, cache_dir);
+
     let has_zkp = zkp_registration.is_some();
 
-    // Debug: verify session is stored and count total sessions
     {
         let sessions = manager.sessions.lock().unwrap();
         let total = sessions.len();
         let exists = sessions.contains_key(&session_id);
         info!(
-            "✅ Created HLS session {} for user {} - file {} (ZKP: {}, direct: {}, verified_stored: {}, total_sessions: {})",
-            session_id, user_id, file_path, has_zkp, body.direct_mode, exists, total
+            "�?Created HLS session {} for user {} - file {} (ZKP: {}, encrypted: true, verified_stored: {}, total_sessions: {})",
+            session_id, user_id, file_path, has_zkp, exists, total
         );
     }
 
@@ -441,8 +1289,47 @@ pub async fn create_hls_session(
         "expires_at": session.expires_at.timestamp(),
         "playlist_url": format!("/api/v1/secure-hls/{}/playlist.m3u8", session_id),
         "zkp_enabled": has_zkp,
-        "direct_mode": body.direct_mode,
-        "encryption_method": if body.direct_mode { "none" } else { "AES-256-GCM" },
+        "segment_ticket_supported": true,
+        "direct_mode": false,
+        "encryption_method": "ChaCha20-Poly1305",
+    })))
+}
+
+pub async fn create_session_proof_ticket(
+    hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
+    path: web::Path<String>,
+    body: web::Json<CreateProofTicketRequest>,
+) -> Result<impl Responder, AppError> {
+    let session_id = path.into_inner();
+    let user_id = claims.sub.clone();
+
+    let manager = hls_manager.read().await;
+    let session = manager
+        .get_session(&session_id)
+        .map_err(convert_hls_error)?;
+
+    if session.user_id != user_id {
+        return Err(AppError::Unauthorized(
+            "Session does not belong to current user".to_string(),
+        ));
+    }
+
+    if !verify_zkp_proof(&session, &body.zkp_proof)? {
+        return Err(AppError::Unauthorized(
+            "Invalid ZKP proof - authentication failed".to_string(),
+        ));
+    }
+
+    let ticket = issue_segment_access_ticket(&session)?;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "ticket": ticket,
+        "expires_at": (chrono::Utc::now().timestamp() + SEGMENT_TICKET_MAX_AGE_SECONDS)
+            .min(session.expires_at.timestamp()),
+        "scope": "hls_segment_access",
+        "session_id": session.session_id,
     })))
 }
 
@@ -471,31 +1358,35 @@ async fn get_user_zkp_registration(
     }
 }
 
-// ============ 安全播放列表和段获取 ============
+fn ensure_session_belongs_to_user(session: &HlsSession, user_id: &str) -> Result<(), AppError> {
+    if session.user_id != user_id {
+        return Err(AppError::Unauthorized(
+            "Session does not belong to current user".to_string(),
+        ));
+    }
 
-/// 使用 ffmpeg 对视频进行 HLS 分片（渐进式 — 不等待完成）
-///
-/// 关键优化：
-/// 1. 后台启动 ffmpeg (spawn, 不 await 完成)
-/// 2. 使用 `-hls_playlist_type event` + `-hls_flags append_list` 实现渐进式分片
-/// 3. 等待第一个 segment 生成后立即返回 playlist
-/// 4. 对于 stream copy 场景（大多数情况），首个 segment 在 1-2 秒内可用
-/// 5. 播放器一边播放，ffmpeg 一边继续生成后续 segments
-///
-/// 结果缓存在 `hls_cache/{video_hash}/` 目录中。
-async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, String), AppError> {
+    Ok(())
+}
+
+async fn ensure_hls_segments(
+    file_path: &str,
+    session_id: Option<&str>,
+) -> Result<(std::path::PathBuf, String), AppError> {
     use std::path::PathBuf;
 
-    let video_hash = blake3::hash(file_path.as_bytes());
-    let video_id = hex::encode(&video_hash.as_bytes()[..8]);
-    let cache_dir = get_hls_cache_dir().join(&video_id);
+    let video_id = blake3_hex8(file_path.as_bytes());
+    let cache_dir = resolve_session_cache_dir(file_path, session_id)?;
+    if let Some(sid) = session_id {
+        set_session_cache_dir(sid, cache_dir.clone());
+    }
     let playlist_path = cache_dir.join("playlist.m3u8");
-    // 标记文件表示分片完成 (包含 #EXT-X-ENDLIST)
     let done_marker = cache_dir.join(".done");
-    // 锁文件防止并发 ffmpeg 进程
     let lock_file = cache_dir.join(".lock");
 
-    // 清理过期锁文件（崩溃的 ffmpeg 进程可能遗留锁文件，阻笜后续转码）
+    let placeholder_playlist = || {
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n".to_string()
+    };
+
     if lock_file.exists() {
         if let Ok(metadata) = tokio::fs::metadata(&lock_file).await {
             if let Ok(modified) = metadata.modified() {
@@ -507,15 +1398,15 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
                         "Removing stale HLS lock file (older than 5 minutes) for {}",
                         video_id
                     );
-                    let _ = tokio::fs::remove_file(&lock_file).await;
-                    // 同时清理残留的不完整分片
+                    let _ = remove_file_best_effort(&lock_file).await;
                     if let Ok(mut entries) = tokio::fs::read_dir(&cache_dir).await {
                         while let Ok(Some(entry)) = entries.next_entry().await {
                             let path = entry.path();
-                            if path.extension().is_some_and(|e| {
-                                e == "ts" || e == "m3u8" || e == "enc"
-                            }) {
-                                let _ = tokio::fs::remove_file(&path).await;
+                            if path
+                                .extension()
+                                .is_some_and(|e| e == "ts" || e == "m3u8" || e == "enc")
+                            {
+                                let _ = remove_file_best_effort(&path).await;
                             }
                         }
                     }
@@ -524,7 +1415,6 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
         }
     }
 
-    // 如果已完成分片，优先复用缓存；但要校验 playlist 引用的分片是否都存在
     if done_marker.exists() && playlist_path.exists() {
         let content = tokio::fs::read_to_string(&playlist_path)
             .await
@@ -538,31 +1428,57 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
             "Detected stale HLS cache for {}, playlist references missing segments; regenerating",
             video_id
         );
-        let _ = tokio::fs::remove_file(&done_marker).await;
+        let _ = remove_file_best_effort(&done_marker).await;
     }
 
-    // 如果有播放列表且至少有一个 segment，说明上一次分片正在进行中或中断
-    // 如果 ffmpeg 正在运行（lock 文件存在），直接返回当前 playlist
-    if playlist_path.exists() && lock_file.exists() {
-        let content = tokio::fs::read_to_string(&playlist_path).await.ok();
-        if let Some(content) = content {
-            if content.contains("#EXTINF") && playlist_segments_exist_on_disk(&cache_dir, &content)
-            {
-                info!(
-                    "FFmpeg still running for {}, returning progressive playlist",
-                    video_id
-                );
-                return Ok((cache_dir, content));
+    if lock_file.exists() {
+        if playlist_path.exists() {
+            if let Ok(content) = tokio::fs::read_to_string(&playlist_path).await {
+                if content.contains("#EXTINF")
+                    && playlist_segments_exist_on_disk(&cache_dir, &content)
+                {
+                    info!(
+                        "FFmpeg still running for {}, returning progressive playlist",
+                        video_id
+                    );
+                    return Ok((cache_dir, content));
+                }
             }
         }
+
+        let mut waited_ms: u64 = 0;
+        let max_wait_ms: u64 = 8_000;
+        let poll_interval_ms: u64 = 200;
+        while waited_ms < max_wait_ms {
+            if playlist_path.exists() {
+                if let Ok(content) = tokio::fs::read_to_string(&playlist_path).await {
+                    if content.contains("#EXTINF")
+                        && playlist_segments_exist_on_disk(&cache_dir, &content)
+                    {
+                        info!(
+                            "FFmpeg in-flight for {}, playlist became ready after {}ms",
+                            video_id, waited_ms
+                        );
+                        return Ok((cache_dir, content));
+                    }
+                }
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
+            waited_ms += poll_interval_ms;
+        }
+
+        warn!(
+            "FFmpeg in-flight for {}, playlist not ready after {}ms; returning placeholder playlist",
+            video_id, max_wait_ms
+        );
+        return Ok((cache_dir, placeholder_playlist()));
     }
 
-    // 创建缓存目录
     tokio::fs::create_dir_all(&cache_dir)
         .await
         .map_err(|e| AppError::IoError(format!("Failed to create cache dir: {}", e)))?;
 
-    // 验证源文件存在
     let original = PathBuf::from(file_path);
     if !original.exists() {
         return Err(AppError::NotFound(format!(
@@ -575,7 +1491,6 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
         .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
         .unwrap_or_else(|_| "ffmpeg".to_string());
 
-    // 预检测视频编码格式，用于调整首段超时策略和传递给转码流程
     let video_codec = detect_video_codec(&ffmpeg_path, file_path).await;
     let needs_transcode = !matches!(
         video_codec.as_deref(),
@@ -593,12 +1508,11 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
     let playlist_str = playlist_path.to_str().unwrap_or("").to_string();
 
     info!(
-        "🎬 Starting progressive segmentation: {} → {}",
+        "🎬 Starting progressive segmentation: {} Cache: {}",
         file_path,
         cache_dir.display()
     );
 
-    // 清理之前的部分输出（如果有）
     if !lock_file.exists() {
         for entry in std::fs::read_dir(&cache_dir)
             .into_iter()
@@ -612,16 +1526,15 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
         }
     }
 
-    // 创建 lock 文件
-    let _ = tokio::fs::write(&lock_file, b"").await;
+    let _ = write_file_best_effort(&lock_file, b"").await;
 
-    // 后台启动 ffmpeg - stream copy（渐进模式）
     let file_path_owned = file_path.to_string();
     let cache_dir_clone = cache_dir.clone();
     let done_marker_clone = done_marker.clone();
     let lock_file_clone = lock_file.clone();
     let ffmpeg_path_clone = ffmpeg_path.clone();
     let video_codec_clone = video_codec.clone();
+    let video_id_for_task = video_id.clone();
 
     tokio::spawn(async move {
         let result = run_ffmpeg_progressive(
@@ -637,16 +1550,13 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
         .await;
 
         match result {
-            Ok(_) => info!("✅ Video segmented successfully: {}", video_id),
-            Err(e) => warn!("❌ FFmpeg segmentation failed: {}", e),
+            Ok(_) => info!("Video segmented successfully: {}", video_id_for_task),
+            Err(e) => warn!("FFmpeg segmentation failed: {}", e),
         }
 
-        // 清理 lock 文件
-        let _ = tokio::fs::remove_file(&lock_file_clone).await;
+        let _ = remove_file_best_effort(&lock_file_clone).await;
     });
 
-    // 等待第一个 segment 生成
-    // AV1/VP9 等需要软件转码的格式，首个 segment 生成较慢，给予 120 秒超时
     let first_segment = cache_dir.join("segment_0.ts");
     let mut waited = 0;
     let max_wait_ms: u64 = if needs_transcode { 120_000 } else { 30_000 };
@@ -654,7 +1564,6 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
 
     while waited < max_wait_ms {
         if first_segment.exists() && playlist_path.exists() {
-            // 等待 playlist 至少包含一个可播放段；对于长视频尽量等待 2 段，降低 segment_1 早到 404
             if let Ok(content) = tokio::fs::read_to_string(&playlist_path).await {
                 let is_done = done_marker.exists();
                 let min_segments = if is_done { 1 } else { 2 };
@@ -671,7 +1580,6 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
         waited += poll_interval_ms;
     }
 
-    // 超时检查 — 可能 ffmpeg 失败了
     if playlist_path.exists() {
         let content = tokio::fs::read_to_string(&playlist_path)
             .await
@@ -683,9 +1591,11 @@ async fn ensure_hls_segments(file_path: &str) -> Result<(std::path::PathBuf, Str
         }
     }
 
-    Err(AppError::InternalServerError(
-        "视频分片超时，请检查 ffmpeg 是否正确安装".to_string(),
-    ))
+    warn!(
+        "Progressive segmentation timed out for {} after {}ms; returning placeholder playlist",
+        video_id, max_wait_ms
+    );
+    Ok((cache_dir, placeholder_playlist()))
 }
 
 fn extract_playlist_segment_names(playlist_content: &str) -> Vec<String> {
@@ -722,13 +1632,7 @@ fn playlist_segments_exist_on_disk(cache_dir: &std::path::Path, playlist_content
     })
 }
 
-/// 探测视频文件的视频编码格式
-///
-/// 使用 ffprobe 获取视频编码格式，用于决定是否需要添加 bitstream filter。
-/// 这是解决 HLS mpegts 黑屏的关键 — H.264/HEVC 的 MP4 封装使用 length-prefixed NALUs，
-/// 而 mpegts 要求 Annex B 格式的 start codes，必须通过 bitstream filter 转换。
 async fn detect_video_codec(ffmpeg_path: &str, file_path: &str) -> Option<String> {
-    // 从 ffmpeg 路径推导 ffprobe 路径
     let ffprobe_path = if let Some(dir) = std::path::Path::new(ffmpeg_path).parent() {
         let probe = dir.join("ffprobe");
         if tokio::fs::metadata(&probe).await.is_ok() {
@@ -768,7 +1672,6 @@ async fn detect_video_codec(ffmpeg_path: &str, file_path: &str) -> Option<String
     None
 }
 
-/// 从 ffmpeg 路径推导 ffprobe 路径
 async fn get_ffprobe_path(ffmpeg_path: &str) -> String {
     if let Some(dir) = std::path::Path::new(ffmpeg_path).parent() {
         let probe = dir.join("ffprobe");
@@ -779,11 +1682,6 @@ async fn get_ffprobe_path(ffmpeg_path: &str) -> String {
     std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string())
 }
 
-/// 探测视频文件的 start_time（秒）
-///
-/// MKV 等容器的 PTS 时间戳可能不从 0 开始（例如 26:28:10）。
-/// stream copy 到 HLS 时这些时间戳会被保留，导致播放器显示错误的时间。
-/// 通过检测 start_time 并使用 -output_ts_offset 将输出时间戳归零。
 async fn detect_video_start_time(ffmpeg_path: &str, file_path: &str) -> f64 {
     let ffprobe_path = get_ffprobe_path(ffmpeg_path).await;
 
@@ -809,22 +1707,11 @@ async fn detect_video_start_time(ffmpeg_path: &str, file_path: &str) -> f64 {
     }
 }
 
-/// 派生用于缓存分片文件静态加密的存储密钥
-///
-/// 使用 Blake3 从固定上下文 + 视频路径派生，确保：
-/// - 同一视频的分片使用相同密钥（缓存命中）
-/// - 不同视频使用不同密钥（隔离性）
-/// - 密钥不存储于磁盘（运行时派生）
 fn derive_segment_storage_key(file_path: &str) -> [u8; 32] {
     let context = format!("rockzero-segment-at-rest-v1:{}", file_path);
-    crate::crypto::blake3_hash_bytes(context.as_bytes())
+    blake3_hash_bytes(context.as_bytes())
 }
 
-/// 加密所有已生成的 TS 段文件（静态存储加密）
-///
-/// 在 ffmpeg 完成分片后调用，使用 AES-256-GCM 加密每个 .ts 文件。
-/// 加密后的文件使用 .ts.enc 扩展名存储，原始 .ts 文件安全删除。
-/// 这确保即使磁盘被物理访问，缓存的视频数据也是加密的。
 async fn encrypt_segments_at_rest(
     cache_dir: &std::path::Path,
     storage_key: &[u8; 32],
@@ -845,71 +1732,106 @@ async fn encrypt_segments_at_rest(
         return Ok(0);
     }
 
-    // ★ 并行加密：利用多核 CPU 同时加密多个分片，大幅减少加密总耗时
-    // AES-256-GCM 加密是 CPU 密集型操作，通过 spawn_blocking 在线程池中并行执行
     let storage_key_owned = *storage_key;
-    let mut join_set = tokio::task::JoinSet::new();
 
-    for ts_path in ts_files {
-        let key = storage_key_owned;
-        join_set.spawn(async move {
+    #[cfg(target_os = "windows")]
+    {
+        let mut encrypted_count = 0usize;
+
+        for ts_path in ts_files {
             let enc_path = ts_path.with_extension("ts.enc");
             match tokio::fs::read(&ts_path).await {
-                Ok(data) => {
-                    // 在阻塞线程池中执行 CPU 密集型加密
-                    let encrypt_result = tokio::task::spawn_blocking(move || {
-                        crate::crypto::aes_encrypt(&key, &data)
-                            .map_err(|e| format!("{}", e))
-                    })
-                    .await;
-
-                    match encrypt_result {
-                        Ok(Ok(encrypted)) => {
-                            if let Err(e) = tokio::fs::write(&enc_path, &encrypted).await {
-                                warn!(
-                                    "Failed to write encrypted segment {:?}: {}",
-                                    enc_path, e
-                                );
-                                return false;
-                            }
-                            // 安全删除原始明文段文件
-                            let _ = tokio::fs::remove_file(&ts_path).await;
-                            true
+                Ok(data) => match chacha_encrypt(&storage_key_owned, &data) {
+                    Ok(encrypted) => {
+                        if let Err(e) = write_file_best_effort(&enc_path, &encrypted).await {
+                            warn!("Failed to write encrypted segment {:?}: {}", enc_path, e);
+                            continue;
                         }
-                        Ok(Err(e)) => {
-                            warn!("Failed to encrypt segment {:?}: {}", ts_path, e);
-                            false
-                        }
-                        Err(e) => {
-                            warn!("Encryption task panicked for {:?}: {}", ts_path, e);
-                            false
-                        }
+                        let _ = remove_file_best_effort(&ts_path).await;
+                        encrypted_count += 1;
                     }
-                }
+                    Err(e) => {
+                        warn!("Failed to encrypt segment {:?}: {}", ts_path, e);
+                    }
+                },
                 Err(e) => {
                     warn!("Failed to read segment {:?}: {}", ts_path, e);
-                    false
                 }
             }
-        });
-    }
-
-    // 收集所有并行加密结果
-    let mut encrypted_count = 0usize;
-    while let Some(result) = join_set.join_next().await {
-        if let Ok(true) = result {
-            encrypted_count += 1;
         }
+
+        if encrypted_count > 0 {
+            info!(
+                "🔒 Encrypted {} segment files at rest in {:?} (windows-safe)",
+                encrypted_count, cache_dir
+            );
+        }
+
+        Ok(encrypted_count)
     }
 
-    if encrypted_count > 0 {
-        info!(
-            "🔒 Encrypted {} segment files at rest in {:?} (parallel)",
-            encrypted_count, cache_dir
-        );
-    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut join_set = tokio::task::JoinSet::new();
 
-    Ok(encrypted_count)
+        for ts_path in ts_files {
+            let key = storage_key_owned;
+            join_set.spawn(async move {
+                let enc_path = ts_path.with_extension("ts.enc");
+                match tokio::fs::read(&ts_path).await {
+                    Ok(data) => {
+                        let encrypt_result = tokio::task::spawn_blocking(move || {
+                            chacha_encrypt(&key, &data).map_err(|e| format!("{}", e))
+                        })
+                        .await;
+
+                        match encrypt_result {
+                            Ok(Ok(encrypted)) => {
+                                if let Err(e) = write_file_best_effort(&enc_path, &encrypted).await
+                                {
+                                    warn!(
+                                        "Failed to write encrypted segment {:?}: {}",
+                                        enc_path, e
+                                    );
+                                    return false;
+                                }
+                                let _ = remove_file_best_effort(&ts_path).await;
+                                true
+                            }
+                            Ok(Err(e)) => {
+                                warn!("Failed to encrypt segment {:?}: {}", ts_path, e);
+                                false
+                            }
+                            Err(e) => {
+                                warn!("Encryption task panicked for {:?}: {}", ts_path, e);
+                                false
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to read segment {:?}: {}", ts_path, e);
+                        false
+                    }
+                }
+            });
+        }
+
+        let mut encrypted_count = 0usize;
+        while let Some(result) = join_set.join_next().await {
+            if let Ok(true) = result {
+                encrypted_count += 1;
+            }
+        }
+
+        if encrypted_count > 0 {
+            info!(
+                "🔒 Encrypted {} segment files at rest in {:?} (parallel)",
+                encrypted_count, cache_dir
+            );
+        }
+
+        Ok(encrypted_count)
+    }
 }
 
 async fn read_segment_data(
@@ -922,7 +1844,7 @@ async fn read_segment_data(
         let encrypted = tokio::fs::read(&enc_path)
             .await
             .map_err(|e| AppError::IoError(format!("Failed to read encrypted segment: {}", e)))?;
-        let data = crate::crypto::aes_decrypt(storage_key, &encrypted)?;
+        let data = chacha_decrypt(storage_key, &encrypted)?;
         return Ok(data);
     }
 
@@ -939,7 +1861,6 @@ async fn read_segment_data(
     )))
 }
 
-/// 运行 ffmpeg 渐进式分片（在后台 task 中执行）
 #[allow(clippy::too_many_arguments)]
 async fn run_ffmpeg_progressive(
     ffmpeg_path: &str,
@@ -951,7 +1872,6 @@ async fn run_ffmpeg_progressive(
     lock_file: &std::path::Path,
     pre_detected_codec: Option<String>,
 ) -> Result<(), String> {
-    // 使用预检测结果避免重复调用 ffprobe
     let video_codec = if pre_detected_codec.is_some() {
         pre_detected_codec
     } else {
@@ -959,44 +1879,36 @@ async fn run_ffmpeg_progressive(
     };
     info!("Detected video codec: {:?}", video_codec);
 
-    // 探测视频开始时间，用于修复 PTS 偏移
     let start_time = detect_video_start_time(ffmpeg_path, file_path).await;
     if start_time > 1.0 {
         info!(
-            "Detected video start_time: {:.3}s — will apply -output_ts_offset to normalize timestamps",
+            "Detected video start_time: {:.3}s �?will apply -output_ts_offset to normalize timestamps",
             start_time
         );
     }
 
-    let allow_stream_copy = matches!(
+    let codec_supports_copy = matches!(
         video_codec.as_deref(),
         Some("h264" | "avc" | "avc1" | "hevc" | "h265" | "hev1" | "hvc1")
     );
+    let allow_stream_copy = codec_supports_copy && allow_stream_copy_for_hls();
 
-    // 构建 stream copy 参数
-    // 关键修复：对于 mpegts 容器必须添加正确的 bitstream filter
-    // 否则 H.264/HEVC 的 NAL 封装格式不正确，导致播放器只有音频没有画面
     let mut copy_args: Vec<String> = vec![
         "-y".into(),
-        // ★ 多核并行：使用所有 CPU 核心进行解复用/复用
         "-threads".into(),
         "0".into(),
-        // ★ PTS 时间戳修复：重新生成 PTS 并丢弃损坏帧
-        // 解决：源文件（如 MKV）内嵌非零 start_time（例如 26:28:10），
-        //       stream copy 直接传递导致 HLS 播放器显示错误的时间戳
         "-fflags".into(),
         "+genpts+discardcorrupt".into(),
         "-i".into(),
         file_path.into(),
         "-map".into(),
-        "0:v?".into(), // 视频流（如果有）
+        "0:v?".into(),
         "-map".into(),
-        "0:a?".into(), // 音频流（如果有）
+        "0:a?".into(),
         "-c".into(),
         "copy".into(),
     ];
 
-    // 根据视频编码添加 bitstream filter — 这是解决黑屏问题的关键
     match video_codec.as_deref() {
         Some("h264" | "avc" | "avc1") => {
             copy_args.extend(["-bsf:v".into(), "h264_mp4toannexb".into()]);
@@ -1007,32 +1919,25 @@ async fn run_ffmpeg_progressive(
             info!("Applied hevc_mp4toannexb bitstream filter for TS muxing");
         }
         _ => {
-            // VP9, AV1 等其他编码不需要 bitstream filter
             info!("No bitstream filter needed for codec: {:?}", video_codec);
         }
     }
 
-    // ★ PTS 偏移修复：如果源文件 start_time > 1s（典型的 MKV 内嵌时间戳偏移），
-    //   通过 -output_ts_offset 将输出时间戳归零，避免播放器显示错误时间（如 26:28:10）
     if start_time > 1.0 {
-        copy_args.extend([
-            "-output_ts_offset".into(),
-            format!("{:.6}", -start_time),
-        ]);
+        copy_args.extend(["-output_ts_offset".into(), format!("{:.6}", -start_time)]);
     }
 
     copy_args.extend([
-        // ★ 将首个 DTS 重置为 0，消除源文件的 start_time 偏移
         "-avoid_negative_ts".into(),
         "make_zero".into(),
         "-f".into(),
         "hls".into(),
         "-hls_time".into(),
-        "2".into(), // 2 秒段提升首帧速度与seek响应
+        "2".into(),
         "-hls_list_size".into(),
         "0".into(),
         "-hls_playlist_type".into(),
-        "event".into(), // event 模式 = 渐进式播放列表
+        "event".into(),
         "-hls_flags".into(),
         "append_list+independent_segments".into(),
         "-hls_segment_type".into(),
@@ -1043,7 +1948,6 @@ async fn run_ffmpeg_progressive(
     ]);
 
     if allow_stream_copy {
-        // 先尝试 stream copy + bitstream filter（极快，不需要转码）
         let output = tokio::process::Command::new(ffmpeg_path)
             .args(&copy_args)
             .stdout(std::process::Stdio::null())
@@ -1056,23 +1960,25 @@ async fn run_ffmpeg_progressive(
             })?;
 
         if output.status.success() {
-            // stream copy 成功 — 添加 #EXT-X-ENDLIST 标记完成
             if let Ok(mut content) = tokio::fs::read_to_string(playlist_path).await {
                 if !content.contains("#EXT-X-ENDLIST") {
                     content.push_str("\n#EXT-X-ENDLIST\n");
-                    let _ = tokio::fs::write(playlist_path, &content).await;
+                    let _ = write_file_best_effort(playlist_path, content.as_bytes()).await;
                 }
             }
 
-            // 使用 SecureFileEncryptor 加密缓存段文件（静态存储保护）
-            let storage_key = derive_segment_storage_key(file_path);
-            match encrypt_segments_at_rest(cache_dir, &storage_key).await {
-                Ok(n) => info!("Stream copy: encrypted {} segments at rest", n),
-                Err(e) => warn!("Failed to encrypt segments at rest: {}", e),
+            if encrypt_hls_cache_at_rest() {
+                let storage_key = derive_segment_storage_key(file_path);
+                match encrypt_segments_at_rest(cache_dir, &storage_key).await {
+                    Ok(n) => info!("Stream copy: encrypted {} segments at rest", n),
+                    Err(e) => warn!("Failed to encrypt segments at rest: {}", e),
+                }
+            } else {
+                info!("Stream copy: HLS cache at-rest encryption disabled for this platform/configuration");
             }
 
-            let _ = tokio::fs::write(done_marker, b"").await;
-            let _ = tokio::fs::remove_file(lock_file).await;
+            let _ = write_file_best_effort(done_marker, b"").await;
+            let _ = remove_file_best_effort(lock_file).await;
             return Ok(());
         }
 
@@ -1083,12 +1989,12 @@ async fn run_ffmpeg_progressive(
         );
     } else {
         info!(
-            "Skipping stream copy for codec {:?}, using H.264/AAC transcode for compatibility",
-            video_codec
+            "Skipping stream copy (codec_supports_copy={}, stream_copy_enabled={}), using fixed-cadence transcode for stable seek/sync",
+            codec_supports_copy,
+            allow_stream_copy_for_hls()
         );
     }
 
-    // 清理出错的输出
     for entry in std::fs::read_dir(cache_dir).into_iter().flatten().flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "ts" || e == "m3u8") {
@@ -1096,26 +2002,27 @@ async fn run_ffmpeg_progressive(
         }
     }
 
-    // 检测硬件加速
     let hw_accel = detect_hardware_acceleration().await;
+    if require_hardware_codec_for_video() && hw_accel == HardwareAccel::None {
+        let _ = remove_file_best_effort(lock_file).await;
+        return Err(
+            "Hardware video codec is required but no supported hardware encoder is available"
+                .to_string(),
+        );
+    }
+    let a311d_profile = is_a311d_device();
 
     let build_transcode_args = |accel: HardwareAccel| {
         let mut args: Vec<String> = vec![
             "-y".into(),
-            // ★ 多核并行：使用所有 CPU 核心进行编解码
             "-threads".into(),
             "0".into(),
-            // ★ PTS 时间戳修复（转码路径）
             "-fflags".into(),
             "+genpts+discardcorrupt".into(),
         ];
 
-        // ★ 输入解码选项（必须在 -i 之前）
-        // -hwaccel auto：自动选择硬件解码器，支持 AV1/VP9 等非 H.264 源的硬件辅助解码
-        // 若硬件不支持（如 ARM 设备不支持 AV1 硬解）则自动回退到 CPU 多线程软解码
         match accel {
             HardwareAccel::Vaapi => {
-                // VAAPI 专用解码管线（需指定设备和输出格式）
                 args.extend([
                     "-hwaccel".into(),
                     "vaapi".into(),
@@ -1132,7 +2039,6 @@ async fn run_ffmpeg_progressive(
 
         args.extend(["-i".into(), file_path.into()]);
 
-        // ★ 输出编码选项
         match accel {
             HardwareAccel::Rkmpp => {
                 info!("Using Rockchip MPP hardware encoding for HLS segmentation");
@@ -1140,9 +2046,31 @@ async fn run_ffmpeg_progressive(
                     "-c:v".into(),
                     "h264_rkmpp".into(),
                     "-b:v".into(),
-                    "3M".into(),
+                    if a311d_profile {
+                        "2600k".into()
+                    } else {
+                        "3M".into()
+                    },
+                    "-maxrate".into(),
+                    if a311d_profile {
+                        "3200k".into()
+                    } else {
+                        "4200k".into()
+                    },
+                    "-bufsize".into(),
+                    if a311d_profile {
+                        "5200k".into()
+                    } else {
+                        "8400k".into()
+                    },
                     "-rc_mode".into(),
-                    "VBR".into(),
+                    if a311d_profile {
+                        "CBR".into()
+                    } else {
+                        "VBR".into()
+                    },
+                    "-g".into(),
+                    "48".into(),
                 ]);
             }
             HardwareAccel::V4l2 => {
@@ -1151,7 +2079,25 @@ async fn run_ffmpeg_progressive(
                     "-c:v".into(),
                     "h264_v4l2m2m".into(),
                     "-b:v".into(),
-                    "2M".into(),
+                    if a311d_profile {
+                        "2200k".into()
+                    } else {
+                        "2M".into()
+                    },
+                    "-maxrate".into(),
+                    if a311d_profile {
+                        "2800k".into()
+                    } else {
+                        "3500k".into()
+                    },
+                    "-bufsize".into(),
+                    if a311d_profile {
+                        "4400k".into()
+                    } else {
+                        "7000k".into()
+                    },
+                    "-g".into(),
+                    "48".into(),
                 ]);
             }
             HardwareAccel::Vaapi => {
@@ -1161,6 +2107,8 @@ async fn run_ffmpeg_progressive(
                     "h264_vaapi".into(),
                     "-qp".into(),
                     "23".into(),
+                    "-g".into(),
+                    "48".into(),
                 ]);
             }
             HardwareAccel::None => {
@@ -1169,14 +2117,37 @@ async fn run_ffmpeg_progressive(
                     "-c:v".into(),
                     "libx264".into(),
                     "-preset".into(),
-                    "ultrafast".into(), // ultrafast 更快输出首个 segment
+                    if a311d_profile {
+                        "superfast".into()
+                    } else {
+                        "veryfast".into()
+                    },
                     "-crf".into(),
-                    "23".into(),
+                    if a311d_profile {
+                        "24".into()
+                    } else {
+                        "22".into()
+                    },
+                    "-x264-params".into(),
+                    "keyint=48:min-keyint=48:scenecut=0".into(),
                     "-pix_fmt".into(),
                     "yuv420p".into(),
                 ]);
             }
         }
+
+        args.extend([
+            "-force_key_frames".into(),
+            "expr:gte(t,n_forced*2)".into(),
+            "-sc_threshold".into(),
+            "0".into(),
+            "-muxpreload".into(),
+            "0".into(),
+            "-muxdelay".into(),
+            "0".into(),
+            "-avoid_negative_ts".into(),
+            "make_zero".into(),
+        ]);
 
         args.extend([
             "-c:a".into(),
@@ -1215,6 +2186,14 @@ async fn run_ffmpeg_progressive(
 
     if !output.status.success() && hw_accel != HardwareAccel::None {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if require_hardware_codec_for_video() {
+            let _ = remove_file_best_effort(lock_file).await;
+            return Err(format!(
+                "Hardware transcode failed with strict hardware policy enabled: {}",
+                &stderr[..stderr.len().min(500)]
+            ));
+        }
+
         warn!(
             "Hardware transcode failed ({:?}), retrying with software libx264: {}",
             hw_accel,
@@ -1239,41 +2218,36 @@ async fn run_ffmpeg_progressive(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = tokio::fs::remove_file(lock_file).await;
+        let _ = remove_file_best_effort(lock_file).await;
         return Err(format!(
             "FFmpeg segmentation failed: {}",
             &stderr[..stderr.len().min(500)]
         ));
     }
 
-    // 标记完成
     if let Ok(mut content) = tokio::fs::read_to_string(playlist_path).await {
         if !content.contains("#EXT-X-ENDLIST") {
             content.push_str("\n#EXT-X-ENDLIST\n");
-            let _ = tokio::fs::write(playlist_path, &content).await;
+            let _ = write_file_best_effort(playlist_path, content.as_bytes()).await;
         }
     }
 
-    // 使用 SecureFileEncryptor 加密缓存段文件（静态存储保护）
-    let storage_key = derive_segment_storage_key(file_path);
-    match encrypt_segments_at_rest(cache_dir, &storage_key).await {
-        Ok(n) => info!("Transcode: encrypted {} segments at rest", n),
-        Err(e) => warn!("Failed to encrypt segments at rest: {}", e),
+    if encrypt_hls_cache_at_rest() {
+        let storage_key = derive_segment_storage_key(file_path);
+        match encrypt_segments_at_rest(cache_dir, &storage_key).await {
+            Ok(n) => info!("Transcode: encrypted {} segments at rest", n),
+            Err(e) => warn!("Failed to encrypt segments at rest: {}", e),
+        }
+    } else {
+        info!("Transcode: HLS cache at-rest encryption disabled for this platform/configuration");
     }
 
-    let _ = tokio::fs::write(done_marker, b"").await;
-    let _ = tokio::fs::remove_file(lock_file).await;
+    let _ = write_file_best_effort(done_marker, b"").await;
+    let _ = remove_file_best_effort(lock_file).await;
 
     Ok(())
 }
 
-/// 按需生成单个 HLS 分片（用于 seek 场景）
-///
-/// 当播放器 seek 到视频远处、但 ffmpeg 渐进式转码尚未到达请求的分片时，
-/// 使用 `-ss` 直接跳转到目标时间戳，单独生成该分片。
-/// 这避免了等待全部前序分片生成完成的漫长延迟，极大改善 seek 体验。
-///
-/// 生成的分片会同样进行静态加密（AES-256-GCM）以保持一致的安全策略。
 async fn generate_segment_on_demand(
     file_path: &str,
     cache_dir: &std::path::Path,
@@ -1282,7 +2256,6 @@ async fn generate_segment_on_demand(
 ) -> Result<(), String> {
     let segment_path = cache_dir.join(format!("segment_{}.ts", segment_index));
 
-    // 如果分片已存在（明文或密文），直接返回
     if segment_path.exists() || segment_path.with_extension("ts.enc").exists() {
         return Ok(());
     }
@@ -1293,105 +2266,189 @@ async fn generate_segment_on_demand(
 
     let start_time = segment_index as f64 * segment_duration;
     let seg_path_str = segment_path.to_string_lossy().to_string();
+    let source_start_time = detect_video_start_time(&ffmpeg_path, file_path).await;
 
     info!(
         "🎯 On-demand segment generation: segment_{}.ts (seek to {:.1}s)",
         segment_index, start_time
     );
 
-    // 检测硬件加速，优先使用硬件编码器
+    if source_start_time > 1.0 {
+        info!(
+            "Detected video start_time: {:.3}s for on-demand segment generation, applying -output_ts_offset",
+            source_start_time
+        );
+    }
+
+    let video_codec = detect_video_codec(&ffmpeg_path, file_path).await;
+    let _ = video_codec;
+
     let hw_accel = detect_hardware_acceleration().await;
-
-    let mut args: Vec<String> = vec![
-        "-y".into(),
-        // ★ 多核并行：使用所有 CPU 核心
-        "-threads".into(),
-        "0".into(),
-        // ★ PTS 时间戳修复（按需分片路径）
-        "-fflags".into(),
-        "+genpts+discardcorrupt".into(),
-        "-ss".into(),
-        format!("{:.3}", start_time),
-    ];
-
-    // ★ 输入解码加速（必须在 -i 之前）— 支持 AV1/VP9 等编码的硬件辅助解码
-    match hw_accel {
-        HardwareAccel::Vaapi => {
-            args.extend([
-                "-hwaccel".into(),
-                "vaapi".into(),
-                "-hwaccel_device".into(),
-                "/dev/dri/renderD128".into(),
-                "-hwaccel_output_format".into(),
-                "vaapi".into(),
-            ]);
-        }
-        _ => {
-            args.extend(["-hwaccel".into(), "auto".into()]);
-        }
+    if require_hardware_codec_for_video() && hw_accel == HardwareAccel::None {
+        return Err(
+            "Hardware video codec is required but no supported hardware encoder is available for on-demand segment generation".to_string(),
+        );
     }
+    let a311d_profile = is_a311d_device();
 
-    args.extend([
-        "-i".into(),
-        file_path.into(),
-        "-t".into(),
-        format!("{:.3}", segment_duration + 0.1),
-    ]);
+    let build_on_demand_transcode_args = |accel: HardwareAccel| -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "-y".into(),
+            "-threads".into(),
+            "0".into(),
+            "-fflags".into(),
+            "+genpts+discardcorrupt".into(),
+        ];
 
-    // ★ 输出编码选项
-    match hw_accel {
-        HardwareAccel::Rkmpp => {
-            args.extend([
-                "-c:v".into(),
-                "h264_rkmpp".into(),
-                "-b:v".into(),
-                "3M".into(),
-            ]);
+        match accel {
+            HardwareAccel::Vaapi => {
+                args.extend([
+                    "-hwaccel".into(),
+                    "vaapi".into(),
+                    "-hwaccel_device".into(),
+                    "/dev/dri/renderD128".into(),
+                    "-hwaccel_output_format".into(),
+                    "vaapi".into(),
+                ]);
+            }
+            _ => {
+                args.extend(["-hwaccel".into(), "auto".into()]);
+            }
         }
-        HardwareAccel::V4l2 => {
-            args.extend([
-                "-c:v".into(),
-                "h264_v4l2m2m".into(),
-                "-b:v".into(),
-                "2M".into(),
-            ]);
-        }
-        HardwareAccel::Vaapi => {
-            args.extend([
-                "-c:v".into(),
-                "h264_vaapi".into(),
-                "-qp".into(),
-                "23".into(),
-            ]);
-        }
-        HardwareAccel::None => {
-            args.extend([
-                "-c:v".into(),
-                "libx264".into(),
-                "-preset".into(),
-                "ultrafast".into(),
-                "-crf".into(),
-                "23".into(),
-                "-pix_fmt".into(),
-                "yuv420p".into(),
-            ]);
-        }
-    }
 
-    args.extend([
-        "-c:a".into(),
-        "aac".into(),
-        "-b:a".into(),
-        "128k".into(),
-        "-ac".into(),
-        "2".into(),
-        "-f".into(),
-        "mpegts".into(),
-        seg_path_str.clone(),
-    ]);
+        args.extend([
+            "-i".into(),
+            file_path.into(),
+            "-ss".into(),
+            format!("{:.3}", start_time),
+            "-t".into(),
+            format!("{:.3}", segment_duration),
+        ]);
+
+        if source_start_time > 1.0 {
+            args.extend([
+                "-output_ts_offset".into(),
+                format!("{:.6}", -source_start_time),
+            ]);
+        }
+
+        match accel {
+            HardwareAccel::Rkmpp => {
+                args.extend([
+                    "-c:v".into(),
+                    "h264_rkmpp".into(),
+                    "-b:v".into(),
+                    if a311d_profile {
+                        "2600k".into()
+                    } else {
+                        "3M".into()
+                    },
+                    "-maxrate".into(),
+                    if a311d_profile {
+                        "3200k".into()
+                    } else {
+                        "4200k".into()
+                    },
+                    "-bufsize".into(),
+                    if a311d_profile {
+                        "5200k".into()
+                    } else {
+                        "8400k".into()
+                    },
+                    "-g".into(),
+                    "48".into(),
+                ]);
+            }
+            HardwareAccel::V4l2 => {
+                args.extend([
+                    "-c:v".into(),
+                    "h264_v4l2m2m".into(),
+                    "-b:v".into(),
+                    if a311d_profile {
+                        "2200k".into()
+                    } else {
+                        "2M".into()
+                    },
+                    "-maxrate".into(),
+                    if a311d_profile {
+                        "2800k".into()
+                    } else {
+                        "3500k".into()
+                    },
+                    "-bufsize".into(),
+                    if a311d_profile {
+                        "4400k".into()
+                    } else {
+                        "7000k".into()
+                    },
+                    "-g".into(),
+                    "48".into(),
+                ]);
+            }
+            HardwareAccel::Vaapi => {
+                args.extend([
+                    "-c:v".into(),
+                    "h264_vaapi".into(),
+                    "-qp".into(),
+                    "23".into(),
+                    "-g".into(),
+                    "48".into(),
+                ]);
+            }
+            HardwareAccel::None => {
+                args.extend([
+                    "-c:v".into(),
+                    "libx264".into(),
+                    "-preset".into(),
+                    if a311d_profile {
+                        "superfast".into()
+                    } else {
+                        "veryfast".into()
+                    },
+                    "-crf".into(),
+                    if a311d_profile {
+                        "24".into()
+                    } else {
+                        "22".into()
+                    },
+                    "-x264-params".into(),
+                    "keyint=48:min-keyint=48:scenecut=0".into(),
+                    "-pix_fmt".into(),
+                    "yuv420p".into(),
+                ]);
+            }
+        }
+
+        args.extend([
+            "-force_key_frames".into(),
+            "expr:gte(t,n_forced*2)".into(),
+            "-sc_threshold".into(),
+            "0".into(),
+            "-muxpreload".into(),
+            "0".into(),
+            "-muxdelay".into(),
+            "0".into(),
+            "-avoid_negative_ts".into(),
+            "make_zero".into(),
+        ]);
+
+        args.extend([
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "128k".into(),
+            "-ac".into(),
+            "2".into(),
+            "-f".into(),
+            "mpegts".into(),
+            seg_path_str.clone(),
+        ]);
+
+        args
+    };
 
     let output = tokio::process::Command::new(&ffmpeg_path)
-        .args(&args)
+        .args(build_on_demand_transcode_args(hw_accel))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -1399,50 +2456,23 @@ async fn generate_segment_on_demand(
         .map_err(|e| format!("On-demand segment generation failed: {}", e))?;
 
     if !output.status.success() {
-        // 硬件编码失败时使用软件回退
         if hw_accel != HardwareAccel::None {
+            if require_hardware_codec_for_video() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!(
+                    "Hardware on-demand encode failed with strict hardware policy enabled: {}",
+                    &stderr[..stderr.len().min(500)]
+                ));
+            }
+
             warn!(
                 "Hardware on-demand encode failed ({:?}), retrying with software libx264",
                 hw_accel
             );
-            let fallback_args = vec![
-                "-y".into(),
-                // ★ 多核并行 + 软件回退路径
-                "-threads".into(),
-                "0".into(),
-                // ★ PTS 时间戳修复（软件回退路径）
-                "-fflags".into(),
-                "+genpts+discardcorrupt".into(),
-                "-ss".into(),
-                format!("{:.3}", start_time),
-                // ★ 自动硬件辅助解码（AV1/VP9 输入支持）
-                "-hwaccel".into(),
-                "auto".into(),
-                "-i".into(),
-                file_path.into(),
-                "-t".into(),
-                format!("{:.3}", segment_duration + 0.1),
-                "-c:v".into(),
-                "libx264".into(),
-                "-preset".into(),
-                "ultrafast".into(),
-                "-crf".into(),
-                "23".into(),
-                "-pix_fmt".into(),
-                "yuv420p".into(),
-                "-c:a".into(),
-                "aac".into(),
-                "-b:a".into(),
-                "128k".into(),
-                "-ac".into(),
-                "2".into(),
-                "-f".into(),
-                "mpegts".into(),
-                seg_path_str,
-            ];
+            let _ = remove_file_best_effort(&segment_path).await;
 
             let fallback_output = tokio::process::Command::new(&ffmpeg_path)
-                .args(&fallback_args)
+                .args(build_on_demand_transcode_args(HardwareAccel::None))
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
                 .output()
@@ -1465,28 +2495,64 @@ async fn generate_segment_on_demand(
         }
     }
 
-    // 对按需生成的分片同样进行静态加密
-    let storage_key = derive_segment_storage_key(file_path);
-    if let Ok(data) = tokio::fs::read(&segment_path).await {
-        if let Ok(encrypted) = crate::crypto::aes_encrypt(&storage_key, &data) {
-            let enc_path = segment_path.with_extension("ts.enc");
-            if tokio::fs::write(&enc_path, &encrypted).await.is_ok() {
-                let _ = tokio::fs::remove_file(&segment_path).await;
-            }
-        }
-    }
+    encrypt_on_demand_segment(&segment_path, file_path).await?;
 
     info!(
-        "✅ On-demand segment_{}.ts generated and encrypted",
+        "�?On-demand segment_{}.ts generated (transcode) and encrypted",
         segment_index
     );
     Ok(())
 }
 
-/// 使用 ffprobe 获取视频文件的总时长（秒）
-///
-/// 用于生成覆盖全时长的虚拟 VOD 播放列表，使播放器可以 seek 到任何位置。
-/// 结果缓存到 `.duration` 文件中，避免重复调用 ffprobe。
+async fn encrypt_on_demand_segment(
+    segment_path: &std::path::Path,
+    file_path: &str,
+) -> Result<(), String> {
+    let storage_key = derive_segment_storage_key(file_path);
+    let enc_path = segment_path.with_extension("ts.enc");
+
+    let data = match tokio::fs::read(segment_path).await {
+        Ok(data) => data,
+        Err(e) => {
+            let _ = remove_file_best_effort(&enc_path).await;
+            let _ = remove_file_best_effort(segment_path).await;
+            return Err(format!(
+                "Failed to read on-demand segment for encryption: {}",
+                e
+            ));
+        }
+    };
+
+    let encrypted = match chacha_encrypt(&storage_key, &data) {
+        Ok(encrypted) => encrypted,
+        Err(e) => {
+            let _ = remove_file_best_effort(&enc_path).await;
+            let _ = remove_file_best_effort(segment_path).await;
+            return Err(format!("Failed to encrypt on-demand segment: {}", e));
+        }
+    };
+
+    if let Err(e) = write_file_best_effort(&enc_path, &encrypted).await {
+        let _ = remove_file_best_effort(&enc_path).await;
+        let _ = remove_file_best_effort(segment_path).await;
+        return Err(format!(
+            "Failed to write encrypted on-demand segment: {}",
+            e
+        ));
+    }
+
+    if let Err(e) = remove_file_best_effort(segment_path).await {
+        let _ = remove_file_best_effort(&enc_path).await;
+        let _ = remove_file_best_effort(segment_path).await;
+        return Err(format!(
+            "Failed to remove plaintext on-demand segment: {}",
+            e
+        ));
+    }
+
+    Ok(())
+}
+
 async fn get_video_duration(ffmpeg_path: &str, file_path: &str) -> Option<f64> {
     let ffprobe_path = get_ffprobe_path(ffmpeg_path).await;
 
@@ -1512,15 +2578,8 @@ async fn get_video_duration(ffmpeg_path: &str, file_path: &str) -> Option<f64> {
     }
 }
 
-/// 生成覆盖完整视频时长的 VOD 播放列表
-///
-/// 渐进式 HLS 的 ffmpeg playlist 仅列出已生成的分片，导致播放器无法 seek 到
-/// 尚未生成的位置。此函数生成一个列出所有分片的完整 VOD playlist，使播放器
-/// 可以 seek 到任何位置。当播放器请求尚未生成的分片时，`get_segment_direct`
-/// 会调用 `generate_segment_on_demand` 按需生成。
 fn generate_complete_vod_playlist(total_duration: f64, segment_duration: f64) -> String {
     let total_segments = (total_duration / segment_duration).ceil() as usize;
-    // 实际 target duration 向上取整（HLS 规范要求 TARGETDURATION ≥ 所有 EXTINF）
     let target_duration = segment_duration.ceil() as u64;
 
     let mut playlist = String::with_capacity(total_segments * 40 + 200);
@@ -1533,7 +2592,6 @@ fn generate_complete_vod_playlist(total_duration: f64, segment_duration: f64) ->
 
     for i in 0..total_segments {
         let dur = if i == total_segments - 1 {
-            // 最后一个分片可能短于标准时长
             let remaining = total_duration - (i as f64 * segment_duration);
             if remaining > 0.001 {
                 remaining
@@ -1551,18 +2609,13 @@ fn generate_complete_vod_playlist(total_duration: f64, segment_duration: f64) ->
     playlist
 }
 
-/// 获取 HLS 播放列表（基于 ffmpeg 生成的真实分片）
-///
-/// 不需要 JWT 认证 — session_id 本身就是鉴权 token（创建时已验证 JWT + SAE）。
-/// 首次请求时自动触发 ffmpeg 分片（优先 stream copy）。
-///
-/// ★ Seek 优化：当视频仍在渐进式分片时，返回覆盖全时长的虚拟 VOD 播放列表，
-/// 使播放器可以 seek 到任何位置（尚未生成的分片会被 get_segment_direct 按需生成）。
 pub async fn get_secure_playlist(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     path: web::Path<String>,
 ) -> Result<impl Responder, AppError> {
     let session_id = path.into_inner();
+    let user_id = claims.sub.clone();
 
     info!(
         "📋 Playlist request for session: {} (len={})",
@@ -1570,11 +2623,9 @@ pub async fn get_secure_playlist(
         session_id.len()
     );
 
-    // 验证会话并获取文件路径（然后释放读锁）
     let file_path = {
         let manager = hls_manager.read().await;
 
-        // Debug: list active sessions
         let sessions = manager.sessions.lock().unwrap();
         let active_count = sessions.len();
         let known_ids: Vec<String> = sessions.keys().cloned().collect();
@@ -1589,38 +2640,41 @@ pub async fn get_secure_playlist(
         let session = manager
             .get_session(&session_id)
             .map_err(convert_hls_error)?;
+        ensure_session_belongs_to_user(&session, &user_id)?;
         session.file_path.clone()
     };
 
-    // 确保 HLS 分片存在（首次会触发 ffmpeg 分片）
-    let (_cache_dir, playlist_content) = ensure_hls_segments(&file_path).await?;
+    let ensured = ensure_hls_segments(&file_path, Some(&session_id)).await;
 
-    // ★ 关键优化：渐进式 HLS 的 playlist 仅列出已生成的分片，
-    //   导致播放器无法 seek 到尚未生成的位置（超出 ffmpeg 当前进度）。
-    //   解决方案：当视频仍在分片时，返回覆盖全时长的虚拟 VOD playlist。
-    //   播放器因此可以 seek 到任何位置；当它请求尚未生成的分片时，
-    //   get_segment_direct 会自动调用 generate_segment_on_demand 按需生成。
-    let final_content = if playlist_content.contains("#EXT-X-ENDLIST") {
-        // 分片已全部完成 — 使用 ffmpeg 生成的真实 playlist（时长精确）
+    let (cache_dir, playlist_content, no_disk_mode) = match ensured {
+        Ok((cache_dir, content)) => (Some(cache_dir), content, false),
+        Err(AppError::PreconditionFailed(msg)) => {
+            warn!(
+                "External cache unavailable for session {}, using no-disk virtual playlist: {}",
+                session_id, msg
+            );
+            (None, String::new(), true)
+        }
+        Err(e) => return Err(e),
+    };
+
+    let final_content = if !no_disk_mode && playlist_content.contains("#EXT-X-ENDLIST") {
         playlist_content
     } else {
-        // 视频仍在转码中 — 尝试生成覆盖全时长的虚拟 VOD playlist
-        let duration_file = _cache_dir.join(".duration");
-        let duration = if duration_file.exists() {
-            // 优先使用缓存的时长（避免重复调用 ffprobe）
-            tokio::fs::read_to_string(&duration_file)
+        let duration_file = cache_dir.as_ref().map(|d| d.join(".duration"));
+        let duration = if duration_file.as_ref().is_some_and(|p| p.exists()) {
+            tokio::fs::read_to_string(duration_file.as_ref().unwrap())
                 .await
                 .ok()
                 .and_then(|s| s.trim().parse::<f64>().ok())
                 .filter(|&d| d > 0.0)
         } else {
-            // 首次：通过 ffprobe 获取时长并缓存
             let ffmpeg_path = std::env::var("FFMPEG_PATH")
                 .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
                 .unwrap_or_else(|_| "ffmpeg".to_string());
             let dur = get_video_duration(&ffmpeg_path, &file_path).await;
-            if let Some(d) = dur {
-                let _ = tokio::fs::write(&duration_file, format!("{:.6}", d)).await;
+            if let (Some(d), Some(duration_file)) = (dur, duration_file.as_ref()) {
+                let _ = write_file_best_effort(duration_file, format!("{:.6}", d)).await;
             }
             dur
         };
@@ -1635,12 +2689,24 @@ pub async fn get_secure_playlist(
                 generate_complete_vod_playlist(d, 2.0)
             }
             None => {
-                // 无法获取时长 — 回退使用 ffmpeg 渐进式 playlist（seek 受限但不影响播放）
-                warn!("📋 Cannot determine video duration, falling back to progressive playlist");
-                playlist_content
+                if no_disk_mode {
+                    warn!("📋 Cannot determine duration in no-disk mode, using short fallback playlist");
+                    generate_complete_vod_playlist(1800.0, 2.0)
+                } else {
+                    warn!(
+                        "📋 Cannot determine video duration, using bounded fallback VOD playlist"
+                    );
+                    generate_complete_vod_playlist(1800.0, 2.0)
+                }
             }
         }
     };
+
+    if let Some(cache_dir) = cache_dir.as_ref() {
+        touch_cache_access(cache_dir).await;
+    }
+
+    set_session_no_disk_mode(&session_id, no_disk_mode);
 
     info!(
         "📋 Serving playlist for session {} ({})",
@@ -1737,24 +2803,14 @@ async fn wait_for_segment_ready(
     Ok(segment_path.exists() || enc_path.exists())
 }
 
-/// 直接获取视频段（GET，session 鉴权）
-///
-/// 标准 HLS 播放器可以直接 GET 请求获取视频段。
-/// 安全性由 session_id（随机 UUID）保证：
-/// - 创建 session 时已验证 JWT + SAE 握手
-/// - session_id 是 128 位随机值，不可猜测
-/// - session 有 3 小时过期时间
-/// - 磁盘上的段文件也使用 encrypt_file 进行静态加密（defense in depth）
-///
-/// 当 session.direct_mode == true 时，返回明文视频段（适合 ARM 等低性能设备）。
-/// 当 session.direct_mode == false 时，返回 AES-256-GCM 加密的视频段。
 pub async fn get_segment_direct(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     path: web::Path<(String, String)>,
 ) -> Result<impl Responder, AppError> {
     let (session_id, segment_name) = path.into_inner();
+    let user_id = claims.sub.clone();
 
-    // 验证段名称格式
     if !segment_name.ends_with(".ts") {
         return Err(AppError::BadRequest(format!(
             "Invalid segment name: '{}'",
@@ -1762,236 +2818,151 @@ pub async fn get_segment_direct(
         )));
     }
 
-    // 先读取会话必要数据，避免在 await 期间持有 RwLock 读锁
-    let (file_path, is_direct_mode) = {
+    let file_path = {
         let manager = hls_manager.read().await;
         let session = manager
             .get_session(&session_id)
             .map_err(convert_hls_error)?;
-        (session.file_path.clone(), session.direct_mode)
+        ensure_session_belongs_to_user(&session, &user_id)?;
+        session.file_path.clone()
     };
 
-    // 构建缓存路径
-    let video_hash = blake3::hash(file_path.as_bytes());
-    let video_id = hex::encode(&video_hash.as_bytes()[..8]);
-    let cache_dir = get_hls_cache_dir().join(&video_id);
+    let video_id = blake3_hex8(file_path.as_bytes());
+    let cache_dir = match resolve_session_cache_dir(&file_path, Some(&session_id)) {
+        Ok(dir) => {
+            set_session_cache_dir(&session_id, dir.clone());
+            Some(dir)
+        }
+        Err(AppError::PreconditionFailed(msg)) => {
+            warn_no_disk_fallback_once(Some(&session_id), &segment_name);
+            warn!(
+                "Session {} cannot use disk cache for segment {}: {}",
+                session_id, segment_name, msg
+            );
+            None
+        }
+        Err(e) => return Err(e),
+    };
+
+    if cache_dir.is_none() {
+        if let Some(idx) = parse_segment_index_from_name(&segment_name) {
+            prewarm_no_disk_segments(file_path.clone(), session_id.clone(), idx);
+        }
+
+        let segment_data =
+            read_video_segment_from_ffmpeg(&file_path, &segment_name, Some(&session_id)).await?;
+
+        let manager = hls_manager.read().await;
+        let session = manager
+            .get_session(&session_id)
+            .map_err(convert_hls_error)?;
+        ensure_session_belongs_to_user(&session, &user_id)?;
+        let encrypted_data = session
+            .encrypt_segment(&segment_data)
+            .map_err(convert_hls_error)?;
+
+        return Ok(HttpResponse::Ok()
+            .content_type("application/octet-stream")
+            .insert_header(("X-Encrypted", "true"))
+            .insert_header(("X-Encryption-Method", "ChaCha20-Poly1305"))
+            .insert_header(("X-Key-Exchange", "WPA3-SAE"))
+            .insert_header(("X-Integrity", "Poly1305"))
+            .insert_header(("X-No-Disk-Mode", "true"))
+            .insert_header(("Content-Length", encrypted_data.len()))
+            .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
+            .insert_header(("Access-Control-Allow-Origin", "*"))
+            .body(encrypted_data));
+    }
+
+    let cache_dir = cache_dir.expect("checked above");
     let segment_path = cache_dir.join(&segment_name);
     let enc_path = segment_path.with_extension("ts.enc");
 
-    // 渐进式模式下，段文件可能在 playlist 暴露后短时间内尚未落盘。
-    // 这里进行有限等待，避免播放器被 404 打断。
-    //
-    // ★ Seek 优化：当请求的分片远超当前 ffmpeg 进度时（seek 场景），
-    //   跳过初始等待，立即尝试按需生成，大幅减少 seek 延迟。
     if !segment_path.exists() && !enc_path.exists() {
-        ensure_hls_segments(&file_path).await?;
+        ensure_hls_segments(&file_path, Some(&session_id)).await?;
 
         let done_marker = cache_dir.join(".done");
         let target_idx = parse_segment_index(&segment_name);
         let current_max = get_max_existing_segment_index(&cache_dir);
 
-        // 判断是否为远距离 seek：目标分片远超当前渐进式转码进度
-        let is_far_ahead_seek = !done_marker.exists()
-            && target_idx
-                .map(|idx| idx > current_max.unwrap_or(0) + 5)
-                .unwrap_or(false);
-
-        if is_far_ahead_seek {
-            // ★ 远距离 seek：跳过等待，立即按需生成目标分片
-            let idx = target_idx.unwrap();
+        if let Some(idx) = target_idx {
             let max = current_max.unwrap_or(0);
             info!(
-                "🎯 Far-ahead seek detected: segment_{} requested (current max={}), generating on-demand immediately",
+                "🎯 Missing segment request: segment_{} (current max={}), generating on-demand",
                 idx, max
             );
-            match generate_segment_on_demand(&file_path, &cache_dir, idx, 2.0).await {
-                Ok(()) => {
-                    info!("🎯 On-demand segment_{} ready, serving", idx);
-                }
-                Err(e) => {
-                    warn!(
-                        "On-demand generation failed for segment_{}: {}",
-                        idx, e
-                    );
-                    // 按需失败 — 回退等待顺序生成
-                    let ready =
-                        wait_for_segment_ready(&cache_dir, &segment_name, 45_000).await?;
-                    if !ready {
-                        return Ok(HttpResponse::ServiceUnavailable()
-                            .insert_header(("Retry-After", "3"))
-                            .insert_header((
-                                "Cache-Control",
-                                "no-cache, no-store, must-revalidate",
-                            ))
-                            .insert_header(("Access-Control-Allow-Origin", "*"))
-                            .body(format!(
-                                "Segment '{}' is still being generated, please retry",
-                                segment_name
-                            )));
-                    }
-                }
+            if let Err(e) = generate_segment_on_demand(&file_path, &cache_dir, idx, 2.0).await {
+                warn!("On-demand generation failed for segment_{}: {}", idx, e);
             }
-        } else {
-            // 顺序播放或近邻分片：正常等待 ffmpeg 渐进式生成
-            let ready =
-                wait_for_segment_ready(&cache_dir, &segment_name, 15_000).await?;
-            if !ready {
-                if done_marker.exists() {
-                    let max_str = current_max
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    return Err(AppError::NotFound(format!(
-                        "Segment '{}' not available (video_id={}, max_generated={})",
-                        segment_name, video_id, max_str
-                    )));
-                }
+        }
 
-                if let Some(idx) = target_idx {
-                    let max = current_max.unwrap_or(0);
-                    if idx > max + 5 {
-                        // 在初始等待期间，ffmpeg 进度可能仍未达到 — 尝试按需生成
-                        info!(
-                            "🎯 Segment_{} still not ready after initial wait (max={}), trying on-demand",
-                            idx, max
-                        );
-                        match generate_segment_on_demand(&file_path, &cache_dir, idx, 2.0).await {
-                            Ok(()) => {
-                                info!("🎯 On-demand segment_{} ready, serving", idx);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "On-demand generation failed for segment_{}: {}",
-                                    idx, e
-                                );
-                                let ready2 = wait_for_segment_ready(
-                                    &cache_dir,
-                                    &segment_name,
-                                    30_000,
-                                )
-                                .await?;
-                                if !ready2 {
-                                    return Ok(HttpResponse::ServiceUnavailable()
-                                        .insert_header(("Retry-After", "3"))
-                                        .insert_header((
-                                            "Cache-Control",
-                                            "no-cache, no-store, must-revalidate",
-                                        ))
-                                        .insert_header(("Access-Control-Allow-Origin", "*"))
-                                        .body(format!(
-                                            "Segment '{}' is still being generated, please retry",
-                                            segment_name
-                                        )));
-                                }
-                            }
-                        }
-                    } else {
-                        // 近邻分片：继续等待顺序生成
-                        let ready2 = wait_for_segment_ready(
-                            &cache_dir,
-                            &segment_name,
-                            30_000,
-                        )
-                        .await?;
-                        if !ready2 {
-                            return Ok(HttpResponse::ServiceUnavailable()
-                                .insert_header(("Retry-After", "2"))
-                                .insert_header((
-                                    "Cache-Control",
-                                    "no-cache, no-store, must-revalidate",
-                                ))
-                                .insert_header(("Access-Control-Allow-Origin", "*"))
-                                .body(format!(
-                                    "Segment '{}' is still being generated, please retry",
-                                    segment_name
-                                )));
-                        }
-                    }
-                } else {
-                    return Ok(HttpResponse::ServiceUnavailable()
-                        .insert_header(("Retry-After", "2"))
-                        .insert_header((
-                            "Cache-Control",
-                            "no-cache, no-store, must-revalidate",
-                        ))
-                        .insert_header(("Access-Control-Allow-Origin", "*"))
-                        .body(format!(
-                            "Segment '{}' is still being generated, please retry",
-                            segment_name
-                        )));
-                }
+        let ready = wait_for_segment_ready(&cache_dir, &segment_name, 60_000).await?;
+        if !ready {
+            if done_marker.exists() {
+                let max_str = current_max
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                return Err(AppError::NotFound(format!(
+                    "Segment '{}' not available (video_id={}, max_generated={})",
+                    segment_name, video_id, max_str
+                )));
             }
+
+            return Ok(HttpResponse::ServiceUnavailable()
+                .insert_header(("Retry-After", "1"))
+                .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
+                .insert_header(("Access-Control-Allow-Origin", "*"))
+                .body(format!(
+                    "Segment '{}' is still being generated, please retry",
+                    segment_name
+                )));
         }
     }
 
     let storage_key = derive_segment_storage_key(&file_path);
     let segment_data = read_segment_data(&segment_path, &storage_key).await?;
 
-    let response_data = if is_direct_mode {
-        segment_data
-    } else {
-        let manager = hls_manager.read().await;
-        let session = manager
-            .get_session(&session_id)
-            .map_err(convert_hls_error)?;
-        session.encrypt_segment(&segment_data).map_err(convert_hls_error)?
-    };
+    touch_cache_access(&cache_dir).await;
 
-    if is_direct_mode {
-        info!(
-            "📺 Serving plaintext segment {} for session {} ({} bytes)",
-            segment_name,
-            session_id,
-            response_data.len()
-        );
+    let manager = hls_manager.read().await;
+    let session = manager
+        .get_session(&session_id)
+        .map_err(convert_hls_error)?;
+    ensure_session_belongs_to_user(&session, &user_id)?;
+    let encrypted_data = session
+        .encrypt_segment(&segment_data)
+        .map_err(convert_hls_error)?;
 
-        Ok(HttpResponse::Ok()
-            .content_type("video/mp2t")
-            .insert_header(("X-Encrypted", "false"))
-            .insert_header(("Content-Length", response_data.len()))
-            .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
-            .insert_header(("Access-Control-Allow-Origin", "*"))
-            .body(response_data))
-    } else {
-        info!(
-            "🔒 Serving encrypted segment {} for session {} ({} bytes)",
-            segment_name,
-            session_id,
-            response_data.len()
-        );
+    info!(
+        "🔒 Serving ChaCha20-Poly1305 encrypted segment {} for session {} (plain: {} bytes, encrypted: {} bytes)",
+        segment_name,
+        session_id,
+        segment_data.len(),
+        encrypted_data.len()
+    );
 
-        Ok(HttpResponse::Ok()
-            .content_type("video/mp2t")
-            .insert_header(("X-Encrypted", "true"))
-            .insert_header(("X-Encryption-Method", "AES-256-GCM"))
-            .insert_header(("Content-Length", response_data.len()))
-            .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
-            .insert_header(("Access-Control-Allow-Origin", "*"))
-            .body(response_data))
-    }
+    Ok(HttpResponse::Ok()
+        .content_type("application/octet-stream")
+        .insert_header(("X-Encrypted", "true"))
+        .insert_header(("X-Encryption-Method", "ChaCha20-Poly1305"))
+        .insert_header(("X-Key-Exchange", "WPA3-SAE"))
+        .insert_header(("X-Integrity", "Poly1305"))
+        .insert_header(("X-No-Disk-Mode", "false"))
+        .insert_header(("Content-Length", encrypted_data.len()))
+        .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
+        .insert_header(("Access-Control-Allow-Origin", "*"))
+        .body(encrypted_data))
 }
 
-/// 获取加密的 TS 段（需要 ZKP 证明）
-///
-/// **生产级安全实现**：
-/// - 仅支持 POST 请求 + JSON body
-/// - 必须提供有效的 ZKP 证明
-/// - 验证会话有效性
-/// - 验证 ZKP 证明的时间戳和 nonce
-/// - 使用 AES-256-GCM 加密视频段
-///
-/// # 安全流程
-/// 1. 验证 HTTP 方法（必须是 POST）
-/// 2. 验证会话存在且未过期
-/// 3. 解析并验证 ZKP 证明
-/// 4. 读取并加密视频段
-/// 5. 返回加密数据
 pub async fn get_secure_segment(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     path: web::Path<(String, String)>,
     req: actix_web::HttpRequest,
     body: web::Bytes,
 ) -> Result<impl Responder, AppError> {
     let (session_id, segment_name) = path.into_inner();
+    let user_id = claims.sub.clone();
 
     if req.method() != actix_web::http::Method::POST {
         warn!(
@@ -2003,61 +2974,117 @@ pub async fn get_secure_segment(
         ));
     }
 
-    // 2. 解析 JSON body
     let segment_request: SecureSegmentRequest = serde_json::from_slice(&body).map_err(|e| {
         warn!("Failed to parse segment request body: {}", e);
         AppError::BadRequest(format!("Invalid JSON body: {}", e))
     })?;
 
     info!(
-        "Secure segment request: session={}, segment={}, zkp_proof_len={}",
+        "Secure segment request: session={}, segment={}, has_ticket={}, zkp_proof_len={}",
         session_id,
         segment_name,
-        segment_request.zkp_proof.len()
+        segment_request
+            .zkp_ticket
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false),
+        segment_request
+            .zkp_proof
+            .as_ref()
+            .map(|v| v.len())
+            .unwrap_or(0)
     );
 
-    // 3. 验证会话
     let manager = hls_manager.read().await;
     let session = manager
         .get_session(&session_id)
         .map_err(convert_hls_error)?;
+    ensure_session_belongs_to_user(&session, &user_id)?;
 
-    // 4. 验证 ZKP 证明（生产环境必须验证）
-    if !verify_zkp_proof(&session, &segment_request.zkp_proof)? {
-        warn!(
-            "Invalid ZKP proof for session {} segment {}",
+    let ticket_verified = if let Some(ticket) = segment_request.zkp_ticket.as_ref() {
+        if ticket.is_empty() {
+            false
+        } else {
+            verify_segment_access_ticket(&session, ticket)?
+        }
+    } else {
+        false
+    };
+    let ticket_provided = segment_request
+        .zkp_ticket
+        .as_ref()
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+
+    if !ticket_verified {
+        let Some(proof) = segment_request.zkp_proof.as_ref() else {
+            if ticket_provided {
+                return Err(AppError::Unauthorized(
+                    "Invalid segment access ticket".to_string(),
+                ));
+            }
+            return Err(AppError::Unauthorized(
+                "Missing authentication material: zkp_ticket or zkp_proof is required".to_string(),
+            ));
+        };
+
+        if !verify_zkp_proof(&session, proof)? {
+            warn!(
+                "Invalid ZKP proof for session {} segment {}",
+                session_id, segment_name
+            );
+            return Err(AppError::Unauthorized(
+                "Invalid ZKP proof - authentication failed".to_string(),
+            ));
+        }
+
+        info!(
+            "�?ZKP proof verified for session {} segment {}",
             session_id, segment_name
         );
-        return Err(AppError::Unauthorized(
-            "Invalid ZKP proof - authentication failed".to_string(),
-        ));
     }
 
-    info!(
-        "✅ ZKP proof verified for session {} segment {}",
-        session_id, segment_name
-    );
+    let mut no_disk_mode = false;
 
-    // 5. 从缓存获取视频段数据（支持静态加密文件）
     let segment_data = {
-        let video_hash = blake3::hash(session.file_path.as_bytes());
-        let video_id = hex::encode(&video_hash.as_bytes()[..8]);
-        let cache_dir = get_hls_cache_dir().join(&video_id);
-        let segment_path = cache_dir.join(&segment_name);
+        match resolve_session_cache_dir(&session.file_path, Some(&session_id)) {
+            Ok(cache_dir) => {
+                set_session_cache_dir(&session_id, cache_dir.clone());
+                let segment_path = cache_dir.join(&segment_name);
 
-        let storage_key = derive_segment_storage_key(&session.file_path);
-        let enc_path = segment_path.with_extension("ts.enc");
+                let storage_key = derive_segment_storage_key(&session.file_path);
+                let enc_path = segment_path.with_extension("ts.enc");
 
-        if enc_path.exists() || segment_path.exists() {
-            // 使用已缓存的分片（自动解密静态加密文件）
-            read_segment_data(&segment_path, &storage_key).await?
-        } else {
-            // 回退到按需转码
-            read_video_segment_from_ffmpeg(&session.file_path, &segment_name).await?
+                touch_cache_access(&cache_dir).await;
+
+                if enc_path.exists() || segment_path.exists() {
+                    read_segment_data(&segment_path, &storage_key).await?
+                } else {
+                    read_video_segment_from_ffmpeg(
+                        &session.file_path,
+                        &segment_name,
+                        Some(&session_id),
+                    )
+                    .await?
+                }
+            }
+            Err(AppError::PreconditionFailed(msg)) => {
+                no_disk_mode = true;
+                warn_no_disk_fallback_once(Some(&session_id), &segment_name);
+                warn!(
+                    "Session {} segment {} switched to no-disk mode: {}",
+                    session_id, segment_name, msg
+                );
+                if let Some(idx) = parse_segment_index_from_name(&segment_name) {
+                    prewarm_no_disk_segments(session.file_path.clone(), session_id.clone(), idx);
+                }
+                read_video_segment_from_ffmpeg(&session.file_path, &segment_name, Some(&session_id))
+                    .await?
+            }
+            Err(e) => return Err(e),
         }
     };
 
-    // 6. 使用会话密钥加密段
     let encrypted_segment = session
         .encrypt_segment(&segment_data)
         .map_err(convert_hls_error)?;
@@ -2070,12 +3097,15 @@ pub async fn get_secure_segment(
         encrypted_segment.len()
     );
 
-    // 7. 返回加密的视频段
     Ok(HttpResponse::Ok()
         .content_type("video/mp2t")
         .insert_header(("X-Encrypted", "true"))
-        .insert_header(("X-Encryption-Method", "AES-256-GCM"))
+        .insert_header(("X-Encryption-Method", "ChaCha20-Poly1305"))
         .insert_header(("X-ZKP-Verified", "true"))
+        .insert_header((
+            "X-No-Disk-Mode",
+            if no_disk_mode { "true" } else { "false" },
+        ))
         .insert_header(("Content-Length", encrypted_segment.len()))
         .insert_header(("Cache-Control", "no-cache, no-store, must-revalidate"))
         .insert_header(("Pragma", "no-cache"))
@@ -2083,35 +3113,29 @@ pub async fn get_secure_segment(
         .body(encrypted_segment))
 }
 
-/// 停止 HLS 会话
-///
-/// **生产级安全实现**：
-/// - 验证会话存在
-/// - 移除会话状态
-/// - 清理关联资源
-///
-/// # 参数
-/// - `hls_manager`: HLS 会话管理器
-/// - `path`: 路径参数，包含会话 ID
-///
-/// # 返回
-/// - 成功时返回 200 状态码
-/// - 会话不存在时返回 404
 pub async fn stop_session(
     hls_manager: web::Data<Arc<RwLock<HlsSessionManager>>>,
+    claims: web::ReqData<crate::handlers::auth::Claims>,
     path: web::Path<String>,
 ) -> Result<impl Responder, AppError> {
     let session_id = path.into_inner();
+    let user_id = claims.sub.clone();
+
+    clear_session_no_disk_mode(&session_id);
+    clear_no_disk_segment_cache_for_session(&session_id);
 
     info!("Stopping HLS session: {}", session_id);
-
-    // Use read lock since remove_session uses internal Mutex
     let manager = hls_manager.read().await;
 
-    // 尝试移除会话
+    let session = manager
+        .get_session(&session_id)
+        .map_err(convert_hls_error)?;
+    ensure_session_belongs_to_user(&session, &user_id)?;
+
     match manager.remove_session(&session_id) {
         Ok(_) => {
-            info!("✅ HLS session stopped successfully: {}", session_id);
+            cleanup_session_cache_dir(&session_id).await;
+            info!("�?HLS session stopped successfully: {}", session_id);
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "success": true,
                 "message": "Session stopped successfully",
@@ -2119,7 +3143,7 @@ pub async fn stop_session(
             })))
         }
         Err(rockzero_media::HlsError::SessionNotFound(_)) => {
-            // 会话不存在也返回成功（幂等操作）
+            cleanup_session_cache_dir(&session_id).await;
             info!("HLS session already stopped or not found: {}", session_id);
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "success": true,
@@ -2134,13 +3158,6 @@ pub async fn stop_session(
     }
 }
 
-/// 获取混合传输层统计信息
-///
-/// 返回 UDP/TCP 混合传输的实时统计数据，包括：
-/// - 各通道发送字节数/块数
-/// - 当前动态 UDP/TCP 比例
-/// - 带宽估算
-/// - 丢包统计
 pub async fn get_transport_stats(
     hybrid_transport: web::Data<Arc<rockzero_media::HybridTransport>>,
 ) -> Result<impl Responder, AppError> {
@@ -2171,17 +3188,14 @@ pub async fn get_transport_stats(
             "bandwidth_mbps": bandwidth as f64 / 1_000_000.0
         },
         "encryption": {
-            "method": "AES-256-GCM",
+            "method": "ChaCha20-Poly1305",
             "key_exchange": "WPA3-SAE",
-            "integrity": "Blake3",
-            "zkp": "Bulletproofs"
+            "integrity": "Poly1305",
+            "zkp": "disabled"
         }
     })))
 }
 
-// ============ 辅助函数 ============
-
-/// 生成安全的 M3U8 播放列表（已被 ffmpeg 生成的播放列表替代，保留作为 fallback）
 #[allow(dead_code)]
 fn generate_secure_m3u8(segment_count: usize, segment_duration: f32) -> String {
     let mut playlist = String::from("#EXTM3U\n");
@@ -2192,10 +3206,7 @@ fn generate_secure_m3u8(segment_count: usize, segment_duration: f32) -> String {
     ));
     playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
 
-    // ❌ 不包含 #EXT-X-KEY（密钥通过 SAE 握手获得）
-    // ✅ 客户端已经拥有解密密钥（AES-256-GCM）
-
-    playlist.push_str("# Encrypted with AES-256-GCM\n");
+    playlist.push_str("# Encrypted with ChaCha20-Poly1305\n");
     playlist.push_str("# Requires ZKP proof for segment access\n\n");
 
     for i in 0..segment_count {
@@ -2207,52 +3218,24 @@ fn generate_secure_m3u8(segment_count: usize, segment_duration: f32) -> String {
     playlist
 }
 
-/// 验证客户端的 Bulletproofs ZKP 证明
-///
-/// **生产级安全实现**：使用 Bulletproofs 零知识证明验证
-///
-/// ## 验证流程
-/// 1. 解码 Base64 编码的证明
-/// 2. 解析为 EnhancedPasswordProof 结构
-/// 3. 验证上下文绑定（必须是 "hls_segment_access"）
-/// 4. 验证时间戳（防止延迟重放，5分钟有效期）
-/// 5. 使用 ZkpContext 验证 Schnorr 证明和范围证明
-///
-/// ## 安全特性
-/// - Schnorr 证明：验证客户端知道密码，不泄露密码本身
-/// - Schnorr 证明：验证密码知识
-/// - Bulletproofs 范围证明：密码熵值 >= 28 bits（密码学证明）
-/// - 时间戳 + nonce：防止重放攻击
-/// - 上下文绑定：防止跨上下文攻击
-///
-/// ## 证明类型
-/// - EnhancedPasswordProof: Schnorr 证明 + Bulletproofs 范围证明（完整版）
-///
-/// ## 要求
-/// - 会话必须包含 PasswordRegistration（用户注册时生成）
-/// - 客户端必须使用相同的密码生成证明
-///
 fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, AppError> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
-    // 1. 解码 Base64 编码的证明
     let proof_bytes = BASE64.decode(proof_base64).map_err(|e| {
         AppError::BadRequest(format!("Invalid Base64 encoding in ZKP proof: {}", e))
     })?;
 
-    // 2. 解析为 EnhancedPasswordProof（完整的 Bulletproofs 证明）
     let proof: EnhancedPasswordProof = serde_json::from_slice(&proof_bytes).map_err(|e| {
         AppError::BadRequest(format!(
             "Invalid EnhancedPasswordProof structure: {}. \
-             Ensure the client is using the full Bulletproofs implementation.",
+             Ensure the client is using the full disabled implementation.",
             e
         ))
     })?;
 
     const EXPECTED_CONTEXT: &str = "hls_segment_access";
-    const MAX_AGE_SECONDS: i64 = 300; // 5分钟有效期
+    const MAX_AGE_SECONDS: i64 = 300;
 
-    // 3. 验证上下文
     if proof.context != EXPECTED_CONTEXT {
         warn!(
             "ZKP proof context mismatch: expected '{}', got '{}'",
@@ -2261,7 +3244,6 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
         return Ok(false);
     }
 
-    // 4. 验证时间戳（防止延迟重放）
     let now = chrono::Utc::now().timestamp();
     if now - proof.timestamp > MAX_AGE_SECONDS {
         warn!(
@@ -2281,7 +3263,6 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
         return Ok(false);
     }
 
-    // 5. 检查会话是否有 ZKP 注册数据
     let registration = session.get_zkp_registration().ok_or_else(|| {
         AppError::CryptoError(
             "Session does not have ZKP registration data. \
@@ -2290,11 +3271,10 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
         )
     })?;
 
-    // 6. 使用 ZkpContext 验证完整的 Bulletproofs 证明
     let zkp_context = ZkpContext::new();
 
     info!(
-        "Verifying EnhancedPasswordProof (Bulletproofs) for session {}",
+        "Verifying EnhancedPasswordProof (disabled) for session {}",
         session.session_id
     );
 
@@ -2303,12 +3283,12 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
         Ok(valid) => {
             if valid {
                 info!(
-                    "✅ Bulletproofs ZKP proof verified for session {}",
+                    "�?disabled ZKP proof verified for session {}",
                     session.session_id
                 );
             } else {
                 warn!(
-                    "❌ Bulletproofs ZKP proof verification failed for session {}",
+                    "�?disabled ZKP proof verification failed for session {}",
                     session.session_id
                 );
             }
@@ -2316,57 +3296,117 @@ fn verify_zkp_proof(session: &HlsSession, proof_base64: &str) -> Result<bool, Ap
         }
         Err(e) => {
             warn!(
-                "Bulletproofs ZKP proof verification error for session {}: {}",
+                "disabled ZKP proof verification error for session {}: {}",
                 session.session_id, e
             );
-            Err(AppError::CryptoError(format!(
-                "Bulletproofs ZKP verification failed: {}",
-                e
-            )))
+            Ok(false)
         }
     }
 }
 
-/// 视频段缓存目录配置
-///
-/// 与 StorageConfig 使用相同的环境变量配置，确保清理任务能正确清理缓存。
-///
-/// 优先级:
-/// 1. `HLS_CACHE_PATH` 环境变量（与 StorageConfig 一致）
-/// 2. `ROCKZERO_HLS_CACHE_DIR` 环境变量（兼容旧配置）
-/// 3. 默认 `./data/hls_cache`（与 StorageConfig 默认值一致）
+async fn touch_cache_access(cache_dir: &std::path::Path) {
+    let marker = cache_dir.join(".last_access");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = write_file_best_effort(&marker, ts.to_string()).await;
+}
+
 fn get_hls_cache_dir() -> std::path::PathBuf {
-    // 优先使用 HLS_CACHE_PATH（与 StorageConfig 一致）
     std::env::var("HLS_CACHE_PATH")
         .or_else(|_| std::env::var("ROCKZERO_HLS_CACHE_DIR"))
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            // 默认使用 ./data/hls_cache（与 StorageConfig 默认值一致）
-            std::path::PathBuf::from("./data/hls_cache")
-        })
+        .unwrap_or_else(|_| std::path::PathBuf::from("/mnt/external/cache/hls"))
 }
 
-/// 从 FFmpeg 转码输出读取视频段
-///
-/// 生产级实现流程：
-/// 1. 验证段名称格式（防止路径遍历攻击）
-/// 2. 计算视频文件的唯一标识符（用于缓存目录）
-/// 3. 尝试从 HLS 缓存目录读取预转码的段
-/// 4. 如果缓存不存在，触发实时转码（通过 FFmpeg）
-/// 5. 支持段索引验证和路径遍历保护
-///
-/// # 缓存策略
-/// - 缓存目录：`/var/cache/rockzero/hls/{video_hash}/`
-/// - 段文件命名：`segment_N.ts`
-/// - 自动创建缓存目录
-/// - 转码失败时返回错误，不阻塞服务
+#[cfg(target_os = "linux")]
+fn is_same_filesystem_as_root(path: &std::path::Path) -> bool {
+    use std::os::linux::fs::MetadataExt;
+
+    let root_md = match std::fs::metadata("/") {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let path_md = match std::fs::metadata(path) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    root_md.st_dev() == path_md.st_dev()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_same_filesystem_as_root(_path: &std::path::Path) -> bool {
+    false
+}
+
+fn ensure_external_hls_cache_root() -> Result<std::path::PathBuf, AppError> {
+    let root = get_hls_cache_dir();
+    let allow_internal = std::env::var("ROCKZERO_ALLOW_INTERNAL_HLS_CACHE")
+        .ok()
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+
+    if allow_internal {
+        std::fs::create_dir_all(&root).map_err(|e| {
+            AppError::IoError(format!(
+                "Failed to create HLS cache directory {:?}: {}",
+                root, e
+            ))
+        })?;
+        return Ok(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(stripped) = root.strip_prefix("/") {
+            let mut parts = stripped.components();
+            if let (Some(first), Some(second)) = (parts.next(), parts.next()) {
+                if first.as_os_str() == "mnt" {
+                    let anchor = std::path::Path::new("/")
+                        .join(first.as_os_str())
+                        .join(second.as_os_str());
+                    if !anchor.exists() {
+                        return Err(AppError::PreconditionFailed(format!(
+                            "External storage anchor {:?} is missing; refusing to create cache on internal storage",
+                            anchor
+                        )));
+                    }
+                    if is_same_filesystem_as_root(&anchor) {
+                        return Err(AppError::PreconditionFailed(format!(
+                            "External storage anchor {:?} is on root filesystem; refusing internal cache writes",
+                            anchor
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    std::fs::create_dir_all(&root).map_err(|e| {
+        AppError::IoError(format!(
+            "Failed to create external HLS cache directory {:?}: {}",
+            root, e
+        ))
+    })?;
+
+    if is_same_filesystem_as_root(&root) {
+        return Err(AppError::PreconditionFailed(format!(
+            "External HLS cache path {:?} is on root filesystem. Refusing to write cache to internal storage. Please mount external storage under /mnt and set HLS_CACHE_PATH.",
+            root
+        )));
+    }
+
+    Ok(root)
+}
+
 async fn read_video_segment_from_ffmpeg(
     file_path: &str,
     segment_name: &str,
+    session_id: Option<&str>,
 ) -> Result<Vec<u8>, AppError> {
     use std::path::PathBuf;
 
-    // 1. 验证段名称格式（防止路径遍历攻击）
     if !segment_name.starts_with("segment_") || !segment_name.ends_with(".ts") {
         return Err(AppError::BadRequest(format!(
             "Invalid segment name format: '{}'. Expected 'segment_N.ts'",
@@ -2374,7 +3414,6 @@ async fn read_video_segment_from_ffmpeg(
         )));
     }
 
-    // 2. 解析段索引
     let segment_index: usize = segment_name
         .trim_start_matches("segment_")
         .trim_end_matches(".ts")
@@ -2383,7 +3422,6 @@ async fn read_video_segment_from_ffmpeg(
             AppError::BadRequest(format!("Invalid segment index in name: '{}'", segment_name))
         })?;
 
-    // 3. 验证段索引范围（防止过大的索引导致问题）
     const MAX_SEGMENT_INDEX: usize = 100_000;
     if segment_index > MAX_SEGMENT_INDEX {
         return Err(AppError::BadRequest(format!(
@@ -2392,29 +3430,83 @@ async fn read_video_segment_from_ffmpeg(
         )));
     }
 
-    // 4. 计算视频文件的唯一标识符（用于缓存目录）
-    let video_hash = blake3::hash(file_path.as_bytes());
-    let video_id = hex::encode(&video_hash.as_bytes()[..8]); // 使用前 8 字节作为 ID
+    let video_id = blake3_hex8(file_path.as_bytes());
 
-    // 5. 构建缓存目录路径
-    let cache_dir = get_hls_cache_dir().join(&video_id);
+    let cache_dir = match resolve_session_cache_dir(file_path, session_id) {
+        Ok(dir) => {
+            if let Some(sid) = session_id {
+                set_session_cache_dir(sid, dir.clone());
+            }
+            Some(dir)
+        }
+        Err(AppError::PreconditionFailed(msg)) => {
+            warn_no_disk_fallback_once(session_id, segment_name);
+            warn!(
+                "No-disk fallback for segment {} of {}: {}",
+                segment_name, video_id, msg
+            );
+            None
+        }
+        Err(e) => return Err(e),
+    };
+
+    if cache_dir.is_none() {
+        let cache_scope = session_id.unwrap_or("global");
+        let cache_key = format!("{}:{}:{}", cache_scope, video_id, segment_name);
+        if let Some(cached) = get_cached_no_disk_segment(&cache_key) {
+            return Ok(cached);
+        }
+
+        let lock = get_no_disk_segment_lock(&cache_key);
+        let guard = lock.lock().await;
+
+        if let Some(cached) = get_cached_no_disk_segment(&cache_key) {
+            drop(guard);
+            release_no_disk_segment_lock(&cache_key);
+            return Ok(cached);
+        }
+
+        let original_video = PathBuf::from(file_path);
+        if !original_video.exists() {
+            drop(guard);
+            release_no_disk_segment_lock(&cache_key);
+            return Err(AppError::NotFound(format!(
+                "Original video file not found: {}",
+                file_path
+            )));
+        }
+
+        let transcode_result = transcode_segment_in_memory(&original_video, segment_index).await;
+        if let Ok(ref segment_data) = transcode_result {
+            put_cached_no_disk_segment(cache_key.clone(), segment_data.clone());
+        }
+
+        drop(guard);
+        release_no_disk_segment_lock(&cache_key);
+        return transcode_result;
+    }
+
+    let cache_dir = cache_dir.expect("checked above");
     let cached_segment_path = cache_dir.join(segment_name);
+    let cached_segment_enc_path = cached_segment_path.with_extension("ts.enc");
+    let storage_key = derive_segment_storage_key(file_path);
 
-    // 6. 尝试从缓存读取
-    if cached_segment_path.exists() {
+    if cached_segment_enc_path.exists() {
         info!(
             "Cache hit for segment {} of video {}",
             segment_name, video_id
         );
-        return tokio::fs::read(&cached_segment_path).await.map_err(|e| {
-            AppError::IoError(format!(
-                "Failed to read cached segment {}: {}",
-                segment_name, e
-            ))
-        });
+        let encrypted = tokio::fs::read(&cached_segment_enc_path)
+            .await
+            .map_err(|e| {
+                AppError::IoError(format!(
+                    "Failed to read encrypted cached segment {}: {}",
+                    segment_name, e
+                ))
+            })?;
+        return chacha_decrypt(&storage_key, &encrypted);
     }
 
-    // 7. 缓存不存在，检查原始视频文件
     let original_video = PathBuf::from(file_path);
     if !original_video.exists() {
         return Err(AppError::NotFound(format!(
@@ -2423,50 +3515,164 @@ async fn read_video_segment_from_ffmpeg(
         )));
     }
 
-    // 8. 触发实时转码
     info!(
         "Cache miss for segment {} of video {}, triggering FFmpeg transcode",
         segment_name, video_id
     );
 
-    // 创建缓存目录
+    let cache_key = format!("{}:{}", video_id, segment_name);
+    let lock = get_no_disk_segment_lock(&cache_key);
+    let _guard = lock.lock().await;
+
+    if cached_segment_enc_path.exists() {
+        let encrypted = tokio::fs::read(&cached_segment_enc_path)
+            .await
+            .map_err(|e| {
+                AppError::IoError(format!(
+                    "Failed to read encrypted cached segment {} after wait: {}",
+                    segment_name, e
+                ))
+            })?;
+        let data = chacha_decrypt(&storage_key, &encrypted)?;
+        drop(_guard);
+        release_no_disk_segment_lock(&cache_key);
+        return Ok(data);
+    }
+
     if !cache_dir.exists() {
         tokio::fs::create_dir_all(&cache_dir)
             .await
             .map_err(|e| AppError::IoError(format!("Failed to create cache directory: {}", e)))?;
     }
 
-    // 调用 FFmpeg 进行转码（异步版本）
     let segment_data = transcode_segment_async(&original_video, &cache_dir, segment_index).await?;
 
-    // 将转码结果写入缓存（异步，失败不阻塞）
-    let cache_path_clone = cached_segment_path.clone();
+    let cache_path_clone = cached_segment_enc_path.clone();
     let data_clone = segment_data.clone();
+    let storage_key_clone = storage_key;
     tokio::spawn(async move {
-        if let Err(e) = tokio::fs::write(&cache_path_clone, &data_clone).await {
-            warn!("Failed to cache segment: {}", e);
+        match chacha_encrypt(&storage_key_clone, &data_clone) {
+            Ok(encrypted) => {
+                if let Err(e) = write_file_best_effort(&cache_path_clone, &encrypted).await {
+                    warn!("Failed to cache encrypted segment: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to encrypt segment for cache: {}", e);
+            }
         }
     });
+
+    drop(_guard);
+    release_no_disk_segment_lock(&cache_key);
 
     Ok(segment_data)
 }
 
-/// 使用 FFmpeg 异步转码单个视频段
-///
-/// 这是一个异步实现，用于按需转码。
-/// 支持硬件加速和多种编码器选择。
-///
-/// # FFmpeg 参数说明
-/// - `-ss`: 起始时间（基于段索引计算）
-/// - `-t`: 段持续时间（默认 10 秒）
-/// - `-c:v libx264`: 使用 H.264 编码（软件编码）
-/// - `-c:a aac`: 使用 AAC 音频编码
-/// - `-f mpegts`: 输出 MPEG-TS 格式
-///
-/// # 硬件加速支持
-/// - 检测 `/dev/dri` 设备（Intel/AMD GPU）
-/// - 检测 `/dev/video*` 设备（V4L2 硬件编码器）
-/// - ARM 平台优化（A311D 等 SoC）
+async fn transcode_segment_in_memory(
+    video_path: &std::path::Path,
+    segment_index: usize,
+) -> Result<Vec<u8>, AppError> {
+    use tokio::process::Command;
+
+    const SEGMENT_DURATION: f64 = 2.0;
+    let start_time = segment_index as f64 * SEGMENT_DURATION;
+
+    let ffmpeg_path = std::env::var("FFMPEG_PATH")
+        .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
+        .unwrap_or_else(|_| "ffmpeg".to_string());
+
+    let file_path_str = video_path.to_string_lossy().to_string();
+    let codec_key = hex::encode(blake3_hash_bytes(file_path_str.as_bytes()));
+
+    let maybe_codec = {
+        let cache = video_codec_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.get(&codec_key).cloned().flatten()
+    };
+
+    let video_codec = match maybe_codec {
+        Some(codec) => Some(codec),
+        None => {
+            let detected = detect_video_codec(&ffmpeg_path, &file_path_str).await;
+            let mut cache = video_codec_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            cache.insert(codec_key, detected.clone());
+            detected
+        }
+    };
+
+    let _ = video_codec;
+
+    let hw_accel = detect_hardware_acceleration().await;
+    if require_hardware_codec_for_video() && hw_accel == HardwareAccel::None {
+        return Err(AppError::InternalServerError(
+            "Hardware video codec is required but no supported hardware encoder is available"
+                .to_string(),
+        ));
+    }
+    let mut args = vec![
+        "-v".to_string(),
+        "warning".to_string(),
+        "-threads".to_string(),
+        "0".to_string(),
+    ];
+
+    match hw_accel {
+        HardwareAccel::Vaapi => {
+            args.extend(vec![
+                "-hwaccel".to_string(),
+                "vaapi".to_string(),
+                "-hwaccel_device".to_string(),
+                "/dev/dri/renderD128".to_string(),
+                "-hwaccel_output_format".to_string(),
+                "vaapi".to_string(),
+            ]);
+        }
+        _ => {
+            args.extend(vec!["-hwaccel".to_string(), "auto".to_string()]);
+        }
+    }
+
+    args.extend(vec![
+        "-i".to_string(),
+        file_path_str,
+        "-ss".to_string(),
+        format!("{:.3}", start_time),
+        "-t".to_string(),
+        format!("{:.3}", SEGMENT_DURATION),
+        "-c:v".to_string(),
+        "libx264".to_string(),
+        "-preset".to_string(),
+        "veryfast".to_string(),
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-f".to_string(),
+        "mpegts".to_string(),
+        "pipe:1".to_string(),
+    ]);
+
+    let out = Command::new(&ffmpeg_path)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| AppError::IoError(format!("Failed to run ffmpeg: {}", e)))?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(AppError::InternalServerError(format!(
+            "ffmpeg in-memory transcode failed for segment {}: {}",
+            segment_index, stderr
+        )));
+    }
+
+    Ok(out.stdout)
+}
+
 async fn transcode_segment_async(
     video_path: &std::path::Path,
     output_dir: &std::path::Path,
@@ -2474,34 +3680,28 @@ async fn transcode_segment_async(
 ) -> Result<Vec<u8>, AppError> {
     use tokio::process::Command;
 
-    const SEGMENT_DURATION: f64 = 10.0; // 每段 10 秒
+    const SEGMENT_DURATION: f64 = 2.0;
     let start_time = segment_index as f64 * SEGMENT_DURATION;
 
     let output_path = output_dir.join(format!("segment_{}.ts", segment_index));
 
-    // 检测 FFmpeg 可执行文件路径
     let ffmpeg_path = std::env::var("FFMPEG_PATH")
         .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
         .unwrap_or_else(|_| "ffmpeg".to_string());
 
-    // 检测硬件加速能力
     let hw_accel = detect_hardware_acceleration().await;
+    if require_hardware_codec_for_video() && hw_accel == HardwareAccel::None {
+        return Err(AppError::InternalServerError(
+            "Hardware video codec is required but no supported hardware encoder is available"
+                .to_string(),
+        ));
+    }
+    let a311d_profile = is_a311d_device();
 
-    // 构建 FFmpeg 命令参数
-    let mut args = vec![
-        "-y".to_string(), // 覆盖输出文件
-        // ★ 多核并行：使用所有 CPU 核心进行编解码
-        "-threads".to_string(),
-        "0".to_string(),
-        "-ss".to_string(),
-        format!("{:.3}", start_time), // 起始时间
-    ];
+    let mut args = vec!["-y".to_string(), "-threads".to_string(), "0".to_string()];
 
-    // ★ 输入解码选项（必须在 -i 之前）
-    // -hwaccel auto：自动选择硬件解码器，支持 AV1/VP9 等非 H.264 源的硬件辅助解码
     match hw_accel {
         HardwareAccel::Vaapi => {
-            // VAAPI 专用解码管线（需指定设备和输出格式）
             args.extend(vec![
                 "-hwaccel".to_string(),
                 "vaapi".to_string(),
@@ -2519,11 +3719,16 @@ async fn transcode_segment_async(
     args.extend(vec![
         "-i".to_string(),
         video_path.to_str().unwrap_or("").to_string(),
+        "-ss".to_string(),
+        format!("{:.3}", start_time),
         "-t".to_string(),
-        format!("{:.3}", SEGMENT_DURATION), // 段持续时间
+        format!("{:.3}", SEGMENT_DURATION),
+        "-fflags".to_string(),
+        "+genpts".to_string(),
+        "-avoid_negative_ts".to_string(),
+        "make_zero".to_string(),
     ]);
 
-    // ★ 输出编码选项（根据硬件加速能力选择编码器）
     match hw_accel {
         HardwareAccel::Rkmpp => {
             info!(
@@ -2534,9 +3739,31 @@ async fn transcode_segment_async(
                 "-c:v".to_string(),
                 "h264_rkmpp".to_string(),
                 "-b:v".to_string(),
-                "3M".to_string(),
+                if a311d_profile {
+                    "2600k".to_string()
+                } else {
+                    "3M".to_string()
+                },
+                "-maxrate".to_string(),
+                if a311d_profile {
+                    "3200k".to_string()
+                } else {
+                    "4200k".to_string()
+                },
+                "-bufsize".to_string(),
+                if a311d_profile {
+                    "5200k".to_string()
+                } else {
+                    "8400k".to_string()
+                },
                 "-rc_mode".to_string(),
-                "VBR".to_string(),
+                if a311d_profile {
+                    "CBR".to_string()
+                } else {
+                    "VBR".to_string()
+                },
+                "-g".to_string(),
+                "48".to_string(),
             ]);
         }
         HardwareAccel::Vaapi => {
@@ -2560,7 +3787,25 @@ async fn transcode_segment_async(
                 "-c:v".to_string(),
                 "h264_v4l2m2m".to_string(),
                 "-b:v".to_string(),
-                "2M".to_string(),
+                if a311d_profile {
+                    "2200k".to_string()
+                } else {
+                    "2M".to_string()
+                },
+                "-maxrate".to_string(),
+                if a311d_profile {
+                    "2800k".to_string()
+                } else {
+                    "3500k".to_string()
+                },
+                "-bufsize".to_string(),
+                if a311d_profile {
+                    "4400k".to_string()
+                } else {
+                    "7000k".to_string()
+                },
+                "-g".to_string(),
+                "48".to_string(),
             ]);
         }
         HardwareAccel::None => {
@@ -2572,35 +3817,45 @@ async fn transcode_segment_async(
                 "-c:v".to_string(),
                 "libx264".to_string(),
                 "-preset".to_string(),
-                "veryfast".to_string(), // 快速编码预设
+                if a311d_profile {
+                    "superfast".to_string()
+                } else {
+                    "veryfast".to_string()
+                },
                 "-tune".to_string(),
-                "zerolatency".to_string(), // 低延迟调优
+                "zerolatency".to_string(),
                 "-profile:v".to_string(),
-                "main".to_string(), // Main Profile
+                "main".to_string(),
                 "-level".to_string(),
-                "4.0".to_string(), // Level 4.0
+                "4.0".to_string(),
                 "-crf".to_string(),
-                "23".to_string(), // 恒定质量因子
+                if a311d_profile {
+                    "24".to_string()
+                } else {
+                    "23".to_string()
+                },
             ]);
         }
     }
 
-    // 音频编码参数（通用）
     args.extend(vec![
         "-c:a".to_string(),
-        "aac".to_string(), // AAC 音频编码
+        "aac".to_string(),
         "-b:a".to_string(),
-        "128k".to_string(), // 音频码率
+        "128k".to_string(),
         "-ac".to_string(),
-        "2".to_string(), // 立体声
+        "2".to_string(),
         "-ar".to_string(),
-        "44100".to_string(), // 采样率
+        "44100".to_string(),
+        "-muxdelay".to_string(),
+        "0".to_string(),
+        "-muxpreload".to_string(),
+        "0".to_string(),
         "-f".to_string(),
-        "mpegts".to_string(), // MPEG-TS 容器
+        "mpegts".to_string(),
         output_path.to_str().unwrap_or("").to_string(),
     ]);
 
-    // 执行 FFmpeg 命令
     let output = Command::new(&ffmpeg_path)
         .args(&args)
         .output()
@@ -2620,34 +3875,37 @@ async fn transcode_segment_async(
         )));
     }
 
-    // 读取生成的段文件
-    tokio::fs::read(&output_path)
+    let data = tokio::fs::read(&output_path)
         .await
-        .map_err(|e| AppError::IoError(format!("Failed to read transcoded segment: {}", e)))
+        .map_err(|e| AppError::IoError(format!("Failed to read transcoded segment: {}", e)))?;
+
+    let _ = remove_file_best_effort(&output_path).await;
+
+    Ok(data)
 }
 
-/// 硬件加速类型
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HardwareAccel {
-    Rkmpp, // Rockchip MPP (RK3588 等)
-    Vaapi, // Intel/AMD GPU (VA-API)
-    V4l2,  // V4L2 M2M (ARM SoC)
-    None,  // 软件编码
+    Rkmpp,
+    Vaapi,
+    V4l2,
+    None,
 }
 
-/// 检测可用的硬件加速
-///
-/// 检测顺序（优先ARM场景）：
-/// 1. 检查 CPU 架构 — aarch64 优先使用 ARM 编码器
-/// 2. Rockchip MPP (`h264_rkmpp`) — RK3588/RK3399 等 SoC
-/// 3. V4L2 M2M (`h264_v4l2m2m`) — 通用 ARM 硬件编码
-/// 4. VAAPI (`h264_vaapi`) — Intel/AMD GPU（仅 x86_64）
-/// 5. 软件编码 (`libx264`) — 最终回退
 async fn detect_hardware_acceleration() -> HardwareAccel {
+    if let Some(cached) = HW_ACCEL_DETECTION_CACHE.get() {
+        return *cached;
+    }
+
+    let detected = detect_hardware_acceleration_uncached().await;
+    let _ = HW_ACCEL_DETECTION_CACHE.set(detected);
+    detected
+}
+
+async fn detect_hardware_acceleration_uncached() -> HardwareAccel {
     use tokio::fs;
 
     let is_arm = cfg!(target_arch = "aarch64") || cfg!(target_arch = "arm") || {
-        // 运行时检测（交叉编译场景）
         if let Ok(machine) = tokio::process::Command::new("uname")
             .arg("-m")
             .output()
@@ -2663,22 +3921,16 @@ async fn detect_hardware_acceleration() -> HardwareAccel {
     };
 
     if is_arm {
-        // ARM 平台：优先 Rockchip MPP → V4L2 → 软件编码
-        // 不使用 VAAPI（即使 /dev/dri/renderD128 存在也可能是 Mali 显示驱动）
-
-        // Rockchip MPP
         if check_ffmpeg_encoder("h264_rkmpp").await {
             info!("Detected Rockchip MPP hardware encoder on ARM");
             return HardwareAccel::Rkmpp;
         }
 
-        // V4L2 M2M — 检测设备节点和编码器支持
         let has_v4l2_device = fs::metadata("/dev/video10").await.is_ok()
             || fs::metadata("/dev/video11").await.is_ok()
             || fs::metadata("/dev/video0").await.is_ok();
 
         if has_v4l2_device && check_ffmpeg_encoder("h264_v4l2m2m").await {
-            // 验证 V4L2 编码器真正可用（某些设备列出但无法使用）
             if verify_encoder_works("h264_v4l2m2m").await {
                 info!("Detected V4L2 M2M hardware encoder on ARM");
                 return HardwareAccel::V4l2;
@@ -2691,10 +3943,8 @@ async fn detect_hardware_acceleration() -> HardwareAccel {
         return HardwareAccel::None;
     }
 
-    // x86_64 平台：VAAPI → V4L2 → 软件编码
     if fs::metadata("/dev/dri/renderD128").await.is_ok() && check_ffmpeg_encoder("h264_vaapi").await
     {
-        // 验证 VAAPI 真正可用
         if verify_vaapi_works().await {
             info!("Detected VAAPI hardware encoder on x86_64");
             return HardwareAccel::Vaapi;
@@ -2703,7 +3953,6 @@ async fn detect_hardware_acceleration() -> HardwareAccel {
         }
     }
 
-    // V4L2 回退
     if (fs::metadata("/dev/video10").await.is_ok() || fs::metadata("/dev/video11").await.is_ok())
         && check_ffmpeg_encoder("h264_v4l2m2m").await
     {
@@ -2713,7 +3962,6 @@ async fn detect_hardware_acceleration() -> HardwareAccel {
     HardwareAccel::None
 }
 
-/// 检查 FFmpeg 是否支持指定的编码器
 async fn check_ffmpeg_encoder(encoder: &str) -> bool {
     use tokio::process::Command;
 
@@ -2734,10 +3982,6 @@ async fn check_ffmpeg_encoder(encoder: &str) -> bool {
     false
 }
 
-/// 验证硬件编码器真正可用（而非仅列出）
-///
-/// 通过生成一帧测试视频来验证编码器是否真正工作。
-/// 某些设备（如 Mali GPU）虽然有 /dev/dri/renderD128 但不支持编码。
 async fn verify_encoder_works(encoder: &str) -> bool {
     use tokio::process::Command;
 
@@ -2745,7 +3989,6 @@ async fn verify_encoder_works(encoder: &str) -> bool {
         .or_else(|_| rockzero_media::get_global_ffmpeg_path().ok_or(""))
         .unwrap_or_else(|_| "ffmpeg".to_string());
 
-    // 生成 1 帧黑色视频并尝试用指定编码器编码
     let result = Command::new(&ffmpeg_path)
         .args([
             "-f",
@@ -2769,7 +4012,6 @@ async fn verify_encoder_works(encoder: &str) -> bool {
     matches!(result, Ok(status) if status.success())
 }
 
-/// 验证 VAAPI 编码器真正可用
 async fn verify_vaapi_works() -> bool {
     use tokio::process::Command;
 
@@ -2809,6 +4051,23 @@ async fn verify_vaapi_works() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use actix_web::{body::to_bytes, http::StatusCode, FromRequest, HttpMessage, Responder};
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+    use rockzero_media::HlsSession;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    fn ensure_test_cache_env() -> std::path::PathBuf {
+        static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
+        ROOT.get_or_init(|| {
+            let root = std::env::temp_dir().join("rockzero_hls_cache_tests");
+            let _ = std::fs::create_dir_all(&root);
+            std::env::set_var("HLS_CACHE_PATH", &root);
+            std::env::set_var("ROCKZERO_ALLOW_INTERNAL_HLS_CACHE", "1");
+            root
+        })
+        .clone()
+    }
 
     #[test]
     fn test_secure_playlist_generation() {
@@ -2818,21 +4077,19 @@ mod tests {
         assert!(playlist.contains("segment_0.ts"));
         assert!(playlist.contains("segment_4.ts"));
         assert!(!playlist.contains("#EXT-X-KEY"));
-        assert!(playlist.contains("AES-256-GCM"));
+        assert!(playlist.contains("ChaCha20-Poly1305"));
     }
 
     #[tokio::test]
     async fn test_segment_name_validation() {
-        // 无效的段名称格式（路径遍历攻击）
-        let result = read_video_segment_from_ffmpeg("/video.mp4", "../../../etc/passwd").await;
+        let result =
+            read_video_segment_from_ffmpeg("/video.mp4", "../../../etc/passwd", None).await;
         assert!(matches!(result, Err(AppError::BadRequest(_))));
 
-        // 无效的段名称格式（负数索引）
-        let result = read_video_segment_from_ffmpeg("/video.mp4", "segment_-1.ts").await;
+        let result = read_video_segment_from_ffmpeg("/video.mp4", "segment_-1.ts", None).await;
         assert!(matches!(result, Err(AppError::BadRequest(_))));
 
-        // 无效的段名称格式（非数字索引）
-        let result = read_video_segment_from_ffmpeg("/video.mp4", "segment_abc.ts").await;
+        let result = read_video_segment_from_ffmpeg("/video.mp4", "segment_abc.ts", None).await;
         assert!(matches!(result, Err(AppError::BadRequest(_))));
     }
 
@@ -2843,5 +4100,279 @@ mod tests {
             hw_accel,
             HardwareAccel::Vaapi | HardwareAccel::V4l2 | HardwareAccel::None
         ));
+    }
+
+    fn test_cache_dir_for_file(file_path: &str) -> std::path::PathBuf {
+        let _ = ensure_test_cache_env();
+        let video_id = blake3_hex8(file_path.as_bytes());
+        get_hls_cache_dir().join(video_id)
+    }
+
+    fn cleanup_test_cache(file_path: &str) {
+        let cache_dir = test_cache_dir_for_file(file_path);
+        let _ = std::fs::remove_dir_all(cache_dir);
+        let _ = std::fs::remove_file(file_path);
+    }
+
+    fn insert_test_session(
+        manager: &HlsSessionManager,
+        file_path: &str,
+        zkp_registration: Option<PasswordRegistration>,
+    ) -> String {
+        let session = HlsSession::new_with_registration(
+            "test-user".to_string(),
+            file_path.to_string(),
+            [7u8; 32],
+            1000,
+            zkp_registration,
+        )
+        .unwrap();
+        let session_id = session.session_id.clone();
+        let _ = std::fs::write(file_path, b"rockzero-test-video-placeholder");
+        manager
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), session);
+
+        let cache_dir = test_cache_dir_for_file(file_path);
+        let _ = std::fs::create_dir_all(&cache_dir);
+        set_session_cache_dir(&session_id, cache_dir);
+
+        session_id
+    }
+
+    async fn test_claims() -> web::ReqData<crate::handlers::auth::Claims> {
+        let req = actix_web::test::TestRequest::default().to_http_request();
+        req.extensions_mut().insert(crate::handlers::auth::Claims {
+            sub: "test-user".to_string(),
+            email: "test-user@example.com".to_string(),
+            role: "user".to_string(),
+            token_type: "access".to_string(),
+            exp: i64::MAX,
+            iat: 0,
+            jti: None,
+        });
+
+        web::ReqData::<crate::handlers::auth::Claims>::extract(&req)
+            .await
+            .unwrap()
+    }
+
+    fn build_zkp_proof_base64(
+        password: &str,
+        registration: &PasswordRegistration,
+        context: &str,
+    ) -> String {
+        let zkp = ZkpContext::new();
+        let proof = zkp
+            .generate_enhanced_proof(password, registration, context)
+            .unwrap();
+        BASE64.encode(serde_json::to_vec(&proof).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_e2e_play_then_far_seek_recovers_with_on_demand_segment() {
+        let manager = Arc::new(RwLock::new(HlsSessionManager::new()));
+        let data = web::Data::new(manager.clone());
+
+        let file_path = format!("e2e_play_seek_{}.mp4", uuid::Uuid::new_v4());
+        let session_id = {
+            let guard = manager.read().await;
+            insert_test_session(&guard, &file_path, None)
+        };
+
+        let cache_dir = test_cache_dir_for_file(&file_path);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(
+            cache_dir.join("playlist.m3u8"),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:2.0,\nsegment_0.ts\n",
+        )
+        .unwrap();
+        std::fs::write(cache_dir.join("segment_0.ts"), b"initial-segment").unwrap();
+        std::fs::write(cache_dir.join(".lock"), b"in-progress").unwrap();
+
+        let req = actix_web::test::TestRequest::default().to_http_request();
+        let playlist_resp = get_secure_playlist(
+            data.clone(),
+            test_claims().await,
+            web::Path::from(session_id.clone()),
+        )
+        .await
+        .unwrap()
+        .respond_to(&req);
+        assert_eq!(playlist_resp.status(), StatusCode::OK);
+
+        let play_resp = get_segment_direct(
+            data.clone(),
+            test_claims().await,
+            web::Path::from((session_id.clone(), "segment_0.ts".to_string())),
+        )
+        .await
+        .unwrap()
+        .respond_to(&req);
+        assert_eq!(play_resp.status(), StatusCode::OK);
+
+        let far_segment_name = "segment_80.ts".to_string();
+        let far_segment_path = cache_dir.join(&far_segment_name);
+        let expected_plain = b"far-ahead-on-demand-segment-data".to_vec();
+        let expected_plain_for_writer = expected_plain.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = write_file_best_effort(&far_segment_path, &expected_plain_for_writer).await;
+        });
+
+        let started = Instant::now();
+        let far_resp = get_segment_direct(
+            data.clone(),
+            test_claims().await,
+            web::Path::from((session_id.clone(), far_segment_name)),
+        )
+        .await
+        .unwrap()
+        .respond_to(&req);
+        let elapsed = started.elapsed();
+
+        assert_eq!(far_resp.status(), StatusCode::OK);
+        assert!(elapsed < Duration::from_secs(8));
+
+        let encrypted_body = to_bytes(far_resp.into_body())
+            .await
+            .map_err(|_| "failed to read encrypted far-seek body")
+            .unwrap();
+        let plain = {
+            let guard = manager.read().await;
+            let session = guard.get_session(&session_id).unwrap();
+            session.decrypt_segment(&encrypted_body).unwrap()
+        };
+        assert_eq!(plain, expected_plain);
+
+        cleanup_test_cache(&file_path);
+    }
+
+    #[tokio::test]
+    async fn test_e2e_on_demand_segment_returns_within_timeout_window() {
+        let manager = Arc::new(RwLock::new(HlsSessionManager::new()));
+        let data = web::Data::new(manager.clone());
+
+        let file_path = format!("e2e_timeout_window_{}.mp4", uuid::Uuid::new_v4());
+        let session_id = {
+            let guard = manager.read().await;
+            insert_test_session(&guard, &file_path, None)
+        };
+
+        let cache_dir = test_cache_dir_for_file(&file_path);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(
+            cache_dir.join("playlist.m3u8"),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:2.0,\nsegment_0.ts\n",
+        )
+        .unwrap();
+        std::fs::write(cache_dir.join("segment_0.ts"), b"initial-segment").unwrap();
+        std::fs::write(cache_dir.join(".lock"), b"in-progress").unwrap();
+
+        let far_segment_name = "segment_120.ts".to_string();
+        let far_segment_path = cache_dir.join(&far_segment_name);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = write_file_best_effort(&far_segment_path, b"timeout-window-segment").await;
+        });
+
+        let req = actix_web::test::TestRequest::default().to_http_request();
+        let started = Instant::now();
+        let resp = get_segment_direct(
+            data.clone(),
+            test_claims().await,
+            web::Path::from((session_id, far_segment_name)),
+        )
+        .await
+        .unwrap()
+        .respond_to(&req);
+        let elapsed = started.elapsed();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(elapsed < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn test_e2e_zkp_failure_returns_clear_error_and_recovery_with_new_session() {
+        let manager = Arc::new(RwLock::new(HlsSessionManager::new()));
+        let data = web::Data::new(manager.clone());
+
+        let file_path = format!("e2e_zkp_recover_{}.mp4", uuid::Uuid::new_v4());
+        let password = "RecoverPassword!123".to_string();
+        let zkp = ZkpContext::new();
+        let registration = zkp.register_password(&password).unwrap();
+
+        let session_id_bad = {
+            let guard = manager.read().await;
+            insert_test_session(&guard, &file_path, Some(registration.clone()))
+        };
+
+        let cache_dir = test_cache_dir_for_file(&file_path);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let segment_plain = b"secure-segment-for-zkp-recovery";
+        std::fs::write(cache_dir.join("segment_0.ts"), segment_plain).unwrap();
+
+        let bad_context_proof = build_zkp_proof_base64(&password, &registration, "wrong_context");
+        let bad_body = serde_json::json!({ "zkp_proof": bad_context_proof });
+        let bad_req = actix_web::test::TestRequest::post().to_http_request();
+
+        let bad_result = get_secure_segment(
+            data.clone(),
+            test_claims().await,
+            web::Path::from((session_id_bad, "segment_0.ts".to_string())),
+            bad_req,
+            web::Bytes::from(serde_json::to_vec(&bad_body).unwrap()),
+        )
+        .await;
+
+        assert!(
+            matches!(bad_result, Err(AppError::Unauthorized(msg)) if msg.contains("Invalid ZKP proof"))
+        );
+
+        let session_id_good = {
+            let guard = manager.read().await;
+            insert_test_session(&guard, &file_path, Some(registration.clone()))
+        };
+        let good_cache_dir = get_session_cache_dir(&session_id_good).unwrap();
+        std::fs::create_dir_all(&good_cache_dir).unwrap();
+        std::fs::write(good_cache_dir.join("segment_0.ts"), segment_plain).unwrap();
+        let good_proof = build_zkp_proof_base64(&password, &registration, "hls_segment_access");
+        let good_body = serde_json::json!({ "zkp_proof": good_proof });
+        let good_req = actix_web::test::TestRequest::post().to_http_request();
+
+        let good_resp = get_secure_segment(
+            data.clone(),
+            test_claims().await,
+            web::Path::from((session_id_good.clone(), "segment_0.ts".to_string())),
+            good_req,
+            web::Bytes::from(serde_json::to_vec(&good_body).unwrap()),
+        )
+        .await
+        .unwrap()
+        .respond_to(&actix_web::test::TestRequest::default().to_http_request());
+
+        assert_eq!(good_resp.status(), StatusCode::OK);
+        assert_eq!(
+            good_resp
+                .headers()
+                .get("X-ZKP-Verified")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+
+        let encrypted = to_bytes(good_resp.into_body())
+            .await
+            .map_err(|_| "failed to read encrypted zkp recovery body")
+            .unwrap();
+        let decrypted = {
+            let guard = manager.read().await;
+            let session = guard.get_session(&session_id_good).unwrap();
+            session.decrypt_segment(&encrypted).unwrap()
+        };
+        assert_eq!(decrypted, segment_plain);
+
+        cleanup_test_cache(&file_path);
     }
 }

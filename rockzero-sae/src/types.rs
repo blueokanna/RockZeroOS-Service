@@ -1,30 +1,21 @@
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// SAE Commit message (using Base64 encoding for JSON serialization)
 #[derive(Debug, Clone)]
 pub struct SaeCommit {
-    /// Elliptic curve group ID (19 = Curve25519)
     pub group_id: u16,
-    
-    /// Commit scalar (32 bytes)
+
     pub scalar: [u8; 32],
-    
-    /// Commit element (33 bytes compressed point for secp256r1)
+
     pub element: Vec<u8>,
 }
 
-/// SAE Confirm message (using Base64 encoding for JSON serialization)
 #[derive(Debug, Clone)]
 pub struct SaeConfirm {
-    /// Send-Confirm counter
     pub send_confirm: u16,
-    
-    /// Confirm value (32 bytes HMAC)
+
     pub confirm: [u8; 32],
 }
-
-// ============ Custom Serialization/Deserialization (using Base64) ============
 
 impl Serialize for SaeCommit {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -32,7 +23,7 @@ impl Serialize for SaeCommit {
         S: Serializer,
     {
         use serde::ser::SerializeStruct;
-        
+
         let mut state = serializer.serialize_struct("SaeCommit", 3)?;
         state.serialize_field("group_id", &self.group_id)?;
         state.serialize_field("scalar", &BASE64.encode(self.scalar))?;
@@ -87,9 +78,9 @@ impl<'de> Deserialize<'de> for SaeCommit {
                                 return Err(de::Error::duplicate_field("scalar"));
                             }
                             let scalar_str: String = map.next_value()?;
-                            let scalar_bytes = BASE64
-                                .decode(&scalar_str)
-                                .map_err(|e| de::Error::custom(format!("Invalid base64 for scalar: {}", e)))?;
+                            let scalar_bytes = BASE64.decode(&scalar_str).map_err(|e| {
+                                de::Error::custom(format!("Invalid base64 for scalar: {}", e))
+                            })?;
                             if scalar_bytes.len() != 32 {
                                 return Err(de::Error::custom(format!(
                                     "Scalar must be 32 bytes, got {}",
@@ -105,10 +96,10 @@ impl<'de> Deserialize<'de> for SaeCommit {
                                 return Err(de::Error::duplicate_field("element"));
                             }
                             let element_str: String = map.next_value()?;
-                            let element_bytes = BASE64
-                                .decode(&element_str)
-                                .map_err(|e| de::Error::custom(format!("Invalid base64 for element: {}", e)))?;
-                            // Support 32 bytes (Curve25519) or 33 bytes (secp256r1 compressed point)
+                            let element_bytes = BASE64.decode(&element_str).map_err(|e| {
+                                de::Error::custom(format!("Invalid base64 for element: {}", e))
+                            })?;
+
                             if element_bytes.len() != 32 && element_bytes.len() != 33 {
                                 return Err(de::Error::custom(format!(
                                     "Element must be 32 or 33 bytes, got {}",
@@ -143,7 +134,7 @@ impl Serialize for SaeConfirm {
         S: Serializer,
     {
         use serde::ser::SerializeStruct;
-        
+
         let mut state = serializer.serialize_struct("SaeConfirm", 2)?;
         state.serialize_field("send_confirm", &self.send_confirm)?;
         state.serialize_field("confirm", &BASE64.encode(self.confirm))?;
@@ -195,9 +186,9 @@ impl<'de> Deserialize<'de> for SaeConfirm {
                                 return Err(de::Error::duplicate_field("confirm"));
                             }
                             let confirm_str: String = map.next_value()?;
-                            let confirm_bytes = BASE64
-                                .decode(&confirm_str)
-                                .map_err(|e| de::Error::custom(format!("Invalid base64 for confirm: {}", e)))?;
+                            let confirm_bytes = BASE64.decode(&confirm_str).map_err(|e| {
+                                de::Error::custom(format!("Invalid base64 for confirm: {}", e))
+                            })?;
                             if confirm_bytes.len() != 32 {
                                 return Err(de::Error::custom(format!(
                                     "Confirm must be 32 bytes, got {}",
@@ -211,7 +202,8 @@ impl<'de> Deserialize<'de> for SaeConfirm {
                     }
                 }
 
-                let send_confirm = send_confirm.ok_or_else(|| de::Error::missing_field("send_confirm"))?;
+                let send_confirm =
+                    send_confirm.ok_or_else(|| de::Error::missing_field("send_confirm"))?;
                 let confirm = confirm.ok_or_else(|| de::Error::missing_field("confirm"))?;
 
                 Ok(SaeConfirm {
@@ -226,7 +218,6 @@ impl<'de> Deserialize<'de> for SaeConfirm {
     }
 }
 
-/// SAE handshake complete message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaeHandshake {
     pub commit: SaeCommit,
@@ -234,7 +225,6 @@ pub struct SaeHandshake {
 }
 
 impl SaeCommit {
-    /// Serialize to bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&self.group_id.to_le_bytes());
@@ -243,7 +233,6 @@ impl SaeCommit {
         bytes
     }
 
-    /// Deserialize from bytes
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 66 {
             return None;
@@ -251,7 +240,7 @@ impl SaeCommit {
 
         let group_id = u16::from_le_bytes([bytes[0], bytes[1]]);
         let mut scalar = [0u8; 32];
-        
+
         scalar.copy_from_slice(&bytes[2..34]);
         let element = bytes[34..].to_vec();
 
@@ -264,7 +253,6 @@ impl SaeCommit {
 }
 
 impl SaeConfirm {
-    /// Serialize to bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&self.send_confirm.to_le_bytes());
@@ -272,7 +260,6 @@ impl SaeConfirm {
         bytes
     }
 
-    /// Deserialize from bytes
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 34 {
             return None;

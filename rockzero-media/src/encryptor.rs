@@ -1,17 +1,17 @@
 use crate::error::{HlsError, Result};
-use aes_gcm::{
+use chacha20poly1305::{
     aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
+    ChaCha20Poly1305, Nonce,
 };
 use rand::RngCore;
 
 pub struct HlsEncryptor {
-    cipher: Aes256Gcm,
+    cipher: ChaCha20Poly1305,
 }
 
 impl HlsEncryptor {
     pub fn new(key: &[u8; 32]) -> Result<Self> {
-        let cipher = Aes256Gcm::new(key.into());
+        let cipher = ChaCha20Poly1305::new(key.into());
         Ok(Self { cipher })
     }
 
@@ -20,10 +20,9 @@ impl HlsEncryptor {
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let ciphertext = self
-            .cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|e| HlsError::EncryptionError(format!("AES-GCM encryption failed: {}", e)))?;
+        let ciphertext = self.cipher.encrypt(nonce, plaintext).map_err(|e| {
+            HlsError::EncryptionError(format!("ChaCha20-Poly1305 encryption failed: {}", e))
+        })?;
 
         Ok((nonce_bytes.to_vec(), ciphertext))
     }
@@ -37,10 +36,9 @@ impl HlsEncryptor {
 
         let nonce = Nonce::from_slice(nonce);
 
-        let plaintext = self
-            .cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| HlsError::DecryptionError(format!("AES-GCM decryption failed: {}", e)))?;
+        let plaintext = self.cipher.decrypt(nonce, ciphertext).map_err(|e| {
+            HlsError::DecryptionError(format!("ChaCha20-Poly1305 decryption failed: {}", e))
+        })?;
 
         Ok(plaintext)
     }

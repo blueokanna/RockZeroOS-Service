@@ -129,7 +129,6 @@ impl FfmpegManager {
     pub async fn ensure_available(&mut self) -> io::Result<()> {
         info!("Checking FFmpeg availability...");
 
-        // 1. 首先检查系统是否已安装 FFmpeg
         if let Some(path) = find_system_ffmpeg() {
             info!("Found system FFmpeg: {}", path);
             self.ffmpeg_path = Some(PathBuf::from(&path));
@@ -226,9 +225,7 @@ impl FfmpegManager {
         let download_success = self.download_file(&url, &archive_path).await?;
 
         if !download_success {
-            return Err(io::Error::other(
-                "Failed to download FFmpeg",
-            ));
+            return Err(io::Error::other("Failed to download FFmpeg"));
         }
 
         self.install_from_archive(&archive_path)
@@ -317,9 +314,7 @@ impl FfmpegManager {
             }
         }
 
-        Err(io::Error::other(
-            "Failed to extract tar.xz archive",
-        ))
+        Err(io::Error::other("Failed to extract tar.xz archive"))
     }
 
     fn find_extracted_ffmpeg_dir(&self, temp_dir: &Path) -> io::Result<PathBuf> {
@@ -397,9 +392,7 @@ impl FfmpegManager {
                     "FFmpeg installed but not found in PATH",
                 ))
             }
-            Ok(_) => Err(io::Error::other(
-                "Package manager failed to install FFmpeg",
-            )),
+            Ok(_) => Err(io::Error::other("Package manager failed to install FFmpeg")),
             Err(e) => Err(e),
         }
     }
@@ -669,10 +662,6 @@ pub fn get_global_ffmpeg_path() -> Option<String> {
 pub fn get_global_ffprobe_path() -> Option<String> {
     GLOBAL_FFPROBE_PATH.get().and_then(|p| p.clone())
 }
-
-// ============================================================================
-// 测试模块
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

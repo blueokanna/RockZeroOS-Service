@@ -6,8 +6,6 @@ use validator::Validate;
 #[cfg(feature = "db")]
 use sqlx::FromRow;
 
-// ============ 用户模型 ============
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "db", derive(FromRow))]
 pub struct User {
@@ -40,7 +38,11 @@ impl User {
             email,
             password_hash,
             password_commitment: Some(password_commitment),
-            role: if is_super_admin { "admin".to_string() } else { "user".to_string() },
+            role: if is_super_admin {
+                "admin".to_string()
+            } else {
+                "user".to_string()
+            },
             is_active: true,
             is_super_admin,
             created_at: now,
@@ -70,8 +72,6 @@ impl From<User> for UserResponse {
     }
 }
 
-// ============ 推荐码模型 ============
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "db", derive(FromRow))]
 pub struct InviteCode {
@@ -85,8 +85,6 @@ pub struct InviteCode {
     pub used_by: Option<String>,
     pub used_at: Option<DateTime<Utc>>,
 }
-
-// ============ 认证请求/响应 ============
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct RegisterRequest {
@@ -127,8 +125,6 @@ pub struct InviteCodeResponse {
     pub expires_in_seconds: i64,
 }
 
-// ============ 文件管理模型 ============
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "db", derive(FromRow))]
 pub struct FileMetadata {
@@ -162,8 +158,6 @@ pub struct FileListResponse {
     pub total: i64,
 }
 
-// ============ 媒体播放模型 ============
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "db", derive(FromRow))]
 pub struct MediaItem {
@@ -188,8 +182,6 @@ pub struct MediaResponse {
     pub thumbnail_url: Option<String>,
     pub created_at: DateTime<Utc>,
 }
-
-// ============ 小组件模型 ============
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "db", derive(FromRow))]

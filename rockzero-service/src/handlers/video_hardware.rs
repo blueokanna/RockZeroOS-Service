@@ -5,8 +5,6 @@ use tracing::{error, info};
 
 use rockzero_common::AppError;
 
-// ============ 数据结构 ============
-
 #[derive(Debug, Serialize, Clone)]
 pub struct HardwareCapabilities {
     pub cpu_info: CpuInfo,
@@ -31,10 +29,10 @@ pub struct CpuInfo {
 
 #[derive(Debug, Serialize, Clone)]
 pub struct GpuInfo {
-    pub vendor: String, // "NVIDIA", "AMD", "Intel", "Unknown"
+    pub vendor: String,
     pub model: String,
     pub driver_version: Option<String>,
-    pub vram: Option<u64>, // MB
+    pub vram: Option<u64>,
     pub supports_encoding: bool,
     pub supports_decoding: bool,
     pub acceleration_type: Vec<HardwareAccelType>,
@@ -43,16 +41,16 @@ pub struct GpuInfo {
 #[derive(Debug, Serialize, Clone, PartialEq)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum HardwareAccelType {
-    VAAPI,        // Video Acceleration API (Intel/AMD on Linux)
-    NVENC,        // NVIDIA Encoder
-    NVDEC,        // NVIDIA Decoder
-    QSV,          // Intel Quick Sync Video
-    V4L2M2M,      // Video4Linux2 Memory-to-Memory (ARM)
-    DXVA2,        // DirectX Video Acceleration (Windows)
-    D3D11VA,      // Direct3D 11 Video Acceleration (Windows)
-    VideoToolbox, // Apple VideoToolbox (macOS)
-    CUDA,         // NVIDIA CUDA
-    OpenCL,       // OpenCL
+    VAAPI,
+    NVENC,
+    NVDEC,
+    QSV,
+    V4L2M2M,
+    DXVA2,
+    D3D11VA,
+    VideoToolbox,
+    CUDA,
+    OpenCL,
     None,
 }
 
@@ -78,11 +76,11 @@ pub struct CodecCapability {
 pub struct TranscodeRequest {
     pub input_file: String,
     pub output_file: String,
-    pub codec: String, // "h264", "h265", "vp9", "av1"
+    pub codec: String,
     pub quality: TranscodeQuality,
     pub use_hardware: bool,
-    pub resolution: Option<String>, // "1920x1080", "1280x720", etc.
-    pub bitrate: Option<String>,    // "5M", "10M", etc.
+    pub resolution: Option<String>,
+    pub bitrate: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -93,9 +91,6 @@ pub enum TranscodeQuality {
     VeryHigh,
 }
 
-// ============ API 端点 ============
-
-/// 获取硬件能力
 pub async fn get_hardware_capabilities() -> Result<HttpResponse, AppError> {
     info!("🔍 Detecting hardware capabilities...");
 
@@ -104,7 +99,6 @@ pub async fn get_hardware_capabilities() -> Result<HttpResponse, AppError> {
     Ok(HttpResponse::Ok().json(capabilities))
 }
 
-/// 转码视频（使用硬件加速）
 pub async fn transcode_video(
     body: web::Json<TranscodeRequest>,
     req: actix_web::HttpRequest,
@@ -124,8 +118,6 @@ pub async fn transcode_video(
 
     Ok(HttpResponse::Ok().json(result))
 }
-
-// ============ 硬件检测 ============
 
 fn detect_hardware_capabilities() -> Result<HardwareCapabilities, AppError> {
     let cpu_info = detect_cpu_info();
@@ -171,9 +163,8 @@ fn detect_cpu_info() -> CpuInfo {
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(1);
 
-            let threads = cores; // 简化处理
+            let threads = cores;
 
-            // 检测 AVX 支持
             let flags_output = Command::new("grep")
                 .args(["flags", "/proc/cpuinfo"])
                 .output()
@@ -196,7 +187,6 @@ fn detect_cpu_info() -> CpuInfo {
 
     #[cfg(target_os = "windows")]
     {
-        // Windows 实现
         let output = Command::new("wmic").args(["cpu", "get", "name"]).output();
 
         if let Ok(output) = output {
@@ -215,7 +205,7 @@ fn detect_cpu_info() -> CpuInfo {
                 threads: std::thread::available_parallelism()
                     .map(|n| n.get() as u32)
                     .unwrap_or(1),
-                has_avx: true, // 假设现代 CPU 都支持
+                has_avx: true,
                 has_avx2: true,
                 has_avx512: false,
             };
@@ -241,7 +231,6 @@ fn detect_gpu_info() -> Vec<GpuInfo> {
 
     #[cfg(target_os = "linux")]
     {
-        // 检测 NVIDIA GPU
         if let Ok(output) = Command::new("nvidia-smi")
             .args([
                 "--query-gpu=name,driver_version,memory.total",
@@ -276,7 +265,6 @@ fn detect_gpu_info() -> Vec<GpuInfo> {
             }
         }
 
-        // 检测 Intel GPU
         if let Ok(output) = Command::new("vainfo").output() {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -294,7 +282,6 @@ fn detect_gpu_info() -> Vec<GpuInfo> {
             }
         }
 
-        // 检测 AMD GPU
         if let Ok(output) = Command::new("lspci").output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if stdout.contains("AMD") || stdout.contains("Radeon") {
@@ -310,7 +297,6 @@ fn detect_gpu_info() -> Vec<GpuInfo> {
             }
         }
 
-        // 检测 ARM GPU (V4L2)
         if std::path::Path::new("/dev/video10").exists()
             || std::path::Path::new("/dev/video11").exists()
         {
@@ -328,7 +314,6 @@ fn detect_gpu_info() -> Vec<GpuInfo> {
 
     #[cfg(target_os = "windows")]
     {
-        // Windows GPU 检测
         if let Ok(output) = Command::new("wmic")
             .args(["path", "win32_VideoController", "get", "name"])
             .output()
@@ -501,8 +486,6 @@ fn recommend_codecs(_gpus: &[GpuInfo], accel_types: &[HardwareAccelType]) -> (St
     }
 }
 
-// ============ 转码实现 ============
-
 fn transcode_with_hardware(
     request: &TranscodeRequest,
     capabilities: &HardwareCapabilities,
@@ -516,13 +499,11 @@ fn transcode_with_hardware(
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-i").arg(&request.input_file);
 
-    // 硬件加速
     if request.use_hardware
         && !capabilities
             .hardware_acceleration
             .contains(&HardwareAccelType::None)
     {
-        // 添加硬件加速参数
         if capabilities
             .hardware_acceleration
             .contains(&HardwareAccelType::NVENC)
@@ -545,7 +526,6 @@ fn transcode_with_hardware(
         }
     }
 
-    // 编码器选择
     let encoder = if request.use_hardware {
         match request.codec.as_str() {
             "h264" => capabilities
@@ -574,7 +554,6 @@ fn transcode_with_hardware(
 
     cmd.arg("-c:v").arg(encoder);
 
-    // 质量设置
     let crf = match request.quality {
         TranscodeQuality::Low => "28",
         TranscodeQuality::Medium => "23",
@@ -585,31 +564,25 @@ fn transcode_with_hardware(
     if encoder.starts_with("lib") {
         cmd.arg("-crf").arg(crf);
     } else {
-        // 硬件编码器使用 qp
         cmd.arg("-qp").arg(crf);
     }
 
-    // 分辨率
     if let Some(resolution) = &request.resolution {
         cmd.arg("-s").arg(resolution);
     }
 
-    // 比特率
     if let Some(bitrate) = &request.bitrate {
         cmd.arg("-b:v").arg(bitrate);
     }
 
-    // 音频编码
     cmd.arg("-c:a").arg("aac");
     cmd.arg("-b:a").arg("128k");
 
-    // 输出文件
-    cmd.arg("-y"); // 覆盖输出文件
+    cmd.arg("-y");
     cmd.arg(&request.output_file);
 
     info!("🎬 Running FFmpeg command: {:?}", cmd);
 
-    // 执行转码（异步）
     let output = cmd
         .output()
         .map_err(|e| AppError::InternalServerError(format!("Failed to run FFmpeg: {}", e)))?;
@@ -634,14 +607,8 @@ fn transcode_with_hardware(
     }))
 }
 
-
-// ============ 辅助函数：确保所有类型都被使用 ============
-
-/// 这个函数确保所有枚举变体都被"使用"，避免 dead_code 警告
-/// 虽然某些变体只在特定平台使用，但我们需要在所有平台上定义它们以保持 API 一致性
 #[allow(dead_code)]
 fn ensure_all_accel_types_used() {
-    // 确保所有 HardwareAccelType 变体都被引用
     let _types = [
         HardwareAccelType::VAAPI,
         HardwareAccelType::NVENC,

@@ -12,12 +12,9 @@ use tokio::sync::RwLock;
 use rockzero_common::AppError;
 use rockzero_crypto::{crc32_checksum, crc32_verify, secure_random_bytes};
 
-// ============ 常量定义 ============
 const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
 const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
-
-// ============ CRC32 实现（使用 crypto 模块） ============
 
 pub struct Crc32;
 
@@ -40,8 +37,6 @@ impl Default for Crc32 {
         Self::new()
     }
 }
-
-// ============ Galois Field (GF(2^8)) 运算 - Reed-Solomon 基础 ============
 
 pub struct GaloisField {
     exp_table: [u8; 512],
@@ -107,8 +102,6 @@ impl Default for GaloisField {
         Self::new()
     }
 }
-
-// ============ Reed-Solomon 编码器 ============
 
 pub struct ReedSolomon {
     gf: GaloisField,
@@ -271,8 +264,6 @@ impl ReedSolomon {
     }
 }
 
-// ============ 安全数据块 ============
-
 #[derive(Clone)]
 pub struct SecureBlock {
     pub id: u64,
@@ -361,8 +352,6 @@ impl SecureBlock {
         })
     }
 }
-
-// ============ 恢复数据结构 ============
 
 struct RecoveryData {
     block_id: u64,
@@ -455,10 +444,6 @@ pub struct DatabaseStats {
     pub recovery_path: String,
 }
 
-// ============ 安全数据库管理器 ============
-
-/// 安全数据库管理器
-/// 提供加密存储、完整性校验和自动修复功能
 pub struct SecureDatabase {
     db_path: PathBuf,
     recovery_path: PathBuf,
@@ -471,17 +456,14 @@ pub struct SecureDatabase {
 
 impl SecureDatabase {
     pub fn new(db_path: &Path, master_password: &str) -> Result<Self, AppError> {
-        // Use Blake3-based HKDF for key derivation
         let db_identifier = db_path.to_string_lossy().to_string();
-        
-        // Extract: PRK = Blake3(salt || IKM)
+
         let salt_hash = blake3::hash(db_identifier.as_bytes());
         let mut extract_input = Vec::with_capacity(32 + master_password.len());
         extract_input.extend_from_slice(salt_hash.as_bytes());
         extract_input.extend_from_slice(master_password.as_bytes());
         let prk = blake3::hash(&extract_input);
-        
-        // Expand: key = Blake3(PRK || info || 0x01)
+
         let info = b"rockzero-secure-database-v1";
         let mut expand_input = Vec::with_capacity(32 + info.len() + 1);
         expand_input.extend_from_slice(prk.as_bytes());
@@ -505,7 +487,6 @@ impl SecureDatabase {
         })
     }
 
-    /// 加密并存储数据
     pub async fn store(&self, data: &[u8]) -> Result<u64, AppError> {
         let nonce_vec = secure_random_bytes(12)?;
         let mut nonce_bytes = [0u8; 12];
@@ -516,14 +497,11 @@ impl SecureDatabase {
             .encrypt(nonce, data)
             .map_err(|_| AppError::CryptoError("Encryption failed".to_string()))?;
 
-        // 计算 CRC32
         let crc32 = self.crc.checksum(&encrypted_data);
 
-        // 生成 Reed-Solomon 校验分片
         let shards = self.rs.encode(&encrypted_data)?;
         let parity_shards: Vec<Vec<u8>> = shards[DATA_SHARDS..].to_vec();
 
-        // 获取新的块 ID
         let block_id = {
             let mut id = self.next_block_id.write().await;
             let current = *id;
@@ -555,13 +533,11 @@ impl SecureDatabase {
             .get(&block_id)
             .ok_or_else(|| AppError::NotFound("Block not found".to_string()))?;
 
-        // 验证 CRC32
         if !self.crc.verify(&block.encrypted_data, block.crc32) {
             drop(blocks);
             return self.repair_and_retrieve(block_id).await;
         }
 
-        // 解密数据
         let nonce = Nonce::from_slice(&block.nonce);
         let decrypted = self
             .cipher
@@ -571,11 +547,9 @@ impl SecureDatabase {
         Ok(decrypted)
     }
 
-    /// 修复损坏的数据块并读取
     async fn repair_and_retrieve(&self, block_id: u64) -> Result<Vec<u8>, AppError> {
         tracing::warn!("Block {} CRC check failed, attempting repair", block_id);
 
-        // 从恢复文件读取校验数据
         let recovery_data = self.read_recovery_data(block_id).await?;
 
         let mut blocks = self.blocks.write().await;
@@ -583,12 +557,10 @@ impl SecureDatabase {
             .get_mut(&block_id)
             .ok_or_else(|| AppError::NotFound("Block not found".to_string()))?;
 
-        // 准备分片用于重建
         let shard_size = block.encrypted_data.len().div_ceil(DATA_SHARDS);
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
         for (i, chunk) in block.encrypted_data.chunks(shard_size).enumerate() {
             if i < DATA_SHARDS {
-                // 验证每个分片的局部 CRC
                 let shard_crc = self.crc.checksum(chunk);
                 if let Some(expected_crc) = recovery_data.shard_crcs.get(i) {
                     if shard_crc == *expected_crc {
@@ -598,29 +570,23 @@ impl SecureDatabase {
             }
         }
 
-        // 添加校验分片
         for (i, parity) in block.parity_shards.iter().enumerate() {
             shards[DATA_SHARDS + i] = Some(parity.clone());
         }
 
-        // 使用 Reed-Solomon 重建数据
         let reconstructed = self.rs.reconstruct(&mut shards)?;
 
-        // 截断到原始长度
         let original_len = block.encrypted_data.len();
         let repaired_data: Vec<u8> = reconstructed.into_iter().take(original_len).collect();
 
-        // 验证修复后的数据
         let new_crc = self.crc.checksum(&repaired_data);
         if new_crc != recovery_data.original_crc {
             return Err(AppError::CryptoError("Data repair failed".to_string()));
         }
 
-        // 更新块数据
         block.encrypted_data = repaired_data.clone();
         block.crc32 = new_crc;
 
-        // 解密
         let nonce = Nonce::from_slice(&block.nonce);
         let decrypted = self
             .cipher
@@ -632,7 +598,6 @@ impl SecureDatabase {
         Ok(decrypted)
     }
 
-    /// 持久化数据块到文件
     async fn persist_block(&self, block: &SecureBlock) -> Result<(), AppError> {
         let block_bytes = block.to_bytes();
 
@@ -642,7 +607,6 @@ impl SecureDatabase {
             .open(&self.db_path)
             .map_err(|e| AppError::IoError(e.to_string()))?;
 
-        // 写入块大小和数据
         let size = block_bytes.len() as u32;
         file.write_all(&size.to_le_bytes())
             .map_err(|e| AppError::IoError(e.to_string()))?;
@@ -655,7 +619,6 @@ impl SecureDatabase {
         Ok(())
     }
 
-    /// 更新恢复文件
     async fn update_recovery_file(&self, block: &SecureBlock) -> Result<(), AppError> {
         let recovery_data = RecoveryData {
             block_id: block.id,
@@ -688,7 +651,6 @@ impl SecureDatabase {
         Ok(())
     }
 
-    /// 计算数据分片的 CRC
     fn calculate_shard_crcs(&self, data: &[u8]) -> Vec<u32> {
         let shard_size = data.len().div_ceil(DATA_SHARDS);
         data.chunks(shard_size)
@@ -696,7 +658,6 @@ impl SecureDatabase {
             .collect()
     }
 
-    /// 从恢复文件读取恢复数据
     async fn read_recovery_data(&self, block_id: u64) -> Result<RecoveryData, AppError> {
         if !self.recovery_path.exists() {
             return Err(AppError::NotFound("Recovery file not found".to_string()));
@@ -730,7 +691,6 @@ impl SecureDatabase {
         ))
     }
 
-    /// 从文件加载数据库
     pub async fn load(&self) -> Result<(), AppError> {
         if !self.db_path.exists() {
             return Ok(());
@@ -770,7 +730,6 @@ impl SecureDatabase {
         Ok(())
     }
 
-    /// 验证所有数据块的完整性
     pub async fn verify_integrity(&self) -> Result<Vec<u64>, AppError> {
         let blocks = self.blocks.read().await;
         let mut corrupted = Vec::new();
@@ -784,7 +743,6 @@ impl SecureDatabase {
         Ok(corrupted)
     }
 
-    /// 修复所有损坏的数据块
     pub async fn repair_all(&self) -> Result<usize, AppError> {
         let corrupted = self.verify_integrity().await?;
         let mut repaired = 0;
@@ -798,13 +756,11 @@ impl SecureDatabase {
         Ok(repaired)
     }
 
-    /// 删除数据块
     pub async fn delete(&self, block_id: u64) -> Result<bool, AppError> {
         let mut blocks = self.blocks.write().await;
         Ok(blocks.remove(&block_id).is_some())
     }
 
-    /// 获取数据库统计信息
     pub async fn stats(&self) -> DatabaseStats {
         let blocks = self.blocks.read().await;
         let total_blocks = blocks.len();
@@ -818,8 +774,6 @@ impl SecureDatabase {
         }
     }
 }
-
-// ============ 测试 ============
 
 #[cfg(test)]
 mod tests {
@@ -838,11 +792,9 @@ mod tests {
     fn test_galois_field() {
         let gf = GaloisField::new();
 
-        // 测试乘法
         assert_eq!(gf.mul(0, 5), 0);
         assert_eq!(gf.mul(1, 5), 5);
 
-        // 测试逆元
         let a = 42u8;
         let a_inv = gf.inv(a);
         assert_eq!(gf.mul(a, a_inv), 1);
@@ -853,17 +805,14 @@ mod tests {
         let rs = ReedSolomon::new(5, 3);
         let data = b"Hello, World! This is a test of Reed-Solomon encoding.";
 
-        // 编码
         let shards = rs.encode(data).unwrap();
         assert_eq!(shards.len(), 8);
 
-        // 模拟丢失三个分片
         let mut recovery_shards: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
         recovery_shards[0] = None;
         recovery_shards[1] = None;
         recovery_shards[2] = None;
 
-        // 重建
         let reconstructed = rs.reconstruct(&mut recovery_shards).unwrap();
         assert!(reconstructed.starts_with(data));
     }

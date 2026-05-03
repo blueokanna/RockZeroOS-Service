@@ -80,13 +80,13 @@ impl BulletproofAuthenticator {
             proof_data.extend_from_slice(bit_hasher.finalize().as_bytes());
         }
 
-        // 生成Fiat-Shamir挑战
+
         let mut challenge_hasher = Hasher::new();
         challenge_hasher.update(&commitment);
         challenge_hasher.update(&proof_data);
         let challenge = challenge_hasher.finalize().as_bytes().to_vec();
 
-        // 生成响应
+
         let mut response_hasher = Hasher::new();
         response_hasher.update(&blinding);
         response_hasher.update(&challenge);
@@ -174,8 +174,8 @@ impl BulletproofAuthenticator {
             return Ok(false);
         }
 
-        // 在实际实现中，这里应该验证环签名的有效性
-        // 简化版本只检查格式
+
+
         Ok(true)
     }
 
@@ -205,9 +205,9 @@ impl BulletproofAuthenticator {
         sequence: u64,
         proof: &[u8],
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        // 重新生成证明并比较
-        // 注意：在实际应用中，验证者不应该知道盲化因子
-        // 这里简化为只验证数据哈希
+
+
+
 
         let mut data_hasher = Hasher::new();
         data_hasher.update(data);

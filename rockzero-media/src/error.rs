@@ -33,10 +33,10 @@ pub type Result<T> = std::result::Result<T, HlsError>;
 pub enum AppError {
     #[error("Bad request: {0}")]
     BadRequest(String),
-    
+
     #[error("Internal error")]
     InternalError,
-    
+
     #[error("Not found: {0}")]
     NotFound(String),
 }

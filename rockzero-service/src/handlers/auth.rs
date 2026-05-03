@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
 use rockzero_common::{AppConfig, AppError, TokenResponse};
 use rockzero_crypto::{blake3_hash, constant_time_compare};
@@ -246,6 +246,7 @@ impl Default for SecurePasswordHandler {
 #[derive(Debug, Clone)]
 pub struct PasswordCredentials {
     pub password_hash: String,
+    #[allow(dead_code)]
     pub zkp_registration: PasswordRegistration,
 }
 
@@ -288,7 +289,6 @@ fn derive_key_with_salt(password: &[u8], salt: &[u8]) -> Vec<u8> {
 }
 
 pub fn compute_sae_secret(password: &str) -> String {
-    // Use Blake3 for SAE secret computation
     let hash = blake3::hash(password.as_bytes());
     hex::encode(hash.as_bytes())
 }
@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn test_jwt_eddsa() {
         use base64::Engine;
-        
+
         let config = AppConfig {
             jwt_secret: "test-secret".to_string(),
             jwt_expiration_hours: 24,
@@ -383,8 +383,9 @@ mod tests {
         let parts: Vec<&str> = tokens.access_token.split('.').collect();
         assert_eq!(parts.len(), 3);
 
-        let header_json =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+        let header_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .unwrap();
         let header: serde_json::Value = serde_json::from_slice(&header_json).unwrap();
         assert_eq!(header["alg"], "EdDSA");
         assert_eq!(header["typ"], "JWT");
@@ -518,10 +519,12 @@ pub async fn register(
 
     let sae_secret = compute_sae_secret(&body.password);
 
-    let zkp_registration_json =
-        serde_json::to_string(&credentials.zkp_registration).map_err(|e| {
-            AppError::InternalServerError(format!("Failed to serialize ZKP registration: {}", e))
-        })?;
+    let zkp_ctx = ZkpContext::new();
+    let sae_based_registration = zkp_ctx.register_password(&sae_secret)?;
+
+    let zkp_registration_json = serde_json::to_string(&sae_based_registration).map_err(|e| {
+        AppError::InternalServerError(format!("Failed to serialize ZKP registration: {}", e))
+    })?;
 
     let user = crate::db::create_user(
         &pool,
@@ -574,14 +577,32 @@ pub async fn login(
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     }
 
-    // Update sae_secret if not set or different from current password hash
     let sae_secret = compute_sae_secret(&body.password);
-    if user.sae_secret.as_ref() != Some(&sae_secret) {
-        if let Err(e) = crate::db::update_user_sae_secret(&pool, &user.id, &sae_secret).await {
-            warn!("Failed to update sae_secret for user {}: {}", user.id, e);
-        } else {
-            info!("Updated sae_secret for user {}", user.id);
-        }
+
+    let stored_registration_valid = user
+        .zkp_registration
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<PasswordRegistration>(s).ok())
+        .is_some();
+    let sae_secret_matches = user.sae_secret.as_ref() == Some(&sae_secret);
+
+    if !sae_secret_matches || !stored_registration_valid {
+        let zkp_ctx = ZkpContext::new();
+        let registration = zkp_ctx.register_password(&sae_secret).map_err(|e| {
+            AppError::InternalServerError(format!(
+                "Failed to regenerate synchronized ZKP registration: {}",
+                e
+            ))
+        })?;
+        let reg_json = serde_json::to_string(&registration).map_err(|e| {
+            AppError::InternalServerError(format!(
+                "Failed to serialize synchronized ZKP registration: {}",
+                e
+            ))
+        })?;
+        crate::db::sync_user_sae_and_zkp_registration(&pool, &user.id, &sae_secret, &reg_json)
+            .await?;
+        info!("Synchronized SAE and ZKP credentials for user {}", user.id);
     }
 
     let jwt_config = AppConfig::from_env();

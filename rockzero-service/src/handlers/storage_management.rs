@@ -11,7 +11,7 @@ pub async fn get_storage_stats(
     storage_manager: web::Data<Arc<StorageManager>>,
 ) -> Result<HttpResponse, AppError> {
     let stats = storage_manager.get_storage_stats().await;
-    
+
     Ok(HttpResponse::Ok().json(StorageStatsResponse {
         hls_cache_size: stats.hls_cache_size,
         temp_storage_size: stats.temp_storage_size,
@@ -35,12 +35,12 @@ pub async fn trigger_cleanup(
     storage_manager: web::Data<Arc<StorageManager>>,
 ) -> Result<HttpResponse, AppError> {
     info!("Manual cleanup triggered");
-    
+
     storage_manager
         .run_cleanup()
         .await
         .map_err(|e| AppError::InternalServerError(format!("Cleanup failed: {}", e)))?;
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "message": "Cleanup completed successfully"
@@ -51,12 +51,12 @@ pub async fn cleanup_hls_cache(
     storage_manager: web::Data<Arc<StorageManager>>,
 ) -> Result<HttpResponse, AppError> {
     info!("Manual HLS cache cleanup triggered");
-    
+
     storage_manager
         .cleanup_hls_cache()
         .await
         .map_err(|e| AppError::InternalServerError(format!("HLS cache cleanup failed: {}", e)))?;
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "message": "HLS cache cleaned successfully"
@@ -67,12 +67,12 @@ pub async fn cleanup_temp_files(
     storage_manager: web::Data<Arc<StorageManager>>,
 ) -> Result<HttpResponse, AppError> {
     info!("Manual temp files cleanup triggered");
-    
+
     storage_manager
         .cleanup_temp_files()
         .await
         .map_err(|e| AppError::InternalServerError(format!("Temp files cleanup failed: {}", e)))?;
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "message": "Temporary files cleaned successfully"
@@ -86,9 +86,9 @@ pub async fn check_storage_space(
         .check_storage_space()
         .await
         .map_err(|e| AppError::InternalServerError(format!("Storage check failed: {}", e)))?;
-    
+
     let stats = storage_manager.get_storage_stats().await;
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "available_space_gb": stats.available_space as f64 / 1024.0 / 1024.0 / 1024.0,
@@ -141,19 +141,19 @@ pub async fn get_accurate_disk_usage(
     body: web::Json<AccurateDiskUsageRequest>,
 ) -> Result<HttpResponse, AppError> {
     let mount_point = PathBuf::from(&body.mount_point);
-    
+
     if !mount_point.exists() {
         return Err(AppError::NotFound(format!(
             "Mount point not found: {}",
             body.mount_point
         )));
     }
-    
+
     let usage = storage_manager
         .get_accurate_disk_usage(&mount_point)
         .await
         .map_err(|e| AppError::InternalServerError(format!("Failed to get disk usage: {}", e)))?;
-    
+
     info!(
         "Accurate disk usage - mount: {}, total: {:.2} GB, used: {:.2} GB, cache: {:.2} MB, user data: {:.2} GB",
         body.mount_point,
@@ -162,7 +162,7 @@ pub async fn get_accurate_disk_usage(
         usage.cache_size as f64 / 1024.0 / 1024.0,
         usage.actual_user_data as f64 / 1024.0 / 1024.0 / 1024.0
     );
-    
+
     Ok(HttpResponse::Ok().json(AccurateDiskUsageResponse {
         total_space: usage.total_space,
         available_space: usage.available_space,
@@ -202,10 +202,6 @@ pub async fn force_cleanup_all_cache(
     })))
 }
 
-/// 获取自动清理状态
-///
-/// 返回 2GB 阈值自动清理的实时状态，供仪表板展示。
-/// 替代手动的 Clean Cache / Clear Temp 按钮。
 pub async fn get_auto_cleanup_status(
     storage_manager: web::Data<Arc<StorageManager>>,
 ) -> Result<HttpResponse, AppError> {

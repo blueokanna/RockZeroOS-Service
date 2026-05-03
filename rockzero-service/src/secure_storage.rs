@@ -15,7 +15,7 @@ use rockzero_common::AppError;
 use crate::secure_db::SecureDatabase;
 use tracing::info;
 
-/// 安全存储管理器
+
 pub struct SecureStorageManager {
     databases: RwLock<std::collections::HashMap<String, Arc<SecureDatabase>>>,
     base_path: PathBuf,
@@ -36,7 +36,7 @@ impl SecureStorageManager {
         }
     }
 
-    /// 获取或创建用户的安全数据库
+
     pub async fn get_or_create_db(
         &self,
         user_id: &str,
@@ -58,24 +58,24 @@ impl SecureStorageManager {
         Ok(db)
     }
 
-    /// 关闭用户的数据库连接
+
     pub async fn close_db(&self, user_id: &str) {
         let mut dbs = self.databases.write().await;
         dbs.remove(user_id);
     }
 
-    /// 获取传输管理器
+
     pub fn transfer_manager(&self) -> Arc<TransferManager> {
         self.transfer_manager.clone()
     }
 
-    /// 获取文件加密器
+
     pub fn file_encryptor(&self) -> Arc<SecureFileEncryptor> {
         self.file_encryptor.clone()
     }
 }
 
-// ============ 请求/响应结构 ============
+
 
 #[derive(Debug, Deserialize)]
 pub struct InitDatabaseRequest {
@@ -85,7 +85,7 @@ pub struct InitDatabaseRequest {
 #[derive(Debug, Deserialize)]
 pub struct StoreDataRequest {
     pub master_password: String,
-    pub data: String, // Base64 编码的数据
+    pub data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,7 +102,7 @@ pub struct RetrieveDataRequest {
 
 #[derive(Debug, Serialize)]
 pub struct RetrieveDataResponse {
-    pub data: String, // Base64 编码的数据
+    pub data: String,
     pub block_id: u64,
 }
 
@@ -125,9 +125,9 @@ pub struct RepairResponse {
     pub message: String,
 }
 
-// ============ API 处理器 ============
 
-/// 初始化安全数据库
+
+
 pub async fn init_secure_database(
     storage: web::Data<Arc<SecureStorageManager>>,
     claims: web::ReqData<Claims>,
@@ -143,7 +143,7 @@ pub async fn init_secure_database(
     })))
 }
 
-/// 存储加密数据
+
 pub async fn store_secure_data(
     storage: web::Data<Arc<SecureStorageManager>>,
     claims: web::ReqData<Claims>,
@@ -164,7 +164,7 @@ pub async fn store_secure_data(
     }))
 }
 
-/// 读取加密数据
+
 pub async fn retrieve_secure_data(
     storage: web::Data<Arc<SecureStorageManager>>,
     claims: web::ReqData<Claims>,
@@ -182,7 +182,7 @@ pub async fn retrieve_secure_data(
     }))
 }
 
-/// 删除加密数据
+
 pub async fn delete_secure_data(
     storage: web::Data<Arc<SecureStorageManager>>,
     claims: web::ReqData<Claims>,
@@ -202,7 +202,7 @@ pub async fn delete_secure_data(
     }
 }
 
-/// 检查数据完整性
+
 pub async fn check_integrity(
     storage: web::Data<Arc<SecureStorageManager>>,
     claims: web::ReqData<Claims>,
@@ -220,7 +220,7 @@ pub async fn check_integrity(
     }))
 }
 
-/// 修复损坏的数据
+
 pub async fn repair_data(
     storage: web::Data<Arc<SecureStorageManager>>,
     claims: web::ReqData<Claims>,
@@ -236,7 +236,7 @@ pub async fn repair_data(
     }))
 }
 
-/// 获取数据库统计信息
+
 pub async fn get_database_stats(
     storage: web::Data<Arc<SecureStorageManager>>,
     claims: web::ReqData<Claims>,
@@ -249,7 +249,7 @@ pub async fn get_database_stats(
     Ok(HttpResponse::Ok().json(stats))
 }
 
-/// 关闭数据库连接
+
 pub async fn close_database(
     storage: web::Data<Arc<SecureStorageManager>>,
     claims: web::ReqData<Claims>,
@@ -263,36 +263,36 @@ pub async fn close_database(
 }
 
 
-// ============ 加密工具 API ============
 
-/// 加密数据请求
+
+
 #[derive(Debug, Deserialize)]
 pub struct EncryptDataRequest {
     pub password: String,
-    pub data: String, // Base64 编码
+    pub data: String,
 }
 
-/// 加密数据响应
+
 #[derive(Debug, Serialize)]
 pub struct EncryptDataResponse {
-    pub encrypted: String, // Base64 编码
+    pub encrypted: String,
     pub key_id: String,
 }
 
-/// 解密数据请求
+
 #[derive(Debug, Deserialize)]
 pub struct DecryptDataRequest {
     pub password: String,
-    pub encrypted: String, // Base64 编码
+    pub encrypted: String,
 }
 
-/// 解密数据响应
+
 #[derive(Debug, Serialize)]
 pub struct DecryptDataResponse {
-    pub data: String, // Base64 编码
+    pub data: String,
 }
 
-/// 使用密码加密数据
+
 pub async fn encrypt_data(
     _claims: web::ReqData<Claims>,
     body: web::Json<EncryptDataRequest>,
@@ -312,7 +312,7 @@ pub async fn encrypt_data(
     }))
 }
 
-/// 使用密码解密数据
+
 pub async fn decrypt_data(
     _claims: web::ReqData<Claims>,
     body: web::Json<DecryptDataRequest>,
@@ -334,7 +334,7 @@ pub async fn decrypt_data(
     }))
 }
 
-/// 密钥派生请求
+
 #[derive(Debug, Deserialize)]
 pub struct DeriveKeyRequest {
     pub password: String,
@@ -343,14 +343,14 @@ pub struct DeriveKeyRequest {
     pub use_wpa3_sae: bool,
 }
 
-/// 密钥派生响应
+
 #[derive(Debug, Serialize)]
 pub struct DeriveKeyResponse {
-    pub key: String, // Hex 编码
+    pub key: String,
     pub method: String,
 }
 
-/// 派生加密密钥
+
 pub async fn derive_key(
     _claims: web::ReqData<Claims>,
     body: web::Json<DeriveKeyRequest>,
@@ -371,14 +371,14 @@ pub async fn derive_key(
     }))
 }
 
-/// 批量密钥派生请求
+
 #[derive(Debug, Deserialize)]
 pub struct DeriveBatchKeysRequest {
     pub password: String,
     pub contexts: Vec<String>,
 }
 
-/// 批量密钥派生响应
+
 #[derive(Debug, Serialize)]
 pub struct DeriveBatchKeysResponse {
     pub keys: Vec<DerivedKey>,
@@ -387,10 +387,10 @@ pub struct DeriveBatchKeysResponse {
 #[derive(Debug, Serialize)]
 pub struct DerivedKey {
     pub context: String,
-    pub key: String, // Hex 编码
+    pub key: String,
 }
 
-/// 批量派生密钥
+
 pub async fn derive_batch_keys(
     _claims: web::ReqData<Claims>,
     body: web::Json<DeriveBatchKeysRequest>,
@@ -411,19 +411,19 @@ pub async fn derive_batch_keys(
     }))
 }
 
-/// 生成随机数据请求
+
 #[derive(Debug, Deserialize)]
 pub struct GenerateRandomRequest {
     pub length: usize,
     #[serde(default = "default_format")]
-    pub format: String, // "hex", "base64", "bytes"
+    pub format: String,
 }
 
 fn default_format() -> String {
     "hex".to_string()
 }
 
-/// 生成随机数据响应
+
 #[derive(Debug, Serialize)]
 pub struct GenerateRandomResponse {
     pub data: String,
@@ -431,7 +431,7 @@ pub struct GenerateRandomResponse {
     pub length: usize,
 }
 
-/// 生成安全随机数据
+
 pub async fn generate_random(
     _claims: web::ReqData<Claims>,
     body: web::Json<GenerateRandomRequest>,
@@ -458,22 +458,22 @@ pub async fn generate_random(
     }))
 }
 
-/// 哈希数据请求
+
 #[derive(Debug, Deserialize)]
 pub struct HashDataRequest {
-    pub data: String, // Base64 编码
+    pub data: String,
     #[serde(default)]
-    pub key: Option<String>, // Hex 编码的密钥（可选，用于 keyed hash）
+    pub key: Option<String>,
 }
 
-/// 哈希数据响应
+
 #[derive(Debug, Serialize)]
 pub struct HashDataResponse {
-    pub hash: String, // Hex 编码
+    pub hash: String,
     pub algorithm: String,
 }
 
-/// 计算 BLAKE3 哈希
+
 pub async fn hash_data(
     _claims: web::ReqData<Claims>,
     body: web::Json<HashDataRequest>,
@@ -506,15 +506,15 @@ pub async fn hash_data(
     }))
 }
 
-/// CRC32 校验请求
+
 #[derive(Debug, Deserialize)]
 pub struct Crc32Request {
-    pub data: String, // Base64 编码
+    pub data: String,
     #[serde(default)]
     pub expected: Option<u32>,
 }
 
-/// CRC32 校验响应
+
 #[derive(Debug, Serialize)]
 pub struct Crc32Response {
     pub checksum: u32,
@@ -523,7 +523,7 @@ pub struct Crc32Response {
     pub valid: Option<bool>,
 }
 
-/// 计算或验证 CRC32
+
 pub async fn crc32_check(
     _claims: web::ReqData<Claims>,
     body: web::Json<Crc32Request>,
@@ -543,20 +543,20 @@ pub async fn crc32_check(
     }))
 }
 
-/// 常量时间比较请求
+
 #[derive(Debug, Deserialize)]
 pub struct ConstantTimeCompareRequest {
-    pub a: String, // Hex 编码
-    pub b: String, // Hex 编码
+    pub a: String,
+    pub b: String,
 }
 
-/// 常量时间比较响应
+
 #[derive(Debug, Serialize)]
 pub struct ConstantTimeCompareResponse {
     pub equal: bool,
 }
 
-/// 常量时间比较（防止时序攻击）
+
 pub async fn constant_time_compare_endpoint(
     _claims: web::ReqData<Claims>,
     body: web::Json<ConstantTimeCompareRequest>,
@@ -571,13 +571,13 @@ pub async fn constant_time_compare_endpoint(
     Ok(HttpResponse::Ok().json(ConstantTimeCompareResponse { equal }))
 }
 
-/// 文件传输状态请求
+
 #[derive(Debug, Deserialize)]
 pub struct TransferStatusRequest {
     pub path: String,
 }
 
-/// 文件传输状态响应
+
 #[derive(Debug, Serialize)]
 pub struct TransferStatusResponse {
     pub path: String,
@@ -597,7 +597,7 @@ pub struct TransferStatusResponse {
     pub expected_size: Option<u64>,
 }
 
-/// 获取文件传输状态
+
 pub async fn get_transfer_status(
     storage: web::Data<Arc<SecureStorageManager>>,
     _claims: web::ReqData<Claims>,
@@ -634,14 +634,14 @@ pub async fn get_transfer_status(
     }))
 }
 
-/// 开始文件传输请求
+
 #[derive(Debug, Deserialize)]
 pub struct StartTransferRequest {
     pub path: String,
     pub expected_size: u64,
 }
 
-/// 开始文件传输
+
 pub async fn start_transfer(
     storage: web::Data<Arc<SecureStorageManager>>,
     _claims: web::ReqData<Claims>,
@@ -657,14 +657,14 @@ pub async fn start_transfer(
     })))
 }
 
-/// 完成文件传输请求
+
 #[derive(Debug, Deserialize)]
 pub struct CompleteTransferRequest {
     pub path: String,
     pub crc32: u32,
 }
 
-/// 完成文件传输
+
 pub async fn complete_transfer(
     storage: web::Data<Arc<SecureStorageManager>>,
     _claims: web::ReqData<Claims>,
@@ -681,23 +681,23 @@ pub async fn complete_transfer(
     })))
 }
 
-/// 加密文件请求
+
 #[derive(Debug, Deserialize)]
 pub struct EncryptFileRequest {
     pub path: String,
     pub password: String,
-    pub data: String, // Base64 编码
+    pub data: String,
 }
 
-/// 加密文件响应
+
 #[derive(Debug, Serialize)]
 pub struct EncryptFileResponse {
-    pub encrypted: String, // Base64 编码
+    pub encrypted: String,
     pub original_crc32: u32,
     pub original_size: u64,
 }
 
-/// 加密文件数据
+
 pub async fn encrypt_file(
     storage: web::Data<Arc<SecureStorageManager>>,
     _claims: web::ReqData<Claims>,
@@ -722,7 +722,7 @@ pub async fn encrypt_file(
     }))
 }
 
-/// 获取活跃传输列表
+
 pub async fn list_active_transfers(
     storage: web::Data<Arc<SecureStorageManager>>,
     _claims: web::ReqData<Claims>,
@@ -747,13 +747,13 @@ pub async fn list_active_transfers(
     Ok(HttpResponse::Ok().json(response))
 }
 
-/// 清理已完成的传输
+
 pub async fn cleanup_transfers(
     storage: web::Data<Arc<SecureStorageManager>>,
     _claims: web::ReqData<Claims>,
 ) -> Result<impl Responder, AppError> {
     let tm = storage.transfer_manager();
-    tm.cleanup_completed()?; // 清理已完成的传输
+    tm.cleanup_completed()?;
     
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
@@ -761,20 +761,20 @@ pub async fn cleanup_transfers(
     })))
 }
 
-/// 安全擦除请求
+
 #[derive(Debug, Deserialize)]
 pub struct SecureEraseRequest {
-    pub data: String, // Hex 编码
+    pub data: String,
 }
 
-/// 安全擦除响应
+
 #[derive(Debug, Serialize)]
 pub struct SecureEraseResponse {
     pub success: bool,
     pub message: String,
 }
 
-/// 安全擦除数据（演示用）
+
 pub async fn secure_erase_demo(
     _claims: web::ReqData<Claims>,
     body: web::Json<SecureEraseRequest>,
@@ -782,10 +782,10 @@ pub async fn secure_erase_demo(
     let mut data = hex::decode(&body.data)
         .map_err(|_| AppError::BadRequest("Invalid hex data".to_string()))?;
     
-    // 安全擦除数据
+
     secure_zero(&mut data);
     
-    // 如果是 32 字节，也可以作为密钥擦除
+
     if data.len() == 32 {
         let mut key = [0u8; 32];
         key.copy_from_slice(&data);
@@ -799,23 +799,23 @@ pub async fn secure_erase_demo(
 }
 
 
-// ============ 字符串加密 API ============
 
-/// 加密字符串请求
+
+
 #[derive(Debug, Deserialize)]
 pub struct EncryptStringRequest {
     pub password: String,
     pub plaintext: String,
 }
 
-/// 加密字符串响应
+
 #[derive(Debug, Serialize)]
 pub struct EncryptStringResponse {
     pub encrypted: String,
     pub key_id: String,
 }
 
-/// 加密字符串
+
 pub async fn encrypt_string(
     _claims: web::ReqData<Claims>,
     body: web::Json<EncryptStringRequest>,
@@ -829,20 +829,20 @@ pub async fn encrypt_string(
     }))
 }
 
-/// 解密字符串请求
+
 #[derive(Debug, Deserialize)]
 pub struct DecryptStringRequest {
     pub password: String,
     pub encrypted: String,
 }
 
-/// 解密字符串响应
+
 #[derive(Debug, Serialize)]
 pub struct DecryptStringResponse {
     pub plaintext: String,
 }
 
-/// 解密字符串
+
 pub async fn decrypt_string(
     _claims: web::ReqData<Claims>,
     body: web::Json<DecryptStringRequest>,
@@ -855,30 +855,30 @@ pub async fn decrypt_string(
     }))
 }
 
-// ============ WPA3-SAE 高级 API ============
 
-/// WPA3-SAE 密钥派生请求
+
+
 #[derive(Debug, Deserialize)]
 pub struct Wpa3SaeKeyRequest {
     pub password: String,
     pub identifier: String,
     #[serde(default = "default_key_type")]
-    pub key_type: String, // "db", "file", "auth", "session"
+    pub key_type: String,
 }
 
 fn default_key_type() -> String {
     "db".to_string()
 }
 
-/// WPA3-SAE 密钥派生响应
+
 #[derive(Debug, Serialize)]
 pub struct Wpa3SaeKeyResponse {
-    pub key: String, // Hex 编码
+    pub key: String,
     pub key_type: String,
     pub algorithm: String,
 }
 
-/// 使用 WPA3-SAE 派生特定类型的密钥
+
 pub async fn derive_wpa3_sae_key(
     _claims: web::ReqData<Claims>,
     body: web::Json<Wpa3SaeKeyRequest>,
@@ -903,14 +903,14 @@ pub async fn derive_wpa3_sae_key(
     }))
 }
 
-// ============ KeyDeriver 高级 API ============
 
-/// KeyDeriver 特定密钥请求
+
+
 #[derive(Debug, Deserialize)]
 pub struct KeyDeriverRequest {
     pub password: String,
     #[serde(default = "default_deriver_key_type")]
-    pub key_type: String, // "db", "file", "session"
+    pub key_type: String,
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -919,14 +919,14 @@ fn default_deriver_key_type() -> String {
     "db".to_string()
 }
 
-/// KeyDeriver 特定密钥响应
+
 #[derive(Debug, Serialize)]
 pub struct KeyDeriverResponse {
-    pub key: String, // Hex 编码
+    pub key: String,
     pub key_type: String,
 }
 
-/// 使用 KeyDeriver 派生特定类型的密钥
+
 pub async fn derive_specific_key(
     _claims: web::ReqData<Claims>,
     body: web::Json<KeyDeriverRequest>,
@@ -950,25 +950,25 @@ pub async fn derive_specific_key(
     }))
 }
 
-// ============ 文件解密 API ============
 
-/// 解密文件请求
+
+
 #[derive(Debug, Deserialize)]
 pub struct DecryptFileRequest {
     pub password: String,
-    pub encrypted: String, // Base64 编码的加密数据
+    pub encrypted: String,
     pub original_crc32: u32,
     pub original_size: u64,
 }
 
-/// 解密文件响应
+
 #[derive(Debug, Serialize)]
 pub struct DecryptFileResponse {
-    pub data: String, // Base64 编码
+    pub data: String,
     pub verified: bool,
 }
 
-/// 解密文件数据
+
 pub async fn decrypt_file(
     storage: web::Data<Arc<SecureStorageManager>>,
     _claims: web::ReqData<Claims>,
@@ -978,13 +978,13 @@ pub async fn decrypt_file(
     
     let encryptor = storage.file_encryptor();
     
-    // 解码加密数据
+
     let encrypted_data = BASE64.decode(&body.encrypted)
         .map_err(|_| AppError::BadRequest("Invalid Base64 data".to_string()))?;
     
     let encrypted = crate::crypto::EncryptedData {
         ciphertext: encrypted_data,
-        nonce: vec![0; 12], // placeholder
+        nonce: vec![0; 12],
         tag: None,
     };
     
@@ -1000,7 +1000,7 @@ pub async fn decrypt_file(
     }))
 }
 
-/// 检查文件是否可以安全加密
+
 pub async fn can_safely_encrypt(
     storage: web::Data<Arc<SecureStorageManager>>,
     _claims: web::ReqData<Claims>,
@@ -1015,16 +1015,16 @@ pub async fn can_safely_encrypt(
     })))
 }
 
-// ============ 传输管理高级 API ============
 
-/// 更新传输进度请求
+
+
 #[derive(Debug, Deserialize)]
 pub struct UpdateProgressRequest {
     pub path: String,
     pub current_size: u64,
 }
 
-/// 更新传输进度
+
 pub async fn update_transfer_progress(
     storage: web::Data<Arc<SecureStorageManager>>,
     _claims: web::ReqData<Claims>,
@@ -1040,14 +1040,14 @@ pub async fn update_transfer_progress(
     })))
 }
 
-/// 标记加密失败请求
+
 #[derive(Debug, Deserialize)]
 pub struct MarkEncryptionFailedRequest {
     pub path: String,
     pub error: String,
 }
 
-/// 标记加密失败
+
 pub async fn mark_encryption_failed(
     storage: web::Data<Arc<SecureStorageManager>>,
     _claims: web::ReqData<Claims>,
@@ -1063,13 +1063,13 @@ pub async fn mark_encryption_failed(
     })))
 }
 
-/// 移除传输记录请求
+
 #[derive(Debug, Deserialize)]
 pub struct RemoveTransferRequest {
     pub path: String,
 }
 
-/// 移除传输记录
+
 pub async fn remove_transfer(
     storage: web::Data<Arc<SecureStorageManager>>,
     _claims: web::ReqData<Claims>,

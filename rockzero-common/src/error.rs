@@ -102,11 +102,16 @@ impl actix_web::ResponseError for AppError {
                 "error": "Conflict",
                 "message": msg
             })),
-            AppError::PreconditionFailed(msg) => HttpResponse::PreconditionFailed().json(serde_json::json!({
-                "error": "Precondition Failed",
-                "message": msg
-            })),
-            AppError::CryptoError(msg) | AppError::DatabaseError(msg) | AppError::IoError(msg) | AppError::InternalServerError(msg) => {
+            AppError::PreconditionFailed(msg) => {
+                HttpResponse::PreconditionFailed().json(serde_json::json!({
+                    "error": "Precondition Failed",
+                    "message": msg
+                }))
+            }
+            AppError::CryptoError(msg)
+            | AppError::DatabaseError(msg)
+            | AppError::IoError(msg)
+            | AppError::InternalServerError(msg) => {
                 HttpResponse::InternalServerError().json(serde_json::json!({
                     "error": "Internal Server Error",
                     "message": msg
@@ -120,10 +125,12 @@ impl actix_web::ResponseError for AppError {
                 "error": "Validation Error",
                 "message": msg
             })),
-            AppError::InternalError => HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": "Internal Server Error",
-                "message": "An internal error occurred"
-            })),
+            AppError::InternalError => {
+                HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": "Internal Server Error",
+                    "message": "An internal error occurred"
+                }))
+            }
         }
     }
 }

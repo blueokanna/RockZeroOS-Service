@@ -1,17 +1,14 @@
-//! Event notifier module for broadcasting system events
-//! This module is infrastructure code prepared for future real-time notification features.
 #![allow(dead_code)]
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast, RwLock, Mutex};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{info, warn};
-use serde::{Serialize, Deserialize};
 
-/// System event type
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SystemEventType {
     FileSystemChange,
@@ -27,7 +24,6 @@ pub enum SystemEventType {
     SecurityAlert,
 }
 
-/// System event (with security verification)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemEvent {
     pub event_type: SystemEventType,
@@ -55,9 +51,9 @@ impl SystemEvent {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        
+
         let path_str = path.as_ref().map(|p| p.to_string_lossy().to_string());
-        
+
         let mut event = Self {
             event_type,
             path: path_str,
@@ -69,11 +65,11 @@ impl SystemEvent {
             user_id,
             session_id,
         };
-        
+
         event.event_hash = event.compute_hash();
         event
     }
-    
+
     fn compute_hash(&self) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(format!("{:?}", self.event_type).as_bytes());
@@ -87,7 +83,7 @@ impl SystemEvent {
         }
         hex::encode(hasher.finalize().as_bytes())
     }
-    
+
     pub fn verify(&self) -> bool {
         let computed_hash = self.compute_hash();
         computed_hash == self.event_hash
@@ -114,7 +110,7 @@ impl EventAggregator {
             warn!("Rejecting invalid event: {:?}", event.event_type);
             return;
         }
-        
+
         self.pending_events
             .entry(event.event_type.clone())
             .or_default()
@@ -128,16 +124,16 @@ impl EventAggregator {
     fn flush(&mut self) -> Vec<SystemEvent> {
         self.last_flush = Instant::now();
         let mut events = Vec::new();
-        
+
         for (_, event_list) in self.pending_events.drain() {
             if let Some(latest) = event_list.into_iter().last() {
                 events.push(latest);
             }
         }
-        
+
         events
     }
-    
+
     fn clear(&mut self) {
         self.pending_events.clear();
     }
@@ -156,18 +152,18 @@ impl EventHistory {
             max_size,
         }
     }
-    
+
     fn add(&mut self, event: SystemEvent) {
         if self.events.len() >= self.max_size {
-            self.events.pop_front(); // O(1) with VecDeque
+            self.events.pop_front();
         }
         self.events.push_back(event);
     }
-    
+
     pub fn get_recent(&self, count: usize) -> Vec<SystemEvent> {
         self.events.iter().rev().take(count).cloned().collect()
     }
-    
+
     pub fn get_by_user(&self, user_id: &str) -> Vec<SystemEvent> {
         self.events
             .iter()
@@ -175,7 +171,7 @@ impl EventHistory {
             .cloned()
             .collect()
     }
-    
+
     pub fn get_by_type(&self, event_type: &SystemEventType) -> Vec<SystemEvent> {
         self.events
             .iter()
@@ -205,10 +201,10 @@ pub struct EventNotifier {
 impl EventNotifier {
     pub fn new(debounce_ms: u64) -> Self {
         let (event_sender, _) = broadcast::channel(1000);
-        let aggregator = Arc::new(RwLock::new(EventAggregator::new(
-            Duration::from_millis(debounce_ms),
-        )));
-        let history = Arc::new(Mutex::new(EventHistory::new(1000)));  // Reduced from 10000 for ARM devices
+        let aggregator = Arc::new(RwLock::new(EventAggregator::new(Duration::from_millis(
+            debounce_ms,
+        ))));
+        let history = Arc::new(Mutex::new(EventHistory::new(1000)));
 
         Self {
             version_counter: Arc::new(RwLock::new(0)),
@@ -224,8 +220,8 @@ impl EventNotifier {
     }
 
     pub async fn emit_event(
-        &self, 
-        event_type: SystemEventType, 
+        &self,
+        event_type: SystemEventType,
         path: Option<PathBuf>,
         user_id: Option<String>,
         session_id: Option<String>,
@@ -243,19 +239,13 @@ impl EventNotifier {
                 return;
             }
         }
-        
+
         let mut version = self.version_counter.write().await;
         *version += 1;
         let version_token = *version;
         drop(version);
 
-        let event = SystemEvent::new(
-            event_type,
-            path,
-            version_token,
-            user_id,
-            session_id,
-        );
+        let event = SystemEvent::new(event_type, path, version_token, user_id, session_id);
 
         let mut history = self.history.lock().await;
         history.add(event.clone());
@@ -263,7 +253,7 @@ impl EventNotifier {
 
         let mut agg = self.aggregator.write().await;
         agg.add_event(event);
-        
+
         if agg.should_flush() {
             let events = agg.flush();
             for evt in events {
@@ -274,10 +264,10 @@ impl EventNotifier {
 
     pub fn start_flush_task(self: Arc<Self>) {
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(1000));  // Reduced from 100ms for ARM devices
+            let mut interval = tokio::time::interval(Duration::from_millis(1000));
             loop {
                 interval.tick().await;
-                
+
                 let mut agg = self.aggregator.write().await;
                 if agg.should_flush() {
                     let events = agg.flush();
@@ -288,13 +278,13 @@ impl EventNotifier {
             }
         });
     }
-    
+
     pub fn start_session_cleanup_task(self: Arc<Self>) {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                
+
                 let mut sessions = self.active_sessions.write().await;
                 let now = Instant::now();
                 sessions.retain(|_, session| {
@@ -307,7 +297,7 @@ impl EventNotifier {
     pub async fn get_version(&self) -> u64 {
         *self.version_counter.read().await
     }
-    
+
     pub async fn create_session(&self, user_id: String, permissions: Vec<String>) -> String {
         let session_id = uuid::Uuid::new_v4().to_string();
         let session_info = SessionInfo {
@@ -316,40 +306,40 @@ impl EventNotifier {
             last_activity: Instant::now(),
             permissions,
         };
-        
+
         let mut sessions = self.active_sessions.write().await;
         sessions.insert(session_id.clone(), session_info);
-        
+
         info!("Created new session: {}", session_id);
         session_id
     }
-    
+
     pub async fn verify_session(&self, session_id: &str) -> Option<SessionInfo> {
         let sessions = self.active_sessions.read().await;
         sessions.get(session_id).cloned()
     }
-    
+
     pub async fn revoke_session(&self, session_id: &str) {
         let mut sessions = self.active_sessions.write().await;
         sessions.remove(session_id);
         info!("Revoked session: {}", session_id);
     }
-    
+
     pub async fn get_recent_events(&self, count: usize) -> Vec<SystemEvent> {
         let history = self.history.lock().await;
         history.get_recent(count)
     }
-    
+
     pub async fn get_user_events(&self, user_id: &str) -> Vec<SystemEvent> {
         let history = self.history.lock().await;
         history.get_by_user(user_id)
     }
-    
+
     pub async fn get_events_by_type(&self, event_type: &SystemEventType) -> Vec<SystemEvent> {
         let history = self.history.lock().await;
         history.get_by_type(event_type)
     }
-    
+
     pub async fn clear_pending(&self) {
         let mut agg = self.aggregator.write().await;
         agg.clear();
@@ -357,7 +347,6 @@ impl EventNotifier {
     }
 }
 
-/// Global event notifier (using OnceLock for thread safety)
 static GLOBAL_NOTIFIER: OnceLock<Arc<EventNotifier>> = OnceLock::new();
 
 pub fn init_global_notifier(debounce_ms: u64) -> Arc<EventNotifier> {
@@ -366,7 +355,10 @@ pub fn init_global_notifier(debounce_ms: u64) -> Arc<EventNotifier> {
             let notifier = Arc::new(EventNotifier::new(debounce_ms));
             notifier.clone().start_flush_task();
             notifier.clone().start_session_cleanup_task();
-            info!("Event notifier initialized with {}ms debounce and security features", debounce_ms);
+            info!(
+                "Event notifier initialized with {}ms debounce and security features",
+                debounce_ms
+            );
             notifier
         })
         .clone()

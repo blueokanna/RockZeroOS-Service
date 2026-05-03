@@ -130,7 +130,7 @@ impl UdpStreamReceiver {
     }
 
     pub async fn receive_chunk(&self) -> Result<EncryptedChunk, Box<dyn std::error::Error>> {
-        let mut buf = vec![0u8; 128 * 1024]; // 128KB buffer
+        let mut buf = vec![0u8; 128 * 1024];
         let (len, _addr) = self.socket.recv_from(&mut buf).await?;
         let chunk: EncryptedChunk = bincode::deserialize(&buf[..len])?;
         self.transport.verify_zkp_proof(&chunk).await?;
